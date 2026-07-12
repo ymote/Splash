@@ -16,10 +16,11 @@
 - Per-tool deferred deadlines with host-driven expiration.
 - Host-only bounded external retries with stable idempotency keys.
 - Bounded, redactor-hooked external output streaming outside Splash source.
+- Bounded data-only workflow checkpoints with fresh host approval on resume.
 
 ## Next: richer external operations
 
-- Durable stream checkpoints and resumable external operations.
+- Resumable external operations with authenticated worker reconciliation.
 
 ## Next: contained local effects
 
@@ -32,5 +33,5 @@
 
 - Published grammar and formatter/LSP support.
 - Fuzzing and resource-exhaustion coverage.
-- Durable event storage, replay, checkpoints, and compensation actions.
+- Durable event storage, replay, and compensation actions.
 - Independent security review of effectful adapters.

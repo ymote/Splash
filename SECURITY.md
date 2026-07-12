@@ -80,7 +80,18 @@ need independent concurrent workflows should use separate runtime instances.
 
 Workflow plans are approved by the Rust host. An approval is bound to one plan
 and consumed by execution, so a script cannot manufacture approval for another
-workflow or resume a rejected plan by mutating its own state.
+workflow or resume a rejected plan by mutating its own state. Plans are also
+bound to their creating workflow engine; another engine cannot approve,
+checkpoint, or execute a foreign plan object.
+
+Workflow checkpoints are bounded data-only records of a completed step prefix.
+They bind to the ordered trusted plan through a BLAKE3 fingerprint, but include
+no approval, grant, VM state, output, promise, or external operation handle.
+Loading one cannot run a workflow: the host must recreate the plan and current
+capability policy, authenticate its durable storage, and explicitly issue a
+fresh checkpoint-bound approval. A checkpoint is not proof that its prefix ran
+or that an interrupted step is safe to replay; hosts must use idempotency,
+reconciliation, or compensation for effects around the restart boundary.
 
 This baseline does not yet provide filesystem adapters, network adapters,
 secret storage, worker-process isolation, signed packages, full JSON Schema,

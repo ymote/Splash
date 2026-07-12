@@ -91,6 +91,11 @@ A runtime evaluates one script at a time. A host must resume a paused script
 before evaluating new source on that runtime; independent workflows should use
 separate runtime instances.
 
+Workflow restart state is also host-owned. Splash source cannot create or load
+a checkpoint, and a persisted checkpoint never restores variables, promises,
+or tool authority. The host reconstructs a trusted plan and explicitly approves
+the remaining suffix; see [Workflow checkpoints](workflow-checkpoints.md).
+
 ## LLM generation rules
 
 - Generate source only; do not add Makepad widget wrappers or `runsplash`
