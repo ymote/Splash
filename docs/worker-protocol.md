@@ -1,4 +1,4 @@
-# Worker Protocol v2
+# Worker Protocol v3
 
 `splash-protocol` is the portable data contract between a trusted Splash host
 and a platform-contained worker. It defines capability attenuation, bounded
@@ -23,7 +23,7 @@ only inside its chosen worker backend.
 
 ```json
 {
-  "protocol_version": 2,
+  "protocol_version": 3,
   "session_id": "release-42",
   "grants": [
     {
@@ -95,6 +95,34 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
 
 Transport framing, worker lifecycle, cancellation delivery, durable replay,
 and OS policy remain backend responsibilities.
+
+## Durable Operation Dispatch
+
+`dispatch_operation` is the v3 path for an effect whose idempotency must
+survive a worker restart. It carries the normal session, request ID, tool, and
+bounded text or JSON payload plus a host-owned non-authorizing `operation_key`.
+The worker returns `operation_result` using the existing operation status
+shape: `running`, `succeeded`, `failed`, or `cancelled`.
+
+Both messages must travel through `SessionAuthenticator`. A contained worker
+first validates the request through `SessionAuthorizer`, then calls
+`WorkerOperationJournal::admit` and persists that journal before it lets an
+adapter run an effect. A new admission permits one dispatch. An exact duplicate
+returns its existing `pending`, `running`, or terminal state and must not run
+the adapter again. Reusing the same key with a different tool or canonical
+input is rejected.
+
+For a host workflow ledger, derive and record the input with
+`canonical_operation_input_bytes(&payload)` before it creates the dispatch
+request. `WorkflowEngine::operation_dispatch_request` verifies that exact
+canonical input binding before returning the frame data.
+
+The journal has no ambient storage or tenant identity. Its host creates it for
+one opaque worker scope, serializes it through authenticated rollback-resistant
+storage, and validates that scope on load. A terminal result is retained so a
+duplicate can receive the same output; use encryption if that output is
+sensitive. See [worker durable operations](worker-operations.md) for the
+complete state machine and restart sequence.
 
 ## External operation reconciliation
 

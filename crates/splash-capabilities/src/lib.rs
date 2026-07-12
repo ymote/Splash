@@ -21,10 +21,12 @@ use serde::Serialize;
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 pub use splash_protocol::{
-    AuthenticatedWorkerMessage, CapabilityManifest, OperationReconcileRequest,
-    OperationReconcileResult, OperationStatus, ProtocolError, SessionAuthenticator, SessionKey,
-    SessionRole, ToolInvocation as WorkerInvocation, ToolPayload as WorkerPayload,
-    ToolResult as WorkerResult, WorkerMessage,
+    canonical_operation_input_bytes, AuthenticatedWorkerMessage, CapabilityManifest,
+    OperationDispatchRequest, OperationReconcileRequest, OperationReconcileResult, OperationStatus,
+    ProtocolError, SessionAuthenticator, SessionKey, SessionRole,
+    ToolInvocation as WorkerInvocation, ToolPayload as WorkerPayload, ToolResult as WorkerResult,
+    WorkerMessage, WorkerOperationAdmission, WorkerOperationJournal, WorkerOperationState,
+    WorkerOperationStateKind,
 };
 use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 pub use splash_schema::{JsonSchema, SchemaError};

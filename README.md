@@ -24,6 +24,8 @@ and keeps UI support optional rather than making UI the language boundary.
   trusted host, never directly to Splash source.
 - Keyed, directional, replay-checked worker protocol frames and authenticated
   reconciliation for live external operations.
+- Authenticated durable-operation dispatch frames and a bounded worker journal
+  for replay-safe idempotency across a worker restart.
 - Bounded, data-only workflow checkpoints with fresh host approval required
   for a restart to run the remaining plan suffix.
 - Plan-bound durable external-operation ledgers with input fingerprints,
@@ -121,7 +123,7 @@ defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schem
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
 
-[Worker protocol v2](docs/worker-protocol.md) also defines keyed worker frames
+[Worker protocol v3](docs/worker-protocol.md) also defines keyed worker frames
 and the live-operation reconciliation boundary.
 
 [Workflow checkpoints](docs/workflow-checkpoints.md) define the durable
@@ -132,3 +134,6 @@ records and safely reconciles uncertain external effects across a restart.
 
 [Authenticated storage](docs/durable-storage.md) defines the trusted durable
 record boundary used to persist those host-owned records.
+
+[Worker durable operations](docs/worker-operations.md) define the contained
+worker-side replay and persistence boundary for effectful operation keys.

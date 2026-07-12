@@ -272,6 +272,7 @@ dependencies = [
  "constant_time_eq",
  "serde",
  "serde_json",
+ "splash-storage",
 ]
 
 [[package]]

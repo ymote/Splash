@@ -13,10 +13,16 @@ use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
 pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
 pub const MAX_OPERATION_ERROR_BYTES: usize = 4 * 1024;
+/// Maximum serialized worker operation journal accepted from durable storage.
+pub const MAX_WORKER_OPERATION_JOURNAL_BYTES: usize = 512 * 1024;
+/// Maximum durable operation intents retained by one worker journal.
+pub const MAX_WORKER_OPERATION_RECORDS: usize = 64;
+/// Current serialized worker operation journal format version.
+pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 1;
 const MAX_RESOURCES_PER_GRANT: usize = 64;
 
 /// The format an adapter accepts and returns across the worker boundary.
@@ -362,6 +368,65 @@ impl ToolResult {
     }
 }
 
+/// An effectful operation dispatch sent from a policy host to a contained
+/// worker.
+///
+/// Unlike a regular [`ToolInvocation`], this carries a host-owned durable
+/// `operation_key`. A worker journal must persist the intent before it runs
+/// the effect and must reject reuse of the key for a different tool or input.
+/// The key is a correlation and deduplication value, never authority.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationDispatchRequest {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub operation_key: String,
+    pub payload: ToolPayload,
+}
+
+impl OperationDispatchRequest {
+    pub fn new(
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        tool: impl Into<String>,
+        operation_key: impl Into<String>,
+        payload: ToolPayload,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            request_id: request_id.into(),
+            tool: tool.into(),
+            operation_key: operation_key.into(),
+            payload,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate_header(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)
+    }
+
+    /// Validates portable request syntax before the session grant is applied.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.validate_header()?;
+        self.payload.validate_for(self.payload.format()).map(|_| ())
+    }
+
+    /// Returns the stable canonical bytes that bind this dispatch input into a
+    /// durable operation identity.
+    pub fn canonical_input_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        canonical_operation_input_bytes(&self.payload)
+    }
+}
+
 /// A host request to recover the status of one externally dispatched operation.
 ///
 /// `operation_key` is an idempotency or durable workflow key supplied by the
@@ -474,6 +539,15 @@ impl OperationReconcileResult {
             && self.operation_key == request.operation_key
     }
 
+    /// Returns whether this status reports the exact durable dispatch request.
+    pub fn matches_dispatch(&self, request: &OperationDispatchRequest) -> bool {
+        self.protocol_version == request.protocol_version
+            && self.session_id == request.session_id
+            && self.request_id == request.request_id
+            && self.tool == request.tool
+            && self.operation_key == request.operation_key
+    }
+
     /// Validates a worker-reported operation state before host reconciliation.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         validate_protocol_version(self.protocol_version)?;
@@ -483,6 +557,363 @@ impl OperationReconcileResult {
         validate_token("operation key", &self.operation_key)?;
         self.status.validate()
     }
+}
+
+/// Persisted lifecycle state for one worker-side durable operation.
+///
+/// `Pending` means the worker recorded intent before dispatch but has not
+/// recorded a worker observation. Terminal success data is retained solely so
+/// a worker can return an idempotent result; persist the journal only in
+/// authenticated storage appropriate for that payload's sensitivity.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkerOperationState {
+    Pending,
+    Running,
+    Succeeded { payload: ToolPayload },
+    Failed { message: String },
+    Cancelled,
+}
+
+impl WorkerOperationState {
+    /// Returns the state without exposing any retained result payload.
+    pub fn kind(&self) -> WorkerOperationStateKind {
+        match self {
+            Self::Pending => WorkerOperationStateKind::Pending,
+            Self::Running => WorkerOperationStateKind::Running,
+            Self::Succeeded { .. } => WorkerOperationStateKind::Succeeded,
+            Self::Failed { .. } => WorkerOperationStateKind::Failed,
+            Self::Cancelled => WorkerOperationStateKind::Cancelled,
+        }
+    }
+
+    /// Converts an observed worker state into its protocol status, if one
+    /// exists. `Pending` deliberately has no wire status.
+    pub fn as_status(&self) -> Option<OperationStatus> {
+        match self {
+            Self::Pending => None,
+            Self::Running => Some(OperationStatus::Running),
+            Self::Succeeded { payload } => Some(OperationStatus::Succeeded {
+                payload: payload.clone(),
+            }),
+            Self::Failed { message } => Some(OperationStatus::Failed {
+                message: message.clone(),
+            }),
+            Self::Cancelled => Some(OperationStatus::Cancelled),
+        }
+    }
+
+    fn from_status(status: OperationStatus) -> Self {
+        match status {
+            OperationStatus::Running => Self::Running,
+            OperationStatus::Succeeded { payload } => Self::Succeeded { payload },
+            OperationStatus::Failed { message } => Self::Failed { message },
+            OperationStatus::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Pending | Self::Running | Self::Cancelled => Ok(()),
+            Self::Succeeded { payload } => payload.validate_for(payload.format()).map(|_| ()),
+            Self::Failed { message } => OperationStatus::Failed {
+                message: message.clone(),
+            }
+            .validate(),
+        }
+    }
+
+    fn accepts(&self, observed: &Self) -> bool {
+        match self {
+            Self::Pending => !matches!(observed, Self::Pending),
+            Self::Running => !matches!(observed, Self::Pending),
+            Self::Succeeded { .. } | Self::Failed { .. } | Self::Cancelled => self == observed,
+        }
+    }
+}
+
+impl fmt::Debug for WorkerOperationState {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => formatter.write_str("WorkerOperationState::Pending"),
+            Self::Running => formatter.write_str("WorkerOperationState::Running"),
+            Self::Succeeded { .. } => {
+                formatter.write_str("WorkerOperationState::Succeeded([REDACTED])")
+            }
+            Self::Failed { .. } => formatter.write_str("WorkerOperationState::Failed([REDACTED])"),
+            Self::Cancelled => formatter.write_str("WorkerOperationState::Cancelled"),
+        }
+    }
+}
+
+/// A payload-free view used in durable operation transition errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerOperationStateKind {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// One bounded durable operation intent retained by a contained worker.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerOperationRecord {
+    tool: String,
+    operation_key: String,
+    input_fingerprint: String,
+    state: WorkerOperationState,
+}
+
+impl WorkerOperationRecord {
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn operation_key(&self) -> &str {
+        &self.operation_key
+    }
+
+    pub fn input_fingerprint(&self) -> &str {
+        &self.input_fingerprint
+    }
+
+    pub fn state(&self) -> &WorkerOperationState {
+        &self.state
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)?;
+        if !is_blake3_fingerprint(&self.input_fingerprint) {
+            return Err(ProtocolError::InvalidOperationFingerprint);
+        }
+        self.state.validate()
+    }
+}
+
+impl fmt::Debug for WorkerOperationRecord {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerOperationRecord")
+            .field("tool", &self.tool)
+            .field("operation_key", &self.operation_key)
+            .field("input_fingerprint", &self.input_fingerprint)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// Bounded worker-side state used to deduplicate durable operations.
+///
+/// Persist a journal before an effect reaches an adapter. A new journal record
+/// returns [`WorkerOperationAdmission::Dispatch`]; an exact duplicate returns
+/// its existing state and must not cause another effect. This type does not
+/// write storage itself, select a tenant namespace, or authorize a tool. The
+/// contained worker's host owns those boundaries.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerOperationJournal {
+    format_version: u8,
+    scope: String,
+    records: Vec<WorkerOperationRecord>,
+}
+
+impl WorkerOperationJournal {
+    /// Creates a journal for one opaque host-selected worker tenant or policy
+    /// domain. Never share a scope across principals that must not deduplicate
+    /// each other's durable effects.
+    pub fn new(scope: impl Into<String>) -> Result<Self, ProtocolError> {
+        let scope = scope.into();
+        validate_token("operation journal scope", &scope)?;
+        Ok(Self {
+            format_version: WORKER_OPERATION_JOURNAL_FORMAT_VERSION,
+            scope,
+            records: Vec::new(),
+        })
+    }
+
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Rejects a restored journal that belongs to another worker tenant or
+    /// policy domain.
+    pub fn validate_scope(&self, expected_scope: &str) -> Result<(), ProtocolError> {
+        validate_token("operation journal scope", expected_scope)?;
+        if self.scope != expected_scope {
+            return Err(ProtocolError::OperationJournalScopeMismatch {
+                expected: expected_scope.to_owned(),
+                actual: self.scope.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn records(&self) -> &[WorkerOperationRecord] {
+        &self.records
+    }
+
+    pub fn operation(&self, operation_key: &str) -> Option<&WorkerOperationRecord> {
+        self.records
+            .iter()
+            .find(|record| record.operation_key == operation_key)
+    }
+
+    /// Encodes bounded worker-owned state for authenticated durable storage.
+    pub fn to_json(&self) -> Result<String, ProtocolError> {
+        self.validate_and_bound()?;
+        serde_json::to_string(self).map_err(|error| ProtocolError::Serialization(error.to_string()))
+    }
+
+    /// Decodes bounded worker state from host-selected durable storage.
+    ///
+    /// This checks syntax and resource bounds, but the caller must authenticate
+    /// the storage and scope one journal to one worker tenant or policy domain.
+    pub fn from_json(encoded: &str) -> Result<Self, ProtocolError> {
+        if encoded.len() > MAX_WORKER_OPERATION_JOURNAL_BYTES {
+            return Err(ProtocolError::OperationJournalTooLarge {
+                actual: encoded.len(),
+                maximum: MAX_WORKER_OPERATION_JOURNAL_BYTES,
+            });
+        }
+        let journal: Self = serde_json::from_str(encoded)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+        journal.validate_and_bound()?;
+        Ok(journal)
+    }
+
+    /// Decodes and validates a journal for one expected host-controlled scope.
+    pub fn from_json_for_scope(encoded: &str, expected_scope: &str) -> Result<Self, ProtocolError> {
+        let journal = Self::from_json(encoded)?;
+        journal.validate_scope(expected_scope)?;
+        Ok(journal)
+    }
+
+    /// Records durable intent for an authorized operation before worker
+    /// dispatch. Exact duplicates return their existing state without mutation.
+    pub fn admit(
+        &mut self,
+        authorized: &AuthorizedOperationInvocation,
+    ) -> Result<WorkerOperationAdmission, ProtocolError> {
+        self.validate_and_bound()?;
+        let request = authorized.request();
+        let input_fingerprint = worker_operation_input_fingerprint(&request.payload)?;
+        if let Some(record) = self.operation(&request.operation_key) {
+            ensure_operation_identity(record, request, &input_fingerprint)?;
+            validate_worker_operation_state_for_grant(&record.state, authorized.grant())?;
+            return Ok(WorkerOperationAdmission::Existing {
+                state: record.state.clone(),
+            });
+        }
+        if self.records.len() >= MAX_WORKER_OPERATION_RECORDS {
+            return Err(ProtocolError::TooManyWorkerOperations {
+                maximum: MAX_WORKER_OPERATION_RECORDS,
+            });
+        }
+
+        let mut candidate = self.clone();
+        candidate.records.push(WorkerOperationRecord {
+            tool: request.tool.clone(),
+            operation_key: request.operation_key.clone(),
+            input_fingerprint,
+            state: WorkerOperationState::Pending,
+        });
+        candidate.validate_and_bound()?;
+        *self = candidate;
+        Ok(WorkerOperationAdmission::Dispatch)
+    }
+
+    /// Records a worker observation after an adapter has acted on an admitted
+    /// operation. Terminal states are idempotent only when their complete
+    /// payload or failure message matches exactly.
+    pub fn observe(
+        &mut self,
+        authorized: &AuthorizedOperationInvocation,
+        status: OperationStatus,
+    ) -> Result<WorkerOperationState, ProtocolError> {
+        self.validate_and_bound()?;
+        validate_operation_status_for_grant(&status, authorized.grant())?;
+        let request = authorized.request();
+        let input_fingerprint = worker_operation_input_fingerprint(&request.payload)?;
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.operation_key == request.operation_key)
+            .ok_or_else(|| ProtocolError::UnknownOperation(request.operation_key.clone()))?;
+        let record = &self.records[record_index];
+        ensure_operation_identity(record, request, &input_fingerprint)?;
+        let observed = WorkerOperationState::from_status(status);
+        if !record.state.accepts(&observed) {
+            return Err(ProtocolError::InvalidWorkerOperationTransition {
+                operation_key: request.operation_key.clone(),
+                current: record.state.kind(),
+                observed: observed.kind(),
+            });
+        }
+        if record.state == observed {
+            return Ok(observed);
+        }
+
+        let mut candidate = self.clone();
+        candidate.records[record_index].state = observed.clone();
+        candidate.validate_and_bound()?;
+        *self = candidate;
+        Ok(observed)
+    }
+
+    fn validate_and_bound(&self) -> Result<(), ProtocolError> {
+        if self.format_version != WORKER_OPERATION_JOURNAL_FORMAT_VERSION {
+            return Err(ProtocolError::UnsupportedOperationJournalVersion(
+                self.format_version,
+            ));
+        }
+        validate_token("operation journal scope", &self.scope)?;
+        if self.records.len() > MAX_WORKER_OPERATION_RECORDS {
+            return Err(ProtocolError::TooManyWorkerOperations {
+                maximum: MAX_WORKER_OPERATION_RECORDS,
+            });
+        }
+        let mut seen_operation_keys = BTreeSet::new();
+        for record in &self.records {
+            record.validate()?;
+            if !seen_operation_keys.insert(&record.operation_key) {
+                return Err(ProtocolError::DuplicateOperationKey(
+                    record.operation_key.clone(),
+                ));
+            }
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_WORKER_OPERATION_JOURNAL_BYTES {
+            return Err(ProtocolError::OperationJournalTooLarge {
+                actual: encoded.len(),
+                maximum: MAX_WORKER_OPERATION_JOURNAL_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for WorkerOperationJournal {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerOperationJournal")
+            .field("format_version", &self.format_version)
+            .field("scope", &self.scope)
+            .field("record_count", &self.records.len())
+            .finish()
+    }
+}
+
+/// Admission outcome for [`WorkerOperationJournal::admit`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkerOperationAdmission {
+    /// Persist the journal before allowing the adapter to execute the effect.
+    Dispatch,
+    /// The exact operation already exists; do not execute it again.
+    Existing { state: WorkerOperationState },
 }
 
 /// Framed protocol messages for a future pipe, socket, or platform IPC layer.
@@ -497,6 +928,12 @@ pub enum WorkerMessage {
     },
     Result {
         result: ToolResult,
+    },
+    DispatchOperation {
+        request: OperationDispatchRequest,
+    },
+    OperationResult {
+        result: OperationReconcileResult,
     },
     ReconcileOperation {
         request: OperationReconcileRequest,
@@ -521,6 +958,8 @@ impl WorkerMessage {
             Self::OpenSession { manifest } => manifest.validate(),
             Self::Invoke { invocation } => invocation.validate_header(),
             Self::Result { result } => result.validate_header(),
+            Self::DispatchOperation { request } => request.validate(),
+            Self::OperationResult { result } => result.validate(),
             Self::ReconcileOperation { request } => request.validate(),
             Self::ReconciledOperation { result } => result.validate(),
             Self::Cancel {
@@ -548,6 +987,8 @@ impl WorkerMessage {
             Self::OpenSession { manifest } => &manifest.session_id,
             Self::Invoke { invocation } => &invocation.session_id,
             Self::Result { result } => &result.session_id,
+            Self::DispatchOperation { request } => &request.session_id,
+            Self::OperationResult { result } => &result.session_id,
             Self::ReconcileOperation { request } => &request.session_id,
             Self::ReconciledOperation { result } => &result.session_id,
             Self::Cancel { session_id, .. } | Self::CloseSession { session_id, .. } => session_id,
@@ -805,7 +1246,7 @@ fn authentication_tag(
     message: &WorkerMessage,
 ) -> Result<[u8; AUTH_TAG_BYTES], ProtocolError> {
     let encoded = serde_json::to_vec(&AuthenticationPayload {
-        domain: "splash-worker-auth-v2",
+        domain: "splash-worker-auth-v3",
         protocol_version: PROTOCOL_VERSION,
         sender: sender.tag(),
         sequence,
@@ -879,6 +1320,23 @@ impl AuthorizedInvocation {
     }
 }
 
+/// A durable operation dispatch the policy host has accepted for a worker.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorizedOperationInvocation {
+    request: OperationDispatchRequest,
+    grant: CapabilityGrant,
+}
+
+impl AuthorizedOperationInvocation {
+    pub fn request(&self) -> &OperationDispatchRequest {
+        &self.request
+    }
+
+    pub fn grant(&self) -> &CapabilityGrant {
+        &self.grant
+    }
+}
+
 /// Stateful host-side validation for a single capability manifest.
 ///
 /// Authorization consumes call budget before dispatch. This intentionally
@@ -915,40 +1373,30 @@ impl SessionAuthorizer {
         invocation: ToolInvocation,
     ) -> Result<AuthorizedInvocation, ProtocolError> {
         invocation.validate_header()?;
-        if invocation.session_id != self.manifest.session_id {
-            return Err(ProtocolError::UnknownSession(invocation.session_id));
-        }
-
-        let grant = self
-            .manifest
-            .grants
-            .iter()
-            .find(|grant| grant.tool == invocation.tool)
-            .cloned()
-            .ok_or_else(|| ProtocolError::UnknownTool(invocation.tool.clone()))?;
-        let input_bytes = invocation.payload.validate_for(grant.format)?;
-        if input_bytes > grant.max_input_bytes as usize {
-            return Err(ProtocolError::InputTooLarge {
-                actual: input_bytes,
-                maximum: grant.max_input_bytes as usize,
-            });
-        }
-
-        if self.seen_request_ids.contains(&invocation.request_id) {
-            return Err(ProtocolError::DuplicateRequest(invocation.request_id));
-        }
-
-        let calls = self.calls_by_tool.entry(grant.tool.clone()).or_default();
-        if *calls >= grant.max_calls {
-            return Err(ProtocolError::CallBudgetExhausted {
-                tool: grant.tool.clone(),
-                maximum: grant.max_calls,
-            });
-        }
-        self.seen_request_ids.insert(invocation.request_id.clone());
-        *calls = calls.saturating_add(1);
+        let grant = self.authorize_payload(
+            &invocation.session_id,
+            &invocation.request_id,
+            &invocation.tool,
+            &invocation.payload,
+        )?;
 
         Ok(AuthorizedInvocation { invocation, grant })
+    }
+
+    /// Validates and reserves one durable operation dispatch against this
+    /// session's capability manifest.
+    pub fn authorize_operation(
+        &mut self,
+        request: OperationDispatchRequest,
+    ) -> Result<AuthorizedOperationInvocation, ProtocolError> {
+        request.validate_header()?;
+        let grant = self.authorize_payload(
+            &request.session_id,
+            &request.request_id,
+            &request.tool,
+            &request.payload,
+        )?;
+        Ok(AuthorizedOperationInvocation { request, grant })
     }
 
     pub fn validate_result(
@@ -979,6 +1427,96 @@ impl SessionAuthorizer {
         self.completed_request_ids.insert(result.request_id.clone());
         Ok(())
     }
+
+    /// Validates one initial dispatch status against an authorized durable
+    /// operation. A worker may report `running` or a terminal observation; a
+    /// later reconciliation uses its own request ID and is validated separately.
+    pub fn validate_operation_result(
+        &mut self,
+        authorized: &AuthorizedOperationInvocation,
+        result: &OperationReconcileResult,
+    ) -> Result<(), ProtocolError> {
+        result.validate()?;
+        if result.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(result.session_id.clone()));
+        }
+        if !result.matches_dispatch(&authorized.request) {
+            return Err(ProtocolError::OperationResultMismatch);
+        }
+        if self.completed_request_ids.contains(&result.request_id) {
+            return Err(ProtocolError::DuplicateResult(result.request_id.clone()));
+        }
+        validate_operation_status_for_grant(&result.status, &authorized.grant)?;
+        self.completed_request_ids.insert(result.request_id.clone());
+        Ok(())
+    }
+
+    fn authorize_payload(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        tool: &str,
+        payload: &ToolPayload,
+    ) -> Result<CapabilityGrant, ProtocolError> {
+        if session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(session_id.to_owned()));
+        }
+        let grant = self
+            .manifest
+            .grants
+            .iter()
+            .find(|grant| grant.tool == tool)
+            .cloned()
+            .ok_or_else(|| ProtocolError::UnknownTool(tool.to_owned()))?;
+        let input_bytes = payload.validate_for(grant.format)?;
+        if input_bytes > grant.max_input_bytes as usize {
+            return Err(ProtocolError::InputTooLarge {
+                actual: input_bytes,
+                maximum: grant.max_input_bytes as usize,
+            });
+        }
+        if self.seen_request_ids.contains(request_id) {
+            return Err(ProtocolError::DuplicateRequest(request_id.to_owned()));
+        }
+        let calls = self.calls_by_tool.entry(grant.tool.clone()).or_default();
+        if *calls >= grant.max_calls {
+            return Err(ProtocolError::CallBudgetExhausted {
+                tool: grant.tool.clone(),
+                maximum: grant.max_calls,
+            });
+        }
+        self.seen_request_ids.insert(request_id.to_owned());
+        *calls = calls.saturating_add(1);
+        Ok(grant)
+    }
+}
+
+fn validate_operation_status_for_grant(
+    status: &OperationStatus,
+    grant: &CapabilityGrant,
+) -> Result<(), ProtocolError> {
+    status.validate()?;
+    if let OperationStatus::Succeeded { payload } = status {
+        let output_bytes = payload.validate_for(grant.format)?;
+        if output_bytes > grant.max_output_bytes as usize {
+            return Err(ProtocolError::OutputTooLarge {
+                actual: output_bytes,
+                maximum: grant.max_output_bytes as usize,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_worker_operation_state_for_grant(
+    state: &WorkerOperationState,
+    grant: &CapabilityGrant,
+) -> Result<(), ProtocolError> {
+    state.validate()?;
+    if let Some(status) = state.as_status() {
+        validate_operation_status_for_grant(&status, grant)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1013,6 +1551,28 @@ pub enum ProtocolError {
     InvalidAuthenticationTag,
     DuplicateRequest(String),
     DuplicateResult(String),
+    OperationResultMismatch,
+    UnsupportedOperationJournalVersion(u8),
+    OperationJournalTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
+    OperationJournalScopeMismatch {
+        expected: String,
+        actual: String,
+    },
+    TooManyWorkerOperations {
+        maximum: usize,
+    },
+    InvalidOperationFingerprint,
+    DuplicateOperationKey(String),
+    UnknownOperation(String),
+    OperationIdentityMismatch(String),
+    InvalidWorkerOperationTransition {
+        operation_key: String,
+        current: WorkerOperationStateKind,
+        observed: WorkerOperationStateKind,
+    },
     PayloadFormatMismatch {
         expected: EnvelopeFormat,
         actual: EnvelopeFormat,
@@ -1100,6 +1660,44 @@ impl Display for ProtocolError {
             Self::DuplicateResult(request_id) => {
                 write!(formatter, "duplicate worker result: {request_id}")
             }
+            Self::OperationResultMismatch => {
+                formatter.write_str("worker operation result does not match its dispatch")
+            }
+            Self::UnsupportedOperationJournalVersion(version) => {
+                write!(formatter, "unsupported worker operation journal version: {version}")
+            }
+            Self::OperationJournalTooLarge { actual, maximum } => write!(
+                formatter,
+                "worker operation journal is {actual} bytes; maximum is {maximum} bytes"
+            ),
+            Self::OperationJournalScopeMismatch { expected, actual } => write!(
+                formatter,
+                "worker operation journal scope mismatch: expected {expected}, got {actual}"
+            ),
+            Self::TooManyWorkerOperations { maximum } => {
+                write!(formatter, "worker operation journal exceeds {maximum} records")
+            }
+            Self::InvalidOperationFingerprint => {
+                formatter.write_str("worker operation journal has an invalid input fingerprint")
+            }
+            Self::DuplicateOperationKey(operation_key) => {
+                write!(formatter, "duplicate worker operation key: {operation_key}")
+            }
+            Self::UnknownOperation(operation_key) => {
+                write!(formatter, "unknown worker operation: {operation_key}")
+            }
+            Self::OperationIdentityMismatch(operation_key) => write!(
+                formatter,
+                "worker operation key was reused with a different tool or input: {operation_key}"
+            ),
+            Self::InvalidWorkerOperationTransition {
+                operation_key,
+                current,
+                observed,
+            } => write!(
+                formatter,
+                "invalid worker operation transition for {operation_key}: {current:?} to {observed:?}"
+            ),
             Self::PayloadFormatMismatch { expected, actual } => {
                 write!(
                     formatter,
@@ -1180,10 +1778,106 @@ fn validate_protocol_version(protocol_version: u16) -> Result<(), ProtocolError>
     Ok(())
 }
 
+fn ensure_operation_identity(
+    record: &WorkerOperationRecord,
+    request: &OperationDispatchRequest,
+    input_fingerprint: &str,
+) -> Result<(), ProtocolError> {
+    if record.tool != request.tool || record.input_fingerprint != input_fingerprint {
+        return Err(ProtocolError::OperationIdentityMismatch(
+            request.operation_key.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn worker_operation_input_fingerprint(payload: &ToolPayload) -> Result<String, ProtocolError> {
+    let input = canonical_operation_input_bytes(payload)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"splash-worker-operation-input-v1");
+    hasher.update(&input);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Produces the stable byte representation used for durable operation input
+/// identity. Text retains its exact UTF-8 bytes; JSON is recursively
+/// canonicalized with object keys in sorted order.
+pub fn canonical_operation_input_bytes(payload: &ToolPayload) -> Result<Vec<u8>, ProtocolError> {
+    payload.validate_for(payload.format())?;
+    let mut encoded = Vec::new();
+    match payload {
+        ToolPayload::Text(value) => {
+            encoded.extend_from_slice(b"text");
+            append_worker_operation_component(&mut encoded, value.as_bytes());
+        }
+        ToolPayload::Json(value) => {
+            encoded.extend_from_slice(b"json");
+            let json = canonical_json_bytes(value)?;
+            append_worker_operation_component(&mut encoded, &json);
+        }
+    }
+    Ok(encoded)
+}
+
+fn append_worker_operation_component(encoded: &mut Vec<u8>, bytes: &[u8]) {
+    encoded.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(bytes);
+}
+
+fn canonical_json_bytes(value: &JsonValue) -> Result<Vec<u8>, ProtocolError> {
+    let mut encoded = Vec::new();
+    write_canonical_json(value, &mut encoded)?;
+    Ok(encoded)
+}
+
+fn write_canonical_json(value: &JsonValue, encoded: &mut Vec<u8>) -> Result<(), ProtocolError> {
+    match value {
+        JsonValue::Array(values) => {
+            encoded.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    encoded.push(b',');
+                }
+                write_canonical_json(value, encoded)?;
+            }
+            encoded.push(b']');
+        }
+        JsonValue::Object(values) => {
+            encoded.push(b'{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    encoded.push(b',');
+                }
+                serde_json::to_writer(&mut *encoded, key)
+                    .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+                encoded.push(b':');
+                write_canonical_json(value, encoded)?;
+            }
+            encoded.push(b'}');
+        }
+        _ => serde_json::to_writer(encoded, value)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?,
+    }
+    Ok(())
+}
+
+fn is_blake3_fingerprint(value: &str) -> bool {
+    value.len() == blake3::OUT_LEN * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use splash_storage::{
+        AuthenticatedStore, StorageKey, StorageKeyId, StorageKeyring, StorageRecordKey,
+        VolatileMemoryStore, STORAGE_KEY_BYTES,
+    };
 
     fn json_grant() -> CapabilityGrant {
         let mut grant = CapabilityGrant::json("math.add");
@@ -1410,6 +2104,284 @@ mod tests {
             authorizer.validate_result(&authorized, &oversized),
             Err(ProtocolError::OutputTooLarge { .. })
         ));
+    }
+
+    fn operation_request(
+        request_id: &str,
+        operation_key: &str,
+        payload: ToolPayload,
+    ) -> OperationDispatchRequest {
+        OperationDispatchRequest::new("session-1", request_id, "math.add", operation_key, payload)
+            .unwrap()
+    }
+
+    #[test]
+    fn operation_dispatch_is_capability_checked_and_binds_its_status() {
+        let request = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer.authorize_operation(request.clone()).unwrap();
+        assert_eq!(authorizer.calls_for("math.add"), 1);
+
+        let wrong_operation = OperationReconcileResult::new(
+            "session-1",
+            "operation-request-1",
+            "math.add",
+            "other-operation",
+            OperationStatus::Running,
+        )
+        .unwrap();
+        assert_eq!(
+            authorizer
+                .validate_operation_result(&authorized, &wrong_operation)
+                .unwrap_err(),
+            ProtocolError::OperationResultMismatch
+        );
+
+        let oversized = OperationReconcileResult::new(
+            "session-1",
+            "operation-request-1",
+            "math.add",
+            "release-42-add",
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(json!({"body": "x".repeat(256)})),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            authorizer.validate_operation_result(&authorized, &oversized),
+            Err(ProtocolError::OutputTooLarge { .. })
+        ));
+
+        let running = OperationReconcileResult::new(
+            "session-1",
+            "operation-request-1",
+            "math.add",
+            "release-42-add",
+            OperationStatus::Running,
+        )
+        .unwrap();
+        authorizer
+            .validate_operation_result(&authorized, &running)
+            .unwrap();
+        assert_eq!(
+            authorizer
+                .validate_operation_result(&authorized, &running)
+                .unwrap_err(),
+            ProtocolError::DuplicateResult("operation-request-1".to_owned())
+        );
+
+        let message = WorkerMessage::DispatchOperation { request };
+        let encoded = message.to_json_line().unwrap();
+        assert_eq!(WorkerMessage::from_json_line(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn worker_operation_journal_deduplicates_exact_dispatches() {
+        let reordered_left: JsonValue = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
+        let reordered_right: JsonValue = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        assert_eq!(
+            worker_operation_input_fingerprint(&ToolPayload::Json(reordered_left)).unwrap(),
+            worker_operation_input_fingerprint(&ToolPayload::Json(reordered_right)).unwrap(),
+        );
+
+        let request = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"token": "private input", "left": 20, "right": 22})),
+        );
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer.authorize_operation(request.clone()).unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+
+        assert_eq!(
+            journal.admit(&authorized).unwrap(),
+            WorkerOperationAdmission::Dispatch
+        );
+        let encoded = journal.to_json().unwrap();
+        assert!(!encoded.contains("private input"));
+        let restored =
+            WorkerOperationJournal::from_json_for_scope(&encoded, "tenant-release").unwrap();
+        assert_eq!(restored, journal);
+        assert_eq!(
+            WorkerOperationJournal::from_json_for_scope(&encoded, "tenant-other").unwrap_err(),
+            ProtocolError::OperationJournalScopeMismatch {
+                expected: "tenant-other".to_owned(),
+                actual: "tenant-release".to_owned(),
+            }
+        );
+        assert_eq!(
+            journal.admit(&authorized).unwrap(),
+            WorkerOperationAdmission::Existing {
+                state: WorkerOperationState::Pending,
+            }
+        );
+
+        assert_eq!(
+            journal
+                .observe(&authorized, OperationStatus::Running)
+                .unwrap(),
+            WorkerOperationState::Running
+        );
+        let succeeded = OperationStatus::Succeeded {
+            payload: ToolPayload::Json(json!({"total": 42})),
+        };
+        assert_eq!(
+            journal.observe(&authorized, succeeded.clone()).unwrap(),
+            WorkerOperationState::Succeeded {
+                payload: ToolPayload::Json(json!({"total": 42})),
+            }
+        );
+        assert_eq!(
+            journal.admit(&authorized).unwrap(),
+            WorkerOperationAdmission::Existing {
+                state: WorkerOperationState::Succeeded {
+                    payload: ToolPayload::Json(json!({"total": 42})),
+                },
+            }
+        );
+        assert_eq!(
+            journal.observe(&authorized, succeeded).unwrap(),
+            WorkerOperationState::Succeeded {
+                payload: ToolPayload::Json(json!({"total": 42})),
+            }
+        );
+        assert_eq!(journal.records().len(), 1);
+    }
+
+    #[test]
+    fn worker_operation_journal_rejects_identity_drift_and_terminal_rewrites() {
+        let request = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer.authorize_operation(request).unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+        journal.admit(&authorized).unwrap();
+
+        let changed_request = operation_request(
+            "operation-request-2",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 23})),
+        );
+        let mut changed_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let changed = changed_authorizer
+            .authorize_operation(changed_request)
+            .unwrap();
+        assert_eq!(
+            journal.admit(&changed).unwrap_err(),
+            ProtocolError::OperationIdentityMismatch("release-42-add".to_owned())
+        );
+
+        journal
+            .observe(
+                &authorized,
+                OperationStatus::Succeeded {
+                    payload: ToolPayload::Json(json!({"total": 42})),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            journal
+                .observe(
+                    &authorized,
+                    OperationStatus::Failed {
+                        message: "late failure".to_owned(),
+                    },
+                )
+                .unwrap_err(),
+            ProtocolError::InvalidWorkerOperationTransition {
+                operation_key: "release-42-add".to_owned(),
+                current: WorkerOperationStateKind::Succeeded,
+                observed: WorkerOperationStateKind::Failed,
+            }
+        );
+        assert_eq!(
+            WorkerOperationJournal::from_json(&"x".repeat(MAX_WORKER_OPERATION_JOURNAL_BYTES + 1))
+                .unwrap_err(),
+            ProtocolError::OperationJournalTooLarge {
+                actual: MAX_WORKER_OPERATION_JOURNAL_BYTES + 1,
+                maximum: MAX_WORKER_OPERATION_JOURNAL_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_operation_journal_rechecks_replayed_state_against_current_grants() {
+        let request = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut wide_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let wide = wide_authorizer.authorize_operation(request).unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+        journal.admit(&wide).unwrap();
+        journal
+            .observe(
+                &wide,
+                OperationStatus::Succeeded {
+                    payload: ToolPayload::Json(json!({"body": "x".repeat(64)})),
+                },
+            )
+            .unwrap();
+
+        let replay = operation_request(
+            "operation-request-2",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut narrow_grant = json_grant();
+        narrow_grant.max_output_bytes = 16;
+        let narrow_manifest = CapabilityManifest::new("session-1", vec![narrow_grant]).unwrap();
+        let mut narrow_authorizer = SessionAuthorizer::new(narrow_manifest).unwrap();
+        let narrow = narrow_authorizer.authorize_operation(replay).unwrap();
+
+        assert!(matches!(
+            journal.admit(&narrow),
+            Err(ProtocolError::OutputTooLarge { maximum: 16, .. })
+        ));
+    }
+
+    #[test]
+    fn worker_operation_journal_restores_from_authenticated_storage() {
+        let request = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer.authorize_operation(request).unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+        journal.admit(&authorized).unwrap();
+        journal
+            .observe(&authorized, OperationStatus::Running)
+            .unwrap();
+
+        let record_key = StorageRecordKey::new("worker-journal", "tenant-release").unwrap();
+        let keyring = StorageKeyring::new(
+            StorageKeyId::new("storage-v1").unwrap(),
+            StorageKey::from_bytes([29; STORAGE_KEY_BYTES]),
+        );
+        let mut store = AuthenticatedStore::new(VolatileMemoryStore::default(), keyring);
+        let encoded = journal.to_json().unwrap();
+        let persisted = store.create(&record_key, encoded.as_bytes()).unwrap();
+        assert_eq!(persisted.revision(), 1);
+
+        let restored_record = store.load(&record_key).unwrap().unwrap();
+        let restored_json = std::str::from_utf8(restored_record.payload()).unwrap();
+        let restored =
+            WorkerOperationJournal::from_json_for_scope(restored_json, "tenant-release").unwrap();
+        assert_eq!(restored, journal);
+        assert_eq!(
+            restored.operation("release-42-add").unwrap().state(),
+            &WorkerOperationState::Running
+        );
     }
 
     #[test]

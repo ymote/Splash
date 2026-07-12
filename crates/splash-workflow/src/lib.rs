@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use splash_capabilities::CapabilityRuntime;
 use splash_core::RuntimeError;
 use splash_protocol::{
-    AuthenticatedWorkerMessage, OperationReconcileRequest, OperationReconcileResult,
-    OperationStatus, ProtocolError, SessionAuthenticator, SessionRole, WorkerMessage,
+    AuthenticatedWorkerMessage, OperationDispatchRequest, OperationReconcileRequest,
+    OperationReconcileResult, OperationStatus, ProtocolError, SessionAuthenticator, SessionRole,
+    ToolPayload, WorkerMessage,
 };
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
@@ -405,6 +406,13 @@ pub struct AuthenticatedWorkflowReconciliationRequest {
     pub frame: AuthenticatedWorkerMessage,
 }
 
+/// A keyed worker frame for a durable operation dispatch request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthenticatedWorkflowOperationDispatch {
+    pub request: OperationDispatchRequest,
+    pub frame: AuthenticatedWorkerMessage,
+}
+
 impl WorkflowOperationLedger {
     /// Monotonic revision incremented by every non-idempotent ledger mutation.
     ///
@@ -708,6 +716,7 @@ pub enum WorkflowOperationLedgerError {
     UnknownOperation(String),
     ReconciliationMismatch,
     ReconciliationRequiresHostAuthenticator,
+    OperationDispatchRequiresHostAuthenticator,
     UnexpectedReconciliationMessage,
     InvalidStateTransition {
         current: WorkflowOperationState,
@@ -782,6 +791,9 @@ impl Display for WorkflowOperationLedgerError {
             }
             Self::ReconciliationRequiresHostAuthenticator => {
                 formatter.write_str("durable reconciliation requires a host session authenticator")
+            }
+            Self::OperationDispatchRequiresHostAuthenticator => {
+                formatter.write_str("durable operation dispatch requires a host session authenticator")
             }
             Self::UnexpectedReconciliationMessage => {
                 formatter.write_str("authenticated worker frame is not an operation reconciliation")
@@ -1172,6 +1184,85 @@ impl WorkflowEngine {
         Ok(operation_key)
     }
 
+    /// Builds a worker operation-dispatch request for a persisted durable
+    /// intent.
+    ///
+    /// Record the request's [`OperationDispatchRequest::canonical_input_bytes`]
+    /// in the ledger before dispatch. This method reconstructs those same bytes
+    /// and fails closed if the current payload differs from the durable intent.
+    pub fn operation_dispatch_request(
+        &self,
+        plan: &WorkflowPlan,
+        ledger: &WorkflowOperationLedger,
+        operation_key: &str,
+        payload: ToolPayload,
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Result<OperationDispatchRequest, WorkflowError> {
+        self.validate_operation_ledger(plan, ledger)?;
+        let operation = ledger.operation(operation_key).ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownOperation(
+                operation_key.to_owned(),
+            ))
+        })?;
+        let request = OperationDispatchRequest::new(
+            session_id,
+            request_id,
+            operation.tool.clone(),
+            operation.operation_key.clone(),
+            payload,
+        )
+        .map_err(|error| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+        })?;
+        let input = request.canonical_input_bytes().map_err(|error| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+        })?;
+        operation
+            .verify_input(&input)
+            .map_err(WorkflowError::OperationLedger)?;
+        Ok(request)
+    }
+
+    /// Creates an authenticated v3 worker dispatch frame for a persisted
+    /// durable operation.
+    ///
+    /// This is the preferred bridge for a contained worker's
+    /// `WorkerOperationJournal`. The host must persist its ledger before it
+    /// sends this frame, and the worker must persist its own journal before it
+    /// runs the effect.
+    pub fn prepare_authenticated_operation_dispatch(
+        &self,
+        plan: &WorkflowPlan,
+        ledger: &WorkflowOperationLedger,
+        operation_key: &str,
+        payload: ToolPayload,
+        request_id: impl Into<String>,
+        authenticator: &mut SessionAuthenticator,
+    ) -> Result<AuthenticatedWorkflowOperationDispatch, WorkflowError> {
+        if authenticator.role() != SessionRole::Host {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::OperationDispatchRequiresHostAuthenticator,
+            ));
+        }
+        let request = self.operation_dispatch_request(
+            plan,
+            ledger,
+            operation_key,
+            payload,
+            authenticator.session_id().to_owned(),
+            request_id,
+        )?;
+        let frame = authenticator
+            .seal(WorkerMessage::DispatchOperation {
+                request: request.clone(),
+            })
+            .map_err(|error| {
+                WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+            })?;
+        Ok(AuthenticatedWorkflowOperationDispatch { request, frame })
+    }
+
     /// Builds a reconciliation request for a durable operation in this plan.
     ///
     /// This returns only protocol data; callers must authenticate the outgoing
@@ -1515,7 +1606,7 @@ fn validate_steps(steps: &[WorkflowStep]) -> Result<(), WorkflowError> {
 mod tests {
     use super::*;
     use splash_capabilities::ToolPolicy;
-    use splash_protocol::{SessionKey, ToolPayload, AUTH_TAG_BYTES};
+    use splash_protocol::{canonical_operation_input_bytes, SessionKey, AUTH_TAG_BYTES};
     use splash_storage::{
         AuthenticatedStore, StorageKey, StorageKeyId, StorageKeyring, StorageRecordKey,
         VolatileMemoryStore, STORAGE_KEY_BYTES,
@@ -1785,6 +1876,96 @@ mod tests {
             .unwrap();
         assert_eq!(restored_ledger, ledger);
         assert_eq!(original_plan.fingerprint(), restarted_plan.fingerprint());
+    }
+
+    #[test]
+    fn workflow_operation_dispatch_requires_the_persisted_canonical_input() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![WorkflowStep::new("publish", "let release = true")])
+            .unwrap();
+        let mut ledger = engine.operation_ledger(&plan).unwrap();
+        let payload = ToolPayload::Json(serde_json::json!({
+            "version": "1.2.3",
+            "channel": "stable",
+        }));
+        let input = canonical_operation_input_bytes(&payload).unwrap();
+        let operation_key = engine
+            .record_derived_operation(
+                &plan,
+                &mut ledger,
+                "publish",
+                "release.publish",
+                &input,
+                b"release-42:publish:1",
+            )
+            .unwrap();
+
+        let request = engine
+            .operation_dispatch_request(
+                &plan,
+                &ledger,
+                &operation_key,
+                payload.clone(),
+                "session-1",
+                "operation-request-1",
+            )
+            .unwrap();
+        assert_eq!(request.tool, "release.publish");
+        assert_eq!(request.operation_key, operation_key);
+
+        let (mut host, mut worker) = operation_reconciliation_authenticators();
+        let outbound = engine
+            .prepare_authenticated_operation_dispatch(
+                &plan,
+                &ledger,
+                &operation_key,
+                payload.clone(),
+                "operation-request-2",
+                &mut host,
+            )
+            .unwrap();
+        assert_eq!(
+            worker.open(outbound.frame).unwrap(),
+            WorkerMessage::DispatchOperation {
+                request: outbound.request.clone(),
+            }
+        );
+        let (_, mut worker_role) = operation_reconciliation_authenticators();
+        assert_eq!(
+            engine
+                .prepare_authenticated_operation_dispatch(
+                    &plan,
+                    &ledger,
+                    &operation_key,
+                    payload.clone(),
+                    "operation-request-3",
+                    &mut worker_role,
+                )
+                .unwrap_err(),
+            WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::OperationDispatchRequiresHostAuthenticator,
+            )
+        );
+
+        assert_eq!(
+            engine
+                .operation_dispatch_request(
+                    &plan,
+                    &ledger,
+                    &operation_key,
+                    ToolPayload::Json(serde_json::json!({
+                        "version": "1.2.4",
+                        "channel": "stable",
+                    })),
+                    "session-1",
+                    "operation-request-4",
+                )
+                .unwrap_err(),
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::InputFingerprintMismatch(
+                operation_key,
+            ))
+        );
     }
 
     #[test]

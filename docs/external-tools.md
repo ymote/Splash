@@ -99,7 +99,9 @@ addition to this per-runtime key. Do not retry a non-idempotent worker unless
 the worker deduplicates requests using that key or another durable operation
 identity. `splash-workflow` provides a plan-bound
 [durable operation ledger](workflow-operations.md) for that host-owned
-identity and restart policy.
+identity and restart policy. A contained worker can accept that identity in an
+authenticated [durable operation dispatch](worker-operations.md), then persist
+its own replay-safe journal before it invokes an effectful adapter.
 
 ## Authenticated reconciliation
 

@@ -25,6 +25,7 @@ and a host-supplied durable nonce.
 
 ~~~rust
 use splash_capabilities::CapabilityRuntime;
+use splash_protocol::{canonical_operation_input_bytes, ToolPayload};
 use splash_workflow::{WorkflowEngine, WorkflowStep};
 
 let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
@@ -34,16 +35,26 @@ let plan = engine.plan(vec![WorkflowStep::new(
 )])?;
 let mut ledger = engine.operation_ledger(&plan)?;
 
-let input = br#"{"version":"1.2.3"}"#;
+let payload = ToolPayload::Json(serde_json::json!({"version": "1.2.3"}));
+let input = canonical_operation_input_bytes(&payload)?;
 let operation_key = engine.record_derived_operation(
     &plan,
     &mut ledger,
     "publish",
     "release.publish",
-    input,
+    &input,
     b"run-42:publish:1",
 )?;
 let stored_ledger = ledger.to_json()?;
+
+let dispatch = engine.operation_dispatch_request(
+    &plan,
+    &ledger,
+    &operation_key,
+    payload,
+    "worker-1",
+    "dispatch-1",
+)?;
 ~~~
 
 The nonce must be non-empty and unique for every logical effect, for example a
@@ -57,6 +68,11 @@ secret storage or a MAC. Keep credentials and secret values out of the input
 identity: pass opaque secret selectors or handles to the worker policy instead.
 Authenticated durable storage remains required even when no raw secret appears
 in the ledger.
+
+When dispatching through worker protocol v3, record
+`canonical_operation_input_bytes(&payload)` rather than an ad hoc JSON string.
+`operation_dispatch_request` recreates those same bytes and rejects a payload
+whose durable identity differs from the ledger entry.
 
 The derived key is not a credential. Its purpose is to bind the host's plan,
 input, and operation identity into the durable worker-deduplication key. Hosts

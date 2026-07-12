@@ -136,6 +136,21 @@ database, or mobile key-value adapter must not claim rollback protection unless
 it has a separate platform trust anchor and the required atomic semantics.
 Generated Splash source receives neither a store nor a key.
 
+Worker protocol v3 adds a distinct authenticated operation-dispatch frame that
+carries a host-owned durable operation key. A contained worker's
+`WorkerOperationJournal` records only the tool, key, canonical-input digest,
+and state before its adapter runs the effect. An exact duplicate returns the
+stored state; a changed tool or input for the same key is rejected. The journal
+must be scoped to one host-controlled worker tenant or policy domain and
+persisted through an authenticated, rollback-resistant backend before an
+effect. It retains terminal result data for idempotent replies, so its storage
+may need encryption in addition to authentication. The host should reconcile
+an ambiguous response rather than blindly re-dispatch. This is a worker
+idempotency primitive, not compensation, key exchange, process containment, or
+an authorization grant to Splash source. The canonical-input digest is an
+unkeyed correlation value, so operation payloads must contain opaque secret
+selectors rather than credential values.
+
 This baseline does not yet provide filesystem adapters, network adapters,
 secret storage, worker-process isolation, signed packages, full JSON Schema,
 or mobile policy backends. Those features must not be inferred from the
