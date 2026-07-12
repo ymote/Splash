@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use makepad_script::{
     id, id_lut, script_args_def, script_err_not_allowed, script_err_unexpected, script_value,
@@ -127,6 +128,8 @@ pub struct ToolDescriptor {
     pub max_calls: usize,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_deferred_millis: Option<u64>,
     #[serde(flatten)]
     pub metadata: ToolMetadata,
 }
@@ -171,6 +174,8 @@ pub struct ToolPolicy {
     pub max_calls: usize,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
+    /// Maximum lifetime of one deferred operation after tool.start reserves it.
+    pub max_deferred_duration: Option<Duration>,
     pub data_format: ToolDataFormat,
 }
 
@@ -181,6 +186,7 @@ impl ToolPolicy {
             max_calls: 1,
             max_input_bytes: 16 * 1024,
             max_output_bytes: 64 * 1024,
+            max_deferred_duration: None,
             data_format: ToolDataFormat::Text,
         }
     }
@@ -236,6 +242,7 @@ pub enum ToolError {
     Denied(String),
     Failed(String),
     Cancelled(String),
+    TimedOut(String),
 }
 
 impl Display for ToolError {
@@ -244,6 +251,7 @@ impl Display for ToolError {
             Self::Denied(message) => write!(formatter, "tool call denied: {message}"),
             Self::Failed(message) => write!(formatter, "tool call failed: {message}"),
             Self::Cancelled(message) => write!(formatter, "tool call cancelled: {message}"),
+            Self::TimedOut(message) => write!(formatter, "tool call timed out: {message}"),
         }
     }
 }
@@ -264,6 +272,7 @@ pub struct ExternalToolInvocation {
     pub call_index: usize,
     pub format: ToolDataFormat,
     pub max_output_bytes: usize,
+    pub remaining_deadline_millis: Option<u64>,
 }
 
 /// Lifecycle errors returned when a host completes or cancels external work.
@@ -383,6 +392,14 @@ fn worker_failed(error: ProtocolError) -> ToolError {
     ToolError::Failed(format!("worker protocol failed: {error}"))
 }
 
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn timeout_error(ticket: &ToolTicket) -> ToolError {
+    ToolError::TimedOut(format!("{} exceeded its deferred deadline", ticket.name))
+}
+
 fn validate_json_envelope(json: &str, tool_name: &str, direction: &str) -> Result<(), ToolError> {
     let value = serde_json::from_str::<JsonValue>(json)
         .map_err(|_| ToolError::Denied(format!("{tool_name} {direction} is not valid JSON")))?;
@@ -439,6 +456,7 @@ pub enum AuditOutcome {
     Denied,
     Failed,
     Cancelled,
+    TimedOut,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -469,6 +487,23 @@ struct RegisteredTool {
 }
 
 #[derive(Clone, Debug)]
+struct DeferredDeadline {
+    started_at: Instant,
+    maximum: Duration,
+}
+
+impl DeferredDeadline {
+    fn expired_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= self.maximum
+    }
+
+    fn remaining_at(&self, now: Instant) -> Duration {
+        self.maximum
+            .saturating_sub(now.saturating_duration_since(self.started_at))
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ToolTicket {
     sequence: u64,
     name: String,
@@ -478,6 +513,21 @@ struct ToolTicket {
     max_output_bytes: usize,
     data_format: ToolDataFormat,
     dispatch: ToolDispatch,
+    deadline: Option<DeferredDeadline>,
+}
+
+impl ToolTicket {
+    fn expired_at(&self, now: Instant) -> bool {
+        self.deadline
+            .as_ref()
+            .is_some_and(|deadline| deadline.expired_at(now))
+    }
+
+    fn remaining_deadline_millis(&self, now: Instant) -> Option<u64> {
+        self.deadline
+            .as_ref()
+            .map(|deadline| duration_millis(deadline.remaining_at(now)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -798,6 +848,7 @@ impl CapabilityHost {
                 max_calls: registered.policy.max_calls,
                 max_input_bytes: registered.policy.max_input_bytes,
                 max_output_bytes: registered.policy.max_output_bytes,
+                max_deferred_millis: registered.policy.max_deferred_duration.map(duration_millis),
                 metadata: registered.metadata.clone(),
             })
             .collect()
@@ -860,7 +911,14 @@ impl CapabilityHost {
                         Ok(())
                     };
                     envelope_result.and_then(|()| {
-                        Self::reserve_registered(sequence, name, input, input_bytes, registered)
+                        Self::reserve_registered(
+                            sequence,
+                            name,
+                            input,
+                            input_bytes,
+                            invocation_kind,
+                            registered,
+                        )
                     })
                 }
             }
@@ -877,6 +935,7 @@ impl CapabilityHost {
         name: &str,
         input: &str,
         input_bytes: usize,
+        invocation_kind: ToolInvocationKind,
         registered: &mut RegisteredTool,
     ) -> Result<ToolTicket, ToolError> {
         if let Some(validator) = registered.input_validator.as_ref() {
@@ -890,6 +949,17 @@ impl CapabilityHost {
         }
 
         registered.calls = registered.calls.saturating_add(1);
+        let deadline = if invocation_kind == ToolInvocationKind::Deferred {
+            registered
+                .policy
+                .max_deferred_duration
+                .map(|maximum| DeferredDeadline {
+                    started_at: Instant::now(),
+                    maximum,
+                })
+        } else {
+            None
+        };
         Ok(ToolTicket {
             sequence,
             name: name.to_owned(),
@@ -899,6 +969,7 @@ impl CapabilityHost {
             max_output_bytes: registered.policy.max_output_bytes,
             data_format: registered.policy.data_format,
             dispatch: registered.dispatch,
+            deadline,
         })
     }
 
@@ -931,7 +1002,11 @@ impl CapabilityHost {
         ticket: &ToolTicket,
         result: Result<String, ToolError>,
     ) -> Result<String, ToolError> {
-        let result = result.and_then(|output| self.validate_output(ticket, output));
+        let result = if ticket.expired_at(Instant::now()) {
+            Err(timeout_error(ticket))
+        } else {
+            result.and_then(|output| self.validate_output(ticket, output))
+        };
         self.record_ticket_result(ticket, &result);
         result
     }
@@ -966,6 +1041,7 @@ impl CapabilityHost {
             Err(ToolError::Denied(_)) => (0, AuditOutcome::Denied),
             Err(ToolError::Failed(_)) => (0, AuditOutcome::Failed),
             Err(ToolError::Cancelled(_)) => (0, AuditOutcome::Cancelled),
+            Err(ToolError::TimedOut(_)) => (0, AuditOutcome::TimedOut),
         };
         self.audit.push(AuditEvent {
             sequence: ticket.sequence,
@@ -981,6 +1057,7 @@ impl CapabilityHost {
             ToolError::Denied(_) => AuditOutcome::Denied,
             ToolError::Failed(_) => AuditOutcome::Failed,
             ToolError::Cancelled(_) => AuditOutcome::Cancelled,
+            ToolError::TimedOut(_) => AuditOutcome::TimedOut,
         };
         self.audit.push(AuditEvent {
             sequence,
@@ -1054,6 +1131,42 @@ impl CapabilityHost {
         self.pending.borrow().len()
     }
 
+    fn expire_due_pending(
+        &mut self,
+        now: Instant,
+        max_expirations: usize,
+    ) -> Vec<PendingCompletion> {
+        let due = {
+            let pending = self.pending.borrow();
+            pending
+                .iter()
+                .filter_map(|(handle, entry)| match &entry.state {
+                    PendingToolState::Pending { waiting_thread, .. }
+                        if entry.ticket.expired_at(now) =>
+                    {
+                        Some((*handle, entry.ticket.clone(), *waiting_thread))
+                    }
+                    PendingToolState::Pending { .. } | PendingToolState::Ready(_) => None,
+                })
+                .take(max_expirations)
+                .collect::<Vec<_>>()
+        };
+
+        due.into_iter()
+            .filter_map(|(handle, ticket, waiting_thread)| {
+                let result = self.complete_ticket(&ticket, Err(timeout_error(&ticket)));
+                let mut pending = self.pending.borrow_mut();
+                let entry = pending.get_mut(&handle)?;
+                let orphaned = entry.orphaned;
+                entry.state = PendingToolState::Ready(result);
+                if orphaned {
+                    pending.remove(&handle);
+                }
+                Some(PendingCompletion { waiting_thread })
+            })
+            .collect()
+    }
+
     fn claim_next_external(&mut self) -> Option<ExternalToolInvocation> {
         let mut pending = self.pending.borrow_mut();
         let handle = pending.iter().find_map(|(handle, entry)| {
@@ -1078,6 +1191,7 @@ impl CapabilityHost {
             dispatch: PendingDispatch::ExternalClaimed,
             waiting_thread,
         };
+        let remaining_deadline_millis = ticket.remaining_deadline_millis(Instant::now());
         Some(ExternalToolInvocation {
             id,
             name: ticket.name,
@@ -1085,6 +1199,7 @@ impl CapabilityHost {
             call_index: ticket.call_index,
             format: ticket.data_format,
             max_output_bytes: ticket.max_output_bytes,
+            remaining_deadline_millis,
         })
     }
 
@@ -1154,7 +1269,11 @@ impl CapabilityHost {
                 })?
         };
 
-        let result = self.execute(ticket);
+        let result = if ticket.expired_at(Instant::now()) {
+            self.complete_ticket(&ticket, Err(timeout_error(&ticket)))
+        } else {
+            self.execute(ticket)
+        };
         if let Some(entry) = self.pending.borrow_mut().get_mut(&handle) {
             entry.state = PendingToolState::Ready(result);
         }
@@ -1165,9 +1284,16 @@ impl CapabilityHost {
 /// Summary of completed tool work and scripts resumed by [`CapabilityRuntime::pump`].
 #[derive(Debug, Default)]
 pub struct PumpReport {
-    /// Number of queued tool handlers that completed during this pump.
+    /// Number of queued local operations resolved during this pump.
     pub completed: usize,
     /// Evaluations resumed after their corresponding tool result became ready.
+    pub resumed: Vec<Evaluation>,
+}
+
+/// Summary of deferred operations resolved because their deadline elapsed.
+#[derive(Debug, Default)]
+pub struct DeadlineReport {
+    pub expired: usize,
     pub resumed: Vec<Evaluation>,
 }
 
@@ -1451,6 +1577,33 @@ impl CapabilityRuntime {
     ) -> Result<Option<Evaluation>, ExternalToolError> {
         let completion = self.runtime.host_mut().cancel_external(id)?;
         self.resume_external_completion(completion)
+    }
+
+    /// Resolves every currently due deferred operation up to the pending bound.
+    ///
+    /// Hosts should call this from their event loop when the next deferred
+    /// deadline fires. It covers both host-pump and external operations.
+    pub fn expire_timed_out_tools(&mut self) -> Result<DeadlineReport, RuntimeError> {
+        self.expire_timed_out_tools_up_to(self.max_pending_tools)
+    }
+
+    /// Resolves no more than max_expirations due deferred operations.
+    pub fn expire_timed_out_tools_up_to(
+        &mut self,
+        max_expirations: usize,
+    ) -> Result<DeadlineReport, RuntimeError> {
+        let completions = self
+            .runtime
+            .host_mut()
+            .expire_due_pending(Instant::now(), max_expirations);
+        let mut report = DeadlineReport::default();
+        for completion in completions {
+            report.expired = report.expired.saturating_add(1);
+            if let Some(waiting_thread) = completion.waiting_thread {
+                report.resumed.push(self.runtime.resume(waiting_thread)?);
+            }
+        }
+        Ok(report)
     }
 
     pub fn max_pending_tools(&self) -> usize {
@@ -1862,6 +2015,7 @@ mod tests {
         assert_eq!(invocation.name, "text.remote");
         assert_eq!(invocation.input, "hello");
         assert_eq!(invocation.format, ToolDataFormat::Text);
+        assert_eq!(invocation.remaining_deadline_millis, None);
         assert_eq!(runtime.tool_catalog()[0].dispatch, ToolDispatch::External);
 
         let resumed = runtime
@@ -1931,6 +2085,85 @@ mod tests {
     }
 
     #[test]
+    fn external_deadline_expires_a_claimed_operation_and_resumes_its_waiter() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_deferred_duration = Some(Duration::ZERO);
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"wait\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        assert_eq!(invocation.remaining_deadline_millis, Some(0));
+
+        let report = runtime.expire_timed_out_tools().unwrap();
+
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.resumed.len(), 1);
+        assert!(!report.resumed[0].succeeded());
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::TimedOut);
+        assert_eq!(runtime.tool_catalog()[0].max_deferred_millis, Some(0));
+        assert_eq!(
+            runtime
+                .complete_external_tool(invocation.id, Ok("late".to_owned()))
+                .unwrap_err(),
+            ExternalToolError::AlreadyCompleted(invocation.id)
+        );
+    }
+
+    #[test]
+    fn a_late_external_completion_is_converted_to_a_timeout() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_deferred_duration = Some(Duration::ZERO);
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"wait\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("late".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(!resumed.succeeded());
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::TimedOut);
+    }
+
+    #[test]
+    fn a_host_pump_deadline_prevents_the_local_handler_from_running() {
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let mut policy = ToolPolicy::new("text.echo");
+        policy.max_deferred_duration = Some(Duration::ZERO);
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(policy, move |request| {
+                calls.set(calls.get() + 1);
+                Ok(request.input.clone())
+            })
+            .unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.echo\", \"wait\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+
+        let report = runtime.pump().unwrap();
+
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.resumed.len(), 1);
+        assert!(!report.resumed[0].succeeded());
+        assert_eq!(observed_calls.get(), 0);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::TimedOut);
+    }
+
+    #[test]
     fn a_claimed_operation_survives_promise_gc_until_its_audit_is_recorded() {
         let pending = Rc::new(RefCell::new(BTreeMap::new()));
         let handle = ScriptHandle::ZERO;
@@ -1948,6 +2181,7 @@ mod tests {
                     max_output_bytes: 64,
                     data_format: ToolDataFormat::Text,
                     dispatch: ToolDispatch::External,
+                    deadline: None,
                 },
                 state: PendingToolState::Pending {
                     dispatch: PendingDispatch::ExternalClaimed,

@@ -70,6 +70,12 @@ the pending invocation, dispatches it through its own adapter, and completes
 or cancels it later. This does not expose an external API to Splash source;
 the script still sees only its promise. See [External tools](external-tools.md).
 
+A host may configure a maximum deferred duration per tool. The duration starts
+when start reserves the operation. The host uses expire_timed_out_tools from
+its event loop to resolve due external work; pump also rejects expired local
+queued work before its handler runs. This does not interrupt a Rust handler
+that is already executing.
+
 A runtime evaluates one script at a time. A host must resume a paused script
 before evaluating new source on that runtime; independent workflows should use
 separate runtime instances.

@@ -10,6 +10,10 @@ and byte limits, description, and optional JSON input/output schemas. The
 runtime does not install catalog access into `mod.tool`: a script cannot
 discover or mint capabilities by inspecting descriptions.
 
+When a deferred deadline is configured, max_deferred_millis is also present in
+the catalog. It is a host scheduling constraint, not an instruction for a
+script to add a timer or retry loop.
+
 ```rust
 use splash_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
 

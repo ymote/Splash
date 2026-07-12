@@ -13,7 +13,8 @@ must create a promise with tool.start or tool.start_json and await it.
 1. A script starts the granted external tool. The runtime validates input,
    reserves the call budget, and retains one pending-promise slot.
 2. The host calls claim_next_external_tool. This returns a host-owned opaque
-   ID, the validated input, format, call index, and output byte limit.
+   ID, the validated input, format, call index, output byte limit, and any
+   remaining deadline in milliseconds.
 3. The host dispatches that invocation to its own worker or platform adapter.
 4. The host calls complete_external_tool with the result, or
    cancel_external_tool when it decides the work must stop.
@@ -58,6 +59,23 @@ CapabilityRuntime remains single-threaded. The host can copy the invocation
 fields into a worker request while retaining its opaque ID locally, then map
 the authenticated worker request ID back to that ID when it completes. Its
 completion must be delivered back to the event loop that owns the runtime.
+When present, remaining_deadline_millis should also be applied by the worker
+adapter.
+
+## Deadlines
+
+Set ToolPolicy::max_deferred_duration before registering the tool to bound a
+deferred operation from the moment tool.start reserves it. The host should
+schedule CapabilityRuntime::expire_timed_out_tools from its event loop at the
+next deadline. Expired external operations receive a timeout result through
+the same audit and promise path as a normal completion. A result delivered
+after its deadline is also converted to a timeout, even if the expiry tick was
+late.
+
+For host-pump tools, pump checks the deadline before it invokes the Rust
+handler. A deadline cannot interrupt a handler that has already started or
+cancel a worker process by itself; adapters must apply their own I/O deadline
+and translate timeout into worker cancellation.
 
 ## Cancellation and containment
 

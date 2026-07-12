@@ -16,6 +16,8 @@ and keeps UI support optional rather than making UI the language boundary.
   embedded event loops.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
+- Per-tool deferred deadlines with host-driven expiry and auditable timeout
+  outcomes.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

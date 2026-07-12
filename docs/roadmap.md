@@ -13,10 +13,11 @@
 - Bounded executable JSON input/output contracts for local and worker tools.
 - External-only deferred tools with host claim, completion, cancellation, and
   bounded concurrent pending work.
+- Per-tool deferred deadlines with host-driven expiration.
 
 ## Next: richer external operations
 
-- Per-tool deadlines, retry classification, and idempotency keys.
+- Retry classification and idempotency keys.
 - Streaming output with byte limits and redaction hooks.
 
 ## Next: contained local effects

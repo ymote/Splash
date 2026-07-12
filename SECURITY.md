@@ -46,6 +46,13 @@ the normal output validation and audit boundary. This does not terminate a
 worker or enforce an operating-system policy. The host must bind cancellation
 to its transport and enforce containment outside this process.
 
+Hosts can set a deferred deadline on each tool policy. Expiration is enforced
+before a queued host-pump handler begins and through
+CapabilityRuntime::expire_timed_out_tools for external work. It cannot stop a
+Rust handler that is already blocking; effectful adapters still need their own
+I/O deadline and containment policy. A result delivered after the deferred
+deadline is rejected as timed out.
+
 One v0.1 runtime is single-flight: a host must resume or discard a suspended
 evaluation before submitting new source to that runtime instance. Hosts that
 need independent concurrent workflows should use separate runtime instances.
