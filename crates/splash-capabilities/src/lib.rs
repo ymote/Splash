@@ -21,8 +21,10 @@ use serde::Serialize;
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 pub use splash_protocol::{
-    CapabilityManifest, ProtocolError, ToolInvocation as WorkerInvocation,
-    ToolPayload as WorkerPayload, ToolResult as WorkerResult,
+    AuthenticatedWorkerMessage, CapabilityManifest, OperationReconcileRequest,
+    OperationReconcileResult, OperationStatus, ProtocolError, SessionAuthenticator, SessionKey,
+    SessionRole, ToolInvocation as WorkerInvocation, ToolPayload as WorkerPayload,
+    ToolResult as WorkerResult, WorkerMessage,
 };
 use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 pub use splash_schema::{JsonSchema, SchemaError};
@@ -49,6 +51,13 @@ pub enum ToolDataFormat {
     Text,
     /// A JSON object or array validated at the capability boundary.
     Json,
+}
+
+fn envelope_format(format: ToolDataFormat) -> EnvelopeFormat {
+    match format {
+        ToolDataFormat::Text => EnvelopeFormat::Text,
+        ToolDataFormat::Json => EnvelopeFormat::Json,
+    }
 }
 
 /// Where a deferred tool's work is permitted to run.
@@ -397,6 +406,27 @@ pub struct ExternalToolStreamChunk {
     pub text: String,
 }
 
+/// A keyed worker frame for an external operation reconciliation request.
+///
+/// The contained request identifies work by the non-authorizing operation key,
+/// never by [`ExternalToolId`]. Send `frame` through the host's worker
+/// transport and keep `request` for
+/// [`CapabilityRuntime::reconcile_authenticated_external_tool`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthenticatedReconciliationRequest {
+    pub request: OperationReconcileRequest,
+    pub frame: AuthenticatedWorkerMessage,
+}
+
+/// Outcome of reconciling an externally dispatched operation.
+#[derive(Debug)]
+pub enum ExternalReconciliation {
+    /// The authenticated worker reports that the operation is still running.
+    Running,
+    /// The operation reached a terminal state and its promise was resolved.
+    Resolved(Option<Evaluation>),
+}
+
 /// Lifecycle errors returned when a host completes or cancels external work.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExternalToolError {
@@ -409,6 +439,10 @@ pub enum ExternalToolError {
     StreamingDisabled(ExternalToolId),
     StreamLimitExceeded(ExternalToolId),
     ToolUnavailable(ExternalToolId),
+    ReconciliationMismatch(ExternalToolId),
+    ReconciliationRequiresHostAuthenticator,
+    UnexpectedReconciliationMessage,
+    Protocol(ProtocolError),
     Runtime(RuntimeError),
 }
 
@@ -440,6 +474,16 @@ impl Display for ExternalToolError {
             Self::ToolUnavailable(_) => {
                 formatter.write_str("registered tool for external operation is unavailable")
             }
+            Self::ReconciliationMismatch(_) => {
+                formatter.write_str("worker reconciliation does not match the claimed operation")
+            }
+            Self::ReconciliationRequiresHostAuthenticator => {
+                formatter.write_str("external reconciliation requires a host session authenticator")
+            }
+            Self::UnexpectedReconciliationMessage => {
+                formatter.write_str("authenticated worker frame is not an operation reconciliation")
+            }
+            Self::Protocol(error) => write!(formatter, "worker protocol rejected: {error}"),
             Self::Runtime(error) => write!(formatter, "could not resume tool operation: {error}"),
         }
     }
@@ -755,6 +799,11 @@ type PendingTools = Rc<RefCell<BTreeMap<ScriptHandle, PendingTool>>>;
 
 struct PendingCompletion {
     waiting_thread: Option<ScriptThreadId>,
+}
+
+enum ExternalReconcileCompletion {
+    Running,
+    Resolved(PendingCompletion),
 }
 
 struct ToolPromiseGc {
@@ -1461,6 +1510,99 @@ impl CapabilityHost {
         }
     }
 
+    fn claimed_external_ticket(
+        &self,
+        id: ExternalToolId,
+    ) -> Result<(ToolTicket, String), ExternalToolError> {
+        let pending = self.pending.borrow();
+        let Some(entry) = pending.values().find(|entry| entry.id == id) else {
+            return Err(ExternalToolError::Unknown(id));
+        };
+        match &entry.state {
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::ExternalClaimed,
+                ..
+            } => Ok((entry.ticket.clone(), entry.idempotency_key.clone())),
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::ExternalQueued,
+                ..
+            } => Err(ExternalToolError::NotClaimed(id)),
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::HostPump,
+                ..
+            } => Err(ExternalToolError::NotExternal(id)),
+            PendingToolState::Ready(_) => Err(ExternalToolError::AlreadyCompleted(id)),
+        }
+    }
+
+    fn external_reconcile_request(
+        &self,
+        id: ExternalToolId,
+        session_id: String,
+        request_id: String,
+    ) -> Result<OperationReconcileRequest, ExternalToolError> {
+        let (ticket, operation_key) = self.claimed_external_ticket(id)?;
+        if ticket.expired_at(Instant::now()) {
+            return Err(ExternalToolError::DeadlineElapsed(id));
+        }
+        OperationReconcileRequest::new(session_id, request_id, ticket.name, operation_key)
+            .map_err(ExternalToolError::Protocol)
+    }
+
+    fn reconcile_external(
+        &mut self,
+        id: ExternalToolId,
+        request: &OperationReconcileRequest,
+        result: OperationReconcileResult,
+    ) -> Result<ExternalReconcileCompletion, ExternalToolError> {
+        request.validate().map_err(ExternalToolError::Protocol)?;
+        result.validate().map_err(ExternalToolError::Protocol)?;
+
+        let (ticket, operation_key) = self.claimed_external_ticket(id)?;
+        if request.tool != ticket.name || request.operation_key != operation_key {
+            return Err(ExternalToolError::ReconciliationMismatch(id));
+        }
+        if !result.matches_request(request) {
+            return Err(ExternalToolError::ReconciliationMismatch(id));
+        }
+
+        match result.status {
+            OperationStatus::Running => {
+                if ticket.expired_at(Instant::now()) {
+                    return Err(ExternalToolError::DeadlineElapsed(id));
+                }
+                Ok(ExternalReconcileCompletion::Running)
+            }
+            OperationStatus::Succeeded { payload } => {
+                let expected = envelope_format(ticket.data_format);
+                let actual = payload.format();
+                if actual != expected {
+                    return Err(ExternalToolError::Protocol(
+                        ProtocolError::PayloadFormatMismatch { expected, actual },
+                    ));
+                }
+                let output = match payload {
+                    WorkerPayload::Text(value) => value,
+                    WorkerPayload::Json(value) => {
+                        serde_json::to_string(&value).map_err(|error| {
+                            ExternalToolError::Protocol(ProtocolError::Serialization(
+                                error.to_string(),
+                            ))
+                        })?
+                    }
+                };
+                self.complete_external(id, Ok(output))
+                    .map(ExternalReconcileCompletion::Resolved)
+            }
+            OperationStatus::Failed { message } => self
+                .complete_external(id, Err(ToolError::Failed(message)))
+                .map(ExternalReconcileCompletion::Resolved),
+            OperationStatus::Cancelled => self
+                .cancel_external(id)
+                .map(ExternalReconcileCompletion::Resolved),
+        }
+    }
+
     fn claim_next_external(&mut self) -> Option<ExternalToolInvocation> {
         let mut pending = self.pending.borrow_mut();
         let handle = pending.iter().find_map(|(handle, entry)| {
@@ -2027,6 +2169,97 @@ impl CapabilityRuntime {
     /// the external completion or cancellation API.
     pub fn claim_next_external_tool(&mut self) -> Option<ExternalToolInvocation> {
         self.runtime.host_mut().claim_next_external()
+    }
+
+    /// Creates the worker protocol request for one claimed external operation.
+    ///
+    /// The request carries the operation's stable idempotency key rather than
+    /// its opaque [`ExternalToolId`]. Callers using a custom worker transport
+    /// must authenticate the request and matching result before passing the
+    /// result to [`Self::reconcile_external_tool`].
+    pub fn external_reconcile_request(
+        &self,
+        id: ExternalToolId,
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Result<OperationReconcileRequest, ExternalToolError> {
+        self.runtime
+            .host()
+            .external_reconcile_request(id, session_id.into(), request_id.into())
+    }
+
+    /// Creates and authenticates a reconciliation request for a claimed tool.
+    ///
+    /// This is the preferred bridge for `splash-protocol` workers. The host
+    /// sends the returned frame, then passes the worker's returned frame to
+    /// [`Self::reconcile_authenticated_external_tool`].
+    pub fn prepare_authenticated_external_reconciliation(
+        &mut self,
+        id: ExternalToolId,
+        request_id: impl Into<String>,
+        authenticator: &mut SessionAuthenticator,
+    ) -> Result<AuthenticatedReconciliationRequest, ExternalToolError> {
+        if authenticator.role() != SessionRole::Host {
+            return Err(ExternalToolError::ReconciliationRequiresHostAuthenticator);
+        }
+        let session_id = authenticator.session_id().to_owned();
+        let request = self.external_reconcile_request(id, session_id, request_id)?;
+        let frame = authenticator
+            .seal(WorkerMessage::ReconcileOperation {
+                request: request.clone(),
+            })
+            .map_err(ExternalToolError::Protocol)?;
+        Ok(AuthenticatedReconciliationRequest { request, frame })
+    }
+
+    /// Applies a validated worker operation state to a claimed external tool.
+    ///
+    /// The result must have passed transport authentication and sequence
+    /// validation. Prefer [`Self::reconcile_authenticated_external_tool`] for
+    /// the built-in protocol framing. A `Running` state leaves the promise
+    /// pending; every terminal state passes through the normal output contract
+    /// and audit boundary before a waiting script is resumed.
+    pub fn reconcile_external_tool(
+        &mut self,
+        id: ExternalToolId,
+        request: &OperationReconcileRequest,
+        result: OperationReconcileResult,
+    ) -> Result<ExternalReconciliation, ExternalToolError> {
+        match self
+            .runtime
+            .host_mut()
+            .reconcile_external(id, request, result)?
+        {
+            ExternalReconcileCompletion::Running => Ok(ExternalReconciliation::Running),
+            ExternalReconcileCompletion::Resolved(completion) => self
+                .resume_external_completion(completion)
+                .map(ExternalReconciliation::Resolved),
+        }
+    }
+
+    /// Opens an authenticated worker frame and applies its reconciliation
+    /// result to a claimed external tool.
+    ///
+    /// The supplied authenticator must be the host side of the same keyed
+    /// session used to prepare the request. Tampered, reflected, replayed, or
+    /// incorrectly sequenced frames fail before the pending promise changes.
+    pub fn reconcile_authenticated_external_tool(
+        &mut self,
+        id: ExternalToolId,
+        request: &OperationReconcileRequest,
+        authenticator: &mut SessionAuthenticator,
+        frame: AuthenticatedWorkerMessage,
+    ) -> Result<ExternalReconciliation, ExternalToolError> {
+        if authenticator.role() != SessionRole::Host {
+            return Err(ExternalToolError::ReconciliationRequiresHostAuthenticator);
+        }
+        let message = authenticator
+            .open(frame)
+            .map_err(ExternalToolError::Protocol)?;
+        let WorkerMessage::ReconciledOperation { result } = message else {
+            return Err(ExternalToolError::UnexpectedReconciliationMessage);
+        };
+        self.reconcile_external_tool(id, request, result)
     }
 
     /// Schedules another host-owned attempt for a claimed external tool.
@@ -3064,6 +3297,310 @@ mod tests {
 
         assert!(!resumed.succeeded());
         assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    fn reconciliation_authenticators() -> (SessionAuthenticator, SessionAuthenticator) {
+        let key = SessionKey::from_bytes([7; splash_protocol::AUTH_TAG_BYTES]).unwrap();
+        (
+            SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap(),
+            SessionAuthenticator::new("worker-1", key, SessionRole::Worker).unwrap(),
+        )
+    }
+
+    #[test]
+    fn authenticated_reconciliation_resolves_a_claimed_text_operation() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet output = tool.start(\"text.remote\", \"release\").await()\nassert(output == \"done\")",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let (mut host, mut worker) = reconciliation_authenticators();
+
+        let outbound = runtime
+            .prepare_authenticated_external_reconciliation(invocation.id, "reconcile-1", &mut host)
+            .unwrap();
+        assert_eq!(
+            worker.open(outbound.frame.clone()).unwrap(),
+            WorkerMessage::ReconcileOperation {
+                request: outbound.request.clone(),
+            }
+        );
+        let result = OperationReconcileResult::new(
+            outbound.request.session_id.clone(),
+            outbound.request.request_id.clone(),
+            outbound.request.tool.clone(),
+            outbound.request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: WorkerPayload::Text("done".to_owned()),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation { result })
+            .unwrap();
+
+        let reconciliation = runtime
+            .reconcile_authenticated_external_tool(
+                invocation.id,
+                &outbound.request,
+                &mut host,
+                response,
+            )
+            .unwrap();
+        let ExternalReconciliation::Resolved(Some(resumed)) = reconciliation else {
+            panic!("expected the pending script to resume");
+        };
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn authenticated_reconciliation_rejects_tampering_without_resolving() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"release\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let (mut host, mut worker) = reconciliation_authenticators();
+        let outbound = runtime
+            .prepare_authenticated_external_reconciliation(invocation.id, "reconcile-1", &mut host)
+            .unwrap();
+        worker.open(outbound.frame).unwrap();
+        let result = OperationReconcileResult::new(
+            outbound.request.session_id.clone(),
+            outbound.request.request_id.clone(),
+            outbound.request.tool.clone(),
+            outbound.request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: WorkerPayload::Text("done".to_owned()),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation { result })
+            .unwrap();
+        let mut tampered = response.clone();
+        let replacement = if tampered.auth_tag.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        tampered.auth_tag.replace_range(0..1, replacement);
+
+        assert_eq!(
+            runtime
+                .reconcile_authenticated_external_tool(
+                    invocation.id,
+                    &outbound.request,
+                    &mut host,
+                    tampered,
+                )
+                .unwrap_err(),
+            ExternalToolError::Protocol(ProtocolError::InvalidAuthenticationTag)
+        );
+        assert_eq!(runtime.pending_tools(), 1);
+        assert!(runtime.audit().is_empty());
+
+        assert!(matches!(
+            runtime
+                .reconcile_authenticated_external_tool(
+                    invocation.id,
+                    &outbound.request,
+                    &mut host,
+                    response,
+                )
+                .unwrap(),
+            ExternalReconciliation::Resolved(Some(_))
+        ));
+    }
+
+    #[test]
+    fn authenticated_reconciliation_keeps_running_operations_pending() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"release\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let (mut host, mut worker) = reconciliation_authenticators();
+
+        let first = runtime
+            .prepare_authenticated_external_reconciliation(invocation.id, "reconcile-1", &mut host)
+            .unwrap();
+        worker.open(first.frame).unwrap();
+        let running = OperationReconcileResult::new(
+            first.request.session_id.clone(),
+            first.request.request_id.clone(),
+            first.request.tool.clone(),
+            first.request.operation_key.clone(),
+            OperationStatus::Running,
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation { result: running })
+            .unwrap();
+        assert!(matches!(
+            runtime
+                .reconcile_authenticated_external_tool(
+                    invocation.id,
+                    &first.request,
+                    &mut host,
+                    response,
+                )
+                .unwrap(),
+            ExternalReconciliation::Running
+        ));
+        assert_eq!(runtime.pending_tools(), 1);
+        assert!(runtime.audit().is_empty());
+
+        let second = runtime
+            .prepare_authenticated_external_reconciliation(invocation.id, "reconcile-2", &mut host)
+            .unwrap();
+        worker.open(second.frame).unwrap();
+        let completed = OperationReconcileResult::new(
+            second.request.session_id.clone(),
+            second.request.request_id.clone(),
+            second.request.tool.clone(),
+            second.request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: WorkerPayload::Text("done".to_owned()),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation { result: completed })
+            .unwrap();
+        assert!(matches!(
+            runtime
+                .reconcile_authenticated_external_tool(
+                    invocation.id,
+                    &second.request,
+                    &mut host,
+                    response,
+                )
+                .unwrap(),
+            ExternalReconciliation::Resolved(Some(_))
+        ));
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn reconciliation_rejects_mismatched_bindings_and_payload_formats() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"release\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let request = runtime
+            .external_reconcile_request(invocation.id, "worker-1", "reconcile-1")
+            .unwrap();
+
+        let mut wrong_request = request.clone();
+        wrong_request.operation_key = "other-operation".to_owned();
+        let wrong_result = OperationReconcileResult::new(
+            wrong_request.session_id.clone(),
+            wrong_request.request_id.clone(),
+            wrong_request.tool.clone(),
+            wrong_request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: WorkerPayload::Text("done".to_owned()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .reconcile_external_tool(invocation.id, &wrong_request, wrong_result)
+                .unwrap_err(),
+            ExternalToolError::ReconciliationMismatch(invocation.id)
+        );
+
+        let wrong_format = OperationReconcileResult::new(
+            request.session_id.clone(),
+            request.request_id.clone(),
+            request.tool.clone(),
+            request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: WorkerPayload::Json(serde_json::json!({"output": "done"})),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .reconcile_external_tool(invocation.id, &request, wrong_format)
+                .unwrap_err(),
+            ExternalToolError::Protocol(ProtocolError::PayloadFormatMismatch {
+                expected: EnvelopeFormat::Text,
+                actual: EnvelopeFormat::Json,
+            })
+        );
+        assert_eq!(runtime.pending_tools(), 1);
+        assert!(runtime.audit().is_empty());
+    }
+
+    #[test]
+    fn authenticated_reconciliation_uses_json_output_contracts() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_external_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer values outside the VM."),
+                add_contract(),
+            )
+            .unwrap();
+        let initial = runtime
+            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20 right: 22}).await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let (mut host, mut worker) = reconciliation_authenticators();
+        let outbound = runtime
+            .prepare_authenticated_external_reconciliation(invocation.id, "reconcile-1", &mut host)
+            .unwrap();
+        worker.open(outbound.frame).unwrap();
+        let result = OperationReconcileResult::new(
+            outbound.request.session_id.clone(),
+            outbound.request.request_id.clone(),
+            outbound.request.tool.clone(),
+            outbound.request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: WorkerPayload::Json(serde_json::json!({"unexpected": true})),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation { result })
+            .unwrap();
+
+        let reconciliation = runtime
+            .reconcile_authenticated_external_tool(
+                invocation.id,
+                &outbound.request,
+                &mut host,
+                response,
+            )
+            .unwrap();
+        assert!(matches!(
+            reconciliation,
+            ExternalReconciliation::Resolved(Some(_))
+        ));
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
     }
 
     #[test]

@@ -16,11 +16,14 @@
 - Per-tool deferred deadlines with host-driven expiration.
 - Host-only bounded external retries with stable idempotency keys.
 - Bounded, redactor-hooked external output streaming outside Splash source.
+- Keyed, replay-checked worker frames and authenticated live-operation
+  reconciliation.
 - Bounded data-only workflow checkpoints with fresh host approval on resume.
 
-## Next: richer external operations
+## Next: durable external operations
 
-- Resumable external operations with authenticated worker reconciliation.
+- Persisted operation ledgers and restart reconciliation policy.
+- Durable worker-side idempotency and compensation hooks.
 
 ## Next: contained local effects
 

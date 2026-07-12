@@ -87,6 +87,14 @@ become a Splash value or a script-level stream; `await()` still resolves only
 the terminal result. See [External tools](external-tools.md) for the host
 streaming contract.
 
+For a live claimed external operation, the host may use an authenticated worker
+reconciliation request to observe `running` or apply a terminal result. This
+is entirely outside the language: Splash source cannot see the operation key,
+worker frame, status poll, or progress state. The host still validates a
+terminal payload against the registered text/JSON contract before it resumes
+`await()`. A reconciliation result does not restore a promise after a process
+restart; durable workflow policy remains host-owned.
+
 A runtime evaluates one script at a time. A host must resume a paused script
 before evaluating new source on that runtime; independent workflows should use
 separate runtime instances.

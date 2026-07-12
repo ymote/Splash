@@ -22,6 +22,8 @@ and keeps UI support optional rather than making UI the language boundary.
   idempotency keys for each deferred operation.
 - Bounded, optionally redacted external output chunks released only to the
   trusted host, never directly to Splash source.
+- Keyed, directional, replay-checked worker protocol frames and authenticated
+  reconciliation for live external operations.
 - Bounded, data-only workflow checkpoints with fresh host approval required
   for a restart to run the remaining plan suffix.
 - A small `splash` CLI for local evaluation and the workflow example.
@@ -99,8 +101,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 - `splash-capabilities`: explicit tool policy, audit log, deferred promises,
   LLM-facing host catalog, JSON contracts, and safe host bridge.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
-- `splash-protocol`: portable worker messages, capability attenuation, and
-  host-side invocation/result validation.
+- `splash-protocol`: portable worker messages, capability attenuation,
+  keyed session framing, and host-side invocation/result validation.
 - `splash-workflow`: host-owned planning, approval, checkpointing, and
   sequential execution.
 - `splash-cli`: local development CLI.
@@ -112,6 +114,9 @@ defines the handoff to future contained adapters. The [host tool catalog](docs/t
 defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schema-contracts.md)
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
+
+[Worker protocol v2](docs/worker-protocol.md) also defines keyed worker frames
+and the live-operation reconciliation boundary.
 
 [Workflow checkpoints](docs/workflow-checkpoints.md) define the durable
 host-orchestration boundary.

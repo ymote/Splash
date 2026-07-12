@@ -262,6 +262,8 @@ dependencies = [
 name = "splash-protocol"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "constant_time_eq",
  "serde",
  "serde_json",
 ]

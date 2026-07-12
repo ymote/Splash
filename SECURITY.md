@@ -10,10 +10,14 @@ untrusted. The runtime has two separate security boundaries:
    production local-tool adapter will run in a dedicated worker with a
    platform-specific sandbox, not in the interpreter process.
 
-`splash-protocol` now defines the portable, attenuated handoff from a policy
-host to that future worker. It validates manifests, request uniqueness,
-formats, byte limits, and call budgets, but it does not authenticate a peer or
-enforce an operating-system policy itself. The host must provide both before an
+`splash-protocol` defines the portable, attenuated handoff from a policy host
+to that future worker. It validates manifests, request uniqueness, formats,
+byte limits, and call budgets. Its `SessionAuthenticator` can also bind each
+worker frame to a host-provisioned BLAKE3 session key, directional role, and
+strict sequence number, rejecting tampering, reflection, and replay before a
+message is used. It does not establish or protect that key, attest a worker,
+encrypt transport, or enforce an operating-system policy itself. The host must
+provide a trusted bootstrap channel and containment backend before an
 effectful adapter is considered contained.
 
 `ProtocolWorkerClient` connects that validation layer to a host-owned
@@ -52,9 +56,21 @@ operation, the host may use its stable `idempotency_key` when forwarding an
 attempt to a worker. That key is a correlation and deduplication value, not a
 capability token or authorization credential; the opaque `ExternalToolId`
 must remain owned by the host. Hosts that need replay across restarts must
-persist their own workflow identity and authenticate every worker request.
-An adapter must not retry a non-idempotent effect unless its worker performs
-deduplication using that key or an equivalent durable identity.
+persist their own workflow identity and authenticate every worker request with
+the keyed protocol frame or an equivalent transport mechanism. An adapter must
+not retry a non-idempotent effect unless its worker performs deduplication
+using that key or an equivalent durable identity.
+
+Authenticated reconciliation can query a live claimed operation without
+serializing its `ExternalToolId`. `CapabilityRuntime` creates an authenticated
+request carrying only the session, tool, request ID, and operation key, then
+opens a matching worker response before it applies `running`, `succeeded`,
+`failed`, or `cancelled`. The result must match both that request and the
+currently claimed operation; a successful payload also passes through the
+existing output limit and JSON-contract boundary. This does not make a
+promise, operation handle, or VM state restartable. A durable host workflow
+must persist and authenticate its own operation identity, then decide whether
+to reconcile, retry, compensate, or fail before it constructs a fresh runtime.
 
 An external tool may opt into bounded host-visible output chunks. The runtime
 accepts chunks only for a claimed operation, applies source-byte, aggregate,

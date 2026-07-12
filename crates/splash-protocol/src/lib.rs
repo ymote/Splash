@@ -9,11 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 
+use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
+pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
+pub const MAX_OPERATION_ERROR_BYTES: usize = 4 * 1024;
 const MAX_RESOURCES_PER_GRANT: usize = 64;
 
 /// The format an adapter accepts and returns across the worker boundary.
@@ -359,6 +362,129 @@ impl ToolResult {
     }
 }
 
+/// A host request to recover the status of one externally dispatched operation.
+///
+/// `operation_key` is an idempotency or durable workflow key supplied by the
+/// host. It is deliberately not an authorization credential and never carries
+/// a process-local host operation identifier.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationReconcileRequest {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub operation_key: String,
+}
+
+impl OperationReconcileRequest {
+    pub fn new(
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        tool: impl Into<String>,
+        operation_key: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            request_id: request_id.into(),
+            tool: tool.into(),
+            operation_key: operation_key.into(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validates the protocol header before a host dispatches this request.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)
+    }
+}
+
+/// Worker-reported state for an externally dispatched operation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum OperationStatus {
+    Running,
+    Succeeded { payload: ToolPayload },
+    Failed { message: String },
+    Cancelled,
+}
+
+impl OperationStatus {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Running | Self::Cancelled => Ok(()),
+            Self::Succeeded { payload } => payload.validate_for(payload.format()).map(|_| ()),
+            Self::Failed { message } => {
+                if message.is_empty() {
+                    return Err(ProtocolError::InvalidOperationFailure);
+                }
+                if message.len() > MAX_OPERATION_ERROR_BYTES {
+                    return Err(ProtocolError::OperationFailureTooLarge {
+                        actual: message.len(),
+                        maximum: MAX_OPERATION_ERROR_BYTES,
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// An authenticated worker response to [`OperationReconcileRequest`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OperationReconcileResult {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub operation_key: String,
+    pub status: OperationStatus,
+}
+
+impl OperationReconcileResult {
+    pub fn new(
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        tool: impl Into<String>,
+        operation_key: impl Into<String>,
+        status: OperationStatus,
+    ) -> Result<Self, ProtocolError> {
+        let result = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            request_id: request_id.into(),
+            tool: tool.into(),
+            operation_key: operation_key.into(),
+            status,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn matches_request(&self, request: &OperationReconcileRequest) -> bool {
+        self.protocol_version == request.protocol_version
+            && self.session_id == request.session_id
+            && self.request_id == request.request_id
+            && self.tool == request.tool
+            && self.operation_key == request.operation_key
+    }
+
+    /// Validates a worker-reported operation state before host reconciliation.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)?;
+        self.status.validate()
+    }
+}
+
 /// Framed protocol messages for a future pipe, socket, or platform IPC layer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -371,6 +497,12 @@ pub enum WorkerMessage {
     },
     Result {
         result: ToolResult,
+    },
+    ReconcileOperation {
+        request: OperationReconcileRequest,
+    },
+    ReconciledOperation {
+        result: OperationReconcileResult,
     },
     Cancel {
         protocol_version: u16,
@@ -389,6 +521,8 @@ impl WorkerMessage {
             Self::OpenSession { manifest } => manifest.validate(),
             Self::Invoke { invocation } => invocation.validate_header(),
             Self::Result { result } => result.validate_header(),
+            Self::ReconcileOperation { request } => request.validate(),
+            Self::ReconciledOperation { result } => result.validate(),
             Self::Cancel {
                 protocol_version,
                 session_id,
@@ -405,6 +539,18 @@ impl WorkerMessage {
                 validate_protocol_version(*protocol_version)?;
                 validate_token("session id", session_id)
             }
+        }
+    }
+
+    /// Returns the session that scopes this message.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::OpenSession { manifest } => &manifest.session_id,
+            Self::Invoke { invocation } => &invocation.session_id,
+            Self::Result { result } => &result.session_id,
+            Self::ReconcileOperation { request } => &request.session_id,
+            Self::ReconciledOperation { result } => &result.session_id,
+            Self::Cancel { session_id, .. } | Self::CloseSession { session_id, .. } => session_id,
         }
     }
 
@@ -432,6 +578,287 @@ impl WorkerMessage {
             .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
         message.validate()?;
         Ok(message)
+    }
+}
+
+/// Which side of an authenticated worker session is sending a frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionRole {
+    Host,
+    Worker,
+}
+
+impl SessionRole {
+    fn peer(self) -> Self {
+        match self {
+            Self::Host => Self::Worker,
+            Self::Worker => Self::Host,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+/// A host-provisioned BLAKE3 key for one worker session.
+///
+/// This type is intentionally neither serializable nor displayable. Establish
+/// and store it through a platform-specific trusted channel, not in a Splash
+/// script or worker manifest.
+#[derive(Clone)]
+pub struct SessionKey([u8; AUTH_TAG_BYTES]);
+
+impl SessionKey {
+    pub fn from_bytes(bytes: [u8; AUTH_TAG_BYTES]) -> Result<Self, ProtocolError> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Err(ProtocolError::WeakSessionKey);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        if bytes.len() != AUTH_TAG_BYTES {
+            return Err(ProtocolError::InvalidSessionKeyLength {
+                actual: bytes.len(),
+                expected: AUTH_TAG_BYTES,
+            });
+        }
+        let mut key = [0; AUTH_TAG_BYTES];
+        key.copy_from_slice(bytes);
+        Self::from_bytes(key)
+    }
+}
+
+impl fmt::Debug for SessionKey {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionKey([redacted])")
+    }
+}
+
+/// A sequence-numbered worker message carrying a keyed authentication tag.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthenticatedWorkerMessage {
+    pub sequence: u64,
+    pub message: WorkerMessage,
+    pub auth_tag: String,
+}
+
+impl AuthenticatedWorkerMessage {
+    pub fn to_json_line(&self) -> Result<String, ProtocolError> {
+        self.validate_syntax()?;
+        let encoded = serde_json::to_string(self)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+        if encoded.len() > MAX_WIRE_FRAME_BYTES {
+            return Err(ProtocolError::WireFrameTooLarge {
+                actual: encoded.len(),
+                maximum: MAX_WIRE_FRAME_BYTES,
+            });
+        }
+        Ok(encoded)
+    }
+
+    pub fn from_json_line(encoded: &str) -> Result<Self, ProtocolError> {
+        if encoded.len() > MAX_WIRE_FRAME_BYTES {
+            return Err(ProtocolError::WireFrameTooLarge {
+                actual: encoded.len(),
+                maximum: MAX_WIRE_FRAME_BYTES,
+            });
+        }
+        let frame: Self = serde_json::from_str(encoded)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+        frame.validate_syntax()?;
+        Ok(frame)
+    }
+
+    fn validate_syntax(&self) -> Result<(), ProtocolError> {
+        if self.sequence == 0 {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        self.message.validate()?;
+        decode_auth_tag(&self.auth_tag).map(|_| ())
+    }
+}
+
+/// Stateful sender/receiver for one authenticated host-worker session.
+///
+/// Outgoing and incoming sequence numbers are independent. The sender role is
+/// part of the tag, so a host cannot accept a reflected copy of its own frame.
+pub struct SessionAuthenticator {
+    session_id: String,
+    key: SessionKey,
+    role: SessionRole,
+    next_outgoing_sequence: u64,
+    next_incoming_sequence: u64,
+}
+
+impl SessionAuthenticator {
+    pub fn new(
+        session_id: impl Into<String>,
+        key: SessionKey,
+        role: SessionRole,
+    ) -> Result<Self, ProtocolError> {
+        let session_id = session_id.into();
+        validate_token("session id", &session_id)?;
+        Ok(Self {
+            session_id,
+            key,
+            role,
+            next_outgoing_sequence: 1,
+            next_incoming_sequence: 1,
+        })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn role(&self) -> SessionRole {
+        self.role
+    }
+
+    pub fn seal(
+        &mut self,
+        message: WorkerMessage,
+    ) -> Result<AuthenticatedWorkerMessage, ProtocolError> {
+        message.validate()?;
+        if message.session_id() != self.session_id {
+            return Err(ProtocolError::UnknownSession(
+                message.session_id().to_owned(),
+            ));
+        }
+        if self.next_outgoing_sequence == u64::MAX {
+            return Err(ProtocolError::SequenceExhausted);
+        }
+
+        let sequence = self.next_outgoing_sequence;
+        let auth_tag = encode_auth_tag(&authentication_tag(
+            &self.key,
+            &self.session_id,
+            self.role,
+            sequence,
+            &message,
+        )?);
+        let frame = AuthenticatedWorkerMessage {
+            sequence,
+            message,
+            auth_tag,
+        };
+        frame.to_json_line()?;
+        self.next_outgoing_sequence = self.next_outgoing_sequence.saturating_add(1);
+        Ok(frame)
+    }
+
+    pub fn open(
+        &mut self,
+        frame: AuthenticatedWorkerMessage,
+    ) -> Result<WorkerMessage, ProtocolError> {
+        frame.validate_syntax()?;
+        let supplied_tag = decode_auth_tag(&frame.auth_tag)?;
+        let expected_tag = authentication_tag(
+            &self.key,
+            &self.session_id,
+            self.role.peer(),
+            frame.sequence,
+            &frame.message,
+        )?;
+        if !constant_time_eq(&expected_tag, &supplied_tag) {
+            return Err(ProtocolError::InvalidAuthenticationTag);
+        }
+        if frame.message.session_id() != self.session_id {
+            return Err(ProtocolError::UnknownSession(
+                frame.message.session_id().to_owned(),
+            ));
+        }
+        if frame.sequence != self.next_incoming_sequence {
+            return Err(ProtocolError::UnexpectedSequence {
+                expected: self.next_incoming_sequence,
+                actual: frame.sequence,
+            });
+        }
+        if self.next_incoming_sequence == u64::MAX {
+            return Err(ProtocolError::SequenceExhausted);
+        }
+        self.next_incoming_sequence = self.next_incoming_sequence.saturating_add(1);
+        Ok(frame.message)
+    }
+}
+
+#[derive(Serialize)]
+struct AuthenticationPayload<'a> {
+    domain: &'static str,
+    protocol_version: u16,
+    sender: &'static str,
+    sequence: u64,
+    session_id: &'a str,
+    message: &'a WorkerMessage,
+}
+
+fn authentication_tag(
+    key: &SessionKey,
+    session_id: &str,
+    sender: SessionRole,
+    sequence: u64,
+    message: &WorkerMessage,
+) -> Result<[u8; AUTH_TAG_BYTES], ProtocolError> {
+    let encoded = serde_json::to_vec(&AuthenticationPayload {
+        domain: "splash-worker-auth-v2",
+        protocol_version: PROTOCOL_VERSION,
+        sender: sender.tag(),
+        sequence,
+        session_id,
+        message,
+    })
+    .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+    if encoded.len() > MAX_WIRE_FRAME_BYTES {
+        return Err(ProtocolError::WireFrameTooLarge {
+            actual: encoded.len(),
+            maximum: MAX_WIRE_FRAME_BYTES,
+        });
+    }
+    Ok(*blake3::keyed_hash(&key.0, &encoded).as_bytes())
+}
+
+fn encode_auth_tag(bytes: &[u8; AUTH_TAG_BYTES]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(AUTH_TAG_BYTES * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_auth_tag(encoded: &str) -> Result<[u8; AUTH_TAG_BYTES], ProtocolError> {
+    if encoded.len() != AUTH_TAG_BYTES * 2 {
+        return Err(ProtocolError::InvalidAuthenticationTag);
+    }
+    let mut bytes = [0; AUTH_TAG_BYTES];
+    let mut encoded_bytes = encoded.bytes();
+    for byte in &mut bytes {
+        let high = hex_nibble(
+            encoded_bytes
+                .next()
+                .ok_or(ProtocolError::InvalidAuthenticationTag)?,
+        )?;
+        let low = hex_nibble(
+            encoded_bytes
+                .next()
+                .ok_or(ProtocolError::InvalidAuthenticationTag)?,
+        )?;
+        *byte = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, ProtocolError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(ProtocolError::InvalidAuthenticationTag),
     }
 }
 
@@ -572,6 +999,18 @@ pub enum ProtocolError {
     AttenuationExpandsResources,
     UnknownSession(String),
     UnknownTool(String),
+    InvalidSessionKeyLength {
+        actual: usize,
+        expected: usize,
+    },
+    WeakSessionKey,
+    InvalidSequence,
+    SequenceExhausted,
+    UnexpectedSequence {
+        expected: u64,
+        actual: u64,
+    },
+    InvalidAuthenticationTag,
     DuplicateRequest(String),
     DuplicateResult(String),
     PayloadFormatMismatch {
@@ -579,6 +1018,11 @@ pub enum ProtocolError {
         actual: EnvelopeFormat,
     },
     InvalidJsonEnvelope,
+    InvalidOperationFailure,
+    OperationFailureTooLarge {
+        actual: usize,
+        maximum: usize,
+    },
     InputTooLarge {
         actual: usize,
         maximum: usize,
@@ -632,6 +1076,24 @@ impl Display for ProtocolError {
                 write!(formatter, "unknown worker session: {session_id}")
             }
             Self::UnknownTool(tool) => write!(formatter, "tool is not granted: {tool}"),
+            Self::InvalidSessionKeyLength { actual, expected } => {
+                write!(
+                    formatter,
+                    "worker session key is {actual} bytes; expected {expected}"
+                )
+            }
+            Self::WeakSessionKey => formatter.write_str("worker session key must not be all zero"),
+            Self::InvalidSequence => formatter.write_str("worker frame sequence must be nonzero"),
+            Self::SequenceExhausted => formatter.write_str("worker frame sequence is exhausted"),
+            Self::UnexpectedSequence { expected, actual } => {
+                write!(
+                    formatter,
+                    "unexpected worker frame sequence: expected {expected}, got {actual}"
+                )
+            }
+            Self::InvalidAuthenticationTag => {
+                formatter.write_str("worker frame authentication tag is invalid")
+            }
             Self::DuplicateRequest(request_id) => {
                 write!(formatter, "duplicate worker request: {request_id}")
             }
@@ -647,6 +1109,13 @@ impl Display for ProtocolError {
             Self::InvalidJsonEnvelope => {
                 formatter.write_str("JSON worker payload must be an object or array")
             }
+            Self::InvalidOperationFailure => {
+                formatter.write_str("worker operation failure message must not be empty")
+            }
+            Self::OperationFailureTooLarge { actual, maximum } => write!(
+                formatter,
+                "worker operation failure is {actual} bytes; maximum is {maximum} bytes"
+            ),
             Self::InputTooLarge { actual, maximum } => {
                 write!(
                     formatter,
@@ -956,14 +1425,198 @@ mod tests {
 
     #[test]
     fn frame_decoding_validates_message_headers() {
-        let encoded = r#"{"type":"invoke","invocation":{"protocol_version":1,"session_id":"bad session","request_id":"request-1","tool":"math.add","payload":{"format":"json","value":{"left":20,"right":22}}}}"#;
+        let encoded = format!(
+            r#"{{"type":"invoke","invocation":{{"protocol_version":{PROTOCOL_VERSION},"session_id":"bad session","request_id":"request-1","tool":"math.add","payload":{{"format":"json","value":{{"left":20,"right":22}}}}}}}}"#
+        );
 
         assert!(matches!(
-            WorkerMessage::from_json_line(encoded),
+            WorkerMessage::from_json_line(&encoded),
             Err(ProtocolError::InvalidToken {
                 field: "session id",
                 ..
             })
         ));
+    }
+
+    fn session_key(byte: u8) -> SessionKey {
+        SessionKey::from_bytes([byte; AUTH_TAG_BYTES]).unwrap()
+    }
+
+    #[test]
+    fn authenticated_frames_round_trip_with_directional_sequence_numbers() {
+        let mut host =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Host).unwrap();
+        let mut worker =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Worker).unwrap();
+        let request = WorkerMessage::OpenSession {
+            manifest: manifest(),
+        };
+
+        let outbound = host.seal(request.clone()).unwrap();
+        let encoded = outbound.to_json_line().unwrap();
+        let decoded = AuthenticatedWorkerMessage::from_json_line(&encoded).unwrap();
+
+        assert_eq!(worker.open(decoded).unwrap(), request);
+
+        let response = WorkerMessage::CloseSession {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: "session-1".to_owned(),
+        };
+        let outbound = worker.seal(response.clone()).unwrap();
+        assert_eq!(host.open(outbound).unwrap(), response);
+    }
+
+    #[test]
+    fn authenticated_frames_reject_tampering_reflection_and_replay() {
+        let mut host =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Host).unwrap();
+        let mut worker =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Worker).unwrap();
+        let frame = host
+            .seal(WorkerMessage::OpenSession {
+                manifest: manifest(),
+            })
+            .unwrap();
+
+        let mut tampered = frame.clone();
+        tampered.message = WorkerMessage::CloseSession {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: "session-1".to_owned(),
+        };
+        assert_eq!(
+            worker.open(tampered).unwrap_err(),
+            ProtocolError::InvalidAuthenticationTag
+        );
+        assert_eq!(
+            host.open(frame.clone()).unwrap_err(),
+            ProtocolError::InvalidAuthenticationTag
+        );
+
+        worker.open(frame.clone()).unwrap();
+        assert_eq!(
+            worker.open(frame).unwrap_err(),
+            ProtocolError::UnexpectedSequence {
+                expected: 2,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn authenticated_frames_reject_wrong_session_keys_without_advancing_state() {
+        let mut host =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Host).unwrap();
+        let frame = host
+            .seal(WorkerMessage::OpenSession {
+                manifest: manifest(),
+            })
+            .unwrap();
+        let mut wrong_worker =
+            SessionAuthenticator::new("session-1", session_key(8), SessionRole::Worker).unwrap();
+        let mut correct_worker =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Worker).unwrap();
+
+        assert_eq!(
+            wrong_worker.open(frame.clone()).unwrap_err(),
+            ProtocolError::InvalidAuthenticationTag
+        );
+        assert!(correct_worker.open(frame).is_ok());
+        assert_eq!(
+            SessionKey::from_bytes([0; AUTH_TAG_BYTES]).unwrap_err(),
+            ProtocolError::WeakSessionKey
+        );
+        assert_eq!(
+            SessionKey::from_slice(&[7; AUTH_TAG_BYTES - 1]).unwrap_err(),
+            ProtocolError::InvalidSessionKeyLength {
+                actual: AUTH_TAG_BYTES - 1,
+                expected: AUTH_TAG_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn authenticated_reconciliation_binds_status_to_the_requested_operation() {
+        let request = OperationReconcileRequest::new(
+            "session-1",
+            "reconcile-1",
+            "text.remote",
+            "operation-1",
+        )
+        .unwrap();
+        let mut host =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Host).unwrap();
+        let mut worker =
+            SessionAuthenticator::new("session-1", session_key(7), SessionRole::Worker).unwrap();
+
+        let frame = host
+            .seal(WorkerMessage::ReconcileOperation {
+                request: request.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            worker.open(frame).unwrap(),
+            WorkerMessage::ReconcileOperation {
+                request: request.clone(),
+            }
+        );
+
+        let result = OperationReconcileResult::new(
+            "session-1",
+            "reconcile-1",
+            "text.remote",
+            "operation-1",
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(json!({"status": "done"})),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation {
+                result: result.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            host.open(response).unwrap(),
+            WorkerMessage::ReconciledOperation {
+                result: result.clone(),
+            }
+        );
+        assert!(result.matches_request(&request));
+        let wrong_request = OperationReconcileRequest::new(
+            "session-1",
+            "reconcile-2",
+            "text.remote",
+            "operation-1",
+        )
+        .unwrap();
+        assert!(!result.matches_request(&wrong_request));
+
+        assert_eq!(
+            OperationReconcileResult::new(
+                "session-1",
+                "reconcile-1",
+                "text.remote",
+                "operation-1",
+                OperationStatus::Failed {
+                    message: String::new(),
+                },
+            )
+            .unwrap_err(),
+            ProtocolError::InvalidOperationFailure
+        );
+        assert_eq!(
+            OperationReconcileResult::new(
+                "session-1",
+                "reconcile-1",
+                "text.remote",
+                "operation-1",
+                OperationStatus::Succeeded {
+                    payload: ToolPayload::Json(json!(42)),
+                },
+            )
+            .unwrap_err(),
+            ProtocolError::InvalidJsonEnvelope
+        );
     }
 }

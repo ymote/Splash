@@ -56,12 +56,12 @@ Once claimed, an operation remains reserved until the host completes or
 cancels it even if the script drops its promise handle, preserving the audit
 record and preventing unbounded orphaned work.
 
-CapabilityRuntime remains single-threaded. The host can copy the invocation
-fields into a worker request while retaining its opaque ID locally, then map
-the authenticated worker request ID back to that ID when it completes. Its
-completion must be delivered back to the event loop that owns the runtime.
-When present, remaining_deadline_millis should also be applied by the worker
-adapter.
+CapabilityRuntime remains single-threaded. The host can copy invocation fields
+into its worker request while retaining the opaque ID locally, then complete
+the operation on the event loop that owns the runtime. For keyed protocol
+workers, prefer the authenticated reconciliation bridge below instead of
+manually trusting a returned request ID. When present,
+remaining_deadline_millis should also be applied by the worker adapter.
 
 ## Host-owned retries
 
@@ -93,12 +93,91 @@ deadline returns `DeadlineElapsed`; the event loop should resolve it through
 `idempotency_key` is safe to pass to an authenticated worker as a downstream
 deduplication key. It is stable for all attempts of one operation and unique
 within this runtime process, but it is not an authorization credential and is
-not durable across host restarts. Retain the opaque `ExternalToolId` locally;
-map authenticated worker request IDs back to it before calling completion.
+not durable across host restarts. Retain the opaque `ExternalToolId` locally.
 Durable workflows should use a persisted workflow or operation identity in
 addition to this per-runtime key. Do not retry a non-idempotent worker unless
 the worker deduplicates requests using that key or another durable operation
 identity.
+
+## Authenticated reconciliation
+
+When a worker connection is interrupted or a host needs to poll an operation
+that remains claimed, use the keyed reconciliation bridge instead of treating
+a worker status payload as a completion. The request contains the tool and
+non-authorizing operation key, never the opaque `ExternalToolId`. The host
+keeps that ID locally and the worker returns an authenticated status bound to
+the exact request.
+
+~~~rust
+use splash_capabilities::{
+    CapabilityRuntime, ExternalReconciliation, OperationReconcileResult,
+    OperationStatus, SessionAuthenticator, SessionKey, SessionRole,
+    ToolPolicy, WorkerMessage, WorkerPayload,
+};
+use splash_protocol::AUTH_TAG_BYTES;
+
+let mut runtime = CapabilityRuntime::default();
+runtime.register_external_tool(ToolPolicy::new("text.remote"))?;
+let initial = runtime.eval(
+    "use mod.tool\n\
+     tool.start(\"text.remote\", \"release\").await()",
+)?;
+assert!(initial.suspended);
+
+let key = SessionKey::from_bytes([7; AUTH_TAG_BYTES])?;
+let mut host_auth = SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host)?;
+let mut worker_auth = SessionAuthenticator::new("worker-1", key, SessionRole::Worker)?;
+
+let invocation = runtime.claim_next_external_tool().expect("pending worker call");
+let outbound = runtime.prepare_authenticated_external_reconciliation(
+    invocation.id,
+    "reconcile-1",
+    &mut host_auth,
+)?;
+
+// A real transport serializes outbound.frame with to_json_line(), sends it,
+// then returns an AuthenticatedWorkerMessage decoded from the worker response.
+let WorkerMessage::ReconcileOperation { request } = worker_auth.open(outbound.frame)? else {
+    unreachable!("host sent a reconciliation request");
+};
+let result = OperationReconcileResult::new(
+    request.session_id,
+    request.request_id,
+    request.tool,
+    request.operation_key,
+    OperationStatus::Succeeded {
+        payload: WorkerPayload::Text("done".to_owned()),
+    },
+)?;
+let response = worker_auth.seal(WorkerMessage::ReconciledOperation { result })?;
+
+match runtime.reconcile_authenticated_external_tool(
+    invocation.id,
+    &outbound.request,
+    &mut host_auth,
+    response,
+)? {
+    ExternalReconciliation::Running => {}
+    ExternalReconciliation::Resolved(resumed) => {
+        let _completed_script = resumed;
+    }
+}
+~~~
+
+`prepare_authenticated_external_reconciliation` requires the host role and
+creates the request frame with the session authenticator. The matching receive
+method verifies the keyed tag, directional sequence, and worker role before it
+inspects the message. It then checks the request and result fields against the
+currently claimed operation and applies text/JSON output validation and any
+registered JSON contract before resolving the promise. A `running` result
+leaves the promise pending and writes no terminal audit event.
+
+The key must be provisioned through a trusted host-to-worker bootstrap path;
+the protocol is not a key exchange, encrypted transport, or OS sandbox. This
+bridge only reconciles a live runtime. It intentionally cannot restore an
+`ExternalToolId`, promise, or VM state after a process restart. Persist and
+authenticate a durable operation identity separately, then use workflow policy
+to decide how a new runtime handles any interrupted effect.
 
 ## Host-visible output streaming
 
