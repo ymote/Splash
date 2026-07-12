@@ -1,0 +1,18 @@
+use mod.std.assert
+
+let multiplier = 7
+let values = [1, 2, 3]
+let record = {answer: 42 items: values}
+
+fn add(left, right) {
+    return left + right
+}
+
+let apply = |value| value * multiplier
+let total = 0
+for value in values {
+    total += value
+}
+
+assert(add(20, 22) == record.answer)
+assert(apply(total) == 42)

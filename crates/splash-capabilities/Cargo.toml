@@ -1,0 +1,14 @@
+[package]
+name = "splash-capabilities"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Capability-gated tool host for Splash"
+
+[lints]
+workspace = true
+
+[dependencies]
+makepad-script = { path = "../../vendor/makepad/platform/script" }
+splash-core = { path = "../splash-core" }

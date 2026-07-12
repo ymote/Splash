@@ -1,0 +1,4 @@
+/target/
+vendor/makepad/target/
+*.swp
+.DS_Store

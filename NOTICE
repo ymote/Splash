@@ -1,0 +1,12 @@
+Splash contains a vendored compatibility core derived from Makepad.
+
+Upstream project: https://github.com/makepad/makepad
+Upstream revision: 4f9ce7a8bb3fd19e5c61dcf13edd2e6d4a04cefc
+Imported paths: platform/script and the required leaf dependencies under libs/.
+Copyright (c) 2023 Makepad B.V.
+License: MIT (see LICENSE). Individual imported crates may additionally be
+licensed under Apache-2.0 as declared in their manifests.
+
+The vendored copy of smallvec is Copyright (c) The Servo Project Developers
+and is dual licensed under MIT OR Apache-2.0. Its license texts are retained
+under vendor/makepad/libs/smallvec/.

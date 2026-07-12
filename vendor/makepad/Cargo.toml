@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "platform/script",
+    "platform/script/derive",
+    "libs/error_log",
+    "libs/math",
+    "libs/live_id",
+    "libs/live_id/id_macros",
+    "libs/regex",
+    "libs/html",
+    "libs/micro_serde",
+    "libs/micro_serde/derive",
+    "libs/micro_proc_macro",
+    "libs/smallvec",
+]
+exclude = ["libs/regex/src/fuzz"]
+resolver = "2"

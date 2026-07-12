@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/splash-core",
+    "crates/splash-capabilities",
+    "crates/splash-workflow",
+    "crates/splash-cli",
+]
+default-members = [
+    "crates/splash-core",
+    "crates/splash-capabilities",
+    "crates/splash-workflow",
+    "crates/splash-cli",
+]
+exclude = ["vendor/makepad"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ymote/Splash"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

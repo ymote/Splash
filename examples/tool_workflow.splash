@@ -1,0 +1,5 @@
+use mod.tool
+
+let task = "prepare release notes"
+let result = tool.call("text.echo", task)
+result
