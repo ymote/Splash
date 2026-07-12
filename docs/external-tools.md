@@ -13,8 +13,9 @@ must create a promise with tool.start or tool.start_json and await it.
 1. A script starts the granted external tool. The runtime validates input,
    reserves the call budget, and retains one pending-promise slot.
 2. The host calls claim_next_external_tool. This returns a host-owned opaque
-   ID, the validated input, format, call index, output byte limit, and any
-   remaining deadline in milliseconds.
+   ID, the validated input, format, call index, attempt limit, stable
+   idempotency key, output byte limit, and any remaining deadline in
+   milliseconds.
 3. The host dispatches that invocation to its own worker or platform adapter.
 4. The host calls complete_external_tool with the result, or
    cancel_external_tool when it decides the work must stop.
@@ -61,6 +62,43 @@ the authenticated worker request ID back to that ID when it completes. Its
 completion must be delivered back to the event loop that owns the runtime.
 When present, remaining_deadline_millis should also be applied by the worker
 adapter.
+
+## Host-owned retries
+
+`ToolPolicy::max_attempts` bounds external dispatch attempts for one deferred
+operation and defaults to `1`. After a worker reports a retryable failure, the
+host may call `retry_external_tool` with `RetryClass::Transient` or
+`RetryClass::RateLimited`. It returns the next invocation directly: the
+operation remains claimed, so it is not returned again by
+`claim_next_external_tool`.
+
+~~~rust
+use splash_capabilities::RetryClass;
+
+let first = runtime.claim_next_external_tool().expect("pending worker call");
+let retry = runtime.retry_external_tool(first.id, RetryClass::Transient)?;
+assert_eq!(retry.id, first.id);
+assert_eq!(retry.idempotency_key, first.idempotency_key);
+assert_eq!(retry.attempt, 2);
+~~~
+
+The retry preserves its input, call index, opaque host ID, and idempotency key.
+It does not create another Splash call or consume another tool call budget.
+The runtime records an `AuditOutcome::RetryScheduled` event with the host's
+retry class. Reaching the attempt bound returns `RetryLimitReached`; the host
+must then complete or cancel the claimed operation. A retry after the deferred
+deadline returns `DeadlineElapsed`; the event loop should resolve it through
+`expire_timed_out_tools`.
+
+`idempotency_key` is safe to pass to an authenticated worker as a downstream
+deduplication key. It is stable for all attempts of one operation and unique
+within this runtime process, but it is not an authorization credential and is
+not durable across host restarts. Retain the opaque `ExternalToolId` locally;
+map authenticated worker request IDs back to it before calling completion.
+Durable workflows should use a persisted workflow or operation identity in
+addition to this per-runtime key. Do not retry a non-idempotent worker unless
+the worker deduplicates requests using that key or another durable operation
+identity.
 
 ## Deadlines
 

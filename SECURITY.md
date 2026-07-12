@@ -46,6 +46,16 @@ the normal output validation and audit boundary. This does not terminate a
 worker or enforce an operating-system policy. The host must bind cancellation
 to its transport and enforce containment outside this process.
 
+External retries are also host-only. A script receives no retry API and cannot
+spend another capability call by requesting another attempt. For each claimed
+operation, the host may use its stable `idempotency_key` when forwarding an
+attempt to a worker. That key is a correlation and deduplication value, not a
+capability token or authorization credential; the opaque `ExternalToolId`
+must remain owned by the host. Hosts that need replay across restarts must
+persist their own workflow identity and authenticate every worker request.
+An adapter must not retry a non-idempotent effect unless its worker performs
+deduplication using that key or an equivalent durable identity.
+
 Hosts can set a deferred deadline on each tool policy. Expiration is enforced
 before a queued host-pump handler begins and through
 CapabilityRuntime::expire_timed_out_tools for external work. It cannot stop a

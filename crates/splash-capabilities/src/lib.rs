@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use makepad_script::{
@@ -34,6 +35,8 @@ pub const DEFAULT_MAX_PENDING_TOOLS: usize = 64;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 32 * 1024;
 
+static NEXT_CAPABILITY_SESSION: AtomicU64 = AtomicU64::new(1);
+
 /// Serialization contract for a capability's input and output envelopes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +55,16 @@ pub enum ToolDispatch {
     HostPump,
     /// The host must explicitly claim and complete the work outside the VM.
     External,
+}
+
+/// Host-side classification for a failure that may be retried externally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryClass {
+    /// A temporary transport or service failure.
+    Transient,
+    /// The downstream service requested backoff before another attempt.
+    RateLimited,
 }
 
 /// Trusted host metadata supplied to an LLM orchestrator or operator UI.
@@ -126,6 +139,7 @@ pub struct ToolDescriptor {
     pub format: ToolDataFormat,
     pub dispatch: ToolDispatch,
     pub max_calls: usize,
+    pub max_attempts: u32,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +186,8 @@ impl JsonToolContract {
 pub struct ToolPolicy {
     pub name: String,
     pub max_calls: usize,
+    /// Maximum external dispatch attempts for one deferred operation.
+    pub max_attempts: u32,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
     /// Maximum lifetime of one deferred operation after tool.start reserves it.
@@ -184,6 +200,7 @@ impl ToolPolicy {
         Self {
             name: name.into(),
             max_calls: 1,
+            max_attempts: 1,
             max_input_bytes: 16 * 1024,
             max_output_bytes: 64 * 1024,
             max_deferred_duration: None,
@@ -211,6 +228,11 @@ impl ToolPolicy {
         if self.max_calls == 0 {
             return Err(ToolRegistrationError::InvalidPolicy(
                 "max_calls must be greater than zero",
+            ));
+        }
+        if self.max_attempts == 0 {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "max_attempts must be greater than zero",
             ));
         }
         if self.max_input_bytes == 0 || self.max_output_bytes == 0 {
@@ -270,6 +292,9 @@ pub struct ExternalToolInvocation {
     pub name: String,
     pub input: String,
     pub call_index: usize,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub idempotency_key: String,
     pub format: ToolDataFormat,
     pub max_output_bytes: usize,
     pub remaining_deadline_millis: Option<u64>,
@@ -282,6 +307,8 @@ pub enum ExternalToolError {
     NotExternal(ExternalToolId),
     NotClaimed(ExternalToolId),
     AlreadyCompleted(ExternalToolId),
+    RetryLimitReached(ExternalToolId),
+    DeadlineElapsed(ExternalToolId),
     Runtime(RuntimeError),
 }
 
@@ -297,6 +324,12 @@ impl Display for ExternalToolError {
             }
             Self::AlreadyCompleted(_) => {
                 formatter.write_str("external tool operation is already complete")
+            }
+            Self::RetryLimitReached(_) => {
+                formatter.write_str("external tool operation exhausted its retry limit")
+            }
+            Self::DeadlineElapsed(_) => {
+                formatter.write_str("external tool operation deadline has elapsed")
             }
             Self::Runtime(error) => write!(formatter, "could not resume tool operation: {error}"),
         }
@@ -450,22 +483,26 @@ impl Display for ToolRegistrationError {
 
 impl std::error::Error for ToolRegistrationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Allowed,
     Denied,
     Failed,
     Cancelled,
     TimedOut,
+    RetryScheduled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AuditEvent {
     pub sequence: u64,
     pub tool: String,
     pub input_bytes: usize,
     pub output_bytes: usize,
     pub outcome: AuditOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_class: Option<RetryClass>,
 }
 
 pub type ToolHandler = Box<dyn FnMut(&ToolRequest) -> Result<String, ToolError> + 'static>;
@@ -511,6 +548,7 @@ struct ToolTicket {
     input_bytes: usize,
     call_index: usize,
     max_output_bytes: usize,
+    max_attempts: u32,
     data_format: ToolDataFormat,
     dispatch: ToolDispatch,
     deadline: Option<DeferredDeadline>,
@@ -556,6 +594,8 @@ enum PendingToolState {
 struct PendingTool {
     id: ExternalToolId,
     ticket: ToolTicket,
+    attempt: u32,
+    idempotency_key: String,
     state: PendingToolState,
     orphaned: bool,
 }
@@ -595,13 +635,26 @@ impl ScriptHandleGc for ToolPromiseGc {
     }
 }
 
-#[derive(Default)]
 pub struct CapabilityHost {
+    session_id: u64,
     tools: BTreeMap<String, RegisteredTool>,
     audit: Vec<AuditEvent>,
     next_sequence: u64,
     next_pending_id: u64,
     pending: PendingTools,
+}
+
+impl Default for CapabilityHost {
+    fn default() -> Self {
+        Self {
+            session_id: NEXT_CAPABILITY_SESSION.fetch_add(1, Ordering::Relaxed),
+            tools: BTreeMap::new(),
+            audit: Vec::new(),
+            next_sequence: 0,
+            next_pending_id: 0,
+            pending: Rc::new(RefCell::new(BTreeMap::new())),
+        }
+    }
 }
 
 impl CapabilityHost {
@@ -846,6 +899,7 @@ impl CapabilityHost {
                 format: registered.policy.data_format,
                 dispatch: registered.dispatch,
                 max_calls: registered.policy.max_calls,
+                max_attempts: registered.policy.max_attempts,
                 max_input_bytes: registered.policy.max_input_bytes,
                 max_output_bytes: registered.policy.max_output_bytes,
                 max_deferred_millis: registered.policy.max_deferred_duration.map(duration_millis),
@@ -967,6 +1021,7 @@ impl CapabilityHost {
             input_bytes,
             call_index: registered.calls,
             max_output_bytes: registered.policy.max_output_bytes,
+            max_attempts: registered.policy.max_attempts,
             data_format: registered.policy.data_format,
             dispatch: registered.dispatch,
             deadline,
@@ -1049,6 +1104,7 @@ impl CapabilityHost {
             input_bytes: ticket.input_bytes,
             output_bytes,
             outcome,
+            retry_class: None,
         });
     }
 
@@ -1065,6 +1121,18 @@ impl CapabilityHost {
             input_bytes,
             output_bytes: 0,
             outcome,
+            retry_class: None,
+        });
+    }
+
+    fn record_retry(&mut self, ticket: &ToolTicket, retry_class: RetryClass) {
+        self.audit.push(AuditEvent {
+            sequence: ticket.sequence,
+            tool: ticket.name.clone(),
+            input_bytes: ticket.input_bytes,
+            output_bytes: 0,
+            outcome: AuditOutcome::RetryScheduled,
+            retry_class: Some(retry_class),
         });
     }
 
@@ -1073,7 +1141,7 @@ impl CapabilityHost {
         name: &str,
         input: &str,
         max_pending: usize,
-    ) -> Result<(ToolTicket, PendingTools, ExternalToolId), ToolError> {
+    ) -> Result<(ToolTicket, PendingTools, ExternalToolId, String), ToolError> {
         self.begin_async_with_format(name, input, max_pending, None)
     }
 
@@ -1082,7 +1150,7 @@ impl CapabilityHost {
         name: &str,
         input: &str,
         max_pending: usize,
-    ) -> Result<(ToolTicket, PendingTools, ExternalToolId), ToolError> {
+    ) -> Result<(ToolTicket, PendingTools, ExternalToolId, String), ToolError> {
         self.begin_async_with_format(name, input, max_pending, Some(ToolDataFormat::Json))
     }
 
@@ -1092,7 +1160,7 @@ impl CapabilityHost {
         input: &str,
         max_pending: usize,
         expected_format: Option<ToolDataFormat>,
-    ) -> Result<(ToolTicket, PendingTools, ExternalToolId), ToolError> {
+    ) -> Result<(ToolTicket, PendingTools, ExternalToolId, String), ToolError> {
         if self.pending.borrow().len() >= max_pending {
             let sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.saturating_add(1);
@@ -1104,7 +1172,12 @@ impl CapabilityHost {
 
         let id = self.allocate_pending_id(name, input.len())?;
         let ticket = self.reserve(name, input, expected_format, ToolInvocationKind::Deferred)?;
-        Ok((ticket, self.pending.clone(), id))
+        let idempotency_key = self.idempotency_key(&ticket);
+        Ok((ticket, self.pending.clone(), id, idempotency_key))
+    }
+
+    fn idempotency_key(&self, ticket: &ToolTicket) -> String {
+        format!("splash-{}-{}", self.session_id, ticket.sequence)
     }
 
     fn allocate_pending_id(
@@ -1167,6 +1240,22 @@ impl CapabilityHost {
             .collect()
     }
 
+    fn external_invocation(entry: &PendingTool, now: Instant) -> ExternalToolInvocation {
+        let ticket = &entry.ticket;
+        ExternalToolInvocation {
+            id: entry.id,
+            name: ticket.name.clone(),
+            input: ticket.input.clone(),
+            call_index: ticket.call_index,
+            attempt: entry.attempt,
+            max_attempts: ticket.max_attempts,
+            idempotency_key: entry.idempotency_key.clone(),
+            format: ticket.data_format,
+            max_output_bytes: ticket.max_output_bytes,
+            remaining_deadline_millis: ticket.remaining_deadline_millis(now),
+        }
+    }
+
     fn claim_next_external(&mut self) -> Option<ExternalToolInvocation> {
         let mut pending = self.pending.borrow_mut();
         let handle = pending.iter().find_map(|(handle, entry)| {
@@ -1180,27 +1269,61 @@ impl CapabilityHost {
             .then_some(*handle)
         })?;
         let entry = pending.get_mut(&handle)?;
-        let (id, ticket, waiting_thread) = match &entry.state {
+        let waiting_thread = match &entry.state {
             PendingToolState::Pending {
                 dispatch: PendingDispatch::ExternalQueued,
                 waiting_thread,
-            } => (entry.id, entry.ticket.clone(), *waiting_thread),
+            } => *waiting_thread,
             _ => return None,
         };
+        let invocation = Self::external_invocation(entry, Instant::now());
         entry.state = PendingToolState::Pending {
             dispatch: PendingDispatch::ExternalClaimed,
             waiting_thread,
         };
-        let remaining_deadline_millis = ticket.remaining_deadline_millis(Instant::now());
-        Some(ExternalToolInvocation {
-            id,
-            name: ticket.name,
-            input: ticket.input,
-            call_index: ticket.call_index,
-            format: ticket.data_format,
-            max_output_bytes: ticket.max_output_bytes,
-            remaining_deadline_millis,
-        })
+        Some(invocation)
+    }
+
+    fn retry_external(
+        &mut self,
+        id: ExternalToolId,
+        retry_class: RetryClass,
+    ) -> Result<ExternalToolInvocation, ExternalToolError> {
+        let now = Instant::now();
+        let (ticket, invocation) = {
+            let mut pending = self.pending.borrow_mut();
+            let Some((_, entry)) = pending.iter_mut().find(|(_, entry)| entry.id == id) else {
+                return Err(ExternalToolError::Unknown(id));
+            };
+            match &entry.state {
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    ..
+                } => {}
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                } => return Err(ExternalToolError::NotClaimed(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::HostPump,
+                    ..
+                } => return Err(ExternalToolError::NotExternal(id)),
+                PendingToolState::Ready(_) => return Err(ExternalToolError::AlreadyCompleted(id)),
+            }
+            if entry.ticket.expired_at(now) {
+                return Err(ExternalToolError::DeadlineElapsed(id));
+            }
+            if entry.attempt >= entry.ticket.max_attempts {
+                return Err(ExternalToolError::RetryLimitReached(id));
+            }
+
+            entry.attempt += 1;
+            let ticket = entry.ticket.clone();
+            let invocation = Self::external_invocation(entry, now);
+            (ticket, invocation)
+        };
+        self.record_retry(&ticket, retry_class);
+        Ok(invocation)
     }
 
     fn complete_external(
@@ -1556,6 +1679,19 @@ impl CapabilityRuntime {
         self.runtime.host_mut().claim_next_external()
     }
 
+    /// Schedules another host-owned attempt for a claimed external tool.
+    ///
+    /// The retry preserves the operation's idempotency key and does not create
+    /// another script-visible call or consume additional call budget. Scripts
+    /// cannot invoke this API.
+    pub fn retry_external_tool(
+        &mut self,
+        id: ExternalToolId,
+        retry_class: RetryClass,
+    ) -> Result<ExternalToolInvocation, ExternalToolError> {
+        self.runtime.host_mut().retry_external(id, retry_class)
+    }
+
     /// Delivers a host-produced result for a previously claimed external tool.
     ///
     /// The same byte, JSON envelope, and optional schema checks used by local
@@ -1814,8 +1950,8 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending, id)) => {
-                        new_tool_promise(vm, promise_type, id, ticket, pending)
+                    Ok((ticket, pending, id, idempotency_key)) => {
+                        new_tool_promise(vm, promise_type, id, ticket, pending, idempotency_key)
                     }
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
@@ -1845,8 +1981,8 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending, id)) => {
-                        new_tool_promise(vm, promise_type, id, ticket, pending)
+                    Ok((ticket, pending, id, idempotency_key)) => {
+                        new_tool_promise(vm, promise_type, id, ticket, pending, idempotency_key)
                     }
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
@@ -1873,6 +2009,7 @@ fn new_tool_promise(
     id: ExternalToolId,
     ticket: ToolTicket,
     pending: PendingTools,
+    idempotency_key: String,
 ) -> ScriptValue {
     let handle = vm.bx.heap.new_handle(
         promise_type,
@@ -1890,6 +2027,8 @@ fn new_tool_promise(
         PendingTool {
             id,
             ticket,
+            attempt: 1,
+            idempotency_key,
             state: PendingToolState::Pending {
                 dispatch,
                 waiting_thread: None,
@@ -2026,6 +2165,111 @@ mod tests {
         assert!(resumed.completed(), "{:?}", resumed.diagnostics);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
         assert!(runtime.claim_next_external_tool().is_none());
+    }
+
+    #[test]
+    fn external_retries_preserve_one_call_and_a_stable_idempotency_key() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_attempts = 2;
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet output = tool.start(\"text.remote\", \"hello\").await()\nassert(output == \"world\")",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+
+        let first = runtime.claim_next_external_tool().unwrap();
+        assert_eq!(first.attempt, 1);
+        assert_eq!(first.max_attempts, 2);
+        assert_eq!(first.call_index, 1);
+        assert!(first.idempotency_key.starts_with("splash-"));
+        assert_eq!(runtime.tool_catalog()[0].max_attempts, 2);
+
+        let retried = runtime
+            .retry_external_tool(first.id, RetryClass::Transient)
+            .unwrap();
+        assert_eq!(retried.id, first.id);
+        assert_eq!(retried.attempt, 2);
+        assert_eq!(retried.max_attempts, first.max_attempts);
+        assert_eq!(retried.call_index, first.call_index);
+        assert_eq!(retried.idempotency_key, first.idempotency_key);
+        assert!(runtime.claim_next_external_tool().is_none());
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::RetryScheduled);
+        assert_eq!(runtime.audit()[0].retry_class, Some(RetryClass::Transient));
+
+        let resumed = runtime
+            .complete_external_tool(retried.id, Ok("world".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
+        assert_eq!(runtime.audit()[1].retry_class, None);
+    }
+
+    #[test]
+    fn exhausted_retry_limit_requires_a_terminal_external_completion() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"hello\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        assert_eq!(
+            runtime
+                .retry_external_tool(invocation.id, RetryClass::RateLimited)
+                .unwrap_err(),
+            ExternalToolError::RetryLimitReached(invocation.id)
+        );
+        assert!(runtime.audit().is_empty());
+
+        let resumed = runtime
+            .complete_external_tool(
+                invocation.id,
+                Err(ToolError::Failed("remote worker failed".to_owned())),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(!resumed.succeeded());
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Failed);
+    }
+
+    #[test]
+    fn elapsed_external_deadlines_cannot_be_retried() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_attempts = 2;
+        policy.max_deferred_duration = Some(Duration::ZERO);
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"hello\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        assert_eq!(
+            runtime
+                .retry_external_tool(invocation.id, RetryClass::Transient)
+                .unwrap_err(),
+            ExternalToolError::DeadlineElapsed(invocation.id)
+        );
+        assert!(runtime.audit().is_empty());
+
+        let report = runtime.expire_timed_out_tools().unwrap();
+        assert_eq!(report.expired, 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::TimedOut);
     }
 
     #[test]
@@ -2179,10 +2423,13 @@ mod tests {
                     input_bytes: 4,
                     call_index: 1,
                     max_output_bytes: 64,
+                    max_attempts: 1,
                     data_format: ToolDataFormat::Text,
                     dispatch: ToolDispatch::External,
                     deadline: None,
                 },
+                attempt: 1,
+                idempotency_key: "splash-test-0".to_owned(),
                 state: PendingToolState::Pending {
                     dispatch: PendingDispatch::ExternalClaimed,
                     waiting_thread: None,
@@ -2200,8 +2447,10 @@ mod tests {
         assert!(pending.borrow().contains_key(&handle));
         assert!(pending.borrow()[&handle].orphaned);
 
-        let mut host = CapabilityHost::default();
-        host.pending = pending.clone();
+        let mut host = CapabilityHost {
+            pending: pending.clone(),
+            ..CapabilityHost::default()
+        };
         host.register_external(ToolPolicy::new("text.remote"))
             .unwrap();
         let completion = host.complete_external(id, Ok("done".to_owned())).unwrap();
@@ -2263,6 +2512,7 @@ mod tests {
         let first_claim = runtime.claim_next_external_tool().unwrap();
         let second_claim = runtime.claim_next_external_tool().unwrap();
         assert_ne!(first_claim.id, second_claim.id);
+        assert_ne!(first_claim.idempotency_key, second_claim.idempotency_key);
         let (first, second) = if first_claim.input == "first" {
             (first_claim, second_claim)
         } else {
@@ -2654,6 +2904,20 @@ mod tests {
         assert_eq!(
             error,
             ToolRegistrationError::InvalidName("shell exec".to_owned())
+        );
+    }
+
+    #[test]
+    fn tool_policy_requires_at_least_one_external_attempt() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_attempts = 0;
+        let mut runtime = CapabilityRuntime::default();
+
+        let error = runtime.register_external_tool(policy).unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolRegistrationError::InvalidPolicy("max_attempts must be greater than zero")
         );
     }
 

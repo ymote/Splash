@@ -5,10 +5,12 @@ An LLM orchestrator should build its prompt from
 commands. The catalog contains only capabilities registered on that runtime,
 in stable name order.
 
-Each `ToolDescriptor` includes the name, envelope format, dispatch mode, call
-and byte limits, description, and optional JSON input/output schemas. The
-runtime does not install catalog access into `mod.tool`: a script cannot
-discover or mint capabilities by inspecting descriptions.
+Each `ToolDescriptor` includes the name, envelope format, dispatch mode, call,
+attempt, and byte limits, description, and optional JSON input/output schemas.
+`max_attempts` is the host-only bound for an external operation; it does not
+give Splash source a retry API. The runtime does not install catalog access
+into `mod.tool`: a script cannot discover or mint capabilities by inspecting
+descriptions.
 
 When a deferred deadline is configured, max_deferred_millis is also present in
 the catalog. It is a host scheduling constraint, not an instruction for a

@@ -18,6 +18,8 @@ and keeps UI support optional rather than making UI the language boundary.
   installing an in-process handler.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
   outcomes.
+- Host-only bounded retries for external tools, with stable non-authorizing
+  idempotency keys for each deferred operation.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

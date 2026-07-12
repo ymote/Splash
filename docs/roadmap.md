@@ -14,10 +14,10 @@
 - External-only deferred tools with host claim, completion, cancellation, and
   bounded concurrent pending work.
 - Per-tool deferred deadlines with host-driven expiration.
+- Host-only bounded external retries with stable idempotency keys.
 
 ## Next: richer external operations
 
-- Retry classification and idempotency keys.
 - Streaming output with byte limits and redaction hooks.
 
 ## Next: contained local effects
