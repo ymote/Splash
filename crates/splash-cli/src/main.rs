@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use splash_capabilities::{json, CapabilityRuntime, ToolError, ToolMetadata, ToolPolicy};
+use splash_capabilities::{
+    json, CapabilityRuntime, JsonToolContract, ToolError, ToolMetadata, ToolPolicy,
+};
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
@@ -42,12 +44,29 @@ fn run(args: Vec<String>) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     if options.allow_json_add {
+        let contract = JsonToolContract::new(
+            json!({
+                "type": "object",
+                "properties": {
+                    "left": {"type": "integer"},
+                    "right": {"type": "integer"}
+                },
+                "required": ["left", "right"],
+                "additionalProperties": false
+            }),
+            json!({
+                "type": "object",
+                "properties": {"total": {"type": "integer"}},
+                "required": ["total"],
+                "additionalProperties": false
+            }),
+        )
+        .map_err(|error| error.to_string())?;
         runtime
-            .register_json_tool_with_metadata(
+            .register_validated_json_tool(
                 ToolPolicy::json("math.add"),
-                ToolMetadata::new("Adds the integer left and right fields.")
-                    .with_input_schema(json!({"type": "object", "required": ["left", "right"]}))
-                    .with_output_schema(json!({"type": "object", "required": ["total"]})),
+                ToolMetadata::new("Adds the integer left and right fields."),
+                contract,
                 |request| {
                     let left = request.input["left"].as_i64().ok_or_else(|| {
                         ToolError::Denied("math.add expects an integer left field".to_owned())

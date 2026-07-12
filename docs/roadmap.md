@@ -10,10 +10,10 @@
 - Portable worker protocol with capability attenuation and bounded wire
   messages.
 - Stable host-side tool catalog with bounded LLM metadata.
+- Bounded executable JSON input/output contracts for local and worker tools.
 
 ## Next: schema-validated and externally asynchronous tools
 
-- JSON Schema or equivalent typed input/output contracts.
 - Cancellable promise handles, external completion, and bounded concurrent
   work.
 - Per-tool deadlines, retry classification, and idempotency keys.

@@ -166,6 +166,7 @@ dependencies = [
  "serde_json",
  "splash-core",
  "splash-protocol",
+ "splash-schema",
 ]
 
 [[package]]
@@ -187,6 +188,13 @@ name = "splash-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "splash-schema"
+version = "0.1.0"
+dependencies = [
  "serde_json",
 ]
 

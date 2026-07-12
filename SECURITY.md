@@ -25,10 +25,12 @@ bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,
 over-budget, or malformed calls fail before a tool handler is invoked.
 
 JSON capabilities are an explicit policy type. They accept only JSON object or
-array envelopes: input validation happens before the Rust handler is called,
-and output validation happens before a result is returned to Splash. This is a
-data contract, not a way to deserialize arbitrary Rust types or grant a script
-access to a crate.
+array envelopes: envelope validation happens before the Rust handler is called,
+and before a result is returned to Splash. `JsonToolContract` adds an
+executable, bounded schema subset at the same boundary. Input contract failure
+does not invoke a handler or consume a call; output contract failure does not
+reach Splash. This is a data contract, not a way to deserialize arbitrary Rust
+types or grant a script access to a crate.
 
 Deferred tool promises are bounded per runtime and run only when the trusted
 host calls `CapabilityRuntime::pump`; one default pump tick processes at most
@@ -46,10 +48,10 @@ and consumed by execution, so a script cannot manufacture approval for another
 workflow or resume a rejected plan by mutating its own state.
 
 This baseline does not yet provide filesystem adapters, network adapters,
-secret storage, worker-process isolation, signed packages, JSON-schema
-validation, or mobile policy backends. Those features must not be inferred
-from the presence of the VM.
+secret storage, worker-process isolation, signed packages, full JSON Schema,
+or mobile policy backends. Those features must not be inferred from the
+presence of the VM.
 
-Tool descriptions and schema hints are available only through the host-side
-catalog. They are prompt metadata, not script-visible authority or executable
-schema enforcement.
+Tool descriptions and schemas are available only through the host-side
+catalog. They are not script-visible authority. Schemas registered solely as
+`ToolMetadata` remain prompt metadata; only `JsonToolContract` is executable.

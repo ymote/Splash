@@ -1,0 +1,13 @@
+[package]
+name = "splash-schema"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded executable JSON-schema subset for Splash tools"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }

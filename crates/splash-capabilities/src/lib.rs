@@ -23,6 +23,7 @@ pub use splash_protocol::{
     ToolPayload as WorkerPayload, ToolResult as WorkerResult,
 };
 use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
+pub use splash_schema::{JsonSchema, SchemaError};
 
 /// Maximum number of tool promises a runtime may retain at once.
 ///
@@ -117,6 +118,40 @@ pub struct ToolDescriptor {
     pub max_output_bytes: usize,
     #[serde(flatten)]
     pub metadata: ToolMetadata,
+}
+
+/// Executable input/output schemas for a JSON capability.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsonToolContract {
+    input_schema: JsonValue,
+    output_schema: JsonValue,
+    input: JsonSchema,
+    output: JsonSchema,
+}
+
+impl JsonToolContract {
+    /// Compiles the input and output schemas before the tool becomes visible
+    /// to a Splash script.
+    pub fn new(input_schema: JsonValue, output_schema: JsonValue) -> Result<Self, SchemaError> {
+        let input = JsonSchema::compile(input_schema.clone())?;
+        let output = JsonSchema::compile(output_schema.clone())?;
+        Ok(Self {
+            input_schema,
+            output_schema,
+            input,
+            output,
+        })
+    }
+
+    /// Returns the exact input schema published in the host-side catalog.
+    pub fn input_schema(&self) -> &JsonValue {
+        &self.input_schema
+    }
+
+    /// Returns the exact output schema published in the host-side catalog.
+    pub fn output_schema(&self) -> &JsonValue {
+        &self.output_schema
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,6 +336,19 @@ fn validate_json_envelope(json: &str, tool_name: &str, direction: &str) -> Resul
     }
 }
 
+fn schema_validator(schema: JsonSchema, direction: &'static str) -> ToolValidator {
+    Box::new(move |encoded| {
+        let value = serde_json::from_str(encoded).map_err(|_| {
+            ToolError::Denied(format!("{direction} is not valid JSON for its schema"))
+        })?;
+        schema.validate(&value).map_err(|violation| {
+            ToolError::Denied(format!(
+                "{direction} does not match its schema: {violation}"
+            ))
+        })
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolRegistrationError {
     Duplicate(String),
@@ -343,11 +391,14 @@ pub struct AuditEvent {
 }
 
 pub type ToolHandler = Box<dyn FnMut(&ToolRequest) -> Result<String, ToolError> + 'static>;
+type ToolValidator = Box<dyn Fn(&str) -> Result<(), ToolError> + 'static>;
 
 struct RegisteredTool {
     policy: ToolPolicy,
     metadata: ToolMetadata,
     calls: usize,
+    input_validator: Option<ToolValidator>,
+    output_validator: Option<ToolValidator>,
     handler: ToolHandler,
 }
 
@@ -425,6 +476,20 @@ impl CapabilityHost {
     where
         F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
     {
+        self.register_with_validators(policy, metadata, None, None, handler)
+    }
+
+    fn register_with_validators<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        input_validator: Option<ToolValidator>,
+        output_validator: Option<ToolValidator>,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
+    {
         policy.validate()?;
         metadata.validate_for(policy.data_format)?;
         if self.tools.contains_key(&policy.name) {
@@ -436,6 +501,8 @@ impl CapabilityHost {
                 policy,
                 metadata,
                 calls: 0,
+                input_validator,
+                output_validator,
                 handler: Box::new(handler),
             },
         );
@@ -457,6 +524,42 @@ impl CapabilityHost {
         &mut self,
         policy: ToolPolicy,
         metadata: ToolMetadata,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        self.register_json_tool_with_validators(policy, metadata, None, None, handler)
+    }
+
+    pub fn register_validated_json_tool<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        let metadata = metadata
+            .with_input_schema(contract.input_schema.clone())
+            .with_output_schema(contract.output_schema.clone());
+        self.register_json_tool_with_validators(
+            policy,
+            metadata,
+            Some(schema_validator(contract.input, "input")),
+            Some(schema_validator(contract.output, "output")),
+            handler,
+        )
+    }
+
+    fn register_json_tool_with_validators<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        input_validator: Option<ToolValidator>,
+        output_validator: Option<ToolValidator>,
         mut handler: F,
     ) -> Result<(), ToolRegistrationError>
     where
@@ -467,25 +570,31 @@ impl CapabilityHost {
                 "register_json_tool requires ToolPolicy::json",
             ));
         }
-        self.register_with_metadata(policy, metadata, move |request| {
-            let input = serde_json::from_str(&request.input).map_err(|error| {
-                ToolError::Failed(format!(
-                    "{} JSON input failed host validation: {error}",
-                    request.name
-                ))
-            })?;
-            let output = handler(&JsonToolRequest {
-                name: request.name.clone(),
-                input,
-                call_index: request.call_index,
-            })?;
-            serde_json::to_string(&output).map_err(|error| {
-                ToolError::Failed(format!(
-                    "{} JSON output could not be serialized: {error}",
-                    request.name
-                ))
-            })
-        })
+        self.register_with_validators(
+            policy,
+            metadata,
+            input_validator,
+            output_validator,
+            move |request| {
+                let input = serde_json::from_str(&request.input).map_err(|error| {
+                    ToolError::Failed(format!(
+                        "{} JSON input failed host validation: {error}",
+                        request.name
+                    ))
+                })?;
+                let output = handler(&JsonToolRequest {
+                    name: request.name.clone(),
+                    input,
+                    call_index: request.call_index,
+                })?;
+                serde_json::to_string(&output).map_err(|error| {
+                    ToolError::Failed(format!(
+                        "{} JSON output could not be serialized: {error}",
+                        request.name
+                    ))
+                })
+            },
+        )
     }
 
     pub fn audit(&self) -> &[AuditEvent] {
@@ -548,43 +657,14 @@ impl CapabilityHost {
                         "{name} input exceeds {} bytes",
                         registered.policy.max_input_bytes
                     )))
-                } else if registered.policy.data_format == ToolDataFormat::Json {
-                    match validate_json_envelope(input, name, "input") {
-                        Err(error) => Err(error),
-                        Ok(()) if registered.calls >= registered.policy.max_calls => {
-                            Err(ToolError::Denied(format!(
-                                "{name} exhausted its {} call budget",
-                                registered.policy.max_calls
-                            )))
-                        }
-                        Ok(()) => {
-                            registered.calls = registered.calls.saturating_add(1);
-                            Ok(ToolTicket {
-                                sequence,
-                                name: name.to_owned(),
-                                input: input.to_owned(),
-                                input_bytes,
-                                call_index: registered.calls,
-                                max_output_bytes: registered.policy.max_output_bytes,
-                                data_format: registered.policy.data_format,
-                            })
-                        }
-                    }
-                } else if registered.calls >= registered.policy.max_calls {
-                    Err(ToolError::Denied(format!(
-                        "{name} exhausted its {} call budget",
-                        registered.policy.max_calls
-                    )))
                 } else {
-                    registered.calls = registered.calls.saturating_add(1);
-                    Ok(ToolTicket {
-                        sequence,
-                        name: name.to_owned(),
-                        input: input.to_owned(),
-                        input_bytes,
-                        call_index: registered.calls,
-                        max_output_bytes: registered.policy.max_output_bytes,
-                        data_format: registered.policy.data_format,
+                    let envelope_result = if registered.policy.data_format == ToolDataFormat::Json {
+                        validate_json_envelope(input, name, "input")
+                    } else {
+                        Ok(())
+                    };
+                    envelope_result.and_then(|()| {
+                        Self::reserve_registered(sequence, name, input, input_bytes, registered)
                     })
                 }
             }
@@ -594,6 +674,35 @@ impl CapabilityHost {
             self.record_result(sequence, name, input_bytes, error);
         }
         result
+    }
+
+    fn reserve_registered(
+        sequence: u64,
+        name: &str,
+        input: &str,
+        input_bytes: usize,
+        registered: &mut RegisteredTool,
+    ) -> Result<ToolTicket, ToolError> {
+        if let Some(validator) = registered.input_validator.as_ref() {
+            validator(input)?;
+        }
+        if registered.calls >= registered.policy.max_calls {
+            return Err(ToolError::Denied(format!(
+                "{name} exhausted its {} call budget",
+                registered.policy.max_calls
+            )));
+        }
+
+        registered.calls = registered.calls.saturating_add(1);
+        Ok(ToolTicket {
+            sequence,
+            name: name.to_owned(),
+            input: input.to_owned(),
+            input_bytes,
+            call_index: registered.calls,
+            max_output_bytes: registered.policy.max_output_bytes,
+            data_format: registered.policy.data_format,
+        })
     }
 
     fn execute(&mut self, ticket: ToolTicket) -> Result<String, ToolError> {
@@ -619,11 +728,22 @@ impl CapabilityHost {
             ))),
         };
 
-        let result = match result {
-            Ok(output) if ticket.data_format == ToolDataFormat::Json => {
-                validate_json_envelope(&output, &ticket.name, "output").map(|()| output)
-            }
-            other => other,
+        let result = if ticket.data_format == ToolDataFormat::Json {
+            result.and_then(|output| {
+                validate_json_envelope(&output, &ticket.name, "output")?;
+                match self.tools.get(&ticket.name) {
+                    Some(registered) => match registered.output_validator.as_ref() {
+                        Some(validator) => validator(&output).map(|()| output),
+                        None => Ok(output),
+                    },
+                    None => Err(ToolError::Failed(format!(
+                        "registered capability disappeared: {}",
+                        ticket.name
+                    ))),
+                }
+            })
+        } else {
+            result
         };
 
         self.record_ticket_result(&ticket, &result);
@@ -814,8 +934,9 @@ impl CapabilityRuntime {
         self.runtime.host_mut().register_json_tool(policy, handler)
     }
 
-    /// Registers a documented JSON capability. Schemas are catalog metadata;
-    /// they do not replace host-side validation in an adapter.
+    /// Registers a documented JSON capability. Metadata schemas are prompt
+    /// information only; use [`Self::register_validated_json_tool`] when a
+    /// bounded executable contract is required.
     pub fn register_json_tool_with_metadata<F>(
         &mut self,
         policy: ToolPolicy,
@@ -828,6 +949,25 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_json_tool_with_metadata(policy, metadata, handler)
+    }
+
+    /// Registers a JSON capability with executable input and output contracts.
+    ///
+    /// The contract is checked before the handler runs and before its result
+    /// returns to Splash. A rejected input does not consume the call budget.
+    pub fn register_validated_json_tool<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_validated_json_tool(policy, metadata, contract, handler)
     }
 
     /// Registers a JSON tool whose implementation runs behind a validated
@@ -863,6 +1003,28 @@ impl CapabilityRuntime {
             ));
         }
         self.register_json_tool_with_metadata(policy, metadata, move |request| {
+            client.borrow_mut().dispatch_json(request)
+        })
+    }
+
+    /// Registers an attenuated worker capability with executable JSON input
+    /// and output contracts at the host boundary.
+    pub fn register_validated_protocol_json_tool<T>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+        client: Rc<RefCell<ProtocolWorkerClient<T>>>,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        T: WorkerTransport + 'static,
+    {
+        if !client.borrow().supports_json_policy(&policy) {
+            return Err(ToolRegistrationError::IncompatibleWorkerGrant(
+                policy.name.clone(),
+            ));
+        }
+        self.register_validated_json_tool(policy, metadata, contract, move |request| {
             client.borrow_mut().dispatch_json(request)
         })
     }
@@ -1181,6 +1343,27 @@ mod tests {
         }
     }
 
+    fn add_contract() -> JsonToolContract {
+        JsonToolContract::new(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "left": {"type": "integer"},
+                    "right": {"type": "integer"}
+                },
+                "required": ["left", "right"],
+                "additionalProperties": false
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"total": {"type": "integer"}},
+                "required": ["total"],
+                "additionalProperties": false
+            }),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn calls_only_a_registered_tool() {
         let mut runtime = CapabilityRuntime::default();
@@ -1220,6 +1403,87 @@ mod tests {
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn rejects_schema_invalid_input_before_the_handler_without_spending_its_budget() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer values."),
+                add_contract(),
+                move |request| {
+                    calls.set(calls.get() + 1);
+                    let left = request.input["left"].as_i64().unwrap();
+                    let right = request.input["right"].as_i64().unwrap();
+                    Ok(serde_json::json!({"total": left + right}))
+                },
+            )
+            .unwrap();
+
+        let rejected = runtime
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20})")
+            .unwrap();
+
+        assert!(!rejected.succeeded());
+        assert_eq!(observed_calls.get(), 0);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+
+        let allowed = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
+            )
+            .unwrap();
+
+        assert!(allowed.completed(), "{:?}", allowed.diagnostics);
+        assert_eq!(observed_calls.get(), 1);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn rejects_schema_invalid_output_before_returning_to_splash() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer values."),
+                add_contract(),
+                |_| Ok(serde_json::json!({"unexpected": true})),
+            )
+            .unwrap();
+
+        let report = runtime
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20 right: 22})")
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn validated_contracts_are_published_in_the_host_catalog() {
+        let contract = add_contract();
+        let input_schema = contract.input_schema().clone();
+        let output_schema = contract.output_schema().clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer values."),
+                contract,
+                |_| Ok(serde_json::json!({"total": 42})),
+            )
+            .unwrap();
+
+        let catalog = runtime.tool_catalog();
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].metadata.input_schema, Some(input_schema));
+        assert_eq!(catalog[0].metadata.output_schema, Some(output_schema));
     }
 
     #[test]
@@ -1294,7 +1558,12 @@ mod tests {
         ));
         let mut runtime = CapabilityRuntime::default();
         runtime
-            .register_protocol_json_tool(ToolPolicy::json("math.add"), client)
+            .register_validated_protocol_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer values in an attenuated worker."),
+                add_contract(),
+                client,
+            )
             .unwrap();
 
         let report = runtime

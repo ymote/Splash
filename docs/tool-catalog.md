@@ -6,28 +6,41 @@ commands. The catalog contains only capabilities registered on that runtime,
 in stable name order.
 
 Each `ToolDescriptor` includes the name, envelope format, call and byte
-limits, description, and optional JSON input/output schema hints. The runtime
-does not install catalog access into `mod.tool`: a script cannot discover or
-mint capabilities by inspecting descriptions.
+limits, description, and optional JSON input/output schemas. The runtime does
+not install catalog access into `mod.tool`: a script cannot discover or mint
+capabilities by inspecting descriptions.
 
 ```rust
-use splash_capabilities::{ToolMetadata, ToolPolicy};
+use splash_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
 
-let metadata = ToolMetadata::new("Adds two integer fields.")
-    .with_input_schema(serde_json::json!({"type": "object"}))
-    .with_output_schema(serde_json::json!({"type": "object"}));
+let contract = JsonToolContract::new(
+    json!({
+        "type": "object",
+        "properties": {"left": {"type": "integer"}},
+        "required": ["left"],
+        "additionalProperties": false
+    }),
+    json!({
+        "type": "object",
+        "properties": {"total": {"type": "integer"}},
+        "required": ["total"],
+        "additionalProperties": false
+    }),
+)?;
 
-runtime.register_json_tool_with_metadata(
+runtime.register_validated_json_tool(
     ToolPolicy::json("math.add"),
-    metadata,
+    ToolMetadata::new("Adds an integer field."),
+    contract,
     |request| Ok(serde_json::json!({"total": 42})),
 )?;
 ```
 
-Schemas are bounded JSON-object metadata intended for prompt construction and
-operator tooling. They are not JSON Schema validation and do not replace the
-adapter's own input/output checks. A future schema-validation layer will make
-those contracts executable.
+Contracts use Splash's bounded executable schema subset, so the catalog schema
+shown here is enforced at the tool boundary. See [JSON tool contracts](schema-contracts.md)
+for the supported keywords and limits. `ToolMetadata::with_input_schema` and
+`with_output_schema` remain available when a host needs non-enforcing prompt
+metadata only.
 
 The development CLI exposes the same host catalog as JSON:
 

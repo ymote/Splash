@@ -11,6 +11,7 @@ and keeps UI support optional rather than making UI the language boundary.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
 - Audited tool calls with input/output and call-count limits.
+- Bounded executable JSON contracts for structured tool inputs and outputs.
 - Bounded, host-pumped deferred tool promises for cooperative mobile and
   embedded event loops.
 - A small `splash` CLI for local evaluation and the workflow example.
@@ -86,7 +87,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 
 - `splash-core`: bounded VM wrapper and diagnostics.
 - `splash-capabilities`: explicit tool policy, audit log, deferred promises,
-  LLM-facing host catalog, and safe host bridge.
+  LLM-facing host catalog, JSON contracts, and safe host bridge.
+- `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-protocol`: portable worker messages, capability attenuation, and
   host-side invocation/result validation.
 - `splash-workflow`: host-owned planning, approval, and sequential execution.
@@ -96,4 +98,5 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)
 for the import boundary. The [worker protocol](docs/worker-protocol.md)
 defines the handoff to future contained adapters. The [host tool catalog](docs/tool-catalog.md)
-defines safe discovery for an LLM orchestrator.
+defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schema-contracts.md)
+define the executable structured-data boundary.

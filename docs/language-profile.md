@@ -52,6 +52,12 @@ strings that generated code must turn back into values with `parse_json()`.
 This preserves a simple Rust bridge through `serde_json::Value` without
 allowing scripts to import crates directly.
 
+Hosts can register a `JsonToolContract` to enforce bounded schemas for those
+JSON envelopes. Contract checks run before the handler and before output
+returns to Splash; metadata-only schemas in the catalog do not enforce input
+or output. The exact supported subset is defined in
+[JSON tool contracts](schema-contracts.md).
+
 The promise API is cooperative. It does not grant a script a thread, a task
 runtime, or a way to invoke an adapter without the host's pump. Structured
 values, cancellation, external completion, and streaming dataflow are planned
@@ -69,8 +75,8 @@ separate runtime instances.
 - Treat a denied tool call as a runtime error. Do not retry by attempting
   filesystem, process, or network imports.
 - Keep effectful work in named tools and pure transformations in Splash code.
-- Generate against the host-supplied tool catalog only; descriptions and schema
-  hints do not grant access to unlisted tools.
+- Generate against the host-supplied tool catalog only; descriptions and
+  schemas do not grant access to unlisted tools.
 - Await a deferred tool result before using it; do not assume `start` performs
   an effect until the host has pumped the runtime.
 - Use record or array envelopes for JSON tools, then call `parse_json()` on
