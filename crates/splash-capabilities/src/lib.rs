@@ -17,6 +17,11 @@ use makepad_script::{
 };
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
+pub use splash_protocol::{
+    CapabilityManifest, ProtocolError, ToolInvocation as WorkerInvocation,
+    ToolPayload as WorkerPayload, ToolResult as WorkerResult,
+};
+use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 
 /// Maximum number of tool promises a runtime may retain at once.
 ///
@@ -116,6 +121,93 @@ impl Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+/// Transport owned by the trusted host for dispatching a validated worker call.
+///
+/// Implementations may use a contained child process, a platform IPC service,
+/// or an embedded app-provided adapter. Scripts never receive this transport.
+pub trait WorkerTransport {
+    fn dispatch(&mut self, invocation: WorkerInvocation) -> Result<WorkerResult, ProtocolError>;
+}
+
+/// Host-side client for a capability-attenuated worker session.
+pub struct ProtocolWorkerClient<T> {
+    authorizer: SessionAuthorizer,
+    transport: T,
+    next_request_sequence: u64,
+}
+
+impl<T: WorkerTransport> ProtocolWorkerClient<T> {
+    pub fn new(manifest: CapabilityManifest, transport: T) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            authorizer: SessionAuthorizer::new(manifest)?,
+            transport,
+            next_request_sequence: 1,
+        })
+    }
+
+    pub fn manifest(&self) -> &CapabilityManifest {
+        self.authorizer.manifest()
+    }
+
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    pub fn supports_json_policy(&self, policy: &ToolPolicy) -> bool {
+        policy.data_format == ToolDataFormat::Json
+            && self.manifest().grants.iter().any(|grant| {
+                grant.tool == policy.name
+                    && grant.format == EnvelopeFormat::Json
+                    && policy.max_calls <= grant.max_calls as usize
+                    && policy.max_input_bytes <= grant.max_input_bytes as usize
+                    && policy.max_output_bytes <= grant.max_output_bytes as usize
+            })
+    }
+
+    pub fn dispatch_json(&mut self, request: &JsonToolRequest) -> Result<JsonValue, ToolError> {
+        if self.next_request_sequence == u64::MAX {
+            return Err(ToolError::Failed(
+                "worker request sequence exhausted".to_owned(),
+            ));
+        }
+        let request_id = format!("request-{}", self.next_request_sequence);
+        self.next_request_sequence = self.next_request_sequence.saturating_add(1);
+        let invocation = WorkerInvocation::new(
+            self.manifest().session_id.clone(),
+            request_id,
+            request.name.clone(),
+            WorkerPayload::Json(request.input.clone()),
+        )
+        .map_err(worker_failed)?;
+        let authorized = self
+            .authorizer
+            .authorize(invocation)
+            .map_err(worker_denied)?;
+        let result = self
+            .transport
+            .dispatch(authorized.invocation().clone())
+            .map_err(worker_failed)?;
+        self.authorizer
+            .validate_result(&authorized, &result)
+            .map_err(worker_failed)?;
+
+        match result.payload {
+            WorkerPayload::Json(value) => Ok(value),
+            WorkerPayload::Text(_) => Err(ToolError::Failed(
+                "worker returned text for a JSON capability".to_owned(),
+            )),
+        }
+    }
+}
+
+fn worker_denied(error: ProtocolError) -> ToolError {
+    ToolError::Denied(format!("worker capability denied: {error}"))
+}
+
+fn worker_failed(error: ProtocolError) -> ToolError {
+    ToolError::Failed(format!("worker protocol failed: {error}"))
+}
+
 fn validate_json_envelope(json: &str, tool_name: &str, direction: &str) -> Result<(), ToolError> {
     let value = serde_json::from_str::<JsonValue>(json)
         .map_err(|_| ToolError::Denied(format!("{tool_name} {direction} is not valid JSON")))?;
@@ -133,6 +225,7 @@ pub enum ToolRegistrationError {
     Duplicate(String),
     InvalidName(String),
     InvalidPolicy(&'static str),
+    IncompatibleWorkerGrant(String),
 }
 
 impl Display for ToolRegistrationError {
@@ -141,6 +234,9 @@ impl Display for ToolRegistrationError {
             Self::Duplicate(name) => write!(formatter, "tool already registered: {name}"),
             Self::InvalidName(name) => write!(formatter, "invalid tool name: {name}"),
             Self::InvalidPolicy(message) => formatter.write_str(message),
+            Self::IncompatibleWorkerGrant(name) => {
+                write!(formatter, "worker manifest cannot safely back tool: {name}")
+            }
         }
     }
 }
@@ -574,6 +670,29 @@ impl CapabilityRuntime {
         self.runtime.host_mut().register_json_tool(policy, handler)
     }
 
+    /// Registers a JSON tool whose implementation runs behind a validated
+    /// [`ProtocolWorkerClient`] transport.
+    ///
+    /// The local policy must be an attenuation of the matching worker grant;
+    /// a broader policy is rejected before the tool becomes script-visible.
+    pub fn register_protocol_json_tool<T>(
+        &mut self,
+        policy: ToolPolicy,
+        client: Rc<RefCell<ProtocolWorkerClient<T>>>,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        T: WorkerTransport + 'static,
+    {
+        if !client.borrow().supports_json_policy(&policy) {
+            return Err(ToolRegistrationError::IncompatibleWorkerGrant(
+                policy.name.clone(),
+            ));
+        }
+        self.register_json_tool(policy, move |request| {
+            client.borrow_mut().dispatch_json(request)
+        })
+    }
+
     pub fn eval(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
         self.runtime.eval(source)
     }
@@ -850,6 +969,33 @@ fn new_tool_promise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splash_protocol::CapabilityGrant;
+
+    struct AddWorker;
+
+    impl WorkerTransport for AddWorker {
+        fn dispatch(
+            &mut self,
+            invocation: WorkerInvocation,
+        ) -> Result<WorkerResult, ProtocolError> {
+            let session_id = invocation.session_id;
+            let request_id = invocation.request_id;
+            let WorkerPayload::Json(input) = invocation.payload else {
+                return Err(ProtocolError::InvalidJsonEnvelope);
+            };
+            let left = input["left"]
+                .as_i64()
+                .ok_or(ProtocolError::InvalidJsonEnvelope)?;
+            let right = input["right"]
+                .as_i64()
+                .ok_or(ProtocolError::InvalidJsonEnvelope)?;
+            WorkerResult::new(
+                session_id,
+                request_id,
+                WorkerPayload::Json(serde_json::json!({"total": left + right})),
+            )
+        }
+    }
 
     #[test]
     fn calls_only_a_registered_tool() {
@@ -890,6 +1036,80 @@ mod tests {
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn dispatches_json_capabilities_through_an_attenuated_worker_manifest() {
+        let manifest =
+            CapabilityManifest::new("worker-1", vec![CapabilityGrant::json("math.add")]).unwrap();
+        let client = std::rc::Rc::new(std::cell::RefCell::new(
+            ProtocolWorkerClient::new(manifest, AddWorker).unwrap(),
+        ));
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_protocol_json_tool(ToolPolicy::json("math.add"), client)
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn deferred_json_capabilities_dispatch_through_the_worker_manifest() {
+        let manifest =
+            CapabilityManifest::new("worker-1", vec![CapabilityGrant::json("math.add")]).unwrap();
+        let client = std::rc::Rc::new(std::cell::RefCell::new(
+            ProtocolWorkerClient::new(manifest, AddWorker).unwrap(),
+        ));
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_protocol_json_tool(ToolPolicy::json("math.add"), client)
+            .unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.start_json(\"math.add\", {left: 20 right: 22}).await()\nlet response = raw.parse_json()\nassert(response.total == 42)",
+            )
+            .unwrap();
+
+        assert!(initial.suspended);
+        let pumped = runtime.pump().unwrap();
+
+        assert_eq!(pumped.completed, 1);
+        assert_eq!(pumped.resumed.len(), 1);
+        assert!(
+            pumped.resumed[0].completed(),
+            "{:?}",
+            pumped.resumed[0].diagnostics
+        );
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn rejects_a_local_policy_that_is_broader_than_its_worker_grant() {
+        let mut worker_grant = CapabilityGrant::json("math.add");
+        worker_grant.max_output_bytes = 32;
+        let manifest = CapabilityManifest::new("worker-1", vec![worker_grant]).unwrap();
+        let client = std::rc::Rc::new(std::cell::RefCell::new(
+            ProtocolWorkerClient::new(manifest, AddWorker).unwrap(),
+        ));
+        let mut runtime = CapabilityRuntime::default();
+
+        let error = runtime
+            .register_protocol_json_tool(ToolPolicy::json("math.add"), client)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolRegistrationError::IncompatibleWorkerGrant("math.add".to_owned())
+        );
     }
 
     #[test]

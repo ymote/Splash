@@ -7,6 +7,8 @@
 - Deny-by-default, audited string-tool bridge.
 - Bounded, host-pumped deferred tool promises.
 - Host-owned plan, approval, and sequential workflow execution.
+- Portable worker protocol with capability attenuation and bounded wire
+  messages.
 
 ## Next: schema-validated and externally asynchronous tools
 
@@ -18,8 +20,8 @@
 
 ## Next: contained local effects
 
-- A worker protocol with capability attenuation.
 - Per-platform containment backends for desktop and embedded Linux.
+- Authenticated worker transports and contained-worker implementations.
 - Filesystem-root, executable, and network-origin policies.
 - Mobile profile with app-provided tools only.
 

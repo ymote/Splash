@@ -13,3 +13,4 @@ workspace = true
 makepad-script = { path = "../../vendor/makepad/platform/script" }
 serde_json = "1.0.150"
 splash-core = { path = "../splash-core" }
+splash-protocol = { version = "0.1.0", path = "../splash-protocol" }

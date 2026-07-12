@@ -81,9 +81,12 @@ cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.spla
 - `splash-core`: bounded VM wrapper and diagnostics.
 - `splash-capabilities`: explicit tool policy, audit log, deferred promises,
   and safe host bridge.
+- `splash-protocol`: portable worker messages, capability attenuation, and
+  host-side invocation/result validation.
 - `splash-workflow`: host-owned planning, approval, and sequential execution.
 - `splash-cli`: local development CLI.
 - `vendor/makepad`: provenance-preserving compatibility import.
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)
-for the import boundary.
+for the import boundary. The [worker protocol](docs/worker-protocol.md)
+defines the handoff to future contained adapters.

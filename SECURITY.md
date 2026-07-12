@@ -10,6 +10,16 @@ untrusted. The runtime has two separate security boundaries:
    production local-tool adapter will run in a dedicated worker with a
    platform-specific sandbox, not in the interpreter process.
 
+`splash-protocol` now defines the portable, attenuated handoff from a policy
+host to that future worker. It validates manifests, request uniqueness,
+formats, byte limits, and call budgets, but it does not authenticate a peer or
+enforce an operating-system policy itself. The host must provide both before an
+effectful adapter is considered contained.
+
+`ProtocolWorkerClient` connects that validation layer to a host-owned
+`WorkerTransport`; its registration rejects a local policy that is broader than
+the worker grant. This still does not make an in-process transport isolated.
+
 Each registered tool declares a stable identifier and limits for calls, input
 bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,
 over-budget, or malformed calls fail before a tool handler is invoked.
