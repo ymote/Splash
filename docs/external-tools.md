@@ -97,7 +97,9 @@ not durable across host restarts. Retain the opaque `ExternalToolId` locally.
 Durable workflows should use a persisted workflow or operation identity in
 addition to this per-runtime key. Do not retry a non-idempotent worker unless
 the worker deduplicates requests using that key or another durable operation
-identity.
+identity. `splash-workflow` provides a plan-bound
+[durable operation ledger](workflow-operations.md) for that host-owned
+identity and restart policy.
 
 ## Authenticated reconciliation
 

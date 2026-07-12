@@ -65,5 +65,10 @@ idempotency, worker reconciliation, or compensation where retrying an effect
 could be unsafe. External tool handles and in-flight VM promises cannot cross
 a process boundary through this format.
 
+For a bounded durable record of an uncertain external effect, use a separate
+[durable operation ledger](workflow-operations.md). It records plan-bound
+operation metadata and worker observations, but it also does not restore a
+promise or authorize a restart.
+
 The fingerprint binds checkpoint data to a plan without storing source code in
 the checkpoint. It is not a replacement for authenticated durable storage.

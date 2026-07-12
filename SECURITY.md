@@ -109,6 +109,21 @@ fresh checkpoint-bound approval. A checkpoint is not proof that its prefix ran
 or that an interrupted step is safe to replay; hosts must use idempotency,
 reconciliation, or compensation for effects around the restart boundary.
 
+`WorkflowOperationLedger` records durable external-operation intent separately
+from a checkpoint. Each record is bound to the trusted plan and retains only a
+tool, step, non-authorizing operation key, input digest, and worker-observed
+state. Reconciliation request construction requires the exact current input
+bytes and fails closed when their digest differs. The preferred derived key
+also binds the plan, step, tool, input, and host-supplied durable nonce, so a
+host should not reuse it for a different logical effect. A ledger revision is
+only a host-facing compare-and-swap or watermark hook: it does not authenticate
+storage, prevent rollback by itself, validate a worker output, restore a VM
+promise, or authorize a workflow restart. Those decisions remain with an
+authenticated storage backend and fresh host policy.
+The persisted input fingerprint is an unkeyed correlation digest, not encrypted
+secret storage; hosts must pass opaque secret selectors rather than credential
+values into the ledger identity.
+
 This baseline does not yet provide filesystem adapters, network adapters,
 secret storage, worker-process isolation, signed packages, full JSON Schema,
 or mobile policy backends. Those features must not be inferred from the

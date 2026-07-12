@@ -129,6 +129,8 @@ does not make an `ExternalToolId`, promise, or VM state durable. Hosts that
 need restart recovery must persist a durable operation identity and policy,
 authenticate the storage and worker response, then decide whether to retry,
 reconcile, compensate, or fail the workflow before creating a fresh runtime.
+`splash-workflow` can create a plan-bound durable operation key and ledger for
+that host policy; see [durable operation ledgers](workflow-operations.md).
 
 ## Splash integration
 

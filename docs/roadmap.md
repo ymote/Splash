@@ -19,10 +19,13 @@
 - Keyed, replay-checked worker frames and authenticated live-operation
   reconciliation.
 - Bounded data-only workflow checkpoints with fresh host approval on resume.
+- Plan-bound durable operation ledgers with input fingerprint checks, derived
+  worker keys, and revision-watermark hooks.
 
 ## Next: durable external operations
 
-- Persisted operation ledgers and restart reconciliation policy.
+- Authenticated durable storage adapters with compare-and-swap and rollback
+  protection.
 - Durable worker-side idempotency and compensation hooks.
 
 ## Next: contained local effects

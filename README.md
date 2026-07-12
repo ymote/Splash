@@ -26,6 +26,8 @@ and keeps UI support optional rather than making UI the language boundary.
   reconciliation for live external operations.
 - Bounded, data-only workflow checkpoints with fresh host approval required
   for a restart to run the remaining plan suffix.
+- Plan-bound durable external-operation ledgers with input fingerprints,
+  derived worker keys, and revision-watermark hooks for host storage policy.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
@@ -103,8 +105,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-protocol`: portable worker messages, capability attenuation,
   keyed session framing, and host-side invocation/result validation.
-- `splash-workflow`: host-owned planning, approval, checkpointing, and
-  sequential execution.
+- `splash-workflow`: host-owned planning, approval, checkpointing, durable
+  operation records, and sequential execution.
 - `splash-cli`: local development CLI.
 - `vendor/makepad`: provenance-preserving compatibility import.
 
@@ -120,3 +122,6 @@ and the live-operation reconciliation boundary.
 
 [Workflow checkpoints](docs/workflow-checkpoints.md) define the durable
 host-orchestration boundary.
+
+[Durable operation ledgers](docs/workflow-operations.md) define how a host
+records and safely reconciles uncertain external effects across a restart.

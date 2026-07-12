@@ -103,6 +103,9 @@ Workflow restart state is also host-owned. Splash source cannot create or load
 a checkpoint, and a persisted checkpoint never restores variables, promises,
 or tool authority. The host reconstructs a trusted plan and explicitly approves
 the remaining suffix; see [Workflow checkpoints](workflow-checkpoints.md).
+For uncertain external effects, a host may additionally keep a
+[durable operation ledger](workflow-operations.md), but the script cannot read
+or mutate its keys, input digest, worker observation, or restart policy.
 
 ## LLM generation rules
 
