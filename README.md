@@ -47,6 +47,19 @@ Rust applications integrate their existing crate ecosystem by registering a
 narrow, policy-bound adapter for each effect. Splash does not import crates or
 ambient OS APIs directly.
 
+JSON capabilities use object or array envelopes. Rust adapters receive and
+return `serde_json::Value`; Splash turns records and arrays into JSON with
+`tool.call_json` or `tool.start_json`.
+
+```splash
+use mod.tool
+use mod.std.assert
+
+let response_json = tool.call_json("math.add", {left: 20 right: 22})
+let response = response_json.parse_json()
+assert(response.total == 42)
+```
+
 ```sh
 cargo run -p splash-cli -- eval --allow-echo 'use mod.tool tool.call("text.echo", "hello")'
 ```
@@ -55,6 +68,12 @@ The deferred example is runnable with:
 
 ```sh
 cargo run -p splash-cli -- run --allow-echo examples/deferred_tool_workflow.splash
+```
+
+The JSON dataflow example is runnable with:
+
+```sh
+cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.splash
 ```
 
 ## Workspace

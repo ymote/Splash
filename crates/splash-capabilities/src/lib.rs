@@ -12,8 +12,10 @@ use std::rc::Rc;
 
 use makepad_script::{
     id, id_lut, script_args_def, script_err_not_allowed, script_err_unexpected, script_value,
-    LiveId, ScriptHandle, ScriptHandleGc, ScriptIp, ScriptThreadId, ScriptValue, NIL,
+    LiveId, ScriptHandle, ScriptHandleGc, ScriptHandleType, ScriptIp, ScriptThreadId, ScriptValue,
+    NIL,
 };
+pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 
 /// Maximum number of tool promises a runtime may retain at once.
@@ -22,12 +24,22 @@ use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 /// [`CapabilityRuntime::with_limits_and_pending`].
 pub const DEFAULT_MAX_PENDING_TOOLS: usize = 64;
 
+/// Serialization contract for a capability's input and output envelopes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolDataFormat {
+    /// UTF-8 text passed directly to the registered handler.
+    Text,
+    /// A JSON object or array validated at the capability boundary.
+    Json,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolPolicy {
     pub name: String,
     pub max_calls: usize,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
+    pub data_format: ToolDataFormat,
 }
 
 impl ToolPolicy {
@@ -37,7 +49,15 @@ impl ToolPolicy {
             max_calls: 1,
             max_input_bytes: 16 * 1024,
             max_output_bytes: 64 * 1024,
+            data_format: ToolDataFormat::Text,
         }
+    }
+
+    /// Creates a policy for JSON object/array input and output envelopes.
+    pub fn json(name: impl Into<String>) -> Self {
+        let mut policy = Self::new(name);
+        policy.data_format = ToolDataFormat::Json;
+        policy
     }
 
     fn validate(&self) -> Result<(), ToolRegistrationError> {
@@ -71,6 +91,14 @@ pub struct ToolRequest {
     pub call_index: usize,
 }
 
+/// JSON-decoded request passed to [`CapabilityHost::register_json_tool`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsonToolRequest {
+    pub name: String,
+    pub input: JsonValue,
+    pub call_index: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolError {
     Denied(String),
@@ -87,6 +115,18 @@ impl Display for ToolError {
 }
 
 impl std::error::Error for ToolError {}
+
+fn validate_json_envelope(json: &str, tool_name: &str, direction: &str) -> Result<(), ToolError> {
+    let value = serde_json::from_str::<JsonValue>(json)
+        .map_err(|_| ToolError::Denied(format!("{tool_name} {direction} is not valid JSON")))?;
+    if value.is_object() || value.is_array() {
+        Ok(())
+    } else {
+        Err(ToolError::Denied(format!(
+            "{tool_name} {direction} must be a JSON object or array"
+        )))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolRegistrationError {
@@ -139,6 +179,7 @@ struct ToolTicket {
     input_bytes: usize,
     call_index: usize,
     max_output_bytes: usize,
+    data_format: ToolDataFormat,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +248,40 @@ impl CapabilityHost {
         Ok(())
     }
 
+    pub fn register_json_tool<F>(
+        &mut self,
+        policy: ToolPolicy,
+        mut handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        if policy.data_format != ToolDataFormat::Json {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "register_json_tool requires ToolPolicy::json",
+            ));
+        }
+        self.register(policy, move |request| {
+            let input = serde_json::from_str(&request.input).map_err(|error| {
+                ToolError::Failed(format!(
+                    "{} JSON input failed host validation: {error}",
+                    request.name
+                ))
+            })?;
+            let output = handler(&JsonToolRequest {
+                name: request.name.clone(),
+                input,
+                call_index: request.call_index,
+            })?;
+            serde_json::to_string(&output).map_err(|error| {
+                ToolError::Failed(format!(
+                    "{} JSON output could not be serialized: {error}",
+                    request.name
+                ))
+            })
+        })
+    }
+
     pub fn audit(&self) -> &[AuditEvent] {
         &self.audit
     }
@@ -216,39 +291,76 @@ impl CapabilityHost {
     }
 
     fn call(&mut self, name: &str, input: &str) -> Result<String, ToolError> {
-        let ticket = self.reserve(name, input)?;
+        let ticket = self.reserve(name, input, None)?;
         self.execute(ticket)
     }
 
-    fn reserve(&mut self, name: &str, input: &str) -> Result<ToolTicket, ToolError> {
+    fn call_json(&mut self, name: &str, input: &str) -> Result<String, ToolError> {
+        let ticket = self.reserve(name, input, Some(ToolDataFormat::Json))?;
+        self.execute(ticket)
+    }
+
+    fn reserve(
+        &mut self,
+        name: &str,
+        input: &str,
+        expected_format: Option<ToolDataFormat>,
+    ) -> Result<ToolTicket, ToolError> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let input_bytes = input.len();
 
         let result = match self.tools.get_mut(name) {
             None => Err(ToolError::Denied(format!("no capability grants {name}"))),
-            Some(registered) if input_bytes > registered.policy.max_input_bytes => {
-                Err(ToolError::Denied(format!(
-                    "{name} input exceeds {} bytes",
-                    registered.policy.max_input_bytes
-                )))
-            }
-            Some(registered) if registered.calls >= registered.policy.max_calls => {
-                Err(ToolError::Denied(format!(
-                    "{name} exhausted its {} call budget",
-                    registered.policy.max_calls
-                )))
-            }
             Some(registered) => {
-                registered.calls = registered.calls.saturating_add(1);
-                Ok(ToolTicket {
-                    sequence,
-                    name: name.to_owned(),
-                    input: input.to_owned(),
-                    input_bytes,
-                    call_index: registered.calls,
-                    max_output_bytes: registered.policy.max_output_bytes,
-                })
+                if expected_format.is_some_and(|format| format != registered.policy.data_format) {
+                    Err(ToolError::Denied(format!(
+                        "{name} is not registered for JSON envelopes"
+                    )))
+                } else if input_bytes > registered.policy.max_input_bytes {
+                    Err(ToolError::Denied(format!(
+                        "{name} input exceeds {} bytes",
+                        registered.policy.max_input_bytes
+                    )))
+                } else if registered.policy.data_format == ToolDataFormat::Json {
+                    match validate_json_envelope(input, name, "input") {
+                        Err(error) => Err(error),
+                        Ok(()) if registered.calls >= registered.policy.max_calls => {
+                            Err(ToolError::Denied(format!(
+                                "{name} exhausted its {} call budget",
+                                registered.policy.max_calls
+                            )))
+                        }
+                        Ok(()) => {
+                            registered.calls = registered.calls.saturating_add(1);
+                            Ok(ToolTicket {
+                                sequence,
+                                name: name.to_owned(),
+                                input: input.to_owned(),
+                                input_bytes,
+                                call_index: registered.calls,
+                                max_output_bytes: registered.policy.max_output_bytes,
+                                data_format: registered.policy.data_format,
+                            })
+                        }
+                    }
+                } else if registered.calls >= registered.policy.max_calls {
+                    Err(ToolError::Denied(format!(
+                        "{name} exhausted its {} call budget",
+                        registered.policy.max_calls
+                    )))
+                } else {
+                    registered.calls = registered.calls.saturating_add(1);
+                    Ok(ToolTicket {
+                        sequence,
+                        name: name.to_owned(),
+                        input: input.to_owned(),
+                        input_bytes,
+                        call_index: registered.calls,
+                        max_output_bytes: registered.policy.max_output_bytes,
+                        data_format: registered.policy.data_format,
+                    })
+                }
             }
         };
 
@@ -279,6 +391,13 @@ impl CapabilityHost {
                 "registered capability disappeared: {}",
                 ticket.name
             ))),
+        };
+
+        let result = match result {
+            Ok(output) if ticket.data_format == ToolDataFormat::Json => {
+                validate_json_envelope(&output, &ticket.name, "output").map(|()| output)
+            }
+            other => other,
         };
 
         self.record_ticket_result(&ticket, &result);
@@ -320,6 +439,25 @@ impl CapabilityHost {
         input: &str,
         max_pending: usize,
     ) -> Result<(ToolTicket, PendingTools), ToolError> {
+        self.begin_async_with_format(name, input, max_pending, None)
+    }
+
+    fn begin_async_json(
+        &mut self,
+        name: &str,
+        input: &str,
+        max_pending: usize,
+    ) -> Result<(ToolTicket, PendingTools), ToolError> {
+        self.begin_async_with_format(name, input, max_pending, Some(ToolDataFormat::Json))
+    }
+
+    fn begin_async_with_format(
+        &mut self,
+        name: &str,
+        input: &str,
+        max_pending: usize,
+        expected_format: Option<ToolDataFormat>,
+    ) -> Result<(ToolTicket, PendingTools), ToolError> {
         if self.pending.borrow().len() >= max_pending {
             let sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.saturating_add(1);
@@ -329,7 +467,7 @@ impl CapabilityHost {
             return Err(error);
         }
 
-        let ticket = self.reserve(name, input)?;
+        let ticket = self.reserve(name, input, expected_format)?;
         Ok((ticket, self.pending.clone()))
     }
 
@@ -418,6 +556,22 @@ impl CapabilityRuntime {
         F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
     {
         self.runtime.host_mut().register(policy, handler)
+    }
+
+    /// Registers a JSON envelope capability backed by trusted Rust code.
+    ///
+    /// The policy must come from [`ToolPolicy::json`]. Splash scripts use
+    /// `tool.call_json` or `tool.start_json`; the handler receives a parsed
+    /// [`JsonToolRequest`] and returns a [`JsonValue`].
+    pub fn register_json_tool<F>(
+        &mut self,
+        policy: ToolPolicy,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        self.runtime.host_mut().register_json_tool(policy, handler)
     }
 
     pub fn eval(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
@@ -571,6 +725,37 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
 
         vm.add_method(
             tool,
+            id!(call_json),
+            script_args_def!(name = NIL, input = NIL),
+            |vm, args| {
+                let name = script_text(vm, script_value!(vm, args.name));
+                let input = script_json(vm, script_value!(vm, args.input));
+                let result = match (name, input) {
+                    (Ok(name), Ok(input)) => match vm.host.downcast_mut::<CapabilityHost>() {
+                        Some(host) => host.call_json(&name, &input),
+                        None => {
+                            return script_err_unexpected!(
+                                vm.bx.threads.cur_ref().trap,
+                                "invalid Splash capability host"
+                            )
+                        }
+                    },
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                };
+
+                match result {
+                    Ok(output) => {
+                        vm.new_string_with(|_, destination| destination.push_str(&output))
+                    }
+                    Err(error) => {
+                        script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
+                    }
+                }
+            },
+        );
+
+        vm.add_method(
+            tool,
             id!(start),
             script_args_def!(name = NIL, input = NIL),
             move |vm, args| {
@@ -590,23 +775,36 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending)) => {
-                        let handle = vm.bx.heap.new_handle(
-                            promise_type,
-                            Box::new(ToolPromiseGc {
-                                pending: pending.clone(),
-                                handle: ScriptHandle::ZERO,
-                            }),
-                        );
-                        pending.borrow_mut().insert(
-                            handle,
-                            PendingTool {
-                                ticket,
-                                state: PendingToolState::Queued,
-                            },
-                        );
-                        handle.into()
+                    Ok((ticket, pending)) => new_tool_promise(vm, promise_type, ticket, pending),
+                    Err(error) => {
+                        script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
+                }
+            },
+        );
+
+        vm.add_method(
+            tool,
+            id!(start_json),
+            script_args_def!(name = NIL, input = NIL),
+            move |vm, args| {
+                let name = script_text(vm, script_value!(vm, args.name));
+                let input = script_json(vm, script_value!(vm, args.input));
+                let result = match (name, input) {
+                    (Ok(name), Ok(input)) => match vm.host.downcast_mut::<CapabilityHost>() {
+                        Some(host) => host.begin_async_json(&name, &input, max_pending_tools),
+                        None => {
+                            return script_err_unexpected!(
+                                vm.bx.threads.cur_ref().trap,
+                                "invalid Splash capability host"
+                            )
+                        }
+                    },
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                };
+
+                match result {
+                    Ok((ticket, pending)) => new_tool_promise(vm, promise_type, ticket, pending),
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
@@ -618,7 +816,35 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
 
 fn script_text(vm: &mut vm::ScriptVm, value: ScriptValue) -> Result<String, ToolError> {
     vm.string_with(value, |_, text| text.to_owned())
-        .ok_or_else(|| ToolError::Denied("tool.call expects string name and input".to_owned()))
+        .ok_or_else(|| ToolError::Denied("tool API expects a string value".to_owned()))
+}
+
+fn script_json(vm: &mut vm::ScriptVm, value: ScriptValue) -> Result<String, ToolError> {
+    let serialized = vm.bx.heap.to_json(value);
+    script_text(vm, serialized)
+}
+
+fn new_tool_promise(
+    vm: &mut vm::ScriptVm,
+    promise_type: ScriptHandleType,
+    ticket: ToolTicket,
+    pending: PendingTools,
+) -> ScriptValue {
+    let handle = vm.bx.heap.new_handle(
+        promise_type,
+        Box::new(ToolPromiseGc {
+            pending: pending.clone(),
+            handle: ScriptHandle::ZERO,
+        }),
+    );
+    pending.borrow_mut().insert(
+        handle,
+        PendingTool {
+            ticket,
+            state: PendingToolState::Queued,
+        },
+    );
+    handle.into()
 }
 
 #[cfg(test)]
@@ -642,6 +868,131 @@ mod tests {
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
         assert_eq!(runtime.audit()[0].tool, "text.echo");
+    }
+
+    #[test]
+    fn calls_json_tools_with_splash_records() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.add"), |request| {
+                let left = request.input["left"].as_i64().unwrap();
+                let right = request.input["right"].as_i64().unwrap();
+                Ok(serde_json::json!({"total": left + right}))
+            })
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet response_json = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = response_json.parse_json()\nassert(response.total == 42)",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn rejects_malformed_json_before_a_json_handler_runs() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.add"), move |_| {
+                calls.set(calls.get() + 1);
+                Ok(serde_json::json!({"total": 42}))
+            })
+            .unwrap();
+
+        let report = runtime
+            .eval("use mod.tool\ntool.call(\"math.add\", \"not-json\")")
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(observed_calls.get(), 0);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn rejects_scalar_json_envelopes_before_a_json_handler_runs() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.add"), move |_| {
+                calls.set(calls.get() + 1);
+                Ok(serde_json::json!({"total": 42}))
+            })
+            .unwrap();
+
+        let report = runtime
+            .eval("use mod.tool\ntool.call_json(\"math.add\", 42)")
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(observed_calls.get(), 0);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn rejects_scalar_json_output_before_returning_it_to_a_script() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.add"), |_| Ok(JsonValue::from(42)))
+            .unwrap();
+
+        let report = runtime
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20 right: 22})")
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn json_handlers_require_a_json_policy() {
+        let mut runtime = CapabilityRuntime::default();
+        let error = runtime
+            .register_json_tool(ToolPolicy::new("math.add"), |_| Ok(serde_json::json!({})))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolRegistrationError::InvalidPolicy("register_json_tool requires ToolPolicy::json")
+        );
+    }
+
+    #[test]
+    fn deferred_json_tools_resume_with_a_json_envelope() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.add"), |request| {
+                let left = request.input["left"].as_i64().unwrap();
+                let right = request.input["right"].as_i64().unwrap();
+                Ok(serde_json::json!({"total": left + right}))
+            })
+            .unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet response_json = tool.start_json(\"math.add\", {left: 20 right: 22}).await()\nlet response = response_json.parse_json()\nassert(response.total == 42)",
+            )
+            .unwrap();
+
+        assert!(initial.suspended);
+        let pumped = runtime.pump().unwrap();
+
+        assert_eq!(pumped.completed, 1);
+        assert_eq!(pumped.resumed.len(), 1);
+        assert!(
+            pumped.resumed[0].completed(),
+            "{:?}",
+            pumped.resumed[0].diagnostics
+        );
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
     }
 
     #[test]

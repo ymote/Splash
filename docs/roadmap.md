@@ -8,9 +8,9 @@
 - Bounded, host-pumped deferred tool promises.
 - Host-owned plan, approval, and sequential workflow execution.
 
-## Next: structured and externally asynchronous tools
+## Next: schema-validated and externally asynchronous tools
 
-- Typed input/output schemas and JSON-compatible values.
+- JSON Schema or equivalent typed input/output contracts.
 - Cancellable promise handles, external completion, and bounded concurrent
   work.
 - Per-tool deadlines, retry classification, and idempotency keys.

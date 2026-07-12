@@ -20,6 +20,8 @@ The current profile supports:
 - Module imports through `use mod.<name>`.
 - Host-defined tools through `use mod.tool`, `tool.call(name, input)`, and
   `tool.start(name, input).await()`.
+- JSON envelope tools through `tool.call_json(name, value)` and
+  `tool.start_json(name, value).await()`.
 
 Example:
 
@@ -43,6 +45,13 @@ trusted host calls `CapabilityRuntime::pump`. One default pump tick runs at
 most one tool; `pump_up_to` is available for an explicitly bounded batch. The
 default pending-promise cap is 64 and may be lowered by an embedded host.
 
+`ToolPolicy::json` opts a capability into a structured boundary. The input and
+output must each be a JSON object or array. `call_json` and `start_json`
+serialize the supplied Splash record or array, while their results remain JSON
+strings that generated code must turn back into values with `parse_json()`.
+This preserves a simple Rust bridge through `serde_json::Value` without
+allowing scripts to import crates directly.
+
 The promise API is cooperative. It does not grant a script a thread, a task
 runtime, or a way to invoke an adapter without the host's pump. Structured
 values, cancellation, external completion, and streaming dataflow are planned
@@ -62,3 +71,5 @@ separate runtime instances.
 - Keep effectful work in named tools and pure transformations in Splash code.
 - Await a deferred tool result before using it; do not assume `start` performs
   an effect until the host has pumped the runtime.
+- Use record or array envelopes for JSON tools, then call `parse_json()` on
+  their returned strings before reading fields.

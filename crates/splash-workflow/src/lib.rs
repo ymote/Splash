@@ -390,4 +390,32 @@ mod tests {
             Some(WorkflowEvent::Completed { plan_id }) if *plan_id == plan.id()
         ));
     }
+
+    #[test]
+    fn approved_plan_drives_a_deferred_json_capability_to_completion() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.add"), |request| {
+                let left = request.input["left"].as_i64().unwrap();
+                let right = request.input["right"].as_i64().unwrap();
+                Ok(splash_capabilities::json!({"total": left + right}))
+            })
+            .unwrap();
+        let mut engine = WorkflowEngine::new(runtime);
+        let plan = engine
+            .plan(vec![WorkflowStep::new(
+                "deferred-json-add",
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.start_json(\"math.add\", {left: 20 right: 22}).await()\nlet response = raw.parse_json()\nassert(response.total == 42)",
+            )])
+            .unwrap();
+        let approval = engine.approve(&plan);
+
+        engine.execute(&plan, approval).unwrap();
+
+        assert_eq!(engine.runtime().audit().len(), 1);
+        assert_eq!(
+            engine.runtime().audit()[0].outcome,
+            splash_capabilities::AuditOutcome::Allowed
+        );
+    }
 }
