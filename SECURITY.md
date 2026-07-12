@@ -124,6 +124,18 @@ The persisted input fingerprint is an unkeyed correlation digest, not encrypted
 secret storage; hosts must pass opaque secret selectors rather than credential
 values into the ledger identity.
 
+`splash-storage` authenticates host-owned record bytes with a provisioned
+BLAKE3 key and binds them to an opaque record namespace, name, revision, and
+key ID. It supports verification-key rotation, but it does not encrypt payloads
+or generate, transfer, or protect storage keys. Its `RollbackProtectedStore`
+trait is deliberately strict: an implementation must atomically return a
+record with its durable revision floor, and atomically advance that floor with
+a successful compare-and-swap. The included `VolatileMemoryStore` is only a
+process-local test/development implementation, not a durable backend. A file,
+database, or mobile key-value adapter must not claim rollback protection unless
+it has a separate platform trust anchor and the required atomic semantics.
+Generated Splash source receives neither a store nor a key.
+
 This baseline does not yet provide filesystem adapters, network adapters,
 secret storage, worker-process isolation, signed packages, full JSON Schema,
 or mobile policy backends. Those features must not be inferred from the

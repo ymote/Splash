@@ -1,0 +1,18 @@
+[package]
+name = "splash-storage"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-only authenticated durable-record boundary for Splash"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+blake3 = { version = "1.8.5", features = ["pure"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+subtle = "2.6.1"
+zeroize = "1.8.2"

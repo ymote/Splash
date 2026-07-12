@@ -4,6 +4,7 @@ members = [
     "crates/splash-capabilities",
     "crates/splash-protocol",
     "crates/splash-schema",
+    "crates/splash-storage",
     "crates/splash-workflow",
     "crates/splash-cli",
 ]
@@ -12,6 +13,7 @@ default-members = [
     "crates/splash-capabilities",
     "crates/splash-protocol",
     "crates/splash-schema",
+    "crates/splash-storage",
     "crates/splash-workflow",
     "crates/splash-cli",
 ]

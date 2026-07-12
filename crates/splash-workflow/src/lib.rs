@@ -1516,6 +1516,10 @@ mod tests {
     use super::*;
     use splash_capabilities::ToolPolicy;
     use splash_protocol::{SessionKey, ToolPayload, AUTH_TAG_BYTES};
+    use splash_storage::{
+        AuthenticatedStore, StorageKey, StorageKeyId, StorageKeyring, StorageRecordKey,
+        VolatileMemoryStore, STORAGE_KEY_BYTES,
+    };
 
     fn operation_reconciliation_authenticators() -> (SessionAuthenticator, SessionAuthenticator) {
         let key = SessionKey::from_bytes([13; AUTH_TAG_BYTES]).unwrap();
@@ -1741,6 +1745,46 @@ mod tests {
                 tool,
             }) if *plan_id == plan.id() && step_id == "publish" && tool == "release.publish"
         ));
+    }
+
+    #[test]
+    fn authenticated_storage_restores_a_durable_operation_ledger() {
+        let steps = vec![WorkflowStep::new("publish", "let release = true")];
+        let mut original_engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let original_plan = original_engine.plan(steps.clone()).unwrap();
+        let mut ledger = original_engine.operation_ledger(&original_plan).unwrap();
+        original_engine
+            .record_derived_operation(
+                &original_plan,
+                &mut ledger,
+                "publish",
+                "release.publish",
+                b"{\"version\":\"1.2.3\"}",
+                b"release-42:publish:1",
+            )
+            .unwrap();
+
+        let record_key = StorageRecordKey::new("workflow-ledger", "release-42").unwrap();
+        let keyring = StorageKeyring::new(
+            StorageKeyId::new("storage-v1").unwrap(),
+            StorageKey::from_bytes([21; STORAGE_KEY_BYTES]),
+        );
+        let mut store = AuthenticatedStore::new(VolatileMemoryStore::default(), keyring);
+        let encoded = ledger.to_json().unwrap();
+        let persisted = store.create(&record_key, encoded.as_bytes()).unwrap();
+        assert_eq!(persisted.revision(), 1);
+
+        let restored_record = store.load(&record_key).unwrap().unwrap();
+        let restored_json = std::str::from_utf8(restored_record.payload()).unwrap();
+        let restored_ledger = WorkflowOperationLedger::from_json(restored_json).unwrap();
+
+        let mut restarted_engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let restarted_plan = restarted_engine.plan(steps).unwrap();
+        restarted_engine
+            .validate_operation_ledger_at_or_after(&restarted_plan, &restored_ledger, 1)
+            .unwrap();
+        assert_eq!(restored_ledger, ledger);
+        assert_eq!(original_plan.fingerprint(), restarted_plan.fingerprint());
     }
 
     #[test]

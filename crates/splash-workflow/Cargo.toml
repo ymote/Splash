@@ -16,3 +16,6 @@ serde_json = "1.0.150"
 splash-capabilities = { path = "../splash-capabilities" }
 splash-core = { path = "../splash-core" }
 splash-protocol = { version = "0.1.0", path = "../splash-protocol" }
+
+[dev-dependencies]
+splash-storage = { path = "../splash-storage" }

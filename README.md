@@ -28,6 +28,8 @@ and keeps UI support optional rather than making UI the language boundary.
   for a restart to run the remaining plan suffix.
 - Plan-bound durable external-operation ledgers with input fingerprints,
   derived worker keys, and revision-watermark hooks for host storage policy.
+- Host-only authenticated storage envelopes with key rotation and a strict
+  rollback-protected compare-and-swap backend contract.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
@@ -103,6 +105,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 - `splash-capabilities`: explicit tool policy, audit log, deferred promises,
   LLM-facing host catalog, JSON contracts, and safe host bridge.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
+- `splash-storage`: host-only authenticated records and anti-rollback storage
+  boundary.
 - `splash-protocol`: portable worker messages, capability attenuation,
   keyed session framing, and host-side invocation/result validation.
 - `splash-workflow`: host-owned planning, approval, checkpointing, durable
@@ -125,3 +129,6 @@ host-orchestration boundary.
 
 [Durable operation ledgers](docs/workflow-operations.md) define how a host
 records and safely reconciles uncertain external effects across a restart.
+
+[Authenticated storage](docs/durable-storage.md) defines the trusted durable
+record boundary used to persist those host-owned records.

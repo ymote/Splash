@@ -1,0 +1,87 @@
+# Authenticated Durable Storage
+
+`splash-storage` is a host-only record boundary for checkpoints, workflow
+operation ledgers, and other non-script state. It protects a serialized record
+against tampering and transplant to a different logical record key. It does
+not grant a script storage access, expose a storage key, encrypt data, create a
+database, or contain an operating-system effect.
+
+## Record Envelope
+
+`AuthenticatedStore` seals each payload with a provisioned 32-byte BLAKE3 key.
+The tag binds all of the following through length-delimited binary fields:
+
+- the envelope format version;
+- an opaque record namespace and name;
+- the storage key ID and record revision; and
+- the complete payload bytes.
+
+The stored JSON envelope is only a transport representation. Opening it
+checks size bounds, canonical base64, the key ID, its matching backend
+revision, and the keyed tag before returning payload bytes. A record copied to
+another namespace or name fails authentication even if its envelope is valid.
+
+Payload authentication is not encryption. Do not persist credential values or
+other secrets in a record merely because it has a tag. Use opaque secret
+selectors and a platform-provided encrypted secret facility where appropriate.
+
+## Rollback Contract
+
+An authentication tag cannot reveal that an attacker restored an old but valid
+record. `RollbackProtectedStore` therefore has a stronger host-backend
+contract:
+
+1. `load` returns the record and its revision floor as one consistent snapshot.
+2. For a live record, its revision equals that floor. An absent record has a
+   zero floor.
+3. A successful compare-and-swap writes the replacement and advances the
+   floor to its new revision atomically.
+4. The floor is itself durable and rollback-resistant through a platform trust
+   anchor.
+
+`AuthenticatedStore` fails closed when the snapshot violates that contract:
+an old record below the floor is a rollback, and a newer record above the floor
+means the backend did not advance its anchor. An ordinary file, SQLite row, or
+key-value entry does not meet this contract by itself. A production backend
+needs a transactional trusted service, hardware monotonic counter, or an
+equivalent platform primitive that survives storage rollback.
+
+`VolatileMemoryStore` implements the API only to exercise the semantics in
+tests and local development. It loses both bytes and its floor at process exit,
+so it is never a production rollback defense.
+
+## Key Rotation
+
+`StorageKeyring` has one active write key plus prior verification keys. To
+rotate, add a fresh key ID with `rotate_to`, then read and rewrite each record
+with `AuthenticatedStore::replace`. The rewrite moves it to the active key and
+advances the revision. Retire an old key only after every record using it has
+been rewritten or intentionally expired.
+
+Key IDs are metadata, not secrets. Generate each 32-byte key with an
+OS-provided CSPRNG and provision it only to the trusted host and its selected
+storage backend. This crate does not perform key exchange, key wrapping, or
+key attestation.
+
+## Workflow Integration
+
+Persist the serialized ledger under a stable host record key before dispatch
+and after each reconciliation mutation. On restart, open the authenticated
+record first, parse the ledger, recreate the trusted plan, and validate both
+the plan binding and the ledger's own revision policy.
+
+~~~rust
+use splash_storage::StorageRecordKey;
+use splash_workflow::WorkflowOperationLedger;
+
+let record_key = StorageRecordKey::new("workflow-ledger", "release-42")?;
+let stored = store.load(&record_key)?.expect("host-created ledger record");
+let ledger_json = std::str::from_utf8(stored.payload())?;
+let ledger = WorkflowOperationLedger::from_json(ledger_json)?;
+engine.validate_operation_ledger(&recreated_plan, &ledger)?;
+~~~
+
+When the ledger changes, use the authenticated record revision returned by the
+previous load as the compare-and-swap expectation. The storage revision guards
+the envelope; `WorkflowOperationLedger::revision` remains the workflow's own
+monotonic operation record and should also be checked against any host policy.

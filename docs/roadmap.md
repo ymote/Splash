@@ -21,10 +21,12 @@
 - Bounded data-only workflow checkpoints with fresh host approval on resume.
 - Plan-bound durable operation ledgers with input fingerprint checks, derived
   worker keys, and revision-watermark hooks.
+- Host-only authenticated storage envelopes, key rotation, and a strict
+  rollback-protected storage backend contract.
 
 ## Next: durable external operations
 
-- Authenticated durable storage adapters with compare-and-swap and rollback
+- Platform durable-storage adapters with compare-and-swap and rollback
   protection.
 - Durable worker-side idempotency and compensation hooks.
 

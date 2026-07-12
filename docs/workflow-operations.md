@@ -87,6 +87,12 @@ authenticate the ledger and retain its watermark atomically or through a
 compare-and-swap policy. Key rotation, storage encryption, retention, and
 rollback protection are platform responsibilities.
 
+[`splash-storage`](durable-storage.md) supplies the host-only authenticated
+envelope and backend contract for this persistence boundary. Its included
+memory backend is development-only; choose a platform backend that meets the
+documented atomic revision-floor contract before treating a workflow ledger as
+durable across restarts.
+
 Before creating a reconciliation request, the engine requires the current
 input bytes and fails closed with `InputFingerprintMismatch` if they differ
 from the persisted operation. The host must choose an explicit policy for that
