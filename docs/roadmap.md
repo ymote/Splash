@@ -11,11 +11,11 @@
   messages.
 - Stable host-side tool catalog with bounded LLM metadata.
 - Bounded executable JSON input/output contracts for local and worker tools.
+- External-only deferred tools with host claim, completion, cancellation, and
+  bounded concurrent pending work.
 
-## Next: schema-validated and externally asynchronous tools
+## Next: richer external operations
 
-- Cancellable promise handles, external completion, and bounded concurrent
-  work.
 - Per-tool deadlines, retry classification, and idempotency keys.
 - Streaming output with byte limits and redaction hooks.
 

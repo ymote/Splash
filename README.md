@@ -14,6 +14,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - Bounded executable JSON contracts for structured tool inputs and outputs.
 - Bounded, host-pumped deferred tool promises for cooperative mobile and
   embedded event loops.
+- Deferred-only external tools that hosts claim, complete, or cancel without
+  installing an in-process handler.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
@@ -99,4 +101,5 @@ See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UP
 for the import boundary. The [worker protocol](docs/worker-protocol.md)
 defines the handoff to future contained adapters. The [host tool catalog](docs/tool-catalog.md)
 defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schema-contracts.md)
-define the executable structured-data boundary.
+define the executable structured-data boundary. [External tools](docs/external-tools.md)
+define the host-managed async boundary.

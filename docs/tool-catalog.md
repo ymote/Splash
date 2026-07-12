@@ -5,10 +5,10 @@ An LLM orchestrator should build its prompt from
 commands. The catalog contains only capabilities registered on that runtime,
 in stable name order.
 
-Each `ToolDescriptor` includes the name, envelope format, call and byte
-limits, description, and optional JSON input/output schemas. The runtime does
-not install catalog access into `mod.tool`: a script cannot discover or mint
-capabilities by inspecting descriptions.
+Each `ToolDescriptor` includes the name, envelope format, dispatch mode, call
+and byte limits, description, and optional JSON input/output schemas. The
+runtime does not install catalog access into `mod.tool`: a script cannot
+discover or mint capabilities by inspecting descriptions.
 
 ```rust
 use splash_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
@@ -41,6 +41,11 @@ shown here is enforced at the tool boundary. See [JSON tool contracts](schema-co
 for the supported keywords and limits. `ToolMetadata::with_input_schema` and
 `with_output_schema` remain available when a host needs non-enforcing prompt
 metadata only.
+
+Dispatch is `host_pump` for a local Rust handler and `external` for a
+deferred-only tool. An external tool can only be used with `tool.start` or
+`tool.start_json`; the host claims and completes it through the lifecycle
+described in [External tools](external-tools.md).
 
 The development CLI exposes the same host catalog as JSON:
 

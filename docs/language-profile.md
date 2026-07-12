@@ -41,9 +41,10 @@ with a registered tool policy before `tool.call` or `tool.start` can succeed.
 The v0.1 tool contract accepts string input and returns string output.
 `tool.call` is synchronous. `tool.start` reserves the same capability and
 returns an opaque promise; `await()` pauses the current script until the
-trusted host calls `CapabilityRuntime::pump`. One default pump tick runs at
-most one tool; `pump_up_to` is available for an explicitly bounded batch. The
-default pending-promise cap is 64 and may be lowered by an embedded host.
+trusted host delivers its result. For host-pump tools, one default
+`CapabilityRuntime::pump` tick runs at most one tool; `pump_up_to` is
+available for an explicitly bounded batch. The default pending-promise cap is
+64 and may be lowered by an embedded host.
 
 `ToolPolicy::json` opts a capability into a structured boundary. The input and
 output must each be a JSON object or array. `call_json` and `start_json`
@@ -60,8 +61,14 @@ or output. The exact supported subset is defined in
 
 The promise API is cooperative. It does not grant a script a thread, a task
 runtime, or a way to invoke an adapter without the host's pump. Structured
-values, cancellation, external completion, and streaming dataflow are planned
-as additive, versioned host APIs rather than implicit VM effects.
+values and streaming dataflow remain additive, versioned host APIs rather than
+implicit VM effects.
+
+An external-only tool is a separate deferred mode selected by the host. It
+cannot be called synchronously and has no in-process handler. The host claims
+the pending invocation, dispatches it through its own adapter, and completes
+or cancels it later. This does not expose an external API to Splash source;
+the script still sees only its promise. See [External tools](external-tools.md).
 
 A runtime evaluates one script at a time. A host must resume a paused script
 before evaluating new source on that runtime; independent workflows should use
@@ -78,6 +85,6 @@ separate runtime instances.
 - Generate against the host-supplied tool catalog only; descriptions and
   schemas do not grant access to unlisted tools.
 - Await a deferred tool result before using it; do not assume `start` performs
-  an effect until the host has pumped the runtime.
+  an effect until a host pump or external completion has delivered its result.
 - Use record or array envelopes for JSON tools, then call `parse_json()` on
   their returned strings before reading fields.

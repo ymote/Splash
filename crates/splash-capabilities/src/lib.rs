@@ -43,6 +43,16 @@ pub enum ToolDataFormat {
     Json,
 }
 
+/// Where a deferred tool's work is permitted to run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDispatch {
+    /// The trusted runtime invokes its registered Rust handler during a pump.
+    HostPump,
+    /// The host must explicitly claim and complete the work outside the VM.
+    External,
+}
+
 /// Trusted host metadata supplied to an LLM orchestrator or operator UI.
 ///
 /// Metadata is never installed as a script module and conveys no authority.
@@ -113,6 +123,7 @@ impl ToolMetadata {
 pub struct ToolDescriptor {
     pub name: String,
     pub format: ToolDataFormat,
+    pub dispatch: ToolDispatch,
     pub max_calls: usize,
     pub max_input_bytes: usize,
     pub max_output_bytes: usize,
@@ -224,6 +235,7 @@ pub struct JsonToolRequest {
 pub enum ToolError {
     Denied(String),
     Failed(String),
+    Cancelled(String),
 }
 
 impl Display for ToolError {
@@ -231,11 +243,58 @@ impl Display for ToolError {
         match self {
             Self::Denied(message) => write!(formatter, "tool call denied: {message}"),
             Self::Failed(message) => write!(formatter, "tool call failed: {message}"),
+            Self::Cancelled(message) => write!(formatter, "tool call cancelled: {message}"),
         }
     }
 }
 
 impl std::error::Error for ToolError {}
+
+/// Opaque host-side identifier for a claimed external tool operation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ExternalToolId(u64);
+
+/// A deferred tool invocation that the host has explicitly claimed for
+/// external execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalToolInvocation {
+    pub id: ExternalToolId,
+    pub name: String,
+    pub input: String,
+    pub call_index: usize,
+    pub format: ToolDataFormat,
+    pub max_output_bytes: usize,
+}
+
+/// Lifecycle errors returned when a host completes or cancels external work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalToolError {
+    Unknown(ExternalToolId),
+    NotExternal(ExternalToolId),
+    NotClaimed(ExternalToolId),
+    AlreadyCompleted(ExternalToolId),
+    Runtime(RuntimeError),
+}
+
+impl Display for ExternalToolError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(_) => formatter.write_str("unknown external tool operation"),
+            Self::NotExternal(_) => {
+                formatter.write_str("tool operation is not externally dispatched")
+            }
+            Self::NotClaimed(_) => {
+                formatter.write_str("external tool operation has not been claimed")
+            }
+            Self::AlreadyCompleted(_) => {
+                formatter.write_str("external tool operation is already complete")
+            }
+            Self::Runtime(error) => write!(formatter, "could not resume tool operation: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExternalToolError {}
 
 /// Transport owned by the trusted host for dispatching a validated worker call.
 ///
@@ -379,6 +438,7 @@ pub enum AuditOutcome {
     Allowed,
     Denied,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -393,13 +453,19 @@ pub struct AuditEvent {
 pub type ToolHandler = Box<dyn FnMut(&ToolRequest) -> Result<String, ToolError> + 'static>;
 type ToolValidator = Box<dyn Fn(&str) -> Result<(), ToolError> + 'static>;
 
+enum ToolImplementation {
+    HostPump(ToolHandler),
+    External,
+}
+
 struct RegisteredTool {
     policy: ToolPolicy,
     metadata: ToolMetadata,
+    dispatch: ToolDispatch,
     calls: usize,
     input_validator: Option<ToolValidator>,
     output_validator: Option<ToolValidator>,
-    handler: ToolHandler,
+    implementation: ToolImplementation,
 }
 
 #[derive(Clone, Debug)]
@@ -411,19 +477,37 @@ struct ToolTicket {
     call_index: usize,
     max_output_bytes: usize,
     data_format: ToolDataFormat,
+    dispatch: ToolDispatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolInvocationKind {
+    Synchronous,
+    Deferred,
+}
+
+#[derive(Clone, Debug)]
+enum PendingDispatch {
+    HostPump,
+    ExternalQueued,
+    ExternalClaimed,
 }
 
 #[derive(Clone, Debug)]
 enum PendingToolState {
-    Queued,
-    Waiting(ScriptThreadId),
+    Pending {
+        dispatch: PendingDispatch,
+        waiting_thread: Option<ScriptThreadId>,
+    },
     Ready(Result<String, ToolError>),
 }
 
 #[derive(Debug)]
 struct PendingTool {
+    id: ExternalToolId,
     ticket: ToolTicket,
     state: PendingToolState,
+    orphaned: bool,
 }
 
 type PendingTools = Rc<RefCell<BTreeMap<ScriptHandle, PendingTool>>>;
@@ -439,7 +523,21 @@ struct ToolPromiseGc {
 
 impl ScriptHandleGc for ToolPromiseGc {
     fn gc(&mut self) {
-        self.pending.borrow_mut().remove(&self.handle);
+        let mut pending = self.pending.borrow_mut();
+        let Some(entry) = pending.get_mut(&self.handle) else {
+            return;
+        };
+        if matches!(
+            &entry.state,
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::ExternalClaimed,
+                ..
+            }
+        ) {
+            entry.orphaned = true;
+        } else {
+            pending.remove(&self.handle);
+        }
     }
 
     fn set_handle(&mut self, handle: ScriptHandle) {
@@ -452,6 +550,7 @@ pub struct CapabilityHost {
     tools: BTreeMap<String, RegisteredTool>,
     audit: Vec<AuditEvent>,
     next_sequence: u64,
+    next_pending_id: u64,
     pending: PendingTools,
 }
 
@@ -476,20 +575,48 @@ impl CapabilityHost {
     where
         F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
     {
-        self.register_with_validators(policy, metadata, None, None, handler)
+        self.register_with_validators(
+            policy,
+            metadata,
+            None,
+            None,
+            ToolDispatch::HostPump,
+            ToolImplementation::HostPump(Box::new(handler)),
+        )
     }
 
-    fn register_with_validators<F>(
+    /// Registers a deferred-only capability that has no in-process handler.
+    ///
+    /// The host must claim its invocation and complete or cancel it through
+    /// the external completion API.
+    pub fn register_external(&mut self, policy: ToolPolicy) -> Result<(), ToolRegistrationError> {
+        self.register_external_with_metadata(policy, ToolMetadata::default())
+    }
+
+    pub fn register_external_with_metadata(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+    ) -> Result<(), ToolRegistrationError> {
+        self.register_with_validators(
+            policy,
+            metadata,
+            None,
+            None,
+            ToolDispatch::External,
+            ToolImplementation::External,
+        )
+    }
+
+    fn register_with_validators(
         &mut self,
         policy: ToolPolicy,
         metadata: ToolMetadata,
         input_validator: Option<ToolValidator>,
         output_validator: Option<ToolValidator>,
-        handler: F,
-    ) -> Result<(), ToolRegistrationError>
-    where
-        F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
-    {
+        dispatch: ToolDispatch,
+        implementation: ToolImplementation,
+    ) -> Result<(), ToolRegistrationError> {
         policy.validate()?;
         metadata.validate_for(policy.data_format)?;
         if self.tools.contains_key(&policy.name) {
@@ -500,10 +627,11 @@ impl CapabilityHost {
             RegisteredTool {
                 policy,
                 metadata,
+                dispatch,
                 calls: 0,
                 input_validator,
                 output_validator,
-                handler: Box::new(handler),
+                implementation,
             },
         );
         Ok(())
@@ -554,6 +682,60 @@ impl CapabilityHost {
         )
     }
 
+    pub fn register_external_json_tool(
+        &mut self,
+        policy: ToolPolicy,
+    ) -> Result<(), ToolRegistrationError> {
+        self.register_external_json_tool_with_metadata(policy, ToolMetadata::default())
+    }
+
+    pub fn register_external_json_tool_with_metadata(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+    ) -> Result<(), ToolRegistrationError> {
+        self.register_external_json_tool_with_validators(policy, metadata, None, None)
+    }
+
+    pub fn register_validated_external_json_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+    ) -> Result<(), ToolRegistrationError> {
+        let metadata = metadata
+            .with_input_schema(contract.input_schema.clone())
+            .with_output_schema(contract.output_schema.clone());
+        self.register_external_json_tool_with_validators(
+            policy,
+            metadata,
+            Some(schema_validator(contract.input, "input")),
+            Some(schema_validator(contract.output, "output")),
+        )
+    }
+
+    fn register_external_json_tool_with_validators(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        input_validator: Option<ToolValidator>,
+        output_validator: Option<ToolValidator>,
+    ) -> Result<(), ToolRegistrationError> {
+        if policy.data_format != ToolDataFormat::Json {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "register_external_json_tool requires ToolPolicy::json",
+            ));
+        }
+        self.register_with_validators(
+            policy,
+            metadata,
+            input_validator,
+            output_validator,
+            ToolDispatch::External,
+            ToolImplementation::External,
+        )
+    }
+
     fn register_json_tool_with_validators<F>(
         &mut self,
         policy: ToolPolicy,
@@ -575,7 +757,8 @@ impl CapabilityHost {
             metadata,
             input_validator,
             output_validator,
-            move |request| {
+            ToolDispatch::HostPump,
+            ToolImplementation::HostPump(Box::new(move |request| {
                 let input = serde_json::from_str(&request.input).map_err(|error| {
                     ToolError::Failed(format!(
                         "{} JSON input failed host validation: {error}",
@@ -593,7 +776,7 @@ impl CapabilityHost {
                         request.name
                     ))
                 })
-            },
+            })),
         )
     }
 
@@ -611,6 +794,7 @@ impl CapabilityHost {
             .map(|registered| ToolDescriptor {
                 name: registered.policy.name.clone(),
                 format: registered.policy.data_format,
+                dispatch: registered.dispatch,
                 max_calls: registered.policy.max_calls,
                 max_input_bytes: registered.policy.max_input_bytes,
                 max_output_bytes: registered.policy.max_output_bytes,
@@ -626,12 +810,17 @@ impl CapabilityHost {
     }
 
     fn call(&mut self, name: &str, input: &str) -> Result<String, ToolError> {
-        let ticket = self.reserve(name, input, None)?;
+        let ticket = self.reserve(name, input, None, ToolInvocationKind::Synchronous)?;
         self.execute(ticket)
     }
 
     fn call_json(&mut self, name: &str, input: &str) -> Result<String, ToolError> {
-        let ticket = self.reserve(name, input, Some(ToolDataFormat::Json))?;
+        let ticket = self.reserve(
+            name,
+            input,
+            Some(ToolDataFormat::Json),
+            ToolInvocationKind::Synchronous,
+        )?;
         self.execute(ticket)
     }
 
@@ -640,6 +829,7 @@ impl CapabilityHost {
         name: &str,
         input: &str,
         expected_format: Option<ToolDataFormat>,
+        invocation_kind: ToolInvocationKind,
     ) -> Result<ToolTicket, ToolError> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -651,6 +841,12 @@ impl CapabilityHost {
                 if expected_format.is_some_and(|format| format != registered.policy.data_format) {
                     Err(ToolError::Denied(format!(
                         "{name} is not registered for JSON envelopes"
+                    )))
+                } else if invocation_kind == ToolInvocationKind::Synchronous
+                    && registered.dispatch == ToolDispatch::External
+                {
+                    Err(ToolError::Denied(format!(
+                        "{name} is available only through tool.start"
                     )))
                 } else if input_bytes > registered.policy.max_input_bytes {
                     Err(ToolError::Denied(format!(
@@ -702,24 +898,24 @@ impl CapabilityHost {
             call_index: registered.calls,
             max_output_bytes: registered.policy.max_output_bytes,
             data_format: registered.policy.data_format,
+            dispatch: registered.dispatch,
         })
     }
 
     fn execute(&mut self, ticket: ToolTicket) -> Result<String, ToolError> {
-        let result = match self.tools.get_mut(&ticket.name) {
+        let handler_result = match self.tools.get_mut(&ticket.name) {
             Some(registered) => {
                 let request = ToolRequest {
                     name: ticket.name.clone(),
                     input: ticket.input.clone(),
                     call_index: ticket.call_index,
                 };
-                match (registered.handler)(&request) {
-                    Ok(output) if output.len() <= ticket.max_output_bytes => Ok(output),
-                    Ok(_) => Err(ToolError::Denied(format!(
-                        "{} output exceeds {} bytes",
-                        ticket.name, ticket.max_output_bytes
+                match &mut registered.implementation {
+                    ToolImplementation::HostPump(handler) => handler(&request),
+                    ToolImplementation::External => Err(ToolError::Failed(format!(
+                        "{} is registered for external completion",
+                        ticket.name
                     ))),
-                    Err(error) => Err(error),
                 }
             }
             None => Err(ToolError::Failed(format!(
@@ -727,27 +923,41 @@ impl CapabilityHost {
                 ticket.name
             ))),
         };
+        self.complete_ticket(&ticket, handler_result)
+    }
 
-        let result = if ticket.data_format == ToolDataFormat::Json {
-            result.and_then(|output| {
-                validate_json_envelope(&output, &ticket.name, "output")?;
-                match self.tools.get(&ticket.name) {
-                    Some(registered) => match registered.output_validator.as_ref() {
-                        Some(validator) => validator(&output).map(|()| output),
-                        None => Ok(output),
-                    },
-                    None => Err(ToolError::Failed(format!(
-                        "registered capability disappeared: {}",
-                        ticket.name
-                    ))),
-                }
-            })
-        } else {
-            result
-        };
-
-        self.record_ticket_result(&ticket, &result);
+    fn complete_ticket(
+        &mut self,
+        ticket: &ToolTicket,
+        result: Result<String, ToolError>,
+    ) -> Result<String, ToolError> {
+        let result = result.and_then(|output| self.validate_output(ticket, output));
+        self.record_ticket_result(ticket, &result);
         result
+    }
+
+    fn validate_output(&self, ticket: &ToolTicket, output: String) -> Result<String, ToolError> {
+        if output.len() > ticket.max_output_bytes {
+            return Err(ToolError::Denied(format!(
+                "{} output exceeds {} bytes",
+                ticket.name, ticket.max_output_bytes
+            )));
+        }
+        if ticket.data_format == ToolDataFormat::Json {
+            validate_json_envelope(&output, &ticket.name, "output")?;
+            match self.tools.get(&ticket.name) {
+                Some(registered) => match registered.output_validator.as_ref() {
+                    Some(validator) => validator(&output).map(|()| output),
+                    None => Ok(output),
+                },
+                None => Err(ToolError::Failed(format!(
+                    "registered capability disappeared: {}",
+                    ticket.name
+                ))),
+            }
+        } else {
+            Ok(output)
+        }
     }
 
     fn record_ticket_result(&mut self, ticket: &ToolTicket, result: &Result<String, ToolError>) {
@@ -755,6 +965,7 @@ impl CapabilityHost {
             Ok(output) => (output.len(), AuditOutcome::Allowed),
             Err(ToolError::Denied(_)) => (0, AuditOutcome::Denied),
             Err(ToolError::Failed(_)) => (0, AuditOutcome::Failed),
+            Err(ToolError::Cancelled(_)) => (0, AuditOutcome::Cancelled),
         };
         self.audit.push(AuditEvent {
             sequence: ticket.sequence,
@@ -769,6 +980,7 @@ impl CapabilityHost {
         let outcome = match error {
             ToolError::Denied(_) => AuditOutcome::Denied,
             ToolError::Failed(_) => AuditOutcome::Failed,
+            ToolError::Cancelled(_) => AuditOutcome::Cancelled,
         };
         self.audit.push(AuditEvent {
             sequence,
@@ -784,7 +996,7 @@ impl CapabilityHost {
         name: &str,
         input: &str,
         max_pending: usize,
-    ) -> Result<(ToolTicket, PendingTools), ToolError> {
+    ) -> Result<(ToolTicket, PendingTools, ExternalToolId), ToolError> {
         self.begin_async_with_format(name, input, max_pending, None)
     }
 
@@ -793,7 +1005,7 @@ impl CapabilityHost {
         name: &str,
         input: &str,
         max_pending: usize,
-    ) -> Result<(ToolTicket, PendingTools), ToolError> {
+    ) -> Result<(ToolTicket, PendingTools, ExternalToolId), ToolError> {
         self.begin_async_with_format(name, input, max_pending, Some(ToolDataFormat::Json))
     }
 
@@ -803,7 +1015,7 @@ impl CapabilityHost {
         input: &str,
         max_pending: usize,
         expected_format: Option<ToolDataFormat>,
-    ) -> Result<(ToolTicket, PendingTools), ToolError> {
+    ) -> Result<(ToolTicket, PendingTools, ExternalToolId), ToolError> {
         if self.pending.borrow().len() >= max_pending {
             let sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.saturating_add(1);
@@ -813,8 +1025,25 @@ impl CapabilityHost {
             return Err(error);
         }
 
-        let ticket = self.reserve(name, input, expected_format)?;
-        Ok((ticket, self.pending.clone()))
+        let id = self.allocate_pending_id(name, input.len())?;
+        let ticket = self.reserve(name, input, expected_format, ToolInvocationKind::Deferred)?;
+        Ok((ticket, self.pending.clone(), id))
+    }
+
+    fn allocate_pending_id(
+        &mut self,
+        name: &str,
+        input_bytes: usize,
+    ) -> Result<ExternalToolId, ToolError> {
+        if self.next_pending_id == u64::MAX {
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.saturating_add(1);
+            let error = ToolError::Failed("deferred tool identifier space exhausted".to_owned());
+            self.record_result(sequence, name, input_bytes, &error);
+            return Err(error);
+        }
+        self.next_pending_id = self.next_pending_id.saturating_add(1);
+        Ok(ExternalToolId(self.next_pending_id))
     }
 
     fn pending(&self) -> PendingTools {
@@ -825,23 +1054,109 @@ impl CapabilityHost {
         self.pending.borrow().len()
     }
 
+    fn claim_next_external(&mut self) -> Option<ExternalToolInvocation> {
+        let mut pending = self.pending.borrow_mut();
+        let handle = pending.iter().find_map(|(handle, entry)| {
+            matches!(
+                &entry.state,
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                }
+            )
+            .then_some(*handle)
+        })?;
+        let entry = pending.get_mut(&handle)?;
+        let (id, ticket, waiting_thread) = match &entry.state {
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::ExternalQueued,
+                waiting_thread,
+            } => (entry.id, entry.ticket.clone(), *waiting_thread),
+            _ => return None,
+        };
+        entry.state = PendingToolState::Pending {
+            dispatch: PendingDispatch::ExternalClaimed,
+            waiting_thread,
+        };
+        Some(ExternalToolInvocation {
+            id,
+            name: ticket.name,
+            input: ticket.input,
+            call_index: ticket.call_index,
+            format: ticket.data_format,
+            max_output_bytes: ticket.max_output_bytes,
+        })
+    }
+
+    fn complete_external(
+        &mut self,
+        id: ExternalToolId,
+        result: Result<String, ToolError>,
+    ) -> Result<PendingCompletion, ExternalToolError> {
+        let (handle, ticket, waiting_thread) = {
+            let pending = self.pending.borrow();
+            let Some((handle, entry)) = pending.iter().find(|(_, entry)| entry.id == id) else {
+                return Err(ExternalToolError::Unknown(id));
+            };
+            match &entry.state {
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    waiting_thread,
+                } => (*handle, entry.ticket.clone(), *waiting_thread),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                } => return Err(ExternalToolError::NotClaimed(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::HostPump,
+                    ..
+                } => return Err(ExternalToolError::NotExternal(id)),
+                PendingToolState::Ready(_) => return Err(ExternalToolError::AlreadyCompleted(id)),
+            }
+        };
+
+        let result = self.complete_ticket(&ticket, result);
+        let mut pending = self.pending.borrow_mut();
+        let Some(entry) = pending.get_mut(&handle) else {
+            return Err(ExternalToolError::Unknown(id));
+        };
+        let orphaned = entry.orphaned;
+        entry.state = PendingToolState::Ready(result);
+        if orphaned {
+            pending.remove(&handle);
+        }
+        Ok(PendingCompletion { waiting_thread })
+    }
+
+    fn cancel_external(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<PendingCompletion, ExternalToolError> {
+        self.complete_external(
+            id,
+            Err(ToolError::Cancelled(
+                "cancelled by the trusted host".to_owned(),
+            )),
+        )
+    }
+
     fn run_next_pending(&mut self) -> Option<PendingCompletion> {
         let (handle, ticket, waiting_thread) = {
             let pending = self.pending.borrow();
             pending
                 .iter()
-                .find_map(|(handle, pending)| match &pending.state {
-                    PendingToolState::Queued => Some((*handle, pending.ticket.clone(), None)),
-                    PendingToolState::Waiting(thread) => {
-                        Some((*handle, pending.ticket.clone(), Some(*thread)))
-                    }
-                    PendingToolState::Ready(_) => None,
+                .find_map(|(handle, entry)| match &entry.state {
+                    PendingToolState::Pending {
+                        dispatch: PendingDispatch::HostPump,
+                        waiting_thread,
+                    } => Some((*handle, entry.ticket.clone(), *waiting_thread)),
+                    PendingToolState::Pending { .. } | PendingToolState::Ready(_) => None,
                 })?
         };
 
         let result = self.execute(ticket);
-        if let Some(pending) = self.pending.borrow_mut().get_mut(&handle) {
-            pending.state = PendingToolState::Ready(result);
+        if let Some(entry) = self.pending.borrow_mut().get_mut(&handle) {
+            entry.state = PendingToolState::Ready(result);
         }
         Some(PendingCompletion { waiting_thread })
     }
@@ -859,9 +1174,9 @@ pub struct PumpReport {
 /// Runtime with only a single script-visible effect surface: `mod.tool`.
 ///
 /// `tool.call` executes synchronously. `tool.start` creates an opaque promise
-/// and `promise.await()` suspends the script until the trusted host calls
-/// [`Self::pump`]. No worker, filesystem, process, or network API is installed
-/// by this crate.
+/// and `promise.await()` suspends the script until a trusted host pump or
+/// external completion supplies its result. No worker, filesystem, process, or
+/// network API is installed by this crate.
 pub struct CapabilityRuntime {
     runtime: Runtime<CapabilityHost, ()>,
     max_pending_tools: usize,
@@ -918,6 +1233,26 @@ impl CapabilityRuntime {
             .register_with_metadata(policy, metadata, handler)
     }
 
+    /// Registers a deferred-only text capability with no in-process handler.
+    pub fn register_external_tool(
+        &mut self,
+        policy: ToolPolicy,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime.host_mut().register_external(policy)
+    }
+
+    /// Registers a documented deferred-only text capability with no
+    /// in-process handler.
+    pub fn register_external_tool_with_metadata(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .host_mut()
+            .register_external_with_metadata(policy, metadata)
+    }
+
     /// Registers a JSON envelope capability backed by trusted Rust code.
     ///
     /// The policy must come from [`ToolPolicy::json`]. Splash scripts use
@@ -968,6 +1303,38 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_validated_json_tool(policy, metadata, contract, handler)
+    }
+
+    /// Registers a deferred-only JSON capability with no in-process handler.
+    pub fn register_external_json_tool(
+        &mut self,
+        policy: ToolPolicy,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime.host_mut().register_external_json_tool(policy)
+    }
+
+    /// Registers a documented deferred-only JSON capability with no
+    /// in-process handler.
+    pub fn register_external_json_tool_with_metadata(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .host_mut()
+            .register_external_json_tool_with_metadata(policy, metadata)
+    }
+
+    /// Registers a deferred-only JSON capability with executable contracts.
+    pub fn register_validated_external_json_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .host_mut()
+            .register_validated_external_json_tool(policy, metadata, contract)
     }
 
     /// Registers a JSON tool whose implementation runs behind a validated
@@ -1055,6 +1422,37 @@ impl CapabilityRuntime {
         self.runtime.host().pending_len()
     }
 
+    /// Claims one external-only deferred invocation for host dispatch.
+    ///
+    /// Claimed work is never executed by a pump. The host must finish it with
+    /// the external completion or cancellation API.
+    pub fn claim_next_external_tool(&mut self) -> Option<ExternalToolInvocation> {
+        self.runtime.host_mut().claim_next_external()
+    }
+
+    /// Delivers a host-produced result for a previously claimed external tool.
+    ///
+    /// The same byte, JSON envelope, and optional schema checks used by local
+    /// handlers are applied before a suspended script is resumed.
+    pub fn complete_external_tool(
+        &mut self,
+        id: ExternalToolId,
+        result: Result<String, ToolError>,
+    ) -> Result<Option<Evaluation>, ExternalToolError> {
+        let completion = self.runtime.host_mut().complete_external(id, result)?;
+        self.resume_external_completion(completion)
+    }
+
+    /// Cancels a claimed external tool and resumes its waiter with a
+    /// cancellation error when applicable.
+    pub fn cancel_external_tool(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<Option<Evaluation>, ExternalToolError> {
+        let completion = self.runtime.host_mut().cancel_external(id)?;
+        self.resume_external_completion(completion)
+    }
+
     pub fn max_pending_tools(&self) -> usize {
         self.max_pending_tools
     }
@@ -1085,6 +1483,20 @@ impl CapabilityRuntime {
         }
 
         Ok(report)
+    }
+
+    fn resume_external_completion(
+        &mut self,
+        completion: PendingCompletion,
+    ) -> Result<Option<Evaluation>, ExternalToolError> {
+        completion
+            .waiting_thread
+            .map(|thread| {
+                self.runtime
+                    .resume(thread)
+                    .map_err(ExternalToolError::Runtime)
+            })
+            .transpose()
     }
 }
 
@@ -1129,14 +1541,23 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                         );
                     };
 
-                    match &entry.state {
-                        PendingToolState::Ready(result) => Some(result.clone()),
-                        PendingToolState::Queued => {
+                    match entry.state.clone() {
+                        PendingToolState::Ready(result) => Some(result),
+                        PendingToolState::Pending {
+                            dispatch,
+                            waiting_thread: None,
+                        } => {
                             let waiting_thread = vm.bx.threads.cur().pause();
-                            entry.state = PendingToolState::Waiting(waiting_thread);
+                            entry.state = PendingToolState::Pending {
+                                dispatch,
+                                waiting_thread: Some(waiting_thread),
+                            };
                             None
                         }
-                        PendingToolState::Waiting(_) => {
+                        PendingToolState::Pending {
+                            waiting_thread: Some(_),
+                            ..
+                        } => {
                             return script_err_not_allowed!(
                                 vm.bx.threads.cur_ref().trap,
                                 "tool promise is already awaited"
@@ -1240,7 +1661,9 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending)) => new_tool_promise(vm, promise_type, ticket, pending),
+                    Ok((ticket, pending, id)) => {
+                        new_tool_promise(vm, promise_type, id, ticket, pending)
+                    }
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
@@ -1269,7 +1692,9 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending)) => new_tool_promise(vm, promise_type, ticket, pending),
+                    Ok((ticket, pending, id)) => {
+                        new_tool_promise(vm, promise_type, id, ticket, pending)
+                    }
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
@@ -1292,6 +1717,7 @@ fn script_json(vm: &mut vm::ScriptVm, value: ScriptValue) -> Result<String, Tool
 fn new_tool_promise(
     vm: &mut vm::ScriptVm,
     promise_type: ScriptHandleType,
+    id: ExternalToolId,
     ticket: ToolTicket,
     pending: PendingTools,
 ) -> ScriptValue {
@@ -1302,11 +1728,20 @@ fn new_tool_promise(
             handle: ScriptHandle::ZERO,
         }),
     );
+    let dispatch = match ticket.dispatch {
+        ToolDispatch::HostPump => PendingDispatch::HostPump,
+        ToolDispatch::External => PendingDispatch::ExternalQueued,
+    };
     pending.borrow_mut().insert(
         handle,
         PendingTool {
+            id,
             ticket,
-            state: PendingToolState::Queued,
+            state: PendingToolState::Pending {
+                dispatch,
+                waiting_thread: None,
+            },
+            orphaned: false,
         },
     );
     handle.into()
@@ -1403,6 +1838,218 @@ mod tests {
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn external_tool_completion_resumes_a_waiting_script_without_host_pump() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool_with_metadata(
+                ToolPolicy::new("text.remote"),
+                ToolMetadata::new("Completes outside the interpreter process."),
+            )
+            .unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet output = tool.start(\"text.remote\", \"hello\").await()\nassert(output == \"world\")",
+            )
+            .unwrap();
+
+        assert!(initial.suspended);
+        assert_eq!(runtime.pump().unwrap().completed, 0);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        assert_eq!(invocation.name, "text.remote");
+        assert_eq!(invocation.input, "hello");
+        assert_eq!(invocation.format, ToolDataFormat::Text);
+        assert_eq!(runtime.tool_catalog()[0].dispatch, ToolDispatch::External);
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("world".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert!(runtime.claim_next_external_tool().is_none());
+    }
+
+    #[test]
+    fn external_tools_are_deferred_only_without_consuming_a_call_for_sync_denial() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+
+        let denied = runtime
+            .eval("use mod.tool\ntool.call(\"text.remote\", \"sync\")")
+            .unwrap();
+
+        assert!(!denied.succeeded());
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"deferred\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("done".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn cancellation_is_audited_and_cannot_be_completed_twice() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"wait\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        let resumed = runtime
+            .cancel_external_tool(invocation.id)
+            .unwrap()
+            .unwrap();
+
+        assert!(!resumed.succeeded());
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Cancelled);
+        assert_eq!(
+            runtime
+                .complete_external_tool(invocation.id, Ok("late".to_owned()))
+                .unwrap_err(),
+            ExternalToolError::AlreadyCompleted(invocation.id)
+        );
+    }
+
+    #[test]
+    fn a_claimed_operation_survives_promise_gc_until_its_audit_is_recorded() {
+        let pending = Rc::new(RefCell::new(BTreeMap::new()));
+        let handle = ScriptHandle::ZERO;
+        let id = ExternalToolId(7);
+        pending.borrow_mut().insert(
+            handle,
+            PendingTool {
+                id,
+                ticket: ToolTicket {
+                    sequence: 0,
+                    name: "text.remote".to_owned(),
+                    input: "work".to_owned(),
+                    input_bytes: 4,
+                    call_index: 1,
+                    max_output_bytes: 64,
+                    data_format: ToolDataFormat::Text,
+                    dispatch: ToolDispatch::External,
+                },
+                state: PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    waiting_thread: None,
+                },
+                orphaned: false,
+            },
+        );
+        let mut gc = ToolPromiseGc {
+            pending: pending.clone(),
+            handle,
+        };
+
+        gc.gc();
+
+        assert!(pending.borrow().contains_key(&handle));
+        assert!(pending.borrow()[&handle].orphaned);
+
+        let mut host = CapabilityHost::default();
+        host.pending = pending.clone();
+        host.register_external(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let completion = host.complete_external(id, Ok("done".to_owned())).unwrap();
+
+        assert!(completion.waiting_thread.is_none());
+        assert!(!pending.borrow().contains_key(&handle));
+        assert_eq!(host.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn external_json_completion_uses_the_registered_contract() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_external_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer values outside the VM."),
+                add_contract(),
+            )
+            .unwrap();
+
+        let rejected = runtime
+            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20}).await()")
+            .unwrap();
+        assert!(!rejected.succeeded());
+        assert!(!rejected.suspended);
+        assert_eq!(runtime.pending_tools(), 0);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20 right: 22}).await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("{\"unexpected\":true}".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(!resumed.succeeded());
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn claimed_external_tools_can_complete_concurrently_within_the_pending_bound() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_calls = 2;
+        let mut runtime =
+            CapabilityRuntime::with_limits_and_pending(ExecutionLimits::default(), 2).unwrap();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet first = tool.start(\"text.remote\", \"first\")\nlet second = tool.start(\"text.remote\", \"second\")\nassert(first.await() == \"first-result\")\nassert(second.await() == \"second-result\")",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+
+        let first_claim = runtime.claim_next_external_tool().unwrap();
+        let second_claim = runtime.claim_next_external_tool().unwrap();
+        assert_ne!(first_claim.id, second_claim.id);
+        let (first, second) = if first_claim.input == "first" {
+            (first_claim, second_claim)
+        } else {
+            (second_claim, first_claim)
+        };
+
+        assert!(runtime
+            .complete_external_tool(second.id, Ok("second-result".to_owned()))
+            .unwrap()
+            .is_none());
+        let resumed = runtime
+            .complete_external_tool(first.id, Ok("first-result".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit().len(), 2);
+        assert!(runtime
+            .audit()
+            .iter()
+            .all(|event| event.outcome == AuditOutcome::Allowed));
     }
 
     #[test]

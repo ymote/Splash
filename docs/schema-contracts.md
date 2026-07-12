@@ -9,8 +9,8 @@ The runtime validates the ordinary JSON object/array envelope first, then the
 input contract before reserving a call or invoking the handler. It validates
 the output envelope and output contract before returning a result to Splash.
 Rejected input is recorded as denied and does not consume the tool's call
-budget. The same path is used by synchronous calls and host-pumped deferred
-calls.
+budget. The same path is used by synchronous calls and deferred calls, whether
+they are host-pumped or externally completed.
 
 ## Supported subset
 

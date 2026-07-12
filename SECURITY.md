@@ -5,7 +5,7 @@ untrusted. The runtime has two separate security boundaries:
 
 1. The language boundary exposes no ambient filesystem, process, network, or
    platform APIs. Scripts can reach a tool only through `tool.call` or an
-   explicitly host-pumped `tool.start(...).await()` promise.
+   explicitly host-controlled `tool.start(...).await()` promise.
 2. The execution boundary must contain any adapter with OS effects. A future
    production local-tool adapter will run in a dedicated worker with a
    platform-specific sandbox, not in the interpreter process.
@@ -32,12 +32,19 @@ does not invoke a handler or consume a call; output contract failure does not
 reach Splash. This is a data contract, not a way to deserialize arbitrary Rust
 types or grant a script access to a crate.
 
-Deferred tool promises are bounded per runtime and run only when the trusted
-host calls `CapabilityRuntime::pump`; one default pump tick processes at most
-one tool. Hosts may choose a bounded batch with `pump_up_to`. They are
-cooperative scheduling, not a threading or isolation mechanism. A paused
+Host-pump deferred tool promises are bounded per runtime and run only when the
+trusted host calls `CapabilityRuntime::pump`; one default pump tick processes
+at most one tool. Hosts may choose a bounded batch with `pump_up_to`. They
+are cooperative scheduling, not a threading or isolation mechanism. A paused
 script with no runnable capability work must be resumed by a host that
 understands the relevant suspension source.
+
+External-only tools add a host-managed completion path. They have no
+in-process handler and are denied to synchronous calls. A trusted host claims
+each operation, then explicitly completes or cancels it; the runtime reuses
+the normal output validation and audit boundary. This does not terminate a
+worker or enforce an operating-system policy. The host must bind cancellation
+to its transport and enforce containment outside this process.
 
 One v0.1 runtime is single-flight: a host must resume or discard a suspended
 evaluation before submitting new source to that runtime instance. Hosts that
