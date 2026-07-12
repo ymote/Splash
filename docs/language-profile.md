@@ -18,7 +18,8 @@ The current profile supports:
 - Numbers, strings, booleans, arrays, and record literals.
 - Field access, array operations, conditionals, loops, and assertions.
 - Module imports through `use mod.<name>`.
-- Host-defined tools through `use mod.tool` and `tool.call(name, input)`.
+- Host-defined tools through `use mod.tool`, `tool.call(name, input)`, and
+  `tool.start(name, input).await()`.
 
 Example:
 
@@ -33,12 +34,23 @@ summary
 
 The core runtime does not install `mod.fs`, `mod.run`, or `mod.net`. A script
 cannot acquire authority by importing a name. The host must create a runtime
-with a registered tool policy before `tool.call` can succeed.
+with a registered tool policy before `tool.call` or `tool.start` can succeed.
 
-The v0.1 tool contract accepts string input and returns string output. It is
-synchronous by design. Structured values, cancellable promises, and streaming
-dataflow are planned as additive, versioned host APIs rather than implicit VM
-effects.
+The v0.1 tool contract accepts string input and returns string output.
+`tool.call` is synchronous. `tool.start` reserves the same capability and
+returns an opaque promise; `await()` pauses the current script until the
+trusted host calls `CapabilityRuntime::pump`. One default pump tick runs at
+most one tool; `pump_up_to` is available for an explicitly bounded batch. The
+default pending-promise cap is 64 and may be lowered by an embedded host.
+
+The promise API is cooperative. It does not grant a script a thread, a task
+runtime, or a way to invoke an adapter without the host's pump. Structured
+values, cancellation, external completion, and streaming dataflow are planned
+as additive, versioned host APIs rather than implicit VM effects.
+
+A runtime evaluates one script at a time. A host must resume a paused script
+before evaluating new source on that runtime; independent workflows should use
+separate runtime instances.
 
 ## LLM generation rules
 
@@ -48,3 +60,5 @@ effects.
 - Treat a denied tool call as a runtime error. Do not retry by attempting
   filesystem, process, or network imports.
 - Keep effectful work in named tools and pure transformations in Splash code.
+- Await a deferred tool result before using it; do not assume `start` performs
+  an effect until the host has pumped the runtime.

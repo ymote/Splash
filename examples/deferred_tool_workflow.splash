@@ -1,0 +1,6 @@
+use mod.tool
+use mod.std.assert
+
+let task = "prepare release notes"
+let result = tool.start("text.echo", task).await()
+assert(result == task)

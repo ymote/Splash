@@ -70,6 +70,10 @@ pub enum WorkflowEvent {
         plan_id: u64,
         step_id: String,
     },
+    StepSuspended {
+        plan_id: u64,
+        step_id: String,
+    },
     StepFailed {
         plan_id: u64,
         step_id: String,
@@ -87,6 +91,9 @@ pub enum WorkflowError {
     DuplicateStepId(String),
     ApprovalMismatch,
     Runtime(String),
+    StepSuspended {
+        step_id: String,
+    },
     StepFailed {
         step_id: String,
         diagnostics: Vec<String>,
@@ -103,6 +110,12 @@ impl Display for WorkflowError {
                 formatter.write_str("approval is not valid for this workflow")
             }
             Self::Runtime(message) => write!(formatter, "runtime error: {message}"),
+            Self::StepSuspended { step_id } => {
+                write!(
+                    formatter,
+                    "workflow step suspended without runnable tool work: {step_id}"
+                )
+            }
             Self::StepFailed { step_id, .. } => {
                 write!(formatter, "workflow step failed: {step_id}")
             }
@@ -191,7 +204,20 @@ impl WorkflowEngine {
         self.events
             .push(WorkflowEvent::Started { plan_id: plan.id });
         for step in &plan.steps {
-            let report = self.runtime.eval(&step.source)?;
+            let mut report = self.runtime.eval(&step.source)?;
+            while report.succeeded() && report.suspended {
+                let pumped = self.runtime.pump()?;
+                let Some(resumed) = pumped.resumed.into_iter().last() else {
+                    self.events.push(WorkflowEvent::StepSuspended {
+                        plan_id: plan.id,
+                        step_id: step.id.clone(),
+                    });
+                    return Err(WorkflowError::StepSuspended {
+                        step_id: step.id.clone(),
+                    });
+                };
+                report = resumed;
+            }
             if !report.succeeded() {
                 self.events.push(WorkflowEvent::StepFailed {
                     plan_id: plan.id,
@@ -332,6 +358,36 @@ mod tests {
         assert!(matches!(
             engine.events().last(),
             Some(WorkflowEvent::StepFailed { step_id, .. }) if step_id == "deny"
+        ));
+    }
+
+    #[test]
+    fn approved_plan_drives_a_deferred_capability_to_completion() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let mut engine = WorkflowEngine::new(runtime);
+        let plan = engine
+            .plan(vec![WorkflowStep::new(
+                "deferred-echo",
+                "use mod.tool\nuse mod.std.assert\nlet output = tool.start(\"text.echo\", \"release notes\").await()\nassert(output == \"release notes\")",
+            )])
+            .unwrap();
+        let approval = engine.approve(&plan);
+
+        engine.execute(&plan, approval).unwrap();
+
+        assert_eq!(engine.runtime().audit().len(), 1);
+        assert_eq!(
+            engine.runtime().audit()[0].outcome,
+            splash_capabilities::AuditOutcome::Allowed
+        );
+        assert!(matches!(
+            engine.events().last(),
+            Some(WorkflowEvent::Completed { plan_id }) if *plan_id == plan.id()
         ));
     }
 }

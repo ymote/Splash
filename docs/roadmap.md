@@ -5,12 +5,14 @@
 - Standalone VM workspace with upstream provenance.
 - Bounded evaluation and structured diagnostics.
 - Deny-by-default, audited string-tool bridge.
+- Bounded, host-pumped deferred tool promises.
 - Host-owned plan, approval, and sequential workflow execution.
 
-## Next: structured and asynchronous tools
+## Next: structured and externally asynchronous tools
 
 - Typed input/output schemas and JSON-compatible values.
-- Cancellable promise handles and bounded concurrent work.
+- Cancellable promise handles, external completion, and bounded concurrent
+  work.
 - Per-tool deadlines, retry classification, and idempotency keys.
 - Streaming output with byte limits and redaction hooks.
 

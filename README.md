@@ -11,6 +11,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
 - Audited tool calls with input/output and call-count limits.
+- Bounded, host-pumped deferred tool promises for cooperative mobile and
+  embedded event loops.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
@@ -30,14 +32,36 @@ summary
 The host, not the script, decides whether `text.echo` exists and what it can
 access.
 
+For work that should yield back to the host event loop, use an explicit
+promise. The host runs at most one granted tool when it calls `pump()` (or a
+bounded batch with `pump_up_to`).
+
+```splash
+use mod.tool
+
+let summary = tool.start("text.echo", "plan the release").await()
+summary
+```
+
+Rust applications integrate their existing crate ecosystem by registering a
+narrow, policy-bound adapter for each effect. Splash does not import crates or
+ambient OS APIs directly.
+
 ```sh
 cargo run -p splash-cli -- eval --allow-echo 'use mod.tool tool.call("text.echo", "hello")'
+```
+
+The deferred example is runnable with:
+
+```sh
+cargo run -p splash-cli -- run --allow-echo examples/deferred_tool_workflow.splash
 ```
 
 ## Workspace
 
 - `splash-core`: bounded VM wrapper and diagnostics.
-- `splash-capabilities`: explicit tool policy, audit log, and safe host bridge.
+- `splash-capabilities`: explicit tool policy, audit log, deferred promises,
+  and safe host bridge.
 - `splash-workflow`: host-owned planning, approval, and sequential execution.
 - `splash-cli`: local development CLI.
 - `vendor/makepad`: provenance-preserving compatibility import.

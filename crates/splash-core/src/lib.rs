@@ -75,6 +75,8 @@ impl ExecutionLimits {
 pub enum RuntimeError {
     SourceTooLarge { actual: usize, maximum: usize },
     InvalidLimits(&'static str),
+    EvaluationInProgress,
+    UnknownThread { thread_index: usize },
 }
 
 impl Display for RuntimeError {
@@ -87,6 +89,12 @@ impl Display for RuntimeError {
                 )
             }
             Self::InvalidLimits(message) => formatter.write_str(message),
+            Self::EvaluationInProgress => {
+                formatter.write_str("a suspended Splash evaluation must be resumed first")
+            }
+            Self::UnknownThread { thread_index } => {
+                write!(formatter, "unknown suspended script thread: {thread_index}")
+            }
         }
     }
 }
@@ -99,11 +107,16 @@ impl std::error::Error for RuntimeError {}
 pub struct Evaluation {
     pub value: vm::ScriptValue,
     pub diagnostics: Vec<String>,
+    pub suspended: bool,
 }
 
 impl Evaluation {
     pub fn succeeded(&self) -> bool {
         !self.value.is_err()
+    }
+
+    pub fn completed(&self) -> bool {
+        self.succeeded() && !self.suspended
     }
 }
 
@@ -165,15 +178,15 @@ impl<H: Any, S: Any> Runtime<H, S> {
         }
 
         let limits = self.limits;
-        Ok(self.with_vm(|vm| {
-            vm.bx.captured_errors = Some(Vec::new());
-            vm.bx.run_budget = Some(vm::ScriptRunBudget::from_durations(
-                limits.soft_timeout,
-                limits.hard_timeout,
-                limits.budget_sample_interval,
-            ));
-
-            let value = vm.with_instruction_limit(limits.instruction_limit, |vm| {
+        self.with_vm(|vm| {
+            if has_paused_thread(vm) {
+                return Err(RuntimeError::EvaluationInProgress);
+            }
+            // Keep the public runtime single-flight. The underlying VM can
+            // manage several threads, but evaluating new source into a paused
+            // frame would make its module/body lifecycle ambiguous.
+            vm.bx.threads.set_current_to_first_unpaused_thread();
+            Ok(evaluate_with_limits(vm, limits, |vm| {
                 vm.eval(vm::ScriptMod {
                     file: "inline.splash".to_owned(),
                     // The Makepad streaming hosts append this marker before
@@ -182,12 +195,25 @@ impl<H: Any, S: Any> Runtime<H, S> {
                     code: format!("{source}\n;"),
                     ..Default::default()
                 })
-            });
-            let diagnostics = vm.take_errors();
-            vm.bx.run_budget = None;
+            }))
+        })
+    }
 
-            Evaluation { value, diagnostics }
-        }))
+    /// Resume a thread previously suspended by a trusted host binding.
+    ///
+    /// The thread identifier is only expected to originate from the VM. The
+    /// bounds check prevents an invalid host-provided identifier from reaching
+    /// the VM's internal current-thread pointer.
+    pub fn resume(&mut self, thread_id: vm::ScriptThreadId) -> Result<Evaluation, RuntimeError> {
+        let limits = self.limits;
+        self.with_vm(|vm| {
+            let thread_index = thread_id.to_index();
+            if thread_index >= vm.bx.threads.len() {
+                return Err(RuntimeError::UnknownThread { thread_index });
+            }
+            vm.bx.threads.set_current_thread_id(thread_id);
+            Ok(evaluate_with_limits(vm, limits, |vm| vm.resume()))
+        })
     }
 
     fn with_vm<R>(&mut self, operation: impl FnOnce(&mut vm::ScriptVm) -> R) -> R {
@@ -201,6 +227,39 @@ impl<H: Any, S: Any> Runtime<H, S> {
         self.vm = vm.bx;
         result
     }
+}
+
+fn evaluate_with_limits(
+    vm: &mut vm::ScriptVm,
+    limits: ExecutionLimits,
+    operation: impl FnOnce(&mut vm::ScriptVm) -> vm::ScriptValue,
+) -> Evaluation {
+    vm.bx.captured_errors = Some(Vec::new());
+    vm.bx.run_budget = Some(vm::ScriptRunBudget::from_durations(
+        limits.soft_timeout,
+        limits.hard_timeout,
+        limits.budget_sample_interval,
+    ));
+
+    let value = vm.with_instruction_limit(limits.instruction_limit, operation);
+    let diagnostics = vm.take_errors();
+    let suspended = vm.bx.threads.cur_ref().is_paused();
+    vm.bx.run_budget = None;
+
+    Evaluation {
+        value,
+        diagnostics,
+        suspended,
+    }
+}
+
+fn has_paused_thread(vm: &vm::ScriptVm) -> bool {
+    (0..vm.bx.threads.len()).any(|index| {
+        vm.bx
+            .threads
+            .get(index)
+            .is_some_and(vm::ScriptThread::is_paused)
+    })
 }
 
 impl Default for Runtime<(), ()> {

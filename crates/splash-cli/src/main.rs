@@ -27,7 +27,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    let report = runtime.eval(&source).map_err(|error| error.to_string())?;
+    let mut report = runtime.eval(&source).map_err(|error| error.to_string())?;
+    let mut stalled = false;
+    while report.succeeded() && report.suspended {
+        let pumped = runtime.pump().map_err(|error| error.to_string())?;
+        let Some(resumed) = pumped.resumed.into_iter().last() else {
+            stalled = true;
+            break;
+        };
+        report = resumed;
+    }
+
     for diagnostic in &report.diagnostics {
         eprintln!("diagnostic: {diagnostic}");
     }
@@ -38,7 +48,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         );
     }
 
-    if report.succeeded() {
+    if stalled {
+        Err("script suspended without runnable capability work".to_owned())
+    } else if report.succeeded() {
         Ok(())
     } else {
         Err("script evaluation failed".to_owned())
@@ -84,5 +96,15 @@ mod tests {
             .unwrap(),
             ("let value = 1".to_owned(), true)
         );
+    }
+
+    #[test]
+    fn runs_a_deferred_tool_when_the_capability_is_granted() {
+        run(vec![
+            "eval".to_owned(),
+            "use mod.tool\nuse mod.std.assert\nlet output = tool.start(\"text.echo\", \"hello\").await()\nassert(output == \"hello\")".to_owned(),
+            "--allow-echo".to_owned(),
+        ])
+        .unwrap();
     }
 }
