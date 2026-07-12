@@ -15,10 +15,11 @@
   bounded concurrent pending work.
 - Per-tool deferred deadlines with host-driven expiration.
 - Host-only bounded external retries with stable idempotency keys.
+- Bounded, redactor-hooked external output streaming outside Splash source.
 
 ## Next: richer external operations
 
-- Streaming output with byte limits and redaction hooks.
+- Durable stream checkpoints and resumable external operations.
 
 ## Next: contained local effects
 

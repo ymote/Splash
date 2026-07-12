@@ -56,6 +56,17 @@ persist their own workflow identity and authenticate every worker request.
 An adapter must not retry a non-idempotent effect unless its worker performs
 deduplication using that key or an equivalent durable identity.
 
+An external tool may opt into bounded host-visible output chunks. The runtime
+accepts chunks only for a claimed operation, applies source-byte, aggregate,
+and post-redaction limits, and returns only the redacted text to the host.
+Chunks are not installed as a Splash API or buffered as script-visible state.
+A redactor is trusted host Rust code, not generated script code; it must remain
+small and non-blocking, and it cannot substitute for a contained worker or
+output validation by the receiving UI, log, or LLM adapter. Stream limits span
+all retries of the same operation, so a retry cannot reset an output budget.
+The redactor is frozen once the tool reserves its first call, preventing a
+mid-operation configuration change from altering the release policy.
+
 Hosts can set a deferred deadline on each tool policy. Expiration is enforced
 before a queued host-pump handler begins and through
 CapabilityRuntime::expire_timed_out_tools for external work. It cannot stop a

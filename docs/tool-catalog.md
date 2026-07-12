@@ -16,6 +16,12 @@ When a deferred deadline is configured, max_deferred_millis is also present in
 the catalog. It is a host scheduling constraint, not an instruction for a
 script to add a timer or retry loop.
 
+When `stream` is present, it describes the host-only chunk limits for an
+external tool: maximum chunks, source bytes per chunk, aggregate source bytes,
+and aggregate bytes released after redaction. The setting does not make a
+stream readable from `mod.tool`; it tells a worker adapter how much bounded
+progress output it may send through the host lifecycle.
+
 ```rust
 use splash_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
 

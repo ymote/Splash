@@ -34,6 +34,10 @@ pub use splash_schema::{JsonSchema, SchemaError};
 pub const DEFAULT_MAX_PENDING_TOOLS: usize = 64;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 32 * 1024;
+pub const DEFAULT_MAX_STREAM_CHUNKS: usize = 64;
+pub const DEFAULT_MAX_STREAM_CHUNK_BYTES: usize = 8 * 1024;
+pub const DEFAULT_MAX_STREAM_TOTAL_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_STREAM_EMITTED_BYTES: usize = 64 * 1024;
 
 static NEXT_CAPABILITY_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -65,6 +69,69 @@ pub enum RetryClass {
     Transient,
     /// The downstream service requested backoff before another attempt.
     RateLimited,
+}
+
+/// Bounded host-visible output streaming for an external deferred operation.
+///
+/// Source bytes are supplied by the external worker. Emitted bytes are the
+/// redacted chunks returned to the trusted host by
+/// [`CapabilityRuntime::push_external_tool_chunk`]. Neither is exposed to
+/// Splash source before terminal completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ToolStreamPolicy {
+    /// Maximum accepted chunks across every attempt of one operation.
+    pub max_chunks: usize,
+    /// Maximum source bytes in any individual worker chunk.
+    pub max_chunk_bytes: usize,
+    /// Maximum aggregate source bytes accepted from the worker.
+    pub max_total_bytes: usize,
+    /// Maximum aggregate bytes released after redaction.
+    pub max_emitted_bytes: usize,
+}
+
+impl ToolStreamPolicy {
+    pub fn new(
+        max_chunks: usize,
+        max_chunk_bytes: usize,
+        max_total_bytes: usize,
+        max_emitted_bytes: usize,
+    ) -> Self {
+        Self {
+            max_chunks,
+            max_chunk_bytes,
+            max_total_bytes,
+            max_emitted_bytes,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ToolRegistrationError> {
+        if self.max_chunks == 0
+            || self.max_chunk_bytes == 0
+            || self.max_total_bytes == 0
+            || self.max_emitted_bytes == 0
+        {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "stream limits must be greater than zero",
+            ));
+        }
+        if self.max_chunk_bytes > self.max_total_bytes {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "max stream chunk bytes cannot exceed the total stream byte limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ToolStreamPolicy {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAX_STREAM_CHUNKS,
+            DEFAULT_MAX_STREAM_CHUNK_BYTES,
+            DEFAULT_MAX_STREAM_TOTAL_BYTES,
+            DEFAULT_MAX_STREAM_EMITTED_BYTES,
+        )
+    }
 }
 
 /// Trusted host metadata supplied to an LLM orchestrator or operator UI.
@@ -144,6 +211,8 @@ pub struct ToolDescriptor {
     pub max_output_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_deferred_millis: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<ToolStreamPolicy>,
     #[serde(flatten)]
     pub metadata: ToolMetadata,
 }
@@ -192,6 +261,8 @@ pub struct ToolPolicy {
     pub max_output_bytes: usize,
     /// Maximum lifetime of one deferred operation after tool.start reserves it.
     pub max_deferred_duration: Option<Duration>,
+    /// Optional host-visible streaming limits for an external deferred tool.
+    pub stream: Option<ToolStreamPolicy>,
     pub data_format: ToolDataFormat,
 }
 
@@ -204,6 +275,7 @@ impl ToolPolicy {
             max_input_bytes: 16 * 1024,
             max_output_bytes: 64 * 1024,
             max_deferred_duration: None,
+            stream: None,
             data_format: ToolDataFormat::Text,
         }
     }
@@ -213,6 +285,12 @@ impl ToolPolicy {
         let mut policy = Self::new(name);
         policy.data_format = ToolDataFormat::Json;
         policy
+    }
+
+    /// Enables bounded host-visible streaming for a deferred external tool.
+    pub fn with_stream(mut self, stream: ToolStreamPolicy) -> Self {
+        self.stream = Some(stream);
+        self
     }
 
     fn validate(&self) -> Result<(), ToolRegistrationError> {
@@ -239,6 +317,9 @@ impl ToolPolicy {
             return Err(ToolRegistrationError::InvalidPolicy(
                 "tool byte limits must be greater than zero",
             ));
+        }
+        if let Some(stream) = &self.stream {
+            stream.validate()?;
         }
         Ok(())
     }
@@ -295,9 +376,25 @@ pub struct ExternalToolInvocation {
     pub attempt: u32,
     pub max_attempts: u32,
     pub idempotency_key: String,
+    pub stream: Option<ToolStreamPolicy>,
     pub format: ToolDataFormat,
     pub max_output_bytes: usize,
     pub remaining_deadline_millis: Option<u64>,
+}
+
+/// A redacted text chunk emitted by a claimed external tool operation.
+///
+/// It is returned only to the trusted host that owns the runtime. Splash code
+/// cannot poll or subscribe to these chunks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalToolStreamChunk {
+    pub id: ExternalToolId,
+    pub name: String,
+    pub call_index: usize,
+    pub attempt: u32,
+    pub chunk_index: usize,
+    pub idempotency_key: String,
+    pub text: String,
 }
 
 /// Lifecycle errors returned when a host completes or cancels external work.
@@ -309,6 +406,9 @@ pub enum ExternalToolError {
     AlreadyCompleted(ExternalToolId),
     RetryLimitReached(ExternalToolId),
     DeadlineElapsed(ExternalToolId),
+    StreamingDisabled(ExternalToolId),
+    StreamLimitExceeded(ExternalToolId),
+    ToolUnavailable(ExternalToolId),
     Runtime(RuntimeError),
 }
 
@@ -331,12 +431,50 @@ impl Display for ExternalToolError {
             Self::DeadlineElapsed(_) => {
                 formatter.write_str("external tool operation deadline has elapsed")
             }
+            Self::StreamingDisabled(_) => {
+                formatter.write_str("external tool operation does not permit streaming")
+            }
+            Self::StreamLimitExceeded(_) => {
+                formatter.write_str("external tool operation exceeded a stream limit")
+            }
+            Self::ToolUnavailable(_) => {
+                formatter.write_str("registered tool for external operation is unavailable")
+            }
             Self::Runtime(error) => write!(formatter, "could not resume tool operation: {error}"),
         }
     }
 }
 
 impl std::error::Error for ExternalToolError {}
+
+/// Errors returned when a host configures an external streaming redactor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamConfigurationError {
+    UnknownTool(String),
+    NotExternal(String),
+    StreamingDisabled(String),
+    AlreadyReserved(String),
+}
+
+impl Display for StreamConfigurationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTool(name) => write!(formatter, "unknown tool: {name}"),
+            Self::NotExternal(name) => write!(formatter, "tool is not external: {name}"),
+            Self::StreamingDisabled(name) => {
+                write!(formatter, "tool does not permit streaming: {name}")
+            }
+            Self::AlreadyReserved(name) => {
+                write!(
+                    formatter,
+                    "stream redactor must be set before the tool is reserved: {name}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for StreamConfigurationError {}
 
 /// Transport owned by the trusted host for dispatching a validated worker call.
 ///
@@ -492,6 +630,8 @@ pub enum AuditOutcome {
     Cancelled,
     TimedOut,
     RetryScheduled,
+    Streamed,
+    StreamDenied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -507,6 +647,7 @@ pub struct AuditEvent {
 
 pub type ToolHandler = Box<dyn FnMut(&ToolRequest) -> Result<String, ToolError> + 'static>;
 type ToolValidator = Box<dyn Fn(&str) -> Result<(), ToolError> + 'static>;
+type StreamRedactor = Box<dyn FnMut(&str) -> String + 'static>;
 
 enum ToolImplementation {
     HostPump(ToolHandler),
@@ -520,6 +661,7 @@ struct RegisteredTool {
     calls: usize,
     input_validator: Option<ToolValidator>,
     output_validator: Option<ToolValidator>,
+    stream_redactor: Option<StreamRedactor>,
     implementation: ToolImplementation,
 }
 
@@ -549,6 +691,7 @@ struct ToolTicket {
     call_index: usize,
     max_output_bytes: usize,
     max_attempts: u32,
+    stream: Option<ToolStreamPolicy>,
     data_format: ToolDataFormat,
     dispatch: ToolDispatch,
     deadline: Option<DeferredDeadline>,
@@ -590,12 +733,20 @@ enum PendingToolState {
     Ready(Result<String, ToolError>),
 }
 
+#[derive(Debug, Default)]
+struct StreamAccounting {
+    chunks: usize,
+    source_bytes: usize,
+    emitted_bytes: usize,
+}
+
 #[derive(Debug)]
 struct PendingTool {
     id: ExternalToolId,
     ticket: ToolTicket,
     attempt: u32,
     idempotency_key: String,
+    streamed: StreamAccounting,
     state: PendingToolState,
     orphaned: bool,
 }
@@ -711,6 +862,34 @@ impl CapabilityHost {
         )
     }
 
+    /// Installs a trusted redactor for chunks emitted by an external tool.
+    ///
+    /// The hook receives worker text and returns the only text released back
+    /// to the host by the streaming API. It is never visible to Splash source.
+    pub fn set_external_stream_redactor<F>(
+        &mut self,
+        name: &str,
+        redactor: F,
+    ) -> Result<(), StreamConfigurationError>
+    where
+        F: FnMut(&str) -> String + 'static,
+    {
+        let Some(registered) = self.tools.get_mut(name) else {
+            return Err(StreamConfigurationError::UnknownTool(name.to_owned()));
+        };
+        if registered.dispatch != ToolDispatch::External {
+            return Err(StreamConfigurationError::NotExternal(name.to_owned()));
+        }
+        if registered.policy.stream.is_none() {
+            return Err(StreamConfigurationError::StreamingDisabled(name.to_owned()));
+        }
+        if registered.calls != 0 {
+            return Err(StreamConfigurationError::AlreadyReserved(name.to_owned()));
+        }
+        registered.stream_redactor = Some(Box::new(redactor));
+        Ok(())
+    }
+
     fn register_with_validators(
         &mut self,
         policy: ToolPolicy,
@@ -720,6 +899,11 @@ impl CapabilityHost {
         dispatch: ToolDispatch,
         implementation: ToolImplementation,
     ) -> Result<(), ToolRegistrationError> {
+        if dispatch != ToolDispatch::External && policy.stream.is_some() {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "stream policy requires an external tool",
+            ));
+        }
         policy.validate()?;
         metadata.validate_for(policy.data_format)?;
         if self.tools.contains_key(&policy.name) {
@@ -734,6 +918,7 @@ impl CapabilityHost {
                 calls: 0,
                 input_validator,
                 output_validator,
+                stream_redactor: None,
                 implementation,
             },
         );
@@ -903,6 +1088,7 @@ impl CapabilityHost {
                 max_input_bytes: registered.policy.max_input_bytes,
                 max_output_bytes: registered.policy.max_output_bytes,
                 max_deferred_millis: registered.policy.max_deferred_duration.map(duration_millis),
+                stream: registered.policy.stream.clone(),
                 metadata: registered.metadata.clone(),
             })
             .collect()
@@ -1022,6 +1208,7 @@ impl CapabilityHost {
             call_index: registered.calls,
             max_output_bytes: registered.policy.max_output_bytes,
             max_attempts: registered.policy.max_attempts,
+            stream: registered.policy.stream.clone(),
             data_format: registered.policy.data_format,
             dispatch: registered.dispatch,
             deadline,
@@ -1133,6 +1320,23 @@ impl CapabilityHost {
             output_bytes: 0,
             outcome: AuditOutcome::RetryScheduled,
             retry_class: Some(retry_class),
+        });
+    }
+
+    fn record_stream(
+        &mut self,
+        ticket: &ToolTicket,
+        source_bytes: usize,
+        emitted_bytes: usize,
+        outcome: AuditOutcome,
+    ) {
+        self.audit.push(AuditEvent {
+            sequence: ticket.sequence,
+            tool: ticket.name.clone(),
+            input_bytes: source_bytes,
+            output_bytes: emitted_bytes,
+            outcome,
+            retry_class: None,
         });
     }
 
@@ -1250,6 +1454,7 @@ impl CapabilityHost {
             attempt: entry.attempt,
             max_attempts: ticket.max_attempts,
             idempotency_key: entry.idempotency_key.clone(),
+            stream: ticket.stream.clone(),
             format: ticket.data_format,
             max_output_bytes: ticket.max_output_bytes,
             remaining_deadline_millis: ticket.remaining_deadline_millis(now),
@@ -1324,6 +1529,137 @@ impl CapabilityHost {
         };
         self.record_retry(&ticket, retry_class);
         Ok(invocation)
+    }
+
+    fn push_external_stream_chunk(
+        &mut self,
+        id: ExternalToolId,
+        chunk: &str,
+    ) -> Result<ExternalToolStreamChunk, ExternalToolError> {
+        let now = Instant::now();
+        let source_bytes = chunk.len();
+        let prepared = {
+            let pending = self.pending.borrow();
+            let Some((_, entry)) = pending.iter().find(|(_, entry)| entry.id == id) else {
+                return Err(ExternalToolError::Unknown(id));
+            };
+            match &entry.state {
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    ..
+                } => {}
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                } => return Err(ExternalToolError::NotClaimed(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::HostPump,
+                    ..
+                } => return Err(ExternalToolError::NotExternal(id)),
+                PendingToolState::Ready(_) => return Err(ExternalToolError::AlreadyCompleted(id)),
+            }
+            if entry.ticket.expired_at(now) {
+                return Err(ExternalToolError::DeadlineElapsed(id));
+            }
+
+            let ticket = entry.ticket.clone();
+            match ticket.stream.clone() {
+                None => Err((ticket, ExternalToolError::StreamingDisabled(id))),
+                Some(stream)
+                    if entry.streamed.chunks >= stream.max_chunks
+                        || source_bytes > stream.max_chunk_bytes
+                        || source_bytes
+                            > stream
+                                .max_total_bytes
+                                .saturating_sub(entry.streamed.source_bytes) =>
+                {
+                    Err((ticket, ExternalToolError::StreamLimitExceeded(id)))
+                }
+                Some(stream) => Ok((
+                    ticket,
+                    entry.attempt,
+                    entry.idempotency_key.clone(),
+                    stream,
+                    entry.streamed.emitted_bytes,
+                )),
+            }
+        };
+
+        let (ticket, attempt, idempotency_key, stream, emitted_so_far) = match prepared {
+            Ok(prepared) => prepared,
+            Err((ticket, error)) => return self.reject_stream(ticket, source_bytes, error),
+        };
+        let text = match self.tools.get_mut(&ticket.name) {
+            Some(registered) => match registered.stream_redactor.as_mut() {
+                Some(redactor) => redactor(chunk),
+                None => chunk.to_owned(),
+            },
+            None => {
+                return self.reject_stream(
+                    ticket,
+                    source_bytes,
+                    ExternalToolError::ToolUnavailable(id),
+                );
+            }
+        };
+        let emitted_bytes = text.len();
+        if emitted_bytes > stream.max_emitted_bytes.saturating_sub(emitted_so_far) {
+            return self.reject_stream(
+                ticket,
+                source_bytes,
+                ExternalToolError::StreamLimitExceeded(id),
+            );
+        }
+
+        let chunk_index = {
+            let mut pending = self.pending.borrow_mut();
+            let Some((_, entry)) = pending.iter_mut().find(|(_, entry)| entry.id == id) else {
+                return Err(ExternalToolError::Unknown(id));
+            };
+            match &entry.state {
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    ..
+                } => {}
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                } => return Err(ExternalToolError::NotClaimed(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::HostPump,
+                    ..
+                } => return Err(ExternalToolError::NotExternal(id)),
+                PendingToolState::Ready(_) => return Err(ExternalToolError::AlreadyCompleted(id)),
+            }
+            if entry.ticket.expired_at(Instant::now()) {
+                return Err(ExternalToolError::DeadlineElapsed(id));
+            }
+            entry.streamed.chunks = entry.streamed.chunks.saturating_add(1);
+            entry.streamed.source_bytes = entry.streamed.source_bytes.saturating_add(source_bytes);
+            entry.streamed.emitted_bytes =
+                entry.streamed.emitted_bytes.saturating_add(emitted_bytes);
+            entry.streamed.chunks
+        };
+        self.record_stream(&ticket, source_bytes, emitted_bytes, AuditOutcome::Streamed);
+        Ok(ExternalToolStreamChunk {
+            id,
+            name: ticket.name,
+            call_index: ticket.call_index,
+            attempt,
+            chunk_index,
+            idempotency_key,
+            text,
+        })
+    }
+
+    fn reject_stream<T>(
+        &mut self,
+        ticket: ToolTicket,
+        source_bytes: usize,
+        error: ExternalToolError,
+    ) -> Result<T, ExternalToolError> {
+        self.record_stream(&ticket, source_bytes, 0, AuditOutcome::StreamDenied);
+        Err(error)
     }
 
     fn complete_external(
@@ -1500,6 +1836,20 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_external_with_metadata(policy, metadata)
+    }
+
+    /// Installs a trusted redactor for one streaming external capability.
+    pub fn set_external_stream_redactor<F>(
+        &mut self,
+        name: &str,
+        redactor: F,
+    ) -> Result<(), StreamConfigurationError>
+    where
+        F: FnMut(&str) -> String + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .set_external_stream_redactor(name, redactor)
     }
 
     /// Registers a JSON envelope capability backed by trusted Rust code.
@@ -1690,6 +2040,21 @@ impl CapabilityRuntime {
         retry_class: RetryClass,
     ) -> Result<ExternalToolInvocation, ExternalToolError> {
         self.runtime.host_mut().retry_external(id, retry_class)
+    }
+
+    /// Validates, redacts, and returns one host-visible external output chunk.
+    ///
+    /// The operation must be claimed and registered with a stream policy. The
+    /// returned chunk is not delivered to Splash source; call
+    /// [`Self::complete_external_tool`] to resolve the script promise.
+    pub fn push_external_tool_chunk(
+        &mut self,
+        id: ExternalToolId,
+        chunk: &str,
+    ) -> Result<ExternalToolStreamChunk, ExternalToolError> {
+        self.runtime
+            .host_mut()
+            .push_external_stream_chunk(id, chunk)
     }
 
     /// Delivers a host-produced result for a previously claimed external tool.
@@ -2029,6 +2394,7 @@ fn new_tool_promise(
             ticket,
             attempt: 1,
             idempotency_key,
+            streamed: StreamAccounting::default(),
             state: PendingToolState::Pending {
                 dispatch,
                 waiting_thread: None,
@@ -2210,6 +2576,210 @@ mod tests {
         assert_eq!(runtime.audit().len(), 2);
         assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
         assert_eq!(runtime.audit()[1].retry_class, None);
+    }
+
+    #[test]
+    fn external_streams_are_redacted_bounded_and_audited() {
+        let stream = ToolStreamPolicy::new(3, 8, 12, 12);
+        let policy = ToolPolicy::new("text.remote").with_stream(stream.clone());
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+        runtime
+            .set_external_stream_redactor("text.remote", |chunk| {
+                chunk.replace("secret", "[redacted]")
+            })
+            .unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet output = tool.start(\"text.remote\", \"hello\").await()\nassert(output == \"done\")",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+        assert_eq!(
+            runtime
+                .set_external_stream_redactor("text.remote", |chunk| chunk.to_owned())
+                .unwrap_err(),
+            StreamConfigurationError::AlreadyReserved("text.remote".to_owned())
+        );
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        assert_eq!(runtime.tool_catalog()[0].stream, Some(stream.clone()));
+        assert_eq!(invocation.stream, Some(stream));
+
+        let first = runtime
+            .push_external_tool_chunk(invocation.id, "secret")
+            .unwrap();
+        assert_eq!(first.text, "[redacted]");
+        assert_eq!(first.chunk_index, 1);
+        assert_eq!(first.idempotency_key, invocation.idempotency_key);
+
+        let second = runtime
+            .push_external_tool_chunk(invocation.id, "ok")
+            .unwrap();
+        assert_eq!(second.text, "ok");
+        assert_eq!(second.chunk_index, 2);
+        assert_eq!(
+            runtime
+                .push_external_tool_chunk(invocation.id, "x")
+                .unwrap_err(),
+            ExternalToolError::StreamLimitExceeded(invocation.id)
+        );
+        assert_eq!(
+            runtime
+                .push_external_tool_chunk(invocation.id, "1234567")
+                .unwrap_err(),
+            ExternalToolError::StreamLimitExceeded(invocation.id)
+        );
+        assert_eq!(
+            runtime
+                .audit()
+                .iter()
+                .map(|event| event.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                AuditOutcome::Streamed,
+                AuditOutcome::Streamed,
+                AuditOutcome::StreamDenied,
+                AuditOutcome::StreamDenied,
+            ]
+        );
+        assert_eq!(runtime.audit()[0].input_bytes, 6);
+        assert_eq!(runtime.audit()[0].output_bytes, 10);
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("done".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit()[4].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn external_stream_limits_span_retry_attempts() {
+        let stream = ToolStreamPolicy::new(1, 8, 8, 8);
+        let mut policy = ToolPolicy::new("text.remote").with_stream(stream);
+        policy.max_attempts = 2;
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"hello\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let first = runtime.claim_next_external_tool().unwrap();
+        runtime.push_external_tool_chunk(first.id, "one").unwrap();
+
+        let retry = runtime
+            .retry_external_tool(first.id, RetryClass::Transient)
+            .unwrap();
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(
+            runtime
+                .push_external_tool_chunk(retry.id, "two")
+                .unwrap_err(),
+            ExternalToolError::StreamLimitExceeded(retry.id)
+        );
+        assert_eq!(
+            runtime
+                .audit()
+                .iter()
+                .map(|event| event.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                AuditOutcome::Streamed,
+                AuditOutcome::RetryScheduled,
+                AuditOutcome::StreamDenied,
+            ]
+        );
+
+        let resumed = runtime
+            .complete_external_tool(retry.id, Ok("done".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(resumed.succeeded(), "{:?}", resumed.diagnostics);
+        assert_eq!(runtime.audit()[3].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn external_streaming_requires_an_explicit_policy() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .set_external_stream_redactor("text.remote", |chunk| chunk.to_owned())
+                .unwrap_err(),
+            StreamConfigurationError::StreamingDisabled("text.remote".to_owned())
+        );
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"hello\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        assert_eq!(
+            runtime
+                .push_external_tool_chunk(invocation.id, "not allowed")
+                .unwrap_err(),
+            ExternalToolError::StreamingDisabled(invocation.id)
+        );
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::StreamDenied);
+    }
+
+    #[test]
+    fn expired_external_tools_cannot_release_stream_chunks() {
+        let mut policy = ToolPolicy::new("text.remote").with_stream(ToolStreamPolicy::default());
+        policy.max_deferred_duration = Some(Duration::ZERO);
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"hello\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        assert_eq!(
+            runtime
+                .push_external_tool_chunk(invocation.id, "late output")
+                .unwrap_err(),
+            ExternalToolError::DeadlineElapsed(invocation.id)
+        );
+        assert!(runtime.audit().is_empty());
+
+        let report = runtime.expire_timed_out_tools().unwrap();
+        assert_eq!(report.expired, 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::TimedOut);
+    }
+
+    #[test]
+    fn stream_policy_is_rejected_for_local_tools_and_invalid_limits() {
+        let stream = ToolStreamPolicy::default();
+        let mut runtime = CapabilityRuntime::default();
+        let local_error = runtime
+            .register_tool(
+                ToolPolicy::new("text.echo").with_stream(stream),
+                |request| Ok(request.input.clone()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            local_error,
+            ToolRegistrationError::InvalidPolicy("stream policy requires an external tool")
+        );
+
+        let invalid_stream = ToolStreamPolicy {
+            max_chunks: 0,
+            ..ToolStreamPolicy::default()
+        };
+        let external_error = runtime
+            .register_external_tool(ToolPolicy::new("text.remote").with_stream(invalid_stream))
+            .unwrap_err();
+        assert_eq!(
+            external_error,
+            ToolRegistrationError::InvalidPolicy("stream limits must be greater than zero")
+        );
     }
 
     #[test]
@@ -2424,12 +2994,14 @@ mod tests {
                     call_index: 1,
                     max_output_bytes: 64,
                     max_attempts: 1,
+                    stream: None,
                     data_format: ToolDataFormat::Text,
                     dispatch: ToolDispatch::External,
                     deadline: None,
                 },
                 attempt: 1,
                 idempotency_key: "splash-test-0".to_owned(),
+                streamed: StreamAccounting::default(),
                 state: PendingToolState::Pending {
                     dispatch: PendingDispatch::ExternalClaimed,
                     waiting_thread: None,

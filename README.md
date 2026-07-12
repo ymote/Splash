@@ -20,6 +20,8 @@ and keeps UI support optional rather than making UI the language boundary.
   outcomes.
 - Host-only bounded retries for external tools, with stable non-authorizing
   idempotency keys for each deferred operation.
+- Bounded, optionally redacted external output chunks released only to the
+  trusted host, never directly to Splash source.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

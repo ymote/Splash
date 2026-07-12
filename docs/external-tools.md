@@ -14,8 +14,8 @@ must create a promise with tool.start or tool.start_json and await it.
    reserves the call budget, and retains one pending-promise slot.
 2. The host calls claim_next_external_tool. This returns a host-owned opaque
    ID, the validated input, format, call index, attempt limit, stable
-   idempotency key, output byte limit, and any remaining deadline in
-   milliseconds.
+   idempotency key, terminal-output byte limit, optional stream policy, and
+   any remaining deadline in milliseconds.
 3. The host dispatches that invocation to its own worker or platform adapter.
 4. The host calls complete_external_tool with the result, or
    cancel_external_tool when it decides the work must stop.
@@ -99,6 +99,59 @@ Durable workflows should use a persisted workflow or operation identity in
 addition to this per-runtime key. Do not retry a non-idempotent worker unless
 the worker deduplicates requests using that key or another durable operation
 identity.
+
+## Host-visible output streaming
+
+Streaming is opt-in and only applies to external deferred tools. Configure a
+`ToolStreamPolicy` before registration, then optionally install one trusted
+redactor for the tool. The redactor receives raw worker text and returns the
+only text released to the caller of `push_external_tool_chunk`.
+`set_external_stream_redactor` must run before the tool's first `tool.start`;
+the runtime rejects later changes so an operation cannot change redaction
+behavior mid-lifecycle.
+
+~~~rust
+use splash_capabilities::{ToolPolicy, ToolStreamPolicy};
+
+let policy = ToolPolicy::new("text.remote").with_stream(
+    ToolStreamPolicy::new(
+        32,       // chunks per operation
+        4 * 1024, // source bytes per chunk
+        64 * 1024, // aggregate source bytes
+        64 * 1024, // aggregate bytes after redaction
+    ),
+);
+runtime.register_external_tool(policy)?;
+runtime.set_external_stream_redactor("text.remote", |chunk| {
+    chunk.replace("internal-token", "[redacted]")
+})?;
+
+let invocation = runtime.claim_next_external_tool().expect("pending worker call");
+let chunk = runtime.push_external_tool_chunk(invocation.id, "worker progress")?;
+let _host_visible_text = chunk.text;
+~~~
+
+`ToolStreamPolicy` bounds the number of chunks, source bytes per chunk,
+aggregate source bytes, and aggregate bytes after redaction. The runtime does
+not retain chunk payloads: it returns a typed `ExternalToolStreamChunk` to the
+host and records only byte counts and `streamed` or `stream_denied` audit
+outcomes. A chunk must arrive after claim and before completion, cancellation,
+or expiry. Stream counters span all retries of the operation; attempts cannot
+reset them. `StreamLimitExceeded` is a backpressure signal: the worker adapter
+must stop forwarding chunks or apply its own bounded pause/cancellation policy,
+not retry the rejected chunk indefinitely.
+
+Chunks are separate from the terminal result passed to `complete_external_tool`:
+the terminal result still obeys the regular output-size, JSON-envelope, and
+optional executable-schema checks. A JSON tool may therefore stream text
+progress while its final result must remain a valid JSON envelope matching its
+contract. Splash source cannot read, await, or subscribe to chunks; it sees
+only the terminal promise result.
+
+The redactor is trusted, synchronous Rust code. Keep it deterministic and
+bounded for mobile or embedded event loops. It is not a worker sandbox, and a
+receiving UI, log sink, or LLM adapter must still treat even redacted worker
+output as untrusted data.
 
 ## Deadlines
 

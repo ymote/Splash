@@ -81,6 +81,12 @@ no retry primitive: a host may make a bounded retry of an already claimed
 operation, preserving its idempotency key, but that does not create another
 script-visible call or grant new authority.
 
+An external tool may also emit bounded progress chunks to the host after it is
+claimed. Those chunks are optionally redacted by trusted Rust code and never
+become a Splash value or a script-level stream; `await()` still resolves only
+the terminal result. See [External tools](external-tools.md) for the host
+streaming contract.
+
 A runtime evaluates one script at a time. A host must resume a paused script
 before evaluating new source on that runtime; independent workflows should use
 separate runtime instances.
@@ -94,6 +100,8 @@ separate runtime instances.
   filesystem, process, or network imports.
 - Do not generate retry loops for external tools; the host applies its bounded
   retry policy and reports the final result through the existing promise.
+- Do not assume external progress output is readable from Splash source; use
+  the terminal promise result supplied by the host.
 - Keep effectful work in named tools and pure transformations in Splash code.
 - Generate against the host-supplied tool catalog only; descriptions and
   schemas do not grant access to unlisted tools.
