@@ -76,11 +76,17 @@ The JSON dataflow example is runnable with:
 cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.splash
 ```
 
+Inspect the exact demo-tool catalog supplied to an LLM host with:
+
+```sh
+cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
+```
+
 ## Workspace
 
 - `splash-core`: bounded VM wrapper and diagnostics.
 - `splash-capabilities`: explicit tool policy, audit log, deferred promises,
-  and safe host bridge.
+  LLM-facing host catalog, and safe host bridge.
 - `splash-protocol`: portable worker messages, capability attenuation, and
   host-side invocation/result validation.
 - `splash-workflow`: host-owned planning, approval, and sequential execution.
@@ -89,4 +95,5 @@ cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.spla
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)
 for the import boundary. The [worker protocol](docs/worker-protocol.md)
-defines the handoff to future contained adapters.
+defines the handoff to future contained adapters. The [host tool catalog](docs/tool-catalog.md)
+defines safe discovery for an LLM orchestrator.

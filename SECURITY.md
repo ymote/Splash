@@ -49,3 +49,7 @@ This baseline does not yet provide filesystem adapters, network adapters,
 secret storage, worker-process isolation, signed packages, JSON-schema
 validation, or mobile policy backends. Those features must not be inferred
 from the presence of the VM.
+
+Tool descriptions and schema hints are available only through the host-side
+catalog. They are prompt metadata, not script-visible authority or executable
+schema enforcement.

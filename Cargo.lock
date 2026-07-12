@@ -162,6 +162,7 @@ name = "splash-capabilities"
 version = "0.1.0"
 dependencies = [
  "makepad-script",
+ "serde",
  "serde_json",
  "splash-core",
  "splash-protocol",

@@ -15,6 +15,7 @@ use makepad_script::{
     LiveId, ScriptHandle, ScriptHandleGc, ScriptHandleType, ScriptIp, ScriptThreadId, ScriptValue,
     NIL,
 };
+use serde::Serialize;
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 pub use splash_protocol::{
@@ -28,14 +29,94 @@ use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 /// Hosts that need a lower bound for a constrained device can choose one with
 /// [`CapabilityRuntime::with_limits_and_pending`].
 pub const DEFAULT_MAX_PENDING_TOOLS: usize = 64;
+pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
+pub const MAX_TOOL_SCHEMA_BYTES: usize = 32 * 1024;
 
 /// Serialization contract for a capability's input and output envelopes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolDataFormat {
     /// UTF-8 text passed directly to the registered handler.
     Text,
     /// A JSON object or array validated at the capability boundary.
     Json,
+}
+
+/// Trusted host metadata supplied to an LLM orchestrator or operator UI.
+///
+/// Metadata is never installed as a script module and conveys no authority.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct ToolMetadata {
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<JsonValue>,
+}
+
+impl ToolMetadata {
+    pub fn new(description: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_input_schema(mut self, schema: JsonValue) -> Self {
+        self.input_schema = Some(schema);
+        self
+    }
+
+    pub fn with_output_schema(mut self, schema: JsonValue) -> Self {
+        self.output_schema = Some(schema);
+        self
+    }
+
+    fn validate_for(&self, format: ToolDataFormat) -> Result<(), ToolRegistrationError> {
+        if self.description.len() > MAX_TOOL_DESCRIPTION_BYTES {
+            return Err(ToolRegistrationError::InvalidMetadata(
+                "tool description exceeds the byte limit",
+            ));
+        }
+        if format != ToolDataFormat::Json
+            && (self.input_schema.is_some() || self.output_schema.is_some())
+        {
+            return Err(ToolRegistrationError::InvalidMetadata(
+                "schemas require a JSON tool policy",
+            ));
+        }
+        for schema in [&self.input_schema, &self.output_schema]
+            .into_iter()
+            .flatten()
+        {
+            if !schema.is_object() {
+                return Err(ToolRegistrationError::InvalidMetadata(
+                    "tool schemas must be JSON objects",
+                ));
+            }
+            let byte_len = serde_json::to_vec(schema)
+                .map_err(|_| ToolRegistrationError::InvalidMetadata("tool schema is invalid"))?
+                .len();
+            if byte_len > MAX_TOOL_SCHEMA_BYTES {
+                return Err(ToolRegistrationError::InvalidMetadata(
+                    "tool schema exceeds the byte limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stable, serializable description of a currently granted capability.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub format: ToolDataFormat,
+    pub max_calls: usize,
+    pub max_input_bytes: usize,
+    pub max_output_bytes: usize,
+    #[serde(flatten)]
+    pub metadata: ToolMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,6 +306,7 @@ pub enum ToolRegistrationError {
     Duplicate(String),
     InvalidName(String),
     InvalidPolicy(&'static str),
+    InvalidMetadata(&'static str),
     IncompatibleWorkerGrant(String),
 }
 
@@ -234,6 +316,7 @@ impl Display for ToolRegistrationError {
             Self::Duplicate(name) => write!(formatter, "tool already registered: {name}"),
             Self::InvalidName(name) => write!(formatter, "invalid tool name: {name}"),
             Self::InvalidPolicy(message) => formatter.write_str(message),
+            Self::InvalidMetadata(message) => formatter.write_str(message),
             Self::IncompatibleWorkerGrant(name) => {
                 write!(formatter, "worker manifest cannot safely back tool: {name}")
             }
@@ -263,6 +346,7 @@ pub type ToolHandler = Box<dyn FnMut(&ToolRequest) -> Result<String, ToolError> 
 
 struct RegisteredTool {
     policy: ToolPolicy,
+    metadata: ToolMetadata,
     calls: usize,
     handler: ToolHandler,
 }
@@ -329,7 +413,20 @@ impl CapabilityHost {
     where
         F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
     {
+        self.register_with_metadata(policy, ToolMetadata::default(), handler)
+    }
+
+    pub fn register_with_metadata<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
+    {
         policy.validate()?;
+        metadata.validate_for(policy.data_format)?;
         if self.tools.contains_key(&policy.name) {
             return Err(ToolRegistrationError::Duplicate(policy.name));
         }
@@ -337,6 +434,7 @@ impl CapabilityHost {
             policy.name.clone(),
             RegisteredTool {
                 policy,
+                metadata,
                 calls: 0,
                 handler: Box::new(handler),
             },
@@ -347,6 +445,18 @@ impl CapabilityHost {
     pub fn register_json_tool<F>(
         &mut self,
         policy: ToolPolicy,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        self.register_json_tool_with_metadata(policy, ToolMetadata::default(), handler)
+    }
+
+    pub fn register_json_tool_with_metadata<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
         mut handler: F,
     ) -> Result<(), ToolRegistrationError>
     where
@@ -357,7 +467,7 @@ impl CapabilityHost {
                 "register_json_tool requires ToolPolicy::json",
             ));
         }
-        self.register(policy, move |request| {
+        self.register_with_metadata(policy, metadata, move |request| {
             let input = serde_json::from_str(&request.input).map_err(|error| {
                 ToolError::Failed(format!(
                     "{} JSON input failed host validation: {error}",
@@ -384,6 +494,26 @@ impl CapabilityHost {
 
     pub fn clear_audit(&mut self) {
         self.audit.clear();
+    }
+
+    pub fn tool_catalog(&self) -> Vec<ToolDescriptor> {
+        self.tools
+            .values()
+            .map(|registered| ToolDescriptor {
+                name: registered.policy.name.clone(),
+                format: registered.policy.data_format,
+                max_calls: registered.policy.max_calls,
+                max_input_bytes: registered.policy.max_input_bytes,
+                max_output_bytes: registered.policy.max_output_bytes,
+                metadata: registered.metadata.clone(),
+            })
+            .collect()
+    }
+
+    pub fn tool_catalog_json(&self) -> Result<String, ToolError> {
+        serde_json::to_string(&self.tool_catalog()).map_err(|error| {
+            ToolError::Failed(format!("tool catalog serialization failed: {error}"))
+        })
     }
 
     fn call(&mut self, name: &str, input: &str) -> Result<String, ToolError> {
@@ -654,6 +784,20 @@ impl CapabilityRuntime {
         self.runtime.host_mut().register(policy, handler)
     }
 
+    pub fn register_tool_with_metadata<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&ToolRequest) -> Result<String, ToolError> + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_with_metadata(policy, metadata, handler)
+    }
+
     /// Registers a JSON envelope capability backed by trusted Rust code.
     ///
     /// The policy must come from [`ToolPolicy::json`]. Splash scripts use
@@ -670,6 +814,22 @@ impl CapabilityRuntime {
         self.runtime.host_mut().register_json_tool(policy, handler)
     }
 
+    /// Registers a documented JSON capability. Schemas are catalog metadata;
+    /// they do not replace host-side validation in an adapter.
+    pub fn register_json_tool_with_metadata<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_json_tool_with_metadata(policy, metadata, handler)
+    }
+
     /// Registers a JSON tool whose implementation runs behind a validated
     /// [`ProtocolWorkerClient`] transport.
     ///
@@ -683,12 +843,26 @@ impl CapabilityRuntime {
     where
         T: WorkerTransport + 'static,
     {
+        self.register_protocol_json_tool_with_metadata(policy, ToolMetadata::default(), client)
+    }
+
+    /// Registers a documented JSON tool whose implementation runs behind a
+    /// validated [`ProtocolWorkerClient`] transport.
+    pub fn register_protocol_json_tool_with_metadata<T>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        client: Rc<RefCell<ProtocolWorkerClient<T>>>,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        T: WorkerTransport + 'static,
+    {
         if !client.borrow().supports_json_policy(&policy) {
             return Err(ToolRegistrationError::IncompatibleWorkerGrant(
                 policy.name.clone(),
             ));
         }
-        self.register_json_tool(policy, move |request| {
+        self.register_json_tool_with_metadata(policy, metadata, move |request| {
             client.borrow_mut().dispatch_json(request)
         })
     }
@@ -703,6 +877,16 @@ impl CapabilityRuntime {
 
     pub fn clear_audit(&mut self) {
         self.runtime.host_mut().clear_audit();
+    }
+
+    /// Returns host-facing capability descriptions in stable name order.
+    /// This catalog is not exposed to Splash source by default.
+    pub fn tool_catalog(&self) -> Vec<ToolDescriptor> {
+        self.runtime.host().tool_catalog()
+    }
+
+    pub fn tool_catalog_json(&self) -> Result<String, ToolError> {
+        self.runtime.host().tool_catalog_json()
     }
 
     pub fn pending_tools(&self) -> usize {
@@ -1036,6 +1220,69 @@ mod tests {
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn exposes_a_stable_host_side_tool_catalog() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool_with_metadata(
+                ToolPolicy::new("text.echo"),
+                ToolMetadata::new("Returns the supplied text unchanged."),
+                |request| Ok(request.input.clone()),
+            )
+            .unwrap();
+        runtime
+            .register_json_tool_with_metadata(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer fields.")
+                    .with_input_schema(serde_json::json!({"type": "object"}))
+                    .with_output_schema(serde_json::json!({"type": "object"})),
+                |_| Ok(serde_json::json!({"total": 42})),
+            )
+            .unwrap();
+
+        let catalog = runtime.tool_catalog();
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].name, "math.add");
+        assert_eq!(catalog[0].format, ToolDataFormat::Json);
+        assert_eq!(catalog[0].metadata.description, "Adds two integer fields.");
+        assert_eq!(catalog[1].name, "text.echo");
+        assert_eq!(catalog[1].format, ToolDataFormat::Text);
+        assert!(catalog[1].metadata.input_schema.is_none());
+        let encoded = serde_json::to_value(&catalog).unwrap();
+        assert!(encoded.is_array());
+        let catalog_json = runtime.tool_catalog_json().unwrap();
+        assert!(catalog_json.contains("math.add"));
+    }
+
+    #[test]
+    fn rejects_invalid_tool_metadata() {
+        let mut runtime = CapabilityRuntime::default();
+        let text_error = runtime
+            .register_tool_with_metadata(
+                ToolPolicy::new("text.echo"),
+                ToolMetadata::new("text").with_input_schema(serde_json::json!({})),
+                |request| Ok(request.input.clone()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            text_error,
+            ToolRegistrationError::InvalidMetadata("schemas require a JSON tool policy")
+        );
+
+        let schema_error = runtime
+            .register_json_tool_with_metadata(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("math").with_input_schema(serde_json::json!([])),
+                |_| Ok(serde_json::json!({})),
+            )
+            .unwrap_err();
+        assert_eq!(
+            schema_error,
+            ToolRegistrationError::InvalidMetadata("tool schemas must be JSON objects")
+        );
     }
 
     #[test]

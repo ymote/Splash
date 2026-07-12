@@ -69,6 +69,8 @@ separate runtime instances.
 - Treat a denied tool call as a runtime error. Do not retry by attempting
   filesystem, process, or network imports.
 - Keep effectful work in named tools and pure transformations in Splash code.
+- Generate against the host-supplied tool catalog only; descriptions and schema
+  hints do not grant access to unlisted tools.
 - Await a deferred tool result before using it; do not assume `start` performs
   an effect until the host has pumped the runtime.
 - Use record or array envelopes for JSON tools, then call `parse_json()` on

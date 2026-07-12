@@ -9,6 +9,7 @@
 - Host-owned plan, approval, and sequential workflow execution.
 - Portable worker protocol with capability attenuation and bounded wire
   messages.
+- Stable host-side tool catalog with bounded LLM metadata.
 
 ## Next: schema-validated and externally asynchronous tools
 
