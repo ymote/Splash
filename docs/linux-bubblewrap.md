@@ -40,6 +40,7 @@ policy.add_file_root(
         FileRootAccess::ReadOnly,
     )?,
 )?;
+policy.require_no_further_user_namespaces();
 policy.enable_private_tmpfs_with_maximum_bytes(64 * 1024 * 1024)?;
 
 let command = policy.compile(&attenuated_manifest)?;
@@ -81,6 +82,18 @@ that enable it must use a Bubblewrap version that
 supports `--size`; an unsupported option is a launch failure, never a fallback
 to an unbounded worker.
 
+`require_no_further_user_namespaces` is an opt-in hardening mode for Linux
+deployments that require it. It emits `--unshare-user --disable-userns` after
+`--unshare-all`: Bubblewrap's default `--unshare-all` requests a user namespace
+only on a best-effort basis, while `--disable-userns` requires a real user
+namespace and prevents the worker from creating further ones. The mode has no
+fallback. It will refuse to start the worker when Bubblewrap lacks
+`--disable-userns`, when Bubblewrap is installed setuid, or when the host does
+not permit the required user namespace. Bubblewrap may create a nested user
+namespace internally to establish this restriction, so the mode does not claim
+that the worker is never inside one. It is not a seccomp, resource-limit, or
+general containment policy.
+
 After the pipes move into the JSON-line transport, retain `lifecycle` and call
 `lifecycle.terminate()` after a host deadline, cancellation decision, or
 poisoned transport. It force-kills and reaps the host-side Bubblewrap child, returning
@@ -95,6 +108,9 @@ destination, or conflicts with `/proc`, `/dev`, or an enabled private `/tmp`.
 The resulting command uses:
 
 - `--unshare-all`, so it does not retain the host network namespace;
+- optional `--unshare-user --disable-userns` immediately after
+  `--unshare-all`, requiring a usable user namespace and preventing the worker
+  from creating further user namespaces;
 - `--clearenv`, so worker startup does not inherit host environment variables;
 - `--new-session` and `--die-with-parent` for terminal isolation and parent
   lifecycle binding;
@@ -166,6 +182,12 @@ It does not yet provide:
 - protection from a trusted host changing a policy source path between plan
   compilation and process start. Policy sources must be owned and immutable to
   untrusted actors, or a future descriptor-based launcher must be used.
+
+The default user-namespace policy retains Bubblewrap's best-effort
+`--unshare-all` behavior. Hosts requiring prevention of further user namespace
+creation must select `require_no_further_user_namespaces` and treat a failed
+worker or authenticated-session startup as a hard failure, never as a reason
+to run the worker outside Bubblewrap.
 
 Do not expose plan paths or launch errors to a script or LLM. A host must treat
 any launch, transport, authentication, or worker failure as a reason to discard

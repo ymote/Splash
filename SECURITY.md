@@ -114,7 +114,12 @@ not retain the host network namespace. It rejects `network_origin`,
 `executable`, and `secret` selectors because this backend cannot correctly
 enforce them. It also rejects overlapping or root mounts and requires the
 worker program to live in a read-only runtime mount, avoiding a writable grant
-as an executable source.
+as an executable source. Hosts that explicitly select
+`require_no_further_user_namespaces` also get Bubblewrap's mandatory
+`--unshare-user --disable-userns` sequence, which prevents the worker from
+creating further user namespaces. That mode has no compatibility fallback and
+will fail on unsupported, setuid, or user-namespace-restricted hosts; it does
+not mean Bubblewrap never created an internal nested namespace.
 
 `BubblewrapCommand::spawn_with_bootstrap` additionally checks that the private
 bootstrap session matches the compiled manifest before launch, then writes the

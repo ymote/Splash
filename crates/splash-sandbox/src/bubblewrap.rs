@@ -32,6 +32,23 @@ pub enum FileRootAccess {
     ReadWrite,
 }
 
+/// User-namespace hardening selected for a Bubblewrap worker.
+///
+/// [`Self::RequireNoFurtherUserNamespaces`] makes Bubblewrap require a new
+/// user namespace and then prevents the worker from creating more user
+/// namespaces. Bubblewrap may create a nested namespace internally while
+/// establishing that restriction, so this is not a claim that the worker is
+/// never inside a nested namespace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UserNamespacePolicy {
+    /// Retains Bubblewrap's `--unshare-all` best-effort user-namespace setup.
+    #[default]
+    BestEffort,
+    /// Requires Bubblewrap to prevent further user namespaces for the worker.
+    RequireNoFurtherUserNamespaces,
+}
+
 /// One trusted host path mounted read-only into a worker runtime.
 ///
 /// Runtime mounts provide the fixed worker executable and the libraries it
@@ -149,6 +166,7 @@ pub struct BubblewrapWorkerPolicy {
     runtime_mounts: Vec<ReadOnlyMount>,
     file_roots: BTreeMap<String, FileRootBinding>,
     private_tmpfs: PrivateTmpfs,
+    user_namespace_policy: UserNamespacePolicy,
 }
 
 impl BubblewrapWorkerPolicy {
@@ -172,6 +190,7 @@ impl BubblewrapWorkerPolicy {
             runtime_mounts: Vec::new(),
             file_roots: BTreeMap::new(),
             private_tmpfs: PrivateTmpfs::Disabled,
+            user_namespace_policy: UserNamespacePolicy::BestEffort,
         })
     }
 
@@ -246,6 +265,27 @@ impl BubblewrapWorkerPolicy {
         Ok(self)
     }
 
+    /// Returns the requested user-namespace hardening mode.
+    pub const fn user_namespace_policy(&self) -> UserNamespacePolicy {
+        self.user_namespace_policy
+    }
+
+    /// Requires a new user namespace and prevents the worker from creating
+    /// further user namespaces.
+    ///
+    /// The compiled command adds Bubblewrap's `--unshare-user` and
+    /// `--disable-userns` after `--unshare-all`. The explicit first option is
+    /// required because `--unshare-all` only requests user namespaces on a
+    /// best-effort basis. There is no compatibility fallback: a Bubblewrap
+    /// version without `--disable-userns`, a setuid Bubblewrap build, or a host
+    /// that disallows the required user namespace will fail to start the
+    /// worker. This mitigates further namespace manipulation only; it is not a
+    /// seccomp, resource-limit, or general containment policy.
+    pub fn require_no_further_user_namespaces(&mut self) -> &mut Self {
+        self.user_namespace_policy = UserNamespacePolicy::RequireNoFurtherUserNamespaces;
+        self
+    }
+
     /// Validates a manifest and creates an immutable Bubblewrap launch plan.
     ///
     /// `file_root` selectors map only through host-registered bindings. This
@@ -300,6 +340,12 @@ impl BubblewrapWorkerPolicy {
             OsString::from("--die-with-parent"),
             OsString::from("--new-session"),
             OsString::from("--unshare-all"),
+        ];
+        if self.user_namespace_policy == UserNamespacePolicy::RequireNoFurtherUserNamespaces {
+            arguments.push(OsString::from("--unshare-user"));
+            arguments.push(OsString::from("--disable-userns"));
+        }
+        arguments.extend([
             OsString::from("--clearenv"),
             OsString::from("--proc"),
             OsString::from("/proc"),
@@ -307,7 +353,7 @@ impl BubblewrapWorkerPolicy {
             OsString::from("/dev"),
             OsString::from("--chdir"),
             OsString::from("/"),
-        ];
+        ]);
         if let Some(maximum_bytes) = self.private_tmpfs.maximum_bytes() {
             arguments.push(OsString::from("--size"));
             arguments.push(OsString::from(maximum_bytes.get().to_string()));
@@ -1201,6 +1247,12 @@ mod tests {
         assert!(has_arguments(&arguments, &["--new-session"]));
         assert!(has_arguments(&arguments, &["--clearenv"]));
         assert!(has_arguments(&arguments, &["--chdir", "/"]));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--unshare-user"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--disable-userns"));
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
         assert!(has_arguments(
             &arguments,
@@ -1208,6 +1260,35 @@ mod tests {
         ));
         assert_eq!(plan.session_id(), "session-1");
         assert!(!arguments.iter().any(|argument| argument == "session-1"));
+    }
+
+    #[test]
+    fn further_user_namespace_lockdown_is_opt_in_and_requires_bubblewrap_flags() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert_eq!(
+            policy.user_namespace_policy(),
+            UserNamespacePolicy::BestEffort
+        );
+
+        policy.require_no_further_user_namespaces();
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+
+        assert_eq!(
+            policy.user_namespace_policy(),
+            UserNamespacePolicy::RequireNoFurtherUserNamespaces
+        );
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--unshare-all",
+                "--unshare-user",
+                "--disable-userns",
+                "--clearenv",
+            ]
+        ));
+        assert!(!arguments.iter().any(|argument| argument == "--share-net"));
     }
 
     #[test]

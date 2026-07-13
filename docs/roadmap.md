@@ -51,6 +51,9 @@
 - Optional bounded private `/tmp` capacity for Bubblewrap workers and a
   lifecycle handle that force-terminates and reaps a worker. Neither is a
   general resource quota or proof that an adapter effect was cancelled.
+- Optional Bubblewrap user-namespace hardening that requires a usable user
+  namespace and prevents further user namespace creation, with no compatibility
+  fallback to a weaker worker policy.
 
 ## Next: durable external operations
 
