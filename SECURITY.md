@@ -37,6 +37,26 @@ process, a mobile app, or an unrestricted service leaves it with that process's
 ambient authority. Its journal-store trait is a contract, not a file/database
 implementation or anti-rollback mechanism.
 
+`AuthenticatedWorkerJournalStore` connects the runtime to
+`AuthenticatedStore` plus `FencedRollbackProtectedStore`. It authenticates the
+journal bytes and binds each write to a record key, current revision, scope,
+and fencing token, but it inherits the backend's durability and anti-rollback
+guarantees. `VolatileMemoryStore` covers integration tests only and must never
+be treated as a production worker journal backend.
+
+The bridge derives its record key from a host-owned namespace and journal
+scope. A new admission must atomically reserve a nonzero token through the
+backend or an equivalently durable lease service; never calculate a token from
+`current_fence + 1` after a separate read. Fence state and data must share the
+same record key, and the backend must revalidate exact token equality in its
+atomic compare-and-swap. Provision an `AuthenticatedStore` key only to the
+trusted storage coordinator or a narrowly scoped storage client. Do not place
+a general storage key in an untrusted contained adapter process merely because
+that process hosts a worker session. The bridge intentionally exposes no
+general-purpose authenticated-store handle or caller-selected record key. The
+host admission authority must reserve a fence for this exact bridge record;
+the runtime cannot infer a record binding from a raw `u64` token.
+
 Worker adapters must explicitly declare read-only/idempotent safety before the
 non-durable `invoke` path is enabled, and a bounded reconciliation contract
 before durable dispatch or compensation is enabled. A declaration is a trusted

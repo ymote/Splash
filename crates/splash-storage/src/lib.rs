@@ -363,6 +363,73 @@ pub trait RollbackProtectedStore {
     ) -> Result<CompareAndSwapOutcome, Self::Error>;
 }
 
+/// A rollback-protected backend that also fences superseded writers.
+///
+/// A nonzero `fencing_token` identifies one host-admitted writer for one
+/// record key. [`Self::reserve_fence`] atomically allocates and persists a
+/// strictly higher token. A host using a separate lease authority must provide
+/// the same atomic per-key allocation guarantee before it calls
+/// [`Self::establish_fence`]. A process-local counter is insufficient for a
+/// distributed worker deployment.
+///
+/// A higher established token remains current even when its later
+/// compare-and-swap reports a revision conflict, preventing an older writer
+/// from racing the new lease. Equal tokens are valid only for repeated writes
+/// by the one writer that received that reservation. Implementations cannot
+/// verify writer identity from a `u64`; admission must never issue an equal
+/// token to a second writer.
+///
+/// The fence and data record must use the identical [`StorageRecordKey`]. Each
+/// [`Self::compare_and_swap_fenced`] call must revalidate that the supplied
+/// token exactly equals the durable current fence inside its one atomic backend
+/// operation. A read-fence-then-write sequence is not sufficient.
+pub trait FencedRollbackProtectedStore: RollbackProtectedStore {
+    /// Returns the durable current fence for `key`.
+    ///
+    /// This is an observation and audit primitive, not a token allocator.
+    /// Callers must not derive a new token with a separate `current + 1` read;
+    /// use [`Self::reserve_fence`] or an equivalent external atomic lease
+    /// authority instead. The value must be protected by the same durability
+    /// and anti-rollback mechanism as fenced writes.
+    fn current_fence(&self, key: &StorageRecordKey) -> Result<u64, Self::Error>;
+
+    /// Atomically reserves and persists the next nonzero fencing token for
+    /// `key`.
+    ///
+    /// The returned value must be strictly greater than the durable current
+    /// fence observed by this operation. Concurrent reservations for one key
+    /// must return distinct, monotonically increasing values. An exhausted
+    /// token space must return an error rather than wrap to zero.
+    fn reserve_fence(&mut self, key: &StorageRecordKey) -> Result<u64, Self::Error>;
+
+    /// Makes `fencing_token` current for `key`, rejecting a lower token.
+    ///
+    /// A higher token must remain current even when a later compare-and-swap
+    /// conflicts, so a newly admitted writer fences an old one before it
+    /// reloads its snapshot. An equal token is an idempotent use by the one
+    /// writer already admitted by the host; it must not be issued to another
+    /// writer. Zero is invalid and must be rejected.
+    fn establish_fence(
+        &mut self,
+        key: &StorageRecordKey,
+        fencing_token: u64,
+    ) -> Result<(), Self::Error>;
+
+    /// Performs a compare-and-swap only if `fencing_token` exactly matches the
+    /// durable current fence after revalidation within one atomic backend
+    /// operation.
+    ///
+    /// This method does not allocate or establish a new token. Callers must
+    /// first use [`Self::reserve_fence`] or [`Self::establish_fence`].
+    fn compare_and_swap_fenced(
+        &mut self,
+        key: &StorageRecordKey,
+        expected_revision: Option<u64>,
+        replacement: StoredRecord,
+        fencing_token: u64,
+    ) -> Result<CompareAndSwapOutcome, Self::Error>;
+}
+
 /// The verified payload returned by [`AuthenticatedStore::load`] and writes.
 #[derive(Clone, Eq, PartialEq)]
 pub struct AuthenticatedRecord {
@@ -470,6 +537,21 @@ where
         expected_revision: Option<u64>,
         payload: &[u8],
     ) -> Result<AuthenticatedRecord, AuthenticatedStoreError<B::Error>> {
+        let (revision, replacement) =
+            self.prepare_compare_and_swap(key, expected_revision, payload)?;
+        let outcome = self
+            .backend
+            .compare_and_swap(key, expected_revision, replacement)
+            .map_err(AuthenticatedStoreError::Backend)?;
+        self.finish_compare_and_swap(expected_revision, revision, payload, outcome)
+    }
+
+    fn prepare_compare_and_swap(
+        &self,
+        key: &StorageRecordKey,
+        expected_revision: Option<u64>,
+        payload: &[u8],
+    ) -> Result<(u64, StoredRecord), AuthenticatedStoreError<B::Error>> {
         if payload.len() > MAX_AUTHENTICATED_PAYLOAD_BYTES {
             return Err(AuthenticatedStoreError::PayloadTooLarge {
                 actual: payload.len(),
@@ -513,10 +595,16 @@ where
             .checked_add(1)
             .ok_or(AuthenticatedStoreError::RevisionExhausted)?;
         let replacement = self.seal(key, revision, payload)?;
-        let outcome = self
-            .backend
-            .compare_and_swap(key, expected_revision, replacement)
-            .map_err(AuthenticatedStoreError::Backend)?;
+        Ok((revision, replacement))
+    }
+
+    fn finish_compare_and_swap(
+        &self,
+        expected_revision: Option<u64>,
+        revision: u64,
+        payload: &[u8],
+        outcome: CompareAndSwapOutcome,
+    ) -> Result<AuthenticatedRecord, AuthenticatedStoreError<B::Error>> {
         match outcome {
             CompareAndSwapOutcome::Stored { revision_floor } => {
                 if revision_floor != revision {
@@ -648,6 +736,57 @@ where
     }
 }
 
+impl<B> AuthenticatedStore<B>
+where
+    B: FencedRollbackProtectedStore,
+{
+    /// Returns the backend's durable current fencing token for `key`.
+    pub fn current_fence(
+        &self,
+        key: &StorageRecordKey,
+    ) -> Result<u64, AuthenticatedStoreError<B::Error>> {
+        self.backend
+            .current_fence(key)
+            .map_err(AuthenticatedStoreError::Backend)
+    }
+
+    /// Atomically reserves the next durable fencing token for `key`.
+    pub fn reserve_fence(
+        &mut self,
+        key: &StorageRecordKey,
+    ) -> Result<u64, AuthenticatedStoreError<B::Error>> {
+        self.backend
+            .reserve_fence(key)
+            .map_err(AuthenticatedStoreError::Backend)
+    }
+
+    /// Atomically writes an authenticated replacement under a host-issued
+    /// fencing token.
+    ///
+    /// The token is established before the storage snapshot is read so a newer
+    /// lease fences an older writer even when this write later finds a revision
+    /// conflict. A token previously returned by [`Self::reserve_fence`] makes
+    /// that establishment an idempotent equality check.
+    pub fn compare_and_swap_fenced(
+        &mut self,
+        key: &StorageRecordKey,
+        expected_revision: Option<u64>,
+        payload: &[u8],
+        fencing_token: u64,
+    ) -> Result<AuthenticatedRecord, AuthenticatedStoreError<B::Error>> {
+        self.backend
+            .establish_fence(key, fencing_token)
+            .map_err(AuthenticatedStoreError::Backend)?;
+        let (revision, replacement) =
+            self.prepare_compare_and_swap(key, expected_revision, payload)?;
+        let outcome = self
+            .backend
+            .compare_and_swap_fenced(key, expected_revision, replacement, fencing_token)
+            .map_err(AuthenticatedStoreError::Backend)?;
+        self.finish_compare_and_swap(expected_revision, revision, payload, outcome)
+    }
+}
+
 /// Errors emitted by [`AuthenticatedStore`].
 #[derive(Debug)]
 pub enum AuthenticatedStoreError<E> {
@@ -763,6 +902,7 @@ struct StoredEnvelope {
 pub struct VolatileMemoryStore {
     records: BTreeMap<StorageRecordKey, StoredRecord>,
     revision_floors: BTreeMap<StorageRecordKey, u64>,
+    fencing_tokens: BTreeMap<StorageRecordKey, u64>,
 }
 
 impl RollbackProtectedStore for VolatileMemoryStore {
@@ -808,20 +948,85 @@ impl RollbackProtectedStore for VolatileMemoryStore {
     }
 }
 
+impl FencedRollbackProtectedStore for VolatileMemoryStore {
+    fn current_fence(&self, key: &StorageRecordKey) -> Result<u64, Self::Error> {
+        Ok(self.fencing_tokens.get(key).copied().unwrap_or(0))
+    }
+
+    fn reserve_fence(&mut self, key: &StorageRecordKey) -> Result<u64, Self::Error> {
+        let current_token = self.fencing_tokens.get(key).copied().unwrap_or(0);
+        let next_token = current_token
+            .checked_add(1)
+            .ok_or(VolatileMemoryStoreError::FencingTokenExhausted)?;
+        self.fencing_tokens.insert(key.clone(), next_token);
+        Ok(next_token)
+    }
+
+    fn establish_fence(
+        &mut self,
+        key: &StorageRecordKey,
+        fencing_token: u64,
+    ) -> Result<(), Self::Error> {
+        if fencing_token == 0 {
+            return Err(VolatileMemoryStoreError::InvalidFencingToken);
+        }
+        let current_token = self.fencing_tokens.get(key).copied().unwrap_or(0);
+        if fencing_token < current_token {
+            return Err(VolatileMemoryStoreError::FencingTokenRejected {
+                current: current_token,
+                supplied: fencing_token,
+            });
+        }
+        if fencing_token > current_token {
+            self.fencing_tokens.insert(key.clone(), fencing_token);
+        }
+        Ok(())
+    }
+
+    fn compare_and_swap_fenced(
+        &mut self,
+        key: &StorageRecordKey,
+        expected_revision: Option<u64>,
+        replacement: StoredRecord,
+        fencing_token: u64,
+    ) -> Result<CompareAndSwapOutcome, Self::Error> {
+        if fencing_token == 0 {
+            return Err(VolatileMemoryStoreError::InvalidFencingToken);
+        }
+        let current_token = self.fencing_tokens.get(key).copied().unwrap_or(0);
+        if fencing_token != current_token {
+            return Err(VolatileMemoryStoreError::FencingTokenRejected {
+                current: current_token,
+                supplied: fencing_token,
+            });
+        }
+        self.compare_and_swap(key, expected_revision, replacement)
+    }
+}
+
 /// Errors specific to [`VolatileMemoryStore`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolatileMemoryStoreError {
     RevisionExhausted,
+    FencingTokenExhausted,
+    InvalidFencingToken,
     InvalidReplacementRevision { expected: u64, actual: u64 },
+    FencingTokenRejected { current: u64, supplied: u64 },
 }
 
 impl Display for VolatileMemoryStoreError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::RevisionExhausted => formatter.write_str("storage revision is exhausted"),
+            Self::FencingTokenExhausted => formatter.write_str("fencing token space is exhausted"),
+            Self::InvalidFencingToken => formatter.write_str("fencing token must be nonzero"),
             Self::InvalidReplacementRevision { expected, actual } => write!(
                 formatter,
                 "invalid replacement revision: expected {expected}, got {actual}"
+            ),
+            Self::FencingTokenRejected { current, supplied } => write!(
+                formatter,
+                "stale fencing token: current {current}, supplied {supplied}"
             ),
         }
     }
@@ -956,6 +1161,77 @@ mod tests {
         let replaced = store.replace(&key, 1, b"second payload").unwrap();
         assert_eq!(replaced.revision(), 2);
         assert_eq!(store.load(&key).unwrap(), Some(replaced));
+    }
+
+    #[test]
+    fn fenced_compare_and_swap_rejects_a_superseded_writer_after_a_conflict() {
+        let mut store = store();
+        let key = record_key("release-42");
+        let first = store
+            .compare_and_swap_fenced(&key, None, b"first payload", 5)
+            .unwrap();
+        assert_eq!(first.revision(), 1);
+
+        assert!(matches!(
+            store.compare_and_swap_fenced(&key, Some(0), b"stale snapshot", 6),
+            Err(AuthenticatedStoreError::WriteConflict {
+                expected: Some(0),
+                actual: Some(1),
+                revision_floor: 1,
+            })
+        ));
+        assert_eq!(store.current_fence(&key).unwrap(), 6);
+        assert!(matches!(
+            store.compare_and_swap_fenced(&key, Some(1), b"old writer", 5),
+            Err(AuthenticatedStoreError::Backend(
+                VolatileMemoryStoreError::FencingTokenRejected {
+                    current: 6,
+                    supplied: 5,
+                }
+            ))
+        ));
+
+        let current = store
+            .compare_and_swap_fenced(&key, Some(1), b"current writer", 6)
+            .unwrap();
+        assert_eq!(current.revision(), 2);
+        assert_eq!(current.payload(), b"current writer");
+    }
+
+    #[test]
+    fn reserves_distinct_monotonic_fences_without_read_then_increment() {
+        let mut store = store();
+        let key = record_key("release-42");
+
+        assert_eq!(store.reserve_fence(&key).unwrap(), 1);
+        assert_eq!(store.reserve_fence(&key).unwrap(), 2);
+        assert_eq!(store.current_fence(&key).unwrap(), 2);
+
+        store
+            .backend_mut()
+            .fencing_tokens
+            .insert(key.clone(), u64::MAX);
+        assert!(matches!(
+            store.reserve_fence(&key),
+            Err(AuthenticatedStoreError::Backend(
+                VolatileMemoryStoreError::FencingTokenExhausted
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_fencing_tokens() {
+        let mut store = store();
+        let key = record_key("release-42");
+
+        assert!(matches!(
+            store.compare_and_swap_fenced(&key, None, b"first payload", 0),
+            Err(AuthenticatedStoreError::Backend(
+                VolatileMemoryStoreError::InvalidFencingToken
+            ))
+        ));
+        assert_eq!(store.current_fence(&key).unwrap(), 0);
+        assert_eq!(store.load(&key).unwrap(), None);
     }
 
     #[test]

@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 splash-protocol = { version = "0.1.0", path = "../splash-protocol" }
+splash-storage = { version = "0.1.0", path = "../splash-storage" }

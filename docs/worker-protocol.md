@@ -139,7 +139,13 @@ rollback-resistant compare-and-swap storage contract. The host loads the
 journal and its monotonic revision atomically, and each runtime persistence
 must advance that revision under the current scope fencing lease. The store
 rejects older leases, so a superseded session cannot write after a newer worker
-has been admitted. See [worker adapter runtime](worker-runtime.md).
+has been admitted. `AuthenticatedWorkerJournalStore` connects that runtime
+contract to `AuthenticatedStore` only when its backend implements the fenced
+rollback-protected storage extension. A fresh admission must issue a nonzero
+lease from an atomic per-scope reservation, such as
+`FencedRollbackProtectedStore::reserve_fence`, or an equivalent trusted lease
+service. It must not calculate `current_fence + 1` from a separate read. See
+[worker adapter runtime](worker-runtime.md).
 
 ## Durable Operation Dispatch
 

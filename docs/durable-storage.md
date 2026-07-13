@@ -50,6 +50,34 @@ equivalent platform primitive that survives storage rollback.
 tests and local development. It loses both bytes and its floor at process exit,
 so it is never a production rollback defense.
 
+## Fenced Writers
+
+`FencedRollbackProtectedStore` extends the rollback contract for a record that
+can have more than one potential worker writer. A host-issued monotonic fencing
+token is made current before an authenticated compare-and-swap checks the
+record revision. A fenced write succeeds only when its supplied token is the
+exact current token; a lower token is rejected. A higher token remains current
+even when its caller discovers a stale revision and must reload. That sequence
+prevents an older session from writing after a newer session has been admitted.
+
+The token is not a capability or secret. Its authority comes from the host's
+admission service and the backend enforcing the same monotonically increasing
+value. `VolatileMemoryStore` exercises the API in tests only; it is not a
+durable source of fences or rollback protection.
+
+The backend exposes `reserve_fence` to atomically persist and return the next
+nonzero token for one record. Admission and recovery must use that operation,
+or a separate lease authority with the same atomic per-record allocation
+guarantee. Never issue `current_fence() + 1` after a separate read: two hosts
+can observe the same fence and receive the same token. `current_fence` is for
+inspection and audit only. Never reset a fence to zero.
+
+The fence and data record use the same structured `StorageRecordKey`. A fenced
+compare-and-swap must revalidate exact token equality inside one atomic backend
+operation; a separate fence read followed by a write leaves a time-of-check,
+time-of-use gap. The fence backend and its failover behavior are therefore a
+security trust anchor.
+
 `splash-worker::WorkerJournalStore` has the same production requirement for a
 worker operation journal: `persist` must atomically compare the loaded
 `WorkerJournalRevision`, commit the new journal, and advance that revision
@@ -65,6 +93,18 @@ The admission service and the store must share one monotonic lease authority
 for each journal scope. On one host this may be a transaction guarded by the
 same durable backend; across hosts it needs a trusted coordination service or
 platform monotonic primitive. A process-local counter is not a fencing source.
+
+`AuthenticatedWorkerJournalStore` is the concrete bridge from this generic
+fenced storage boundary to `WorkerJournalStore`. It binds one host-owned
+namespace and journal scope to one deterministic `StorageRecordKey`, loads a
+verified journal together with its authenticated revision, and persists it through
+`AuthenticatedStore::compare_and_swap_fenced`. It deliberately requires a
+`FencedRollbackProtectedStore`; an unfenced file, SQLite row, or ordinary
+key-value store cannot instantiate the bridge as a production durable worker
+store. The host must identity-bind the selected journal scope before
+constructing the bridge; its syntax validation alone does not establish tenant
+isolation. The bridge exposes only that selected record's journal operations,
+not its underlying general-purpose authenticated store.
 
 ## Key Rotation
 

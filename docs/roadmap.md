@@ -31,6 +31,8 @@
 - Worker-side capability runtime with explicit Rust adapter registration,
   fresh-session admission, durable journal ordering, bounded reconciliation,
   and indeterminate-effect recovery.
+- Fenced rollback-protected storage extension and an authenticated worker
+  journal-store bridge with scope, revision, and lease enforcement.
 
 ## Next: durable external operations
 

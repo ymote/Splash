@@ -73,8 +73,10 @@ accepted from Splash source or a worker request.
 
 All admission implementations sharing a scope must obtain leases from one
 monotonic authority, such as a transactional durable store, trusted lease
-service, or platform monotonic counter. A per-process counter is insufficient
-when more than one worker host can admit the same scope.
+service, or platform monotonic counter. The authority must atomically reserve a
+distinct token per admission; it cannot derive a new token from a separate
+read of the current fence. A per-process counter is insufficient when more than
+one worker host can admit the same scope.
 
 ## State and Persistence
 

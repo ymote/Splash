@@ -28,15 +28,18 @@ host-authenticated `open_session` frame. It supplies four trusted inputs:
 
 ```rust
 use splash_worker::{
-    WorkerAdapter, WorkerAdapterRegistry, WorkerJournalRevision,
-    WorkerJournalStore, WorkerSession, WorkerSessionAdmission,
+    AuthenticatedWorkerJournalStore, WorkerAdapter, WorkerAdapterRegistry,
+    WorkerSession, WorkerSessionAdmission,
     WorkerSessionLimits,
 };
 
-// `admission` maps the authenticated session to the host-selected tenant
-// scope and records the session ID durably. `store` implements the strict
-// authenticated, rollback-resistant CAS and fencing contract documented by
-// Splash.
+// `journal_store` derives a record key from its host-owned namespace and scope,
+// then wraps AuthenticatedStore<B> where B implements the fenced,
+// rollback-protected backend contract. `admission` reserves its token atomically
+// through journal_store.reserve_fence() or an equivalent trusted lease service;
+// it never derives a token from current_fence() + 1.
+let snapshot = journal_store.load()?;
+let (restored_journal, restored_revision) = snapshot.into_parts();
 let mut worker = WorkerSession::open(
     worker_authenticator,
     opening_frame,
@@ -47,8 +50,23 @@ let mut worker = WorkerSession::open(
     &mut admission,
 )?;
 
-let response = worker.handle(host_frame, &mut store)?;
+let response = worker.handle(host_frame, &mut journal_store)?;
 ```
+
+`AuthenticatedWorkerJournalStore` is a usable bridge, not a platform backend:
+the host still supplies the platform's fenced rollback-protected store and the
+single monotonic lease authority. The bridge derives one record key from its
+namespace and scope, preventing arbitrary scope/key pairings.
+`VolatileMemoryStore` is suitable only for tests and development.
+
+The admission authority must reserve each token atomically from that backend or
+from an equally durable external coordinator. Reading the current fence and
+adding one is not safe across concurrent hosts. Scope selection must also be
+bound to the authenticated tenant or policy identity before the bridge is
+created; the bridge validates syntax and key binding, not caller identity. The
+authority must reserve the token for the same bridge record that the session
+will later persist. A bare `u64` fence cannot detect a host accidentally
+reserving for one record and wiring the session to another.
 
 The adapter registry is intentionally explicit. An adapter receives the
 attenuated `CapabilityGrant` with each request and may resolve only the grant's

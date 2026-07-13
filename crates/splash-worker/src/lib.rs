@@ -18,6 +18,10 @@ use splash_protocol::{
     SessionAuthorizer, SessionRole, ToolInvocation, ToolPayload, ToolResult,
     WorkerCompensationAdmission, WorkerMessage, WorkerOperationAdmission, WorkerOperationJournal,
 };
+use splash_storage::{
+    AuthenticatedStore, AuthenticatedStoreError, FencedRollbackProtectedStore, StorageRecordKey,
+    StorageRecordKeyError,
+};
 
 /// Default maximum reconciliation requests one worker accepts for one tool in
 /// a session.
@@ -125,18 +129,24 @@ impl WorkerJournalRevision {
 /// for the same tenant scope. The journal store must reject writes from a
 /// lease that is no longer current. It is opaque worker metadata, never a
 /// capability or script-visible value.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WorkerJournalLease(u64);
 
 impl WorkerJournalLease {
-    /// Creates the host's opaque monotonic lease value for one journal scope.
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    fn from_fencing_token(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
     }
 
-    /// Returns the lease value for the trusted journal-store integration.
-    pub const fn get(self) -> u64 {
+    /// Returns the opaque host-issued token to a trusted journal-store
+    /// implementation. Callers cannot construct a lease from this value.
+    pub const fn fencing_token(self) -> u64 {
         self.0
+    }
+}
+
+impl fmt::Debug for WorkerJournalLease {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkerJournalLease([REDACTED])")
     }
 }
 
@@ -144,28 +154,32 @@ impl WorkerJournalLease {
 ///
 /// The implementation must atomically bind the authenticated manifest session
 /// ID and host-selected journal scope to the intended tenant, reject stale or
-/// replayed session IDs, and issue the current single-writer fencing lease for
-/// that scope. The scope never comes from a worker frame or Splash source. A
+/// replayed session IDs, and return a nonzero fencing token from a per-key
+/// atomic reservation. It may use [`FencedRollbackProtectedStore::reserve_fence`]
+/// or an equivalent external lease authority; it must not calculate a token
+/// from a separate current-fence read. The runtime turns that token into an
+/// opaque lease. The scope never comes from a worker frame or Splash source. A
 /// fresh session key alone is not sufficient proof that a captured
 /// `open_session` frame was not replayed into a new worker process.
 pub trait WorkerSessionAdmission {
     type Error;
 
+    /// Returns the host-issued nonzero fencing token for this session.
     fn admit(
         &mut self,
         manifest: &CapabilityManifest,
         journal_scope: &str,
-    ) -> Result<WorkerJournalLease, Self::Error>;
+    ) -> Result<u64, Self::Error>;
 }
 
 /// Durable storage boundary for one worker operation journal.
 ///
 /// `persist` must atomically compare `expected_revision` with the currently
-/// loaded journal revision and current fencing lease, durably commit the
-/// supplied journal, and advance the revision to a strictly greater value. It
-/// must return that new revision only after authenticated, rollback-resistant
-/// persistence completes. A buffered write or process-local cache does not
-/// satisfy this contract.
+/// loaded journal revision and verify that the supplied fencing lease is the
+/// exact current lease, durably commit the supplied journal, and advance the
+/// revision to a strictly greater value. It must return that new revision only
+/// after authenticated, rollback-resistant persistence completes. A buffered
+/// write or process-local cache does not satisfy this contract.
 ///
 /// An error must leave the supplied candidate uncommitted. If a backend cannot
 /// know whether a failed call committed, it must make the worker discard its
@@ -181,6 +195,223 @@ pub trait WorkerJournalStore {
         expected_revision: WorkerJournalRevision,
         journal_lease: WorkerJournalLease,
     ) -> Result<WorkerJournalRevision, Self::Error>;
+}
+
+/// A verified worker journal and its trusted storage revision loaded together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkerJournalSnapshot {
+    journal: WorkerOperationJournal,
+    revision: WorkerJournalRevision,
+}
+
+impl WorkerJournalSnapshot {
+    pub fn journal(&self) -> &WorkerOperationJournal {
+        &self.journal
+    }
+
+    pub fn revision(&self) -> WorkerJournalRevision {
+        self.revision
+    }
+
+    pub fn into_parts(self) -> (WorkerOperationJournal, WorkerJournalRevision) {
+        (self.journal, self.revision)
+    }
+}
+
+/// Authenticated worker-journal persistence over a fenced rollback-protected
+/// storage backend.
+///
+/// The host still owns journal scope selection and lease issuance through
+/// [`WorkerSessionAdmission`]. This adapter binds one selected scope to one
+/// authenticated storage record and passes the worker's lease token through to
+/// the backend's atomic fenced compare-and-swap. It deliberately does not
+/// expose its underlying [`AuthenticatedStore`], so this handle cannot be used
+/// to select arbitrary storage record keys.
+pub struct AuthenticatedWorkerJournalStore<B> {
+    store: AuthenticatedStore<B>,
+    record_key: StorageRecordKey,
+    journal_scope: String,
+}
+
+impl<B> AuthenticatedWorkerJournalStore<B> {
+    /// Creates a bridge for one host-selected journal namespace and scope.
+    ///
+    /// The constructor validates the scope syntax and derives the sole storage
+    /// key from the namespace/scope pair. The host must bind that scope to the
+    /// authenticated tenant or policy domain before it calls this constructor;
+    /// syntactic validation alone cannot provide tenant isolation.
+    pub fn new(
+        store: AuthenticatedStore<B>,
+        journal_namespace: impl Into<String>,
+        journal_scope: impl Into<String>,
+    ) -> Result<Self, AuthenticatedWorkerJournalStoreInitError> {
+        let journal_scope = journal_scope.into();
+        WorkerOperationJournal::new(&journal_scope)
+            .map_err(AuthenticatedWorkerJournalStoreInitError::Protocol)?;
+        let record_key = StorageRecordKey::new(journal_namespace, journal_scope.clone())
+            .map_err(AuthenticatedWorkerJournalStoreInitError::RecordKey)?;
+        Ok(Self {
+            store,
+            record_key,
+            journal_scope,
+        })
+    }
+
+    /// Returns the one deterministic storage key used by this bridge.
+    pub fn record_key(&self) -> &StorageRecordKey {
+        &self.record_key
+    }
+
+    /// Returns the host-selected journal scope bound to this bridge.
+    pub fn journal_scope(&self) -> &str {
+        &self.journal_scope
+    }
+}
+
+impl<B> AuthenticatedWorkerJournalStore<B>
+where
+    B: FencedRollbackProtectedStore,
+{
+    /// Loads an authenticated journal or creates an empty in-memory journal
+    /// for an absent authenticated record at revision zero.
+    pub fn load(
+        &self,
+    ) -> Result<WorkerJournalSnapshot, AuthenticatedWorkerJournalStoreError<B::Error>> {
+        let Some(record) = self
+            .store
+            .load(&self.record_key)
+            .map_err(AuthenticatedWorkerJournalStoreError::Storage)?
+        else {
+            let journal = WorkerOperationJournal::new(&self.journal_scope)
+                .map_err(AuthenticatedWorkerJournalStoreError::Protocol)?;
+            return Ok(WorkerJournalSnapshot {
+                journal,
+                revision: WorkerJournalRevision::default(),
+            });
+        };
+        let encoded = std::str::from_utf8(record.payload())
+            .map_err(|_| AuthenticatedWorkerJournalStoreError::InvalidJournalEncoding)?;
+        let journal = WorkerOperationJournal::from_json_for_scope(encoded, &self.journal_scope)
+            .map_err(AuthenticatedWorkerJournalStoreError::Protocol)?;
+        Ok(WorkerJournalSnapshot {
+            journal,
+            revision: WorkerJournalRevision::new(record.revision()),
+        })
+    }
+
+    /// Returns the durable current fence for inspection and audit.
+    ///
+    /// Do not derive a new lease with `current + 1`; use [`Self::reserve_fence`]
+    /// or an equivalent external atomic lease authority.
+    pub fn current_fence(&self) -> Result<u64, AuthenticatedWorkerJournalStoreError<B::Error>> {
+        self.store
+            .current_fence(&self.record_key)
+            .map_err(AuthenticatedWorkerJournalStoreError::Storage)
+    }
+
+    /// Atomically reserves a fresh fencing token for trusted host admission.
+    ///
+    /// The caller must bind the reservation to the authenticated session in
+    /// its admission transaction, keep the returned token inside that trusted
+    /// path, and forward it only through [`WorkerSessionAdmission`]. It is not
+    /// a script-visible capability.
+    pub fn reserve_fence(&mut self) -> Result<u64, AuthenticatedWorkerJournalStoreError<B::Error>> {
+        self.store
+            .reserve_fence(&self.record_key)
+            .map_err(AuthenticatedWorkerJournalStoreError::Storage)
+    }
+}
+
+impl<B> WorkerJournalStore for AuthenticatedWorkerJournalStore<B>
+where
+    B: FencedRollbackProtectedStore,
+{
+    type Error = AuthenticatedWorkerJournalStoreError<B::Error>;
+
+    fn persist(
+        &mut self,
+        journal: &WorkerOperationJournal,
+        expected_revision: WorkerJournalRevision,
+        journal_lease: WorkerJournalLease,
+    ) -> Result<WorkerJournalRevision, Self::Error> {
+        journal
+            .validate_scope(&self.journal_scope)
+            .map_err(AuthenticatedWorkerJournalStoreError::Protocol)?;
+        let encoded = journal
+            .to_json()
+            .map_err(AuthenticatedWorkerJournalStoreError::Protocol)?;
+        let expected_revision = match expected_revision.get() {
+            0 => None,
+            revision => Some(revision),
+        };
+        let stored = self
+            .store
+            .compare_and_swap_fenced(
+                &self.record_key,
+                expected_revision,
+                encoded.as_bytes(),
+                journal_lease.fencing_token(),
+            )
+            .map_err(AuthenticatedWorkerJournalStoreError::Storage)?;
+        Ok(WorkerJournalRevision::new(stored.revision()))
+    }
+}
+
+impl<B> fmt::Debug for AuthenticatedWorkerJournalStore<B> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedWorkerJournalStore")
+            .field("record_key", &self.record_key)
+            .field("journal_scope", &self.journal_scope)
+            .finish()
+    }
+}
+
+/// Construction error for [`AuthenticatedWorkerJournalStore`].
+#[derive(Debug)]
+pub enum AuthenticatedWorkerJournalStoreInitError {
+    Protocol(ProtocolError),
+    RecordKey(StorageRecordKeyError),
+}
+
+impl Display for AuthenticatedWorkerJournalStoreInitError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => write!(formatter, "invalid worker journal scope: {error}"),
+            Self::RecordKey(error) => {
+                write!(formatter, "invalid worker journal record key: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuthenticatedWorkerJournalStoreInitError {}
+
+/// Error from [`AuthenticatedWorkerJournalStore`].
+#[derive(Debug)]
+pub enum AuthenticatedWorkerJournalStoreError<E> {
+    Protocol(ProtocolError),
+    Storage(AuthenticatedStoreError<E>),
+    InvalidJournalEncoding,
+}
+
+impl<E: Display> Display for AuthenticatedWorkerJournalStoreError<E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => write!(formatter, "invalid worker journal: {error}"),
+            Self::Storage(error) => {
+                write!(formatter, "authenticated journal storage failed: {error}")
+            }
+            Self::InvalidJournalEncoding => {
+                formatter.write_str("authenticated worker journal payload is not UTF-8")
+            }
+        }
+    }
+}
+
+impl<E> std::error::Error for AuthenticatedWorkerJournalStoreError<E> where
+    E: std::error::Error + 'static
+{
 }
 
 /// Adapter failure that leaves durable effects in their prior state.
@@ -413,9 +644,11 @@ impl WorkerSession {
                 return Err(WorkerSessionOpenError::MissingAdapter(grant.tool.clone()));
             }
         }
-        let journal_lease = admission
+        let fencing_token = admission
             .admit(authorizer.manifest(), journal.scope())
             .map_err(WorkerSessionOpenError::Admission)?;
+        let journal_lease = WorkerJournalLease::from_fencing_token(fencing_token)
+            .ok_or(WorkerSessionOpenError::InvalidJournalLease)?;
         Ok(Self {
             authenticator,
             authorizer,
@@ -900,6 +1133,7 @@ pub enum WorkerSessionOpenError<E> {
     Protocol(ProtocolError),
     UnexpectedOpeningMessage,
     MissingAdapter(String),
+    InvalidJournalLease,
     Admission(E),
 }
 
@@ -920,6 +1154,9 @@ impl<E: Display> Display for WorkerSessionOpenError<E> {
                     formatter,
                     "worker session manifest grants unregistered adapter {tool}"
                 )
+            }
+            Self::InvalidJournalLease => {
+                formatter.write_str("worker session admission returned an invalid fencing token")
             }
             Self::Admission(error) => write!(formatter, "worker session admission denied: {error}"),
         }
@@ -1121,6 +1358,10 @@ mod tests {
     use splash_protocol::{
         OperationCompensationBinding, SessionKey, WorkerOperationState, AUTH_TAG_BYTES,
     };
+    use splash_storage::{
+        AuthenticatedStoreError, StorageKey, StorageKeyId, StorageKeyring, VolatileMemoryStore,
+        VolatileMemoryStoreError, STORAGE_KEY_BYTES,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum AdmissionError {
@@ -1135,6 +1376,21 @@ mod tests {
 
     impl std::error::Error for AdmissionError {}
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ZeroLeaseAdmission;
+
+    impl WorkerSessionAdmission for ZeroLeaseAdmission {
+        type Error = AdmissionError;
+
+        fn admit(
+            &mut self,
+            _manifest: &CapabilityManifest,
+            _journal_scope: &str,
+        ) -> Result<u64, Self::Error> {
+            Ok(0)
+        }
+    }
+
     #[derive(Default)]
     struct OneTimeAdmission {
         admitted: BTreeSet<(String, String)>,
@@ -1148,13 +1404,13 @@ mod tests {
             &mut self,
             manifest: &CapabilityManifest,
             journal_scope: &str,
-        ) -> Result<WorkerJournalLease, Self::Error> {
+        ) -> Result<u64, Self::Error> {
             if self
                 .admitted
                 .insert((manifest.session_id.clone(), journal_scope.to_owned()))
             {
                 self.next_lease = self.next_lease.saturating_add(1);
-                Ok(WorkerJournalLease::new(self.next_lease))
+                Ok(self.next_lease)
             } else {
                 Err(AdmissionError::Replay)
             }
@@ -1197,7 +1453,7 @@ mod tests {
                 persist_attempts: 0,
                 revision: WorkerJournalRevision::default(),
                 reported_revision: None,
-                active_lease: WorkerJournalLease::new(1),
+                active_lease: WorkerJournalLease::from_fencing_token(1).unwrap(),
             }
         }
     }
@@ -1306,6 +1562,15 @@ mod tests {
         let mut grant = CapabilityGrant::text("text.echo").with_compensation_limit(1);
         grant.max_calls = 4;
         grant
+    }
+
+    fn authenticated_journal_store() -> AuthenticatedWorkerJournalStore<VolatileMemoryStore> {
+        let key_id = StorageKeyId::new("worker-storage-v1").unwrap();
+        let store = AuthenticatedStore::new(
+            VolatileMemoryStore::default(),
+            StorageKeyring::new(key_id, StorageKey::from_bytes([53; STORAGE_KEY_BYTES])),
+        );
+        AuthenticatedWorkerJournalStore::new(store, "worker-journal", "tenant-release").unwrap()
     }
 
     fn open_worker(
@@ -1476,7 +1741,7 @@ mod tests {
         let (mut worker, mut host) =
             open_worker(grant(), WorkerSessionLimits::default(), counts.clone());
         let mut store = MemoryJournalStore {
-            active_lease: WorkerJournalLease::new(2),
+            active_lease: WorkerJournalLease::from_fencing_token(2).unwrap(),
             ..Default::default()
         };
 
@@ -1851,5 +2116,143 @@ mod tests {
                 if tool == "text.echo"
         ));
         assert!(worker.journal().operation("op-release-42").is_none());
+    }
+
+    #[test]
+    fn authenticated_journal_store_round_trips_worker_dispatch_and_fences_stale_leases() {
+        let mut store = authenticated_journal_store();
+        let snapshot = store.load().unwrap();
+        assert_eq!(snapshot.revision(), WorkerJournalRevision::default());
+        assert_eq!(snapshot.journal().scope(), "tenant-release");
+        assert_eq!(store.record_key().namespace(), "worker-journal");
+        assert_eq!(store.record_key().name(), "tenant-release");
+
+        let counts = Rc::new(RefCell::new(AdapterCounts::default()));
+        let key = SessionKey::from_bytes([47; AUTH_TAG_BYTES]).unwrap();
+        let mut host =
+            SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap();
+        let worker_auth = SessionAuthenticator::new("worker-1", key, SessionRole::Worker).unwrap();
+        let manifest = CapabilityManifest::new("worker-1", vec![grant()]).unwrap();
+        let opening = host.seal(WorkerMessage::OpenSession { manifest }).unwrap();
+        let mut adapters = WorkerAdapterRegistry::default();
+        adapters
+            .register(
+                "text.echo",
+                TestAdapter {
+                    counts: counts.clone(),
+                },
+            )
+            .unwrap();
+        let mut admission = OneTimeAdmission::default();
+        let (journal, revision) = snapshot.into_parts();
+        let mut worker = WorkerSession::open(
+            worker_auth,
+            opening,
+            journal,
+            revision,
+            adapters,
+            WorkerSessionLimits::default(),
+            &mut admission,
+        )
+        .unwrap();
+
+        let dispatch = host
+            .seal(WorkerMessage::DispatchOperation {
+                request: dispatch_request("dispatch-1"),
+            })
+            .unwrap();
+        let response = worker.handle(dispatch, &mut store).unwrap();
+        host.open(response).unwrap();
+        assert_eq!(counts.borrow().dispatches, 1);
+
+        let persisted = store.load().unwrap();
+        assert_eq!(persisted.revision(), WorkerJournalRevision::new(2));
+        assert!(matches!(
+            persisted
+                .journal()
+                .operation("op-release-42")
+                .unwrap()
+                .state(),
+            WorkerOperationState::Succeeded { .. }
+        ));
+
+        let revision = persisted.revision();
+        let journal = persisted.journal().clone();
+        let next_revision = store
+            .persist(
+                &journal,
+                revision,
+                WorkerJournalLease::from_fencing_token(2).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(next_revision, WorkerJournalRevision::new(3));
+        assert_eq!(store.current_fence().unwrap(), 2);
+        assert!(matches!(
+            store.persist(
+                &journal,
+                next_revision,
+                WorkerJournalLease::from_fencing_token(1).unwrap(),
+            ),
+            Err(AuthenticatedWorkerJournalStoreError::Storage(
+                AuthenticatedStoreError::Backend(VolatileMemoryStoreError::FencingTokenRejected {
+                    current: 2,
+                    supplied: 1,
+                })
+            ))
+        ));
+    }
+
+    #[test]
+    fn authenticated_journal_store_rejects_a_foreign_journal_scope() {
+        let mut store = authenticated_journal_store();
+        let foreign = WorkerOperationJournal::new("tenant-other").unwrap();
+        assert!(matches!(
+            store.persist(
+                &foreign,
+                WorkerJournalRevision::default(),
+                WorkerJournalLease::from_fencing_token(1).unwrap(),
+            ),
+            Err(AuthenticatedWorkerJournalStoreError::Protocol(
+                ProtocolError::OperationJournalScopeMismatch { expected, actual }
+            )) if expected == "tenant-release" && actual == "tenant-other"
+        ));
+    }
+
+    #[test]
+    fn authenticated_journal_store_reserves_distinct_fences() {
+        let mut store = authenticated_journal_store();
+
+        assert_eq!(store.reserve_fence().unwrap(), 1);
+        assert_eq!(store.reserve_fence().unwrap(), 2);
+        assert_eq!(store.current_fence().unwrap(), 2);
+    }
+
+    #[test]
+    fn session_open_rejects_a_zero_fencing_token() {
+        let key = SessionKey::from_bytes([59; AUTH_TAG_BYTES]).unwrap();
+        let mut host =
+            SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap();
+        let worker = SessionAuthenticator::new("worker-1", key, SessionRole::Worker).unwrap();
+        let manifest = CapabilityManifest::new("worker-1", vec![grant()]).unwrap();
+        let opening = host.seal(WorkerMessage::OpenSession { manifest }).unwrap();
+        let counts = Rc::new(RefCell::new(AdapterCounts::default()));
+        let mut adapters = WorkerAdapterRegistry::default();
+        adapters
+            .register("text.echo", TestAdapter { counts })
+            .unwrap();
+        let mut admission = ZeroLeaseAdmission;
+
+        assert!(matches!(
+            WorkerSession::open(
+                worker,
+                opening,
+                WorkerOperationJournal::new("tenant-release").unwrap(),
+                WorkerJournalRevision::default(),
+                adapters,
+                WorkerSessionLimits::default(),
+                &mut admission,
+            ),
+            Err(WorkerSessionOpenError::InvalidJournalLease)
+        ));
     }
 }

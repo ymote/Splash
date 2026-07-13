@@ -21,7 +21,7 @@ pub const MAX_OPERATION_ERROR_BYTES: usize = 4 * 1024;
 /// object or array.
 pub const MAX_JSON_PAYLOAD_DEPTH: usize = 32;
 /// Maximum serialized worker operation journal accepted from durable storage.
-pub const MAX_WORKER_OPERATION_JOURNAL_BYTES: usize = 512 * 1024;
+pub const MAX_WORKER_OPERATION_JOURNAL_BYTES: usize = 256 * 1024;
 /// Maximum durable operation intents retained by one worker journal.
 pub const MAX_WORKER_OPERATION_RECORDS: usize = 64;
 /// Current serialized worker operation journal format version.
