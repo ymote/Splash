@@ -1395,6 +1395,13 @@ pub enum WorkerMessage {
     ReconciledOperation {
         result: OperationReconcileResult,
     },
+    /// Reserved for a future multiplexed worker transport.
+    ///
+    /// The v0.1 `splash-worker::WorkerSession` does not accept this message:
+    /// a single-flight synchronous transport cannot deliver it while an
+    /// invocation is blocked, so it must not be presented as cooperative
+    /// cancellation. Hosts currently use lifecycle control and treat a forced
+    /// stop as indeterminate.
     Cancel {
         protocol_version: u16,
         session_id: String,

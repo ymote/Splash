@@ -60,6 +60,10 @@
 - Optional Linux Bubblewrap `DenyKnownEscapeSurface` seccomp hardening profile
   with trusted cBPF transport, ABI/x32 checks, and a fixed default-allow deny
   set. It is defense in depth, not a worker-specific syscall allowlist.
+- Optional host-owned Bubblewrap watchdog plus generic bounded worker transport
+  for nonzero per-invocation wall-clock deadlines. A timeout or trusted
+  force-stop poisons the session and is indeterminate, never a cancellation
+  acknowledgement or durable recovery result.
 
 ## Next: durable external operations
 
@@ -68,9 +72,10 @@
 
 ## Next: contained local effects
 
-- Cgroup CPU, memory/RSS, process-tree, aggregate-disk, and wall-clock quotas;
-  worker-specific seccomp allowlists; and authenticated in-band
-  cancellation/deadline policy around the Linux Bubblewrap launcher.
+- Cgroup CPU, memory/RSS, process-tree, aggregate-disk, and session-wide
+  wall-clock quotas; worker-specific seccomp allowlists; authenticated
+  in-band cancellation; and durable post-stop recovery policy around the Linux
+  Bubblewrap launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

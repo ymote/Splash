@@ -15,9 +15,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
 splash-core = { path = "../splash-core" }
 splash-protocol = { version = "0.1.0", path = "../splash-protocol" }
+splash-sandbox = { version = "0.1.0", path = "../splash-sandbox", optional = true }
 splash-schema = { version = "0.1.0", path = "../splash-schema" }
 splash-worker = { version = "0.1.0", path = "../splash-worker", optional = true }
 
 [features]
+bubblewrap-watchdog = ["dep:splash-sandbox"]
 in-process-worker = ["dep:splash-worker"]
 json-line-worker = []

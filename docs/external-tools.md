@@ -248,8 +248,11 @@ late.
 
 For host-pump tools, pump checks the deadline before it invokes the Rust
 handler. A deadline cannot interrupt a handler that has already started or
-cancel a worker process by itself; adapters must apply their own I/O deadline
-and translate timeout into worker cancellation.
+cancel a worker process by itself. A contained adapter must apply its own I/O
+deadline and lifecycle policy. For a synchronous Linux Bubblewrap JSON-line
+worker, `BoundedWorkerTransport` can arm a host-owned watchdog that force-stops
+the worker at a deadline, but that result is indeterminate rather than a
+cooperative cancellation acknowledgement.
 
 ## Cancellation and containment
 
@@ -257,7 +260,10 @@ Cancellation is host-directed. It consumes the reserved call budget and records
 the audit outcome as cancelled; a later completion for the same ID is rejected.
 It does not kill an OS process or network request on its own. The host must
 translate cancellation into its worker transport and platform containment
-mechanism.
+mechanism. The current single-flight JSON-line worker transport cannot deliver
+`WorkerMessage::Cancel` while an invocation is blocked; a Linux Bubblewrap host
+can force-stop it through the watchdog, then discard the session and reconcile
+any durable effect instead of claiming the effect was cancelled.
 
 External dispatch is a capability boundary, not an OS sandbox. A production
 adapter still needs an authenticated transport and a separately contained

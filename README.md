@@ -59,6 +59,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Optional bounded private `/tmp` capacity and a host lifecycle handle that
   force-terminates and reaps a Bubblewrap worker without treating termination
   as an adapter-effect result.
+- Optional Bubblewrap watchdog and generic bounded worker transport that apply
+  a host-selected wall-clock deadline to one synchronous invocation; deadline
+  or host termination poisons the session and remains indeterminate.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

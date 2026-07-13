@@ -129,6 +129,15 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
 Transport framing, worker lifecycle, cancellation delivery, durable replay,
 and OS policy remain backend responsibilities.
 
+`WorkerMessage::Cancel` is reserved wire syntax, not a v0.1 cooperative
+cancellation protocol. `splash-worker::WorkerSession` rejects it. The current
+JSON-line transport is single-flight, so it cannot safely send a second frame
+while it is blocked waiting for an invocation result. A host deadline or
+lifecycle stop must discard the session and treat any effect as indeterminate;
+it must not report a worker acknowledgement that does not exist. A future
+multiplexed transport needs an explicit authenticated cancellation and recovery
+contract before it can use this frame.
+
 ## Rust Adapter Runtime
 
 `splash-worker::WorkerSession` is the baseline implementation for a trusted

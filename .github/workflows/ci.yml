@@ -27,8 +27,7 @@ jobs:
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
       - run: >
           sudo -E env RUSTUP_HOME="$HOME/.rustup"
-          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox
-          bubblewrap_attaches_the_host_owned_seccomp_filter_before_worker_exec -- --ignored
+          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox -- --ignored
 
   fuzz-target:
     runs-on: ubuntu-latest

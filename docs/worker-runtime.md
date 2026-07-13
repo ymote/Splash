@@ -209,20 +209,31 @@ Each line is bounded to the protocol's 1 MiB frame limit before decoding. A
 write, flush, read, malformed frame, oversized frame, invalid response, or
 authentication failure poisons the channel or transport. The host must discard
 it with the session and open a fresh session instead of retrying on the same
-stream. The channel performs synchronous I/O, so the host must also enforce
-worker I/O deadlines, cancellation delivery, process termination, and resource
-limits through its platform backend. A Bubblewrap host can retain the lifecycle
-value returned by `SpawnedBubblewrapWorker::into_lifecycle_parts` and call
-`terminate` to force-stop and reap a worker after the pipes move into this
-channel; that remains process control, not an authenticated cancellation result
-or an effect-recovery decision.
+stream.
+
+The channel performs synchronous I/O, so it cannot deliver an in-band `cancel`
+frame while a call is blocked waiting for its result. On Linux, the optional
+`bubblewrap-watchdog` feature connects a
+`BubblewrapWorkerLifecycle::into_watchdog` lifecycle to the generic
+`BoundedWorkerTransport`. It arms a trusted host-selected nonzero deadline
+before each `invoke`; expiry force-stops and reaps Bubblewrap from a separate
+host thread. An explicit host lifecycle control can do the same. Both outcomes
+are deliberately reported as indeterminate, poison the transport session, and
+require the host to discard it and reconcile any durable effect. This is a
+wall-clock process-stop mechanism, not authenticated cooperative cancellation,
+an adapter acknowledgement, or a durable recovery decision. Other platforms
+must supply their own process, I/O, deadline, cancellation, and resource
+policy.
 
 ## Mobile and Embedded Profiles
 
-The crate has no async runtime, thread, socket, filesystem, process, or
-allocator-specific dependency. It can sit behind an app-owned message loop or
-an embedded transport as long as the host enforces frame-size limits, adapter
-I/O timeouts, storage semantics, and containment appropriate to the target.
+The base capability and JSON-line transport path has no async runtime, thread,
+socket, filesystem, process, or allocator-specific dependency. The optional
+Linux `bubblewrap-watchdog` feature deliberately adds a platform process
+lifecycle dependency and is not part of the mobile or embedded profile. The
+base path can sit behind an app-owned message loop or an embedded transport as
+long as the host enforces frame-size limits, adapter I/O timeouts, storage
+semantics, and containment appropriate to the target.
 
 On mobile, the recommended profile is app-provided adapters only: do not
 expose arbitrary executable, filesystem, or network selectors to the worker.

@@ -32,6 +32,17 @@ pub use splash_protocol::{
 use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 pub use splash_schema::{JsonSchema, SchemaError};
 
+/// Host-enforced deadline and termination wrapper for worker transports.
+///
+/// The wrapper is transport-agnostic so platform containment backends can
+/// supply their own lifecycle supervisor.
+pub mod bounded_worker;
+
+/// Connects the generic bounded worker transport to the Linux Bubblewrap
+/// watchdog lifecycle.
+#[cfg(feature = "bubblewrap-watchdog")]
+pub mod bubblewrap_watchdog;
+
 /// Authenticated in-process worker transport for app-provided adapters.
 ///
 /// This optional module is useful for mobile and embedded hosts that run a
@@ -547,6 +558,14 @@ pub trait WorkerTransport {
     type Error: Display;
 
     fn dispatch(&mut self, invocation: WorkerInvocation) -> Result<WorkerResult, Self::Error>;
+
+    /// Discards the current worker session after a host-side validation or
+    /// lifecycle failure.
+    ///
+    /// The default is appropriate only for transports with no reusable
+    /// session state. Contained transports should poison their channel and
+    /// terminate the worker through their platform supervisor.
+    fn discard(&mut self) {}
 }
 
 /// Host-side client for a capability-attenuated worker session.
@@ -603,19 +622,26 @@ impl<T: WorkerTransport> ProtocolWorkerClient<T> {
             .authorizer
             .authorize(invocation)
             .map_err(worker_denied)?;
-        let result = self
-            .transport
-            .dispatch(authorized.invocation().clone())
-            .map_err(|_| worker_transport_failed())?;
-        self.authorizer
-            .validate_result(&authorized, &result)
-            .map_err(worker_protocol_failed)?;
+        let result = match self.transport.dispatch(authorized.invocation().clone()) {
+            Ok(result) => result,
+            Err(_) => {
+                self.transport.discard();
+                return Err(worker_transport_failed());
+            }
+        };
+        if let Err(error) = self.authorizer.validate_result(&authorized, &result) {
+            self.transport.discard();
+            return Err(worker_protocol_failed(error));
+        }
 
         match result.payload {
             WorkerPayload::Json(value) => Ok(value),
-            WorkerPayload::Text(_) => Err(ToolError::Failed(
-                "worker returned text for a JSON capability".to_owned(),
-            )),
+            WorkerPayload::Text(_) => {
+                self.transport.discard();
+                Err(ToolError::Failed(
+                    "worker returned text for a JSON capability".to_owned(),
+                ))
+            }
         }
     }
 }
@@ -2709,6 +2735,26 @@ mod tests {
         }
     }
 
+    struct MismatchedResultWorker {
+        discarded: bool,
+    }
+
+    impl WorkerTransport for MismatchedResultWorker {
+        type Error = ProtocolError;
+
+        fn dispatch(&mut self, invocation: WorkerInvocation) -> Result<WorkerResult, Self::Error> {
+            WorkerResult::new(
+                "other-worker",
+                invocation.request_id,
+                WorkerPayload::Json(serde_json::json!({"total": 42})),
+            )
+        }
+
+        fn discard(&mut self) {
+            self.discarded = true;
+        }
+    }
+
     fn add_contract() -> JsonToolContract {
         JsonToolContract::new(
             serde_json::json!({
@@ -3876,6 +3922,25 @@ mod tests {
             ToolError::Failed("worker transport failed".to_owned())
         );
         assert!(!error.to_string().contains("production-token"));
+    }
+
+    #[test]
+    fn protocol_worker_client_discards_a_session_after_result_validation_fails() {
+        let manifest =
+            CapabilityManifest::new("worker-1", vec![CapabilityGrant::json("math.add")]).unwrap();
+        let mut client =
+            ProtocolWorkerClient::new(manifest, MismatchedResultWorker { discarded: false })
+                .unwrap();
+
+        assert!(matches!(
+            client.dispatch_json(&JsonToolRequest {
+                name: "math.add".to_owned(),
+                input: serde_json::json!({"left": 20, "right": 22}),
+                call_index: 1,
+            }),
+            Err(ToolError::Failed(message)) if message.starts_with("worker protocol failed:")
+        ));
+        assert!(client.transport_mut().discarded);
     }
 
     #[test]

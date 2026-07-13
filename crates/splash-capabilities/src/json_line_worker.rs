@@ -220,6 +220,10 @@ where
         }
         result
     }
+
+    fn discard(&mut self) {
+        self.poisoned = true;
+    }
 }
 
 impl<C> AuthenticatedFrameWorkerTransport<C>

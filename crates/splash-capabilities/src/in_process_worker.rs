@@ -23,6 +23,7 @@ pub struct InProcessAuthenticatedWorkerTransport<S> {
     host_authenticator: SessionAuthenticator,
     worker: WorkerSession,
     journal_store: S,
+    poisoned: bool,
 }
 
 impl<S> InProcessAuthenticatedWorkerTransport<S> {
@@ -53,6 +54,7 @@ impl<S> InProcessAuthenticatedWorkerTransport<S> {
             host_authenticator,
             worker,
             journal_store,
+            poisoned: false,
         })
     }
 
@@ -69,6 +71,11 @@ impl<S> InProcessAuthenticatedWorkerTransport<S> {
         &self.journal_store
     }
 
+    /// Returns whether a host-side validation failure discarded this session.
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// Consumes the transport and returns its host-owned components.
     pub fn into_parts(self) -> (SessionAuthenticator, WorkerSession, S) {
         (self.host_authenticator, self.worker, self.journal_store)
@@ -83,6 +90,9 @@ where
     type Error = InProcessAuthenticatedWorkerTransportError<S::Error>;
 
     fn dispatch(&mut self, invocation: WorkerInvocation) -> Result<WorkerResult, Self::Error> {
+        if self.poisoned {
+            return Err(InProcessAuthenticatedWorkerTransportError::Poisoned);
+        }
         let request = self
             .host_authenticator
             .seal(WorkerMessage::Invoke { invocation })
@@ -99,6 +109,10 @@ where
             WorkerMessage::Result { result } => Ok(result),
             _ => Err(InProcessAuthenticatedWorkerTransportError::UnexpectedResponse),
         }
+    }
+
+    fn discard(&mut self) {
+        self.poisoned = true;
     }
 }
 
@@ -135,6 +149,7 @@ pub enum InProcessAuthenticatedWorkerTransportError<E> {
     Protocol(ProtocolError),
     Worker(WorkerSessionError<E>),
     UnexpectedResponse,
+    Poisoned,
 }
 
 impl<E: Display> Display for InProcessAuthenticatedWorkerTransportError<E> {
@@ -148,6 +163,7 @@ impl<E: Display> Display for InProcessAuthenticatedWorkerTransportError<E> {
             Self::UnexpectedResponse => {
                 formatter.write_str("in-process worker returned an unexpected response")
             }
+            Self::Poisoned => formatter.write_str("in-process worker transport is poisoned"),
         }
     }
 }

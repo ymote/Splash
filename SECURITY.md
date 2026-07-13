@@ -101,8 +101,11 @@ poisons the channel after any write, flush, read, decode, size, or framing
 failure; the authenticated call transport likewise poisons itself after an
 invalid or unexpected worker response. A host must discard that session rather
 than retrying on the stream. This is protocol robustness, not containment: the
-host still owns trusted key provisioning, I/O deadlines, cancellation, child
+host still owns trusted key provisioning, cancellation semantics, child
 lifecycle, and the platform sandbox that restricts the worker's OS authority.
+The optional Bubblewrap watchdog can enforce a host-selected wall-clock
+force-stop for one synchronous transport invocation, but it is not an
+authenticated cancellation acknowledgement or effect-recovery decision.
 
 `splash-sandbox::bubblewrap` is the first such platform sandbox integration.
 It accepts only a fixed host-selected worker executable and fixed arguments,
@@ -172,10 +175,16 @@ process limit, RSS ceiling, aggregate disk quota, wall-clock deadline, seccomp
 policy, cancellation mechanism, or complete sandbox. Use cgroups and a
 dedicated non-root sandbox identity where those properties are required.
 
-`RLIMIT_CPU` does not bound a sleeping or blocked worker. A host that needs a
-wall-clock deadline must independently schedule lifecycle termination on a
-monotonic timer, discard the session, and reconcile any durable effect. The
-runner does not implement that timer or authenticated in-band cancellation.
+`RLIMIT_CPU` does not bound a sleeping or blocked worker. A host using the
+optional `BubblewrapWorkerWatchdog` through `BoundedWorkerTransport` can arm a
+nonzero trusted wall-clock deadline for one synchronous transport invocation.
+The watchdog owns the child in a separate host thread, force-stops and reaps it
+on expiry, and treats a response race as indeterminate. It is not
+authenticated in-band cancellation and does not establish whether an adapter
+effect occurred. A host that does not use the watchdog must independently
+schedule lifecycle termination on a monotonic timer, discard the session, and
+reconcile any durable effect. The runner does not implement that timer or a
+worker cancellation acknowledgement.
 
 An explicit private `/tmp` can have a Bubblewrap `--size` allocation ceiling.
 That bounds only this tmpfs mount and must not be described as a process-memory,
@@ -187,14 +196,16 @@ or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no worker-specific syscall allowlist, cgroup quotas,
-per-origin network proxy, D-Bus mediation, secret broker, deadline enforcement,
-cancellation delivery, or post-exit recovery. Its optional runner provides only
-the narrow rlimits described above, and `DenyKnownEscapeSurface` provides only
-the fixed default-allow hardening described above. A private `/tmp` is opt-in
-and unbounded unless the host selects its explicit Bubblewrap size limit; that
-limit does not replace a memory or disk policy. Its filesystem boundary is per
-worker session, not per individual invocation: an attenuated manifest should
-be narrowed before launch when per-call filesystem isolation is required.
+per-origin network proxy, D-Bus mediation, secret broker, authenticated
+cancellation delivery, or post-exit recovery. Its optional watchdog supplies
+only the narrow host wall-clock force-stop described above, and its optional
+runner provides only the narrow rlimits described above.
+`DenyKnownEscapeSurface` provides only the fixed default-allow hardening
+described above. A private `/tmp` is opt-in and unbounded unless the host
+selects its explicit Bubblewrap size limit; that limit does not replace a
+memory or disk policy. Its filesystem boundary is per worker session, not per
+individual invocation: an attenuated manifest should be narrowed before launch
+when per-call filesystem isolation is required.
 Policy source paths must be host-owned and immutable to untrusted actors from
 compilation through worker exit, including their executable and symlink
 targets; the current path-based launcher cannot eliminate that race. A fixed

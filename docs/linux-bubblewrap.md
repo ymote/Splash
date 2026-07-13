@@ -67,7 +67,7 @@ let bootstrap = PrivatePipeWorkerBootstrap::new(
     trusted_session_key,
 )?;
 let worker = command.spawn_with_bootstrap(&bootstrap)?;
-let (mut lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
+let (lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
 ```
 
 `spawn_with_bootstrap` binds the bootstrap session ID to the manifest used at
@@ -80,10 +80,56 @@ capability selectors, or ordinary JSON frames.
 The worker must read that preamble exactly once before it creates its JSON-line
 reader, construct its worker `SessionAuthenticator`, and use it to verify the
 one-way authenticated `open_session` frame. The host then wraps the returned
-pipes in the bounded JSON-line transport, sends that frame with
-`host_authenticator`, and enforces its own deadlines and cancellation. This is
-only delivery of a key that the host already generated and trusts; it is not key
-exchange, encrypted transport, worker attestation, or key storage.
+pipes in the bounded JSON-line transport and sends that frame with
+`host_authenticator`. This is only delivery of a key that the host already
+generated and trusts; it is not key exchange, encrypted transport, worker
+attestation, or key storage.
+
+## Host Wall-Clock Watchdog
+
+For a synchronous JSON-line worker, enable both
+`splash-capabilities/json-line-worker` and
+`splash-capabilities/bubblewrap-watchdog`. Move the lifecycle into the
+watchdog before sending effectful work, then wrap the authenticated transport:
+
+```rust
+use std::io::BufReader;
+use std::time::Duration;
+
+use splash_capabilities::bounded_worker::{
+    BoundedWorkerTransport, WorkerInvocationDeadline,
+};
+use splash_capabilities::json_line_worker::{
+    AuthenticatedFrameWorkerTransport, JsonLineWorkerChannel, WorkerFrameChannel,
+};
+use splash_capabilities::WorkerMessage;
+
+let watchdog = lifecycle.into_watchdog()?;
+let stop = watchdog.control(); // Trusted host lifecycle control only.
+let mut channel = JsonLineWorkerChannel::new(BufReader::new(worker_stdout), worker_stdin);
+let opening = host_authenticator.seal(WorkerMessage::OpenSession {
+    manifest: attenuated_manifest.clone(),
+})?;
+channel.send_frame(opening)?;
+let transport = AuthenticatedFrameWorkerTransport::new(host_authenticator, channel)?;
+let deadline = WorkerInvocationDeadline::new(Duration::from_secs(30))?;
+let transport = BoundedWorkerTransport::new(transport, watchdog, deadline);
+```
+
+`BoundedWorkerTransport` arms the watchdog before it sends each synchronous
+`invoke` frame and disarms it only after the frame transport has returned. On
+expiry, the watchdog force-stops and reaps Bubblewrap while the caller can
+still be blocked reading a pipe. `stop.terminate()` performs the same process
+operation for a host cancellation decision. Neither path writes
+`WorkerMessage::Cancel`, waits for a worker acknowledgement, or establishes
+that an adapter effect did not happen. A timeout or force-stop always poisons
+the session and produces an indeterminate transport error, even when a result
+races with termination. Discard the session; use the durable reconciliation or
+compensation path before deciding how to recover an effect.
+
+The watchdog bounds one host transport invocation, not the worker's total
+resource consumption, a child process tree, or an adapter's downstream I/O.
+The deadline is trusted host configuration and is never a Splash value.
 
 `enable_private_tmpfs_with_maximum_bytes` emits `--size BYTES` immediately
 before `--tmpfs /tmp`. Bubblewrap enforces that maximum only for allocations in
@@ -195,19 +241,15 @@ Use a dedicated non-root sandbox identity and cgroups when isolation needs any
 of those guarantees. See the Linux [`getrlimit(2)` manual](https://man7.org/linux/man-pages/man2/getrlimit.2.html)
 for exact kernel semantics.
 
-`RLIMIT_CPU` does not terminate a sleeping or blocked worker. A host that needs
-a wall-clock deadline must independently schedule
+`RLIMIT_CPU` does not terminate a sleeping or blocked worker. The optional
+watchdog above supplies a host wall-clock process deadline for the bounded
+transport path. It force-stops and reaps the Bubblewrap child when its deadline
+or trusted host control wins; that is not authenticated in-band cancellation
+and cannot establish whether an adapter effect began or completed. Hosts that
+do not use the watchdog must independently schedule
 `BubblewrapWorkerLifecycle::terminate()` on a monotonic timer, discard the
-session afterward, and reconcile any durable effect. The runner does not create
-that timer or turn process termination into in-band cancellation.
-
-After the pipes move into the JSON-line transport, retain `lifecycle` and call
-`lifecycle.terminate()` after a host deadline, cancellation decision, or
-poisoned transport. It force-kills and reaps the host-side Bubblewrap child, returning
-whether it was already exited or killed. This is not authenticated in-band
-cancellation and cannot establish whether an adapter effect began or completed.
-Discard the session and use the durable reconciliation or compensation path for
-any effectful operation.
+session afterward, and reconcile any durable effect. The runner itself does
+not create a timer or turn process termination into a worker acknowledgement.
 
 `compile` canonicalizes the source paths and fails closed when a source is
 missing, is the wrong type, resolves to `/`, overlaps another worker-visible
@@ -291,10 +333,11 @@ It does not yet provide:
   hardening filter, not a replacement for any of these;
 - a safe per-origin network allowlist, arbitrary executable selection, secret
   broker, or filesystem access outside registered directory roots;
-- authenticated in-band cancellation delivery, I/O deadlines, post-exit
-  reconciliation, or durable operation storage. `lifecycle.terminate()` is a
-  forceful process stop that the host must schedule for a wall-clock deadline,
-  not proof that an adapter effect was cancelled; and
+- authenticated in-band cancellation delivery, worker cancellation
+  acknowledgements, post-exit reconciliation, or durable operation storage.
+  The optional watchdog supplies a host wall-clock force-stop for one
+  synchronous transport invocation, not proof that an adapter effect was
+  cancelled; and
 - protection from a trusted host changing a policy source path between plan
   compilation and worker exit. Policy sources and their contents, including
   executable and symlink targets, must be owned and immutable to untrusted
