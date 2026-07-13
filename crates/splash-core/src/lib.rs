@@ -305,6 +305,20 @@ pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
     check_syntax_named("inline.splash", source, ExecutionLimits::default())
 }
 
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::{check_profile_named, ExecutionLimits, RuntimeError, SyntaxReport};
+
+    /// Runs only the canonical Splash preflight for differential fuzzing.
+    pub fn check_canonical_profile(
+        source: &str,
+        limits: ExecutionLimits,
+    ) -> Result<SyntaxReport, RuntimeError> {
+        check_profile_named(source, limits)
+    }
+}
+
 /// Validates named canonical Splash source without executing it.
 ///
 /// This function rejects Makepad compatibility syntax outside the documented
@@ -317,16 +331,9 @@ pub fn check_syntax_named(
     source: &str,
     limits: ExecutionLimits,
 ) -> Result<SyntaxReport, RuntimeError> {
-    let limits = limits.validate()?;
-    validate_source_length(source, limits)?;
-
-    let profile = check_canonical_profile(source, limits.max_syntax_tokens);
-    if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
-        return Ok(SyntaxReport {
-            valid: false,
-            diagnostics: profile.diagnostics,
-            diagnostics_truncated: profile.diagnostics_truncated,
-        });
+    let profile = check_profile_named(source, limits)?;
+    if !profile.valid {
+        return Ok(profile);
     }
 
     let mut diagnostics = Vec::new();
@@ -362,6 +369,29 @@ pub fn check_syntax_named(
         valid: !parser.had_error && diagnostics.is_empty(),
         diagnostics,
         diagnostics_truncated,
+    })
+}
+
+fn check_profile_named(
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<SyntaxReport, RuntimeError> {
+    let limits = limits.validate()?;
+    validate_source_length(source, limits)?;
+
+    let profile = check_canonical_profile(source, limits.max_syntax_tokens);
+    if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
+        return Ok(SyntaxReport {
+            valid: false,
+            diagnostics: profile.diagnostics,
+            diagnostics_truncated: profile.diagnostics_truncated,
+        });
+    }
+
+    Ok(SyntaxReport {
+        valid: true,
+        diagnostics: Vec::new(),
+        diagnostics_truncated: false,
     })
 }
 
@@ -642,6 +672,74 @@ mod tests {
         .unwrap();
 
         assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn generated_canonical_corpus_remains_vm_parse_compatible() {
+        const ATOMS: [&str; 14] = [
+            "nil",
+            "true",
+            "false",
+            "0",
+            "42",
+            "1.25e+2",
+            "\"line\\n\\u{0041}\"",
+            "value",
+            "[1, 2]",
+            "{left: 1, right: 2}",
+            "(1 + 2)",
+            "if true { 1 } else { 2 }",
+            "|| 0",
+            "|value| value + 1",
+        ];
+
+        let mut sources = Vec::new();
+        for atom in ATOMS {
+            sources.extend([
+                format!("let value = {atom}\nvalue"),
+                format!("let value = ({atom})\nvalue"),
+                format!("let value = !{atom}\nvalue"),
+                format!("let value = {atom} + 1\nvalue"),
+                format!("let value = {atom} == {atom}\nvalue"),
+                format!("let value = {atom}.field\nvalue"),
+                format!("let value = {atom}[0]\nvalue"),
+            ]);
+        }
+        sources.extend([
+            "fn add(left, right) {\n    return left + right\n}\nadd(1, 2)".to_owned(),
+            "let values = [1, 2]\nfor value in values {\n    let copy = value\n}".to_owned(),
+            "let values = [1, 2]\nfor index, value in values {\n    if index == 0 {\n        continue\n    } else {\n        break\n    }\n}".to_owned(),
+            "let values = [1, 2]\nfor first, second, third in values {\n    break\n}".to_owned(),
+            "while false {\n    break\n}".to_owned(),
+            "loop {\n    break\n}".to_owned(),
+            "let record = {\n    left: 1\n    right: 2\n}\nrecord.left".to_owned(),
+            "let callback = |value| {\n    return value + 1\n}\ncallback(1)".to_owned(),
+            "use mod.std.assert\nassert(true)".to_owned(),
+            "use mod.tool\ntool.call(\"text.echo\", \"hello\")".to_owned(),
+            "use mod.tool\ntool.start(\"text.echo\", \"hello\").await()".to_owned(),
+        ]);
+
+        let limits = ExecutionLimits::default();
+        let mut profile_accepted = 0;
+        for source in sources {
+            let profile = check_canonical_profile(&source, limits.max_syntax_tokens);
+            if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
+                continue;
+            }
+
+            profile_accepted += 1;
+            let report = check_syntax_named("generated.splash", &source, limits).unwrap();
+            assert!(
+                report.valid,
+                "canonical profile accepted source that the VM parser rejected: {source:?}\n{:?}",
+                report.diagnostics
+            );
+        }
+
+        assert!(
+            profile_accepted >= 90,
+            "generated corpus lost canonical coverage: {profile_accepted} sources accepted"
+        );
     }
 
     #[test]

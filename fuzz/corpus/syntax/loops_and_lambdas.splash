@@ -1,0 +1,25 @@
+let values = [1, 2, 3]
+let transform = |value| value * 2
+let total = 0
+
+for value in values {
+    total += transform(value)
+}
+
+for index, value in values {
+    if index == 1 {
+        continue
+    } else {
+        let copy = value
+    }
+}
+
+while false {
+    break
+}
+
+loop {
+    break
+}
+
+total

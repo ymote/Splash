@@ -1,0 +1,6 @@
+use mod.tool
+
+let text = "line\\n\\u{0041}"
+let request = {message: text, values: [1, 2]}
+let reply = tool.start("text.echo", request.message).await()
+reply

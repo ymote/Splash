@@ -18,3 +18,10 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-script
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
+
+  fuzz-target:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: RUSTFLAGS='--cfg fuzzing' cargo +nightly check --locked --manifest-path fuzz/Cargo.toml

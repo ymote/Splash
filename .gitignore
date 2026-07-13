@@ -1,4 +1,10 @@
 /target/
 vendor/makepad/target/
+/fuzz/artifacts/
+/fuzz/corpus/*
+!/fuzz/corpus/syntax/
+/fuzz/corpus/syntax/*
+!/fuzz/corpus/syntax/*.splash
+/fuzz/target/
 *.swp
 .DS_Store

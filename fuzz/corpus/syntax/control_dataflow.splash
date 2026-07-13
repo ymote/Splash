@@ -1,0 +1,16 @@
+use mod.std.assert
+
+let values = [1, 2, 3]
+let record = {left: values[0], right: values[2]}
+
+fn total(left, right) {
+    return left + right
+}
+
+let result = if record.left < record.right {
+    total(record.left, record.right)
+} else {
+    0
+}
+
+assert(result == 4)
