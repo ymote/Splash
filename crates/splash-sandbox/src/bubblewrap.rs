@@ -16,8 +16,16 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
 
 #[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "linux")]
+use rustix::io::{fcntl_setfd, FdFlags};
 use splash_protocol::{
     CapabilityManifest, PrivatePipeWorkerBootstrap, PrivatePipeWorkerBootstrapError, ProtocolError,
     ResourceKind, ResourceSelector,
@@ -48,6 +56,33 @@ pub enum UserNamespacePolicy {
     BestEffort,
     /// Requires Bubblewrap to prevent further user namespaces for the worker.
     RequireNoFurtherUserNamespaces,
+}
+
+/// Seccomp hardening selected for a Bubblewrap worker.
+///
+/// This is trusted host configuration, not a script-facing policy language.
+/// [`Self::DenyKnownEscapeSurface`] is intentionally a default-allow cBPF
+/// filter: it denies a reviewed set of namespace, mount, kernel-control,
+/// tracing, keyring, and terminal-injection operations while preserving the
+/// broad syscall compatibility required by a dynamic worker. It is useful
+/// defense in depth, but it is not a worker-specific syscall allowlist or a
+/// complete syscall sandbox.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WorkerSeccompProfile {
+    /// Do not pass a seccomp program to Bubblewrap.
+    #[default]
+    Disabled,
+    /// Denies a fixed, Splash-owned set of common sandbox-escape operations.
+    ///
+    /// The profile verifies the syscall ABI, kills an x86-64 x32 ABI attempt,
+    /// returns `EPERM` for its denied operations, and returns `ENOSYS` for
+    /// `clone3` so common libc implementations can use legacy `clone`.
+    /// Legacy `clone` remains available for processes and threads but is
+    /// rejected when it requests any namespace-creation flag. Applications
+    /// that require `clone3` must not enable this compatibility-oriented
+    /// profile until a worker-specific allowlist is available.
+    DenyKnownEscapeSurface,
 }
 
 /// One Linux resource controlled by [`WorkerResourceLimits`].
@@ -310,8 +345,9 @@ impl ResourceLimitRunner {
 /// Runtime mounts provide the fixed worker executable and the libraries it
 /// needs. They are separate from capability-selected file roots so the worker
 /// program can never be sourced from a writable grant. They must still be
-/// minimal: without a seccomp policy, a compromised worker can execute or read
-/// any file exposed by a runtime mount.
+/// minimal: the default-allow seccomp hardening profile intentionally permits
+/// `execve`, so a compromised worker can execute or read files exposed by a
+/// runtime mount.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadOnlyMount {
     source: PathBuf,
@@ -424,6 +460,7 @@ pub struct BubblewrapWorkerPolicy {
     private_tmpfs: PrivateTmpfs,
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
+    seccomp_profile: WorkerSeccompProfile,
 }
 
 impl BubblewrapWorkerPolicy {
@@ -449,6 +486,7 @@ impl BubblewrapWorkerPolicy {
             private_tmpfs: PrivateTmpfs::Disabled,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
+            seccomp_profile: WorkerSeccompProfile::Disabled,
         })
     }
 
@@ -556,6 +594,23 @@ impl BubblewrapWorkerPolicy {
         self
     }
 
+    /// Returns the selected seccomp hardening profile.
+    pub const fn seccomp_profile(&self) -> WorkerSeccompProfile {
+        self.seccomp_profile
+    }
+
+    /// Selects a typed, Splash-owned seccomp hardening profile.
+    ///
+    /// A selected profile is compiled by Splash and transferred to Bubblewrap
+    /// over an anonymous launch-only descriptor. Callers cannot provide raw
+    /// cBPF, syscall numbers, or a descriptor. Unsupported platforms and
+    /// architectures reject a selected profile during compilation; launch does
+    /// not fall back to an unfiltered worker.
+    pub fn set_seccomp_profile(&mut self, profile: WorkerSeccompProfile) -> &mut Self {
+        self.seccomp_profile = profile;
+        self
+    }
+
     /// Validates a manifest and creates an immutable Bubblewrap launch plan.
     ///
     /// `file_root` selectors map only through host-registered bindings. This
@@ -622,6 +677,7 @@ impl BubblewrapWorkerPolicy {
                 "resource limit runner source",
             )?;
         }
+        let seccomp_program = compile_seccomp_program(self.seccomp_profile)?;
 
         let mut arguments = vec![
             OsString::from("--die-with-parent"),
@@ -670,6 +726,7 @@ impl BubblewrapWorkerPolicy {
             bwrap_program,
             arguments,
             session_id: manifest.session_id.clone(),
+            seccomp_program,
         })
     }
 }
@@ -686,6 +743,7 @@ pub struct BubblewrapCommand {
     bwrap_program: PathBuf,
     arguments: Vec<OsString>,
     session_id: String,
+    seccomp_program: Option<SeccompProgram>,
 }
 
 impl BubblewrapCommand {
@@ -694,7 +752,11 @@ impl BubblewrapCommand {
         &self.bwrap_program
     }
 
-    /// Returns the exact command-line arguments supplied to Bubblewrap.
+    /// Returns the fixed command-line arguments supplied to Bubblewrap.
+    ///
+    /// A selected seccomp profile contributes a launch-only `--seccomp FD`
+    /// pair that is intentionally omitted here because the anonymous descriptor
+    /// exists only during [`Self::spawn`].
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
@@ -706,6 +768,17 @@ impl BubblewrapCommand {
     /// It is never added to the Bubblewrap command line.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Returns the selected host-owned seccomp hardening profile.
+    ///
+    /// The profile's descriptor is created only while spawning the worker, so
+    /// it is intentionally absent from [`Self::arguments`].
+    pub const fn seccomp_profile(&self) -> WorkerSeccompProfile {
+        match self.seccomp_program {
+            Some(ref program) => program.profile,
+            None => WorkerSeccompProfile::Disabled,
+        }
     }
 
     /// Starts a worker with piped JSON-line standard input and output.
@@ -723,7 +796,17 @@ impl BubblewrapCommand {
 
         #[cfg(target_os = "linux")]
         {
+            let seccomp_descriptor = self
+                .seccomp_program
+                .as_ref()
+                .map(SeccompProgram::open_for_bubblewrap)
+                .transpose()?;
             let mut command = Command::new(&self.bwrap_program);
+            if let Some(descriptor) = &seccomp_descriptor {
+                command
+                    .arg("--seccomp")
+                    .arg(descriptor.as_raw_fd().to_string());
+            }
             command
                 .args(&self.arguments)
                 .env_clear()
@@ -731,6 +814,10 @@ impl BubblewrapCommand {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             let mut child = command.spawn().map_err(BubblewrapSpawnError::Spawn)?;
+            // The worker-side copy is owned and closed by Bubblewrap while it
+            // reads the program. Close our deliberately inherited copy before
+            // any later host process launch can observe it.
+            drop(seccomp_descriptor);
             let Some(stdin) = child.stdin.take() else {
                 discard_child(&mut child);
                 return Err(BubblewrapSpawnError::MissingStdin);
@@ -774,6 +861,50 @@ impl BubblewrapCommand {
             return Err(BubblewrapBootstrapError::Bootstrap(error));
         }
         Ok(worker)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SeccompProgram {
+    profile: WorkerSeccompProfile,
+    bytes: Vec<u8>,
+}
+
+impl SeccompProgram {
+    #[cfg(target_os = "linux")]
+    fn open_for_bubblewrap(&self) -> Result<UnixStream, BubblewrapSpawnError> {
+        let (descriptor, mut producer) =
+            UnixStream::pair().map_err(BubblewrapSpawnError::SeccompTransport)?;
+        producer
+            .write_all(&self.bytes)
+            .map_err(BubblewrapSpawnError::SeccompTransport)?;
+        drop(producer);
+
+        // Bubblewrap receives this descriptor through exec, reads the complete
+        // cBPF program, and closes it before it enters the sandbox. The worker
+        // never receives a descriptor selected by a caller.
+        fcntl_setfd(&descriptor, FdFlags::empty())
+            .map_err(|source| BubblewrapSpawnError::SeccompTransport(source.into()))?;
+        Ok(descriptor)
+    }
+}
+
+fn compile_seccomp_program(
+    profile: WorkerSeccompProfile,
+) -> Result<Option<SeccompProgram>, BubblewrapPolicyError> {
+    if profile == WorkerSeccompProfile::Disabled {
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux_seccomp::compile(profile).map(Some)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = profile;
+        Err(BubblewrapPolicyError::SeccompUnsupportedPlatform)
     }
 }
 
@@ -884,6 +1015,10 @@ pub enum BubblewrapPolicyError {
         maximum_bytes: usize,
     },
     EmptyResourceLimits,
+    SeccompUnsupportedPlatform,
+    SeccompUnsupportedArchitecture {
+        architecture: &'static str,
+    },
     InvalidPath {
         field: &'static str,
         path: PathBuf,
@@ -952,6 +1087,13 @@ impl Display for BubblewrapPolicyError {
             Self::EmptyResourceLimits => {
                 formatter.write_str("resource limit runner requires at least one finite limit")
             }
+            Self::SeccompUnsupportedPlatform => {
+                formatter.write_str("selected seccomp profile is supported only on Linux")
+            }
+            Self::SeccompUnsupportedArchitecture { architecture } => write!(
+                formatter,
+                "selected seccomp profile does not support Linux architecture {architecture}"
+            ),
             Self::InvalidPath {
                 field,
                 path,
@@ -1048,6 +1190,8 @@ impl std::error::Error for BubblewrapPolicyError {
             Self::SourceIo { source, .. } => Some(source),
             Self::InvalidPrivateTmpfsSize { .. }
             | Self::EmptyResourceLimits
+            | Self::SeccompUnsupportedPlatform
+            | Self::SeccompUnsupportedArchitecture { .. }
             | Self::InvalidPath { .. }
             | Self::InvalidSourceType { .. }
             | Self::RootMountForbidden { .. }
@@ -1070,6 +1214,7 @@ impl std::error::Error for BubblewrapPolicyError {
 #[derive(Debug)]
 pub enum BubblewrapSpawnError {
     UnsupportedPlatform,
+    SeccompTransport(io::Error),
     Spawn(io::Error),
     MissingStdin,
     MissingStdout,
@@ -1146,6 +1291,12 @@ impl Display for BubblewrapSpawnError {
             Self::UnsupportedPlatform => {
                 formatter.write_str("Bubblewrap workers are supported only on Linux")
             }
+            Self::SeccompTransport(error) => {
+                write!(
+                    formatter,
+                    "could not prepare Bubblewrap seccomp program: {error}"
+                )
+            }
             Self::Spawn(error) => write!(formatter, "failed to spawn Bubblewrap worker: {error}"),
             Self::MissingStdin => formatter.write_str("Bubblewrap worker did not expose stdin"),
             Self::MissingStdout => formatter.write_str("Bubblewrap worker did not expose stdout"),
@@ -1156,7 +1307,7 @@ impl Display for BubblewrapSpawnError {
 impl std::error::Error for BubblewrapSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Spawn(error) => Some(error),
+            Self::SeccompTransport(error) | Self::Spawn(error) => Some(error),
             Self::UnsupportedPlatform | Self::MissingStdin | Self::MissingStdout => None,
         }
     }
@@ -1462,6 +1613,347 @@ fn discard_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[cfg(target_os = "linux")]
+mod linux_seccomp {
+    use super::{BubblewrapPolicyError, SeccompProgram, WorkerSeccompProfile};
+    use linux_raw_sys::{errno, general, ioctl, ptrace};
+
+    const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+    const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+    const SECCOMP_DATA_ARGUMENTS_OFFSET: u32 = 16;
+    const SECCOMP_DATA_ARGUMENT_SIZE: u32 = 8;
+    const SECCOMP_FILTER_INSTRUCTION_BYTES: usize = 8;
+
+    const BPF_LD_W_ABS: u16 = (ptrace::BPF_LD | ptrace::BPF_W | ptrace::BPF_ABS) as u16;
+    const BPF_JEQ_K: u16 = (ptrace::BPF_JMP | ptrace::BPF_JEQ | ptrace::BPF_K) as u16;
+    const BPF_JSET_K: u16 = (ptrace::BPF_JMP | ptrace::BPF_JSET | ptrace::BPF_K) as u16;
+    const BPF_RET_K: u16 = (ptrace::BPF_RET | ptrace::BPF_K) as u16;
+    const DENY_WITH_EPERM: u32 = ptrace::SECCOMP_RET_ERRNO | errno::EPERM;
+    const DENY_WITH_ENOSYS: u32 = ptrace::SECCOMP_RET_ERRNO | errno::ENOSYS;
+    const NAMESPACE_CLONE_FLAGS: u32 = general::CLONE_NEWNS
+        | general::CLONE_NEWCGROUP
+        | general::CLONE_NEWUTS
+        | general::CLONE_NEWIPC
+        | general::CLONE_NEWUSER
+        | general::CLONE_NEWPID
+        | general::CLONE_NEWNET
+        | general::CLONE_NEWTIME;
+
+    const DENIED_SYSCALLS: &[u32] = &[
+        // Filesystem and namespace construction.
+        general::__NR_mount,
+        general::__NR_umount2,
+        general::__NR_pivot_root,
+        general::__NR_move_mount,
+        general::__NR_open_tree,
+        general::__NR_fsopen,
+        general::__NR_fsconfig,
+        general::__NR_fsmount,
+        general::__NR_fspick,
+        general::__NR_mount_setattr,
+        general::__NR_unshare,
+        general::__NR_setns,
+        general::__NR_name_to_handle_at,
+        general::__NR_open_by_handle_at,
+        // Kernel-control and high-risk kernel interfaces.
+        general::__NR_bpf,
+        general::__NR_perf_event_open,
+        general::__NR_userfaultfd,
+        general::__NR_io_uring_setup,
+        general::__NR_io_uring_enter,
+        general::__NR_io_uring_register,
+        general::__NR_init_module,
+        general::__NR_finit_module,
+        general::__NR_delete_module,
+        general::__NR_kexec_load,
+        general::__NR_kexec_file_load,
+        general::__NR_reboot,
+        // Cross-process inspection and keyrings.
+        general::__NR_ptrace,
+        general::__NR_process_vm_readv,
+        general::__NR_process_vm_writev,
+        general::__NR_add_key,
+        general::__NR_request_key,
+        general::__NR_keyctl,
+        // Process hardening controls.
+        general::__NR_personality,
+    ];
+
+    #[derive(Clone, Copy)]
+    struct FilterInstruction {
+        code: u16,
+        jump_if_true: u8,
+        jump_if_false: u8,
+        value: u32,
+    }
+
+    impl FilterInstruction {
+        const fn load_word(offset: u32) -> Self {
+            Self {
+                code: BPF_LD_W_ABS,
+                jump_if_true: 0,
+                jump_if_false: 0,
+                value: offset,
+            }
+        }
+
+        const fn jump_equal(value: u32, jump_if_true: u8, jump_if_false: u8) -> Self {
+            Self {
+                code: BPF_JEQ_K,
+                jump_if_true,
+                jump_if_false,
+                value,
+            }
+        }
+
+        const fn jump_set(value: u32, jump_if_true: u8, jump_if_false: u8) -> Self {
+            Self {
+                code: BPF_JSET_K,
+                jump_if_true,
+                jump_if_false,
+                value,
+            }
+        }
+
+        const fn return_value(value: u32) -> Self {
+            Self {
+                code: BPF_RET_K,
+                jump_if_true: 0,
+                jump_if_false: 0,
+                value,
+            }
+        }
+
+        fn append_to(self, output: &mut Vec<u8>) {
+            output.extend_from_slice(&self.code.to_ne_bytes());
+            output.push(self.jump_if_true);
+            output.push(self.jump_if_false);
+            output.extend_from_slice(&self.value.to_ne_bytes());
+        }
+    }
+
+    struct ProgramBuilder {
+        instructions: Vec<FilterInstruction>,
+    }
+
+    impl ProgramBuilder {
+        fn new() -> Self {
+            Self {
+                instructions: Vec::new(),
+            }
+        }
+
+        fn load_word(&mut self, offset: u32) {
+            self.instructions.push(FilterInstruction::load_word(offset));
+        }
+
+        fn jump_equal(&mut self, value: u32, jump_if_true: u8, jump_if_false: u8) {
+            self.instructions.push(FilterInstruction::jump_equal(
+                value,
+                jump_if_true,
+                jump_if_false,
+            ));
+        }
+
+        fn jump_set(&mut self, value: u32, jump_if_true: u8, jump_if_false: u8) {
+            self.instructions.push(FilterInstruction::jump_set(
+                value,
+                jump_if_true,
+                jump_if_false,
+            ));
+        }
+
+        fn return_value(&mut self, value: u32) {
+            self.instructions
+                .push(FilterInstruction::return_value(value));
+        }
+
+        fn deny_syscall(&mut self, syscall: u32, action: u32) {
+            self.jump_equal(syscall, 0, 1);
+            self.return_value(action);
+        }
+
+        fn into_bytes(self) -> Vec<u8> {
+            let mut bytes =
+                Vec::with_capacity(self.instructions.len() * SECCOMP_FILTER_INSTRUCTION_BYTES);
+            for instruction in self.instructions {
+                instruction.append_to(&mut bytes);
+            }
+            bytes
+        }
+    }
+
+    pub(super) fn compile(
+        profile: WorkerSeccompProfile,
+    ) -> Result<SeccompProgram, BubblewrapPolicyError> {
+        let architecture = current_audit_architecture()?;
+        let mut program = ProgramBuilder::new();
+
+        match profile {
+            WorkerSeccompProfile::DenyKnownEscapeSurface => {}
+            WorkerSeccompProfile::Disabled => {
+                unreachable!("disabled seccomp profiles are not compiled")
+            }
+        }
+
+        // Linux recommends checking the ABI before interpreting syscall
+        // numbers. A mismatch or x32 ABI attempt must not fall through this
+        // default-allow hardening profile.
+        program.load_word(SECCOMP_DATA_ARCH_OFFSET);
+        program.jump_equal(architecture, 1, 0);
+        program.return_value(ptrace::SECCOMP_RET_KILL_PROCESS);
+        program.load_word(SECCOMP_DATA_NR_OFFSET);
+        #[cfg(target_arch = "x86_64")]
+        {
+            program.jump_set(general::__X32_SYSCALL_BIT, 0, 1);
+            program.return_value(ptrace::SECCOMP_RET_KILL_PROCESS);
+        }
+
+        // Retain ordinary processes and threads through legacy clone, while
+        // rejecting every namespace-creation flag. x86-64, AArch64, and
+        // RISC-V all pass raw clone flags as argument 0. clone3 carries flags
+        // through an indirect structure that cBPF cannot inspect, so return
+        // ENOSYS to request a libc fallback rather than permit it unchecked.
+        program.jump_equal(general::__NR_clone, 0, 4);
+        program.load_word(SECCOMP_DATA_ARGUMENTS_OFFSET);
+        program.jump_set(NAMESPACE_CLONE_FLAGS, 0, 1);
+        program.return_value(DENY_WITH_EPERM);
+        program.load_word(SECCOMP_DATA_NR_OFFSET);
+        program.deny_syscall(general::__NR_clone3, DENY_WITH_ENOSYS);
+
+        // TIOCSTI injects terminal input. Other ioctls remain available for
+        // compatibility because a blanket ioctl denial is not a viable policy
+        // for a general dynamic worker.
+        program.jump_equal(general::__NR_ioctl, 0, 4);
+        program.load_word(SECCOMP_DATA_ARGUMENTS_OFFSET + SECCOMP_DATA_ARGUMENT_SIZE);
+        program.jump_equal(ioctl::TIOCSTI, 0, 1);
+        program.return_value(DENY_WITH_EPERM);
+        program.load_word(SECCOMP_DATA_NR_OFFSET);
+
+        for &syscall in DENIED_SYSCALLS {
+            program.deny_syscall(syscall, DENY_WITH_EPERM);
+        }
+        program.return_value(ptrace::SECCOMP_RET_ALLOW);
+
+        Ok(SeccompProgram {
+            profile,
+            bytes: program.into_bytes(),
+        })
+    }
+
+    fn current_audit_architecture() -> Result<u32, BubblewrapPolicyError> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_pointer_width = "64",
+            target_endian = "little"
+        ))]
+        {
+            return Ok(ptrace::AUDIT_ARCH_X86_64);
+        }
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_pointer_width = "64",
+            target_endian = "little"
+        ))]
+        {
+            return Ok(ptrace::AUDIT_ARCH_AARCH64);
+        }
+        #[cfg(all(
+            target_arch = "riscv64",
+            target_pointer_width = "64",
+            target_endian = "little"
+        ))]
+        {
+            return Ok(ptrace::AUDIT_ARCH_RISCV64);
+        }
+        #[allow(unreachable_code)]
+        Err(BubblewrapPolicyError::SeccompUnsupportedArchitecture {
+            architecture: std::env::consts::ARCH,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn evaluate_for_test(
+        program: &SeccompProgram,
+        architecture: u32,
+        syscall: u32,
+        arguments: [u64; 6],
+    ) -> u32 {
+        assert_eq!(
+            program.bytes.len() % SECCOMP_FILTER_INSTRUCTION_BYTES,
+            0,
+            "cBPF program has a partial instruction"
+        );
+
+        let mut accumulator = 0;
+        let mut index = 0;
+        while index < program.bytes.len() / SECCOMP_FILTER_INSTRUCTION_BYTES {
+            let offset = index * SECCOMP_FILTER_INSTRUCTION_BYTES;
+            let code = u16::from_ne_bytes([program.bytes[offset], program.bytes[offset + 1]]);
+            let jump_if_true = program.bytes[offset + 2];
+            let jump_if_false = program.bytes[offset + 3];
+            let value = u32::from_ne_bytes([
+                program.bytes[offset + 4],
+                program.bytes[offset + 5],
+                program.bytes[offset + 6],
+                program.bytes[offset + 7],
+            ]);
+
+            match code {
+                BPF_LD_W_ABS => {
+                    accumulator = seccomp_data_word(value, architecture, syscall, &arguments);
+                    index += 1;
+                }
+                BPF_JEQ_K => {
+                    let jump = if accumulator == value {
+                        jump_if_true
+                    } else {
+                        jump_if_false
+                    };
+                    index += usize::from(jump) + 1;
+                }
+                BPF_JSET_K => {
+                    let jump = if accumulator & value != 0 {
+                        jump_if_true
+                    } else {
+                        jump_if_false
+                    };
+                    index += usize::from(jump) + 1;
+                }
+                BPF_RET_K => return value,
+                _ => panic!("unexpected cBPF instruction {code:#x}"),
+            }
+        }
+
+        panic!("cBPF program fell through without an action");
+    }
+
+    #[cfg(test)]
+    fn seccomp_data_word(
+        offset: u32,
+        architecture: u32,
+        syscall: u32,
+        arguments: &[u64; 6],
+    ) -> u32 {
+        match offset {
+            SECCOMP_DATA_NR_OFFSET => syscall,
+            SECCOMP_DATA_ARCH_OFFSET => architecture,
+            offset
+                if offset >= SECCOMP_DATA_ARGUMENTS_OFFSET
+                    && offset
+                        < SECCOMP_DATA_ARGUMENTS_OFFSET
+                            + SECCOMP_DATA_ARGUMENT_SIZE * arguments.len() as u32
+                    && (offset - SECCOMP_DATA_ARGUMENTS_OFFSET) % SECCOMP_DATA_ARGUMENT_SIZE
+                        == 0 =>
+            {
+                arguments[((offset - SECCOMP_DATA_ARGUMENTS_OFFSET) / SECCOMP_DATA_ARGUMENT_SIZE)
+                    as usize] as u32
+            }
+            _ => panic!("unexpected seccomp_data offset {offset}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
@@ -1630,6 +2122,111 @@ mod tests {
             ]
         ));
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_hardening_is_typed_and_rejects_its_documented_escape_surface() {
+        use linux_raw_sys::{errno, general, ioctl, ptrace};
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert_eq!(policy.seccomp_profile(), WorkerSeccompProfile::Disabled);
+
+        policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+        let program = plan.seccomp_program.as_ref().unwrap();
+        let architecture = u32::from_ne_bytes(program.bytes[12..16].try_into().unwrap());
+        let denied_with_eperm = ptrace::SECCOMP_RET_ERRNO | errno::EPERM;
+        let denied_with_enosys = ptrace::SECCOMP_RET_ERRNO | errno::ENOSYS;
+
+        assert_eq!(
+            plan.seccomp_profile(),
+            WorkerSeccompProfile::DenyKnownEscapeSurface
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--seccomp"));
+        assert_eq!(program.bytes.len() % 8, 0);
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_mount, [0; 6],),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture,
+                general::__NR_personality,
+                [0; 6],
+            ),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_clone, [0; 6],),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture,
+                general::__NR_clone,
+                [u64::from(general::CLONE_NEWNET); 6],
+            ),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_clone3, [0; 6],),
+            denied_with_enosys
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture,
+                general::__NR_ioctl,
+                [0, u64::from(ioctl::TIOCSTI), 0, 0, 0, 0],
+            ),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_ioctl, [0; 6],),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, u32::MAX, [0; 6]),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture ^ 1,
+                general::__NR_mount,
+                [0; 6]
+            ),
+            ptrace::SECCOMP_RET_KILL_PROCESS
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture,
+                general::__NR_getpid | general::__X32_SYSCALL_BIT,
+                [0; 6],
+            ),
+            ptrace::SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn selected_seccomp_hardening_fails_closed_off_linux() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::SeccompUnsupportedPlatform)
+        ));
     }
 
     #[test]

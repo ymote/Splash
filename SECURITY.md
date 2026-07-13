@@ -128,6 +128,23 @@ reaps the child. This avoids exposing the key in argv or environment variables,
 but it is transfer only: it does not provide key exchange, encryption,
 attestation, or key storage.
 
+Hosts may additionally select the typed
+`WorkerSeccompProfile::DenyKnownEscapeSurface`. Splash generates a fixed cBPF
+program and transfers it over an anonymous launch-only descriptor to
+Bubblewrap, which consumes and closes that descriptor before it attaches the
+filter immediately before worker execution. The profile verifies the syscall
+ABI, kills an x86-64 x32 ABI attempt, rejects mount and namespace construction,
+known kernel-control interfaces, tracing/cross-process-memory calls, keyrings,
+`personality`, and `TIOCSTI`. Bubblewrap requires `no_new_privs` before it
+installs this filter, so a worker can add only stricter seccomp constraints. It
+is intentionally default-allow for dynamic-worker
+compatibility: it permits `execve`, does not constrain arbitrary future or
+unlisted syscalls, and is neither a capability mechanism nor a complete
+syscall sandbox. The profile can return `ENOSYS` for `clone3` to force a legacy
+`clone` fallback with namespace flags checked, which may be incompatible with
+a particular worker. See [`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md)
+for the exact supported architectures, denied operations, and limitations.
+
 An optional host-configured `splash-limit-runner` can execute the fixed worker
 only after applying selected Linux rlimits and disabling core dumps. The runner,
 limits, worker target, and worker arguments are all compiled from trusted Rust
@@ -169,21 +186,22 @@ reconcile a durable effect rather than infer that process termination cancelled
 or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no seccomp filter, cgroup quotas, per-origin network proxy,
-D-Bus mediation, secret broker, deadline enforcement, cancellation delivery,
-or post-exit recovery. Its optional runner provides only the narrow rlimits
-described above. A private `/tmp` is opt-in and unbounded unless the host
-selects its explicit Bubblewrap size limit; that limit does not replace a memory
-or disk policy. Its filesystem boundary is per worker session, not per
-individual invocation: an attenuated manifest should be narrowed before launch
-when per-call filesystem isolation is required. Policy source paths must be
-host-owned and immutable to untrusted actors from compilation through worker
-exit, including their executable and symlink targets; the current path-based
-launcher cannot eliminate that race. A fixed worker program also does not
-prevent a compromised worker from executing or reading other files deliberately
-exposed through a runtime mount; runtime mounts must be minimal and immutable
-until a seccomp policy is implemented. On a failure it does not fall back to an
-unrestricted worker. See
+This backend has no worker-specific syscall allowlist, cgroup quotas,
+per-origin network proxy, D-Bus mediation, secret broker, deadline enforcement,
+cancellation delivery, or post-exit recovery. Its optional runner provides only
+the narrow rlimits described above, and `DenyKnownEscapeSurface` provides only
+the fixed default-allow hardening described above. A private `/tmp` is opt-in
+and unbounded unless the host selects its explicit Bubblewrap size limit; that
+limit does not replace a memory or disk policy. Its filesystem boundary is per
+worker session, not per individual invocation: an attenuated manifest should
+be narrowed before launch when per-call filesystem isolation is required.
+Policy source paths must be host-owned and immutable to untrusted actors from
+compilation through worker exit, including their executable and symlink
+targets; the current path-based launcher cannot eliminate that race. A fixed
+worker program also does not prevent a compromised worker from executing or
+reading other files deliberately exposed through a runtime mount; runtime
+mounts must remain minimal and immutable. On a failure it does not fall back to
+an unrestricted worker. See
 [`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md) before enabling it for
 untrusted local effects.
 

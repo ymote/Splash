@@ -19,7 +19,7 @@ provide it.
 ```rust
 use splash_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, FileRootAccess, FileRootBinding, ReadOnlyMount,
-    ResourceLimitRunner, WorkerResourceLimits,
+    ResourceLimitRunner, WorkerResourceLimits, WorkerSeccompProfile,
 };
 use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
 
@@ -42,6 +42,7 @@ policy.add_file_root(
     )?,
 )?;
 policy.require_no_further_user_namespaces();
+policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
 policy.enable_private_tmpfs_with_maximum_bytes(64 * 1024 * 1024)?;
 
 let mut limits = WorkerResourceLimits::default();
@@ -104,6 +105,48 @@ not permit the required user namespace. Bubblewrap may create a nested user
 namespace internally to establish this restriction, so the mode does not claim
 that the worker is never inside one. It is not a seccomp, resource-limit, or
 general containment policy.
+
+`WorkerSeccompProfile::DenyKnownEscapeSurface` is a second, independent,
+opt-in hardening mode. Splash generates its fixed cBPF program itself and sends
+it through an anonymous launch-only descriptor to Bubblewrap's `--seccomp`
+option. The descriptor is never part of `BubblewrapCommand::arguments`, is not
+caller-supplied, and Bubblewrap consumes and closes it before applying the
+filter immediately before it executes the fixed worker. A selected profile has
+no direct-launch or unfiltered fallback. It currently supports little-endian
+Linux `x86_64`, `aarch64`, and `riscv64`; selecting it on another target fails
+policy compilation.
+
+The profile validates `seccomp_data.arch`, kills an ABI mismatch, and also
+kills x86-64 x32 syscall attempts. It otherwise defaults to `ALLOW` for broad
+dynamic-worker compatibility, returning `EPERM` for a reviewed set of common
+escape-surface operations:
+
+- legacy and modern mount APIs, filesystem-handle APIs, `unshare`, and
+  `setns`;
+- legacy `clone` with any namespace-creation flag;
+- `bpf`, `perf_event_open`, `userfaultfd`, and all `io_uring` entry points;
+- module loading, kexec, reboot, tracing, cross-process memory access, and
+  kernel keyring calls;
+- `personality`, which could disable process hardening such as ASLR; and
+- the `TIOCSTI` terminal-input-injection ioctl.
+
+`clone3` carries its flags in a pointed-to structure that cBPF cannot inspect.
+The profile returns `ENOSYS` for it so common libc implementations fall back to
+legacy `clone`, where the namespace flags are checked. This can break a worker
+that requires `clone3` semantics; validate the exact worker and its runtime
+before selecting the profile.
+
+This is defense in depth, not a general syscall sandbox. It deliberately
+allows `execve`, because Bubblewrap applies the filter before the optional
+trusted pre-exec runner must execute the fixed worker. It also permits every
+syscall outside the fixed deny set, including future kernel interfaces. It
+therefore cannot constrain arbitrary executable chaining from exposed runtime
+mounts, replace a worker-specific syscall allowlist, mediate networking, or
+make a capability decision. Keep runtime mounts minimal and immutable, retain
+the no-host-network namespace, and treat a dedicated worker-specific allowlist
+as future work. Bubblewrap requires `no_new_privs` before it installs the
+filter, so a worker cannot weaken it by adding another seccomp program; a
+worker may still add a stricter filter of its own.
 
 `splash-limit-runner` is an optional Linux-only, fixed pre-exec runner. Build
 the bundled binary on the target Linux platform with:
@@ -175,6 +218,9 @@ The resulting command uses:
 - optional `--unshare-user --disable-userns` immediately after
   `--unshare-all`, requiring a usable user namespace and preventing the worker
   from creating further user namespaces;
+- optional host-generated `--seccomp FD` immediately before launch; Bubblewrap
+  consumes the anonymous descriptor and attaches the selected fixed profile
+  before it executes the worker;
 - `--clearenv`, so worker startup does not inherit host environment variables;
 - `--new-session` and `--die-with-parent` for terminal isolation and parent
   lifecycle binding;
@@ -220,9 +266,10 @@ narrower manifest, rather than relying on one multi-tool worker process.
 The fixed worker program is not an executable syscall policy. A trusted adapter
 cannot receive a script-selected executable through this backend, but a
 compromised worker can still execute or read any file deliberately exposed in a
-runtime mount. Hosts must keep runtime mounts minimal and immutable. Preventing
-unexpected `execve` or other syscalls requires a separately designed seccomp
-policy and remains future work.
+runtime mount. `DenyKnownEscapeSurface` protects only its explicit
+default-allow deny set and intentionally permits `execve`; hosts must keep
+runtime mounts minimal and immutable. Preventing unexpected executable chaining
+requires a separately designed worker-specific syscall allowlist.
 
 ## Non-Guarantees
 
@@ -239,7 +286,9 @@ It does not yet provide:
 - cgroup CPU, memory/RSS, process-tree, aggregate-disk, or wall-clock quotas.
   An optional runner adds the narrower rlimits described above, and a configured
   private `/tmp` size limits only that Bubblewrap `tmpfs`;
-- seccomp policy, D-Bus mediation, device-specific policy, or a network proxy;
+- a worker-specific syscall allowlist, D-Bus mediation, device-specific policy,
+  or a network proxy. `DenyKnownEscapeSurface` is a narrow default-allow
+  hardening filter, not a replacement for any of these;
 - a safe per-origin network allowlist, arbitrary executable selection, secret
   broker, or filesystem access outside registered directory roots;
 - authenticated in-band cancellation delivery, I/O deadlines, post-exit

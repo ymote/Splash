@@ -448,6 +448,7 @@ name = "splash-sandbox"
 version = "0.1.0"
 dependencies = [
  "close_fds",
+ "linux-raw-sys",
  "rustix",
  "splash-protocol",
 ]

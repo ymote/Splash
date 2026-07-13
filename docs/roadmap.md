@@ -57,6 +57,9 @@
 - Optional fixed pre-exec Linux rlimit runner for worker CPU time, virtual
   address space, per-real-UID process threads, open file descriptors, and
   individual file size. It is not a cgroup quota or full containment policy.
+- Optional Linux Bubblewrap `DenyKnownEscapeSurface` seccomp hardening profile
+  with trusted cBPF transport, ABI/x32 checks, and a fixed default-allow deny
+  set. It is defense in depth, not a worker-specific syscall allowlist.
 
 ## Next: durable external operations
 
@@ -66,8 +69,8 @@
 ## Next: contained local effects
 
 - Cgroup CPU, memory/RSS, process-tree, aggregate-disk, and wall-clock quotas;
-  seccomp; and authenticated in-band cancellation/deadline policy around the
-  Linux Bubblewrap launcher.
+  worker-specific seccomp allowlists; and authenticated in-band
+  cancellation/deadline policy around the Linux Bubblewrap launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable
