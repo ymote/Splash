@@ -80,11 +80,6 @@ impl ProfileLexer {
 
     fn tokenize(mut self) -> (Vec<Token>, Vec<SyntaxDiagnostic>, bool) {
         while let Some(character) = self.current() {
-            if self.tokens.len() >= self.max_tokens {
-                let (line, column) = self.location();
-                self.report_token_limit_at(line, column);
-                return (self.tokens, self.diagnostics, self.diagnostics_truncated);
-            }
             match character {
                 ' ' | '\t' | '\u{000C}' => {
                     self.advance();

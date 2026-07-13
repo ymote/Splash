@@ -688,6 +688,22 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_exact_token_limit_with_trailing_non_tokens() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 4,
+            ..ExecutionLimits::default()
+        };
+        let report = check_syntax_named(
+            "tokens.splash",
+            "let value = 1 /* trailing comment */",
+            limits,
+        )
+        .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
     fn bounds_newline_tokens_emitted_from_block_comments() {
         let limits = ExecutionLimits {
             max_syntax_tokens: 3,
