@@ -2243,6 +2243,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires a runner that can configure Bubblewrap's isolated loopback device"]
     fn bubblewrap_attaches_the_host_owned_seccomp_filter_before_worker_exec() {
         use std::io::Read;
 

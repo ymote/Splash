@@ -25,6 +25,10 @@ jobs:
       - run: cargo check --locked -p splash-sandbox --tests --target riscv64gc-unknown-linux-gnu
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-script
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
+      - run: >
+          sudo -E env RUSTUP_HOME="$HOME/.rustup"
+          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox
+          bubblewrap_attaches_the_host_owned_seccomp_filter_before_worker_exec -- --ignored
 
   fuzz-target:
     runs-on: ubuntu-latest
