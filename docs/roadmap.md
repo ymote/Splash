@@ -33,11 +33,13 @@
   and indeterminate-effect recovery.
 - Fenced rollback-protected storage extension and an authenticated worker
   journal-store bridge with scope, revision, and lease enforcement.
+- Feature-gated anchored SQLite payload backend with bounded recovery of
+  uncommitted candidates; it requires a host-provided rollback anchor.
 
 ## Next: durable external operations
 
-- Platform durable-storage adapters with compare-and-swap and rollback
-  protection.
+- Platform `RollbackAnchor` implementations with compare-and-swap and
+  rollback protection, plus target-specific storage-key provisioning.
 
 ## Next: contained local effects
 

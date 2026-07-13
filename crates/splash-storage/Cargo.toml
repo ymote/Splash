@@ -12,7 +12,11 @@ workspace = true
 [dependencies]
 base64 = "0.22.1"
 blake3 = { version = "1.8.5", features = ["pure"] }
+rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 subtle = "2.6.1"
 zeroize = "1.8.2"
+
+[features]
+sqlite = ["dep:rusqlite"]

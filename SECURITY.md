@@ -57,6 +57,16 @@ general-purpose authenticated-store handle or caller-selected record key. The
 host admission authority must reserve a fence for this exact bridge record;
 the runtime cannot infer a record binding from a raw `u64` token.
 
+The optional `AnchoredSqliteStore` persists payload candidates locally but
+accepts them only when a host `RollbackAnchor` has committed their revision,
+content hash, and fence. SQLite is not that anchor and does not become one by
+being opened with durable settings. A real anchor must be linearizable and
+survive both its own failover and local-database rollback. All writers must
+share that anchor and one SQLite file. Host recovery after an anchor outage
+must stop new admissions, reserve a fresh opaque recovery fence, then discard
+only unanchored candidates through the backend API. Never recover by deleting
+the SQLite file or by rebuilding anchor state from it.
+
 Worker adapters must explicitly declare read-only/idempotent safety before the
 non-durable `invoke` path is enabled, and a bounded reconciliation contract
 before durable dispatch or compensation is enabled. A declaration is a trusted

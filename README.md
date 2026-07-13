@@ -36,6 +36,8 @@ and keeps UI support optional rather than making UI the language boundary.
   derived worker keys, and revision-watermark hooks for host storage policy.
 - Host-only authenticated storage envelopes with key rotation and a strict
   rollback-protected compare-and-swap backend contract.
+- Optional SQLite payload storage paired with an explicit trusted rollback
+  anchor, including durable revision and fencing commitments.
 - Fenced authenticated worker-journal storage that binds durable worker state
   to a host-selected record, revision, and current writer lease.
 - A small `splash` CLI for local evaluation and the workflow example.
@@ -114,7 +116,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
   LLM-facing host catalog, JSON contracts, and safe host bridge.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
-  fenced compare-and-swap backend boundary.
+  fenced compare-and-swap backend boundary, plus an optional anchored SQLite
+  payload adapter that requires a platform trust anchor.
 - `splash-protocol`: portable worker messages, capability attenuation,
   keyed session framing, and host-side invocation/result validation.
 - `splash-worker`: worker-side session runtime, explicit Rust adapter registry,

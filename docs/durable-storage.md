@@ -50,6 +50,63 @@ equivalent platform primitive that survives storage rollback.
 tests and local development. It loses both bytes and its floor at process exit,
 so it is never a production rollback defense.
 
+## Anchored SQLite
+
+The optional `sqlite` feature provides
+`splash_storage::sqlite::AnchoredSqliteStore`. It uses SQLite for local
+transactional payload storage and a host-provided `RollbackAnchor` for the
+separate durable, rollback-resistant commitment. SQLite alone remains an
+ordinary local database and is not a trust anchor.
+
+```toml
+splash-storage = { version = "0.1", features = ["sqlite"] }
+```
+
+```rust
+use splash_storage::{
+    sqlite::AnchoredSqliteStore, AuthenticatedStore, StorageKeyring,
+};
+
+// `platform_anchor` must implement RollbackAnchor through a real platform
+// monotonic authority or transactional trusted service.
+let backend = AnchoredSqliteStore::open("/host-owned/splash.sqlite", platform_anchor)?;
+let store = AuthenticatedStore::new(backend, storage_keyring);
+```
+
+For each write, the adapter first commits an immutable SQLite candidate with
+`synchronous=FULL`, then atomically advances the anchor to that candidate's
+revision, content commitment, and fencing state. A candidate left by a crash
+before the anchor transition is ignored. If the anchor has advanced but the
+SQLite file is later restored, missing or substituted payload bytes fail closed
+because they no longer match the anchor's exact record commitment.
+
+All local writers must use the same SQLite file and the same linearizable
+`RollbackAnchor`. Do not use independent SQLite replicas on separate hosts as
+a shared durable store; use a transactional trusted service or a backend built
+for that topology. Keep the database parent directory policy-controlled: an
+anchor detects data rollback but does not make an attacker-controlled path or
+filesystem safe to write.
+
+SQLite candidates are bounded per record. If an anchor outage leaves enough
+uncommitted candidates to reach the bound, stop new admissions, reserve a
+fresh recovery fence, then discard only candidates not committed by the anchor:
+
+```rust
+let recovery = backend.reserve_recovery_fence(&record_key)?;
+let discarded = backend.discard_unanchored_candidates(recovery)?;
+```
+
+The opaque recovery fence is bound to one record and can be used once. It
+prevents older in-flight fenced writers from promoting a candidate after it is
+discarded. A host must still stop new admissions before recovery. The adapter
+does not bootstrap a trust anchor from an existing SQLite file; migration must
+write a new trusted anchor state through the selected platform authority.
+
+`VolatileRollbackAnchor` exists only for tests and local development. A real
+`RollbackAnchor` must atomically and monotonically preserve the revision,
+content commitment, and fence across restart, storage rollback, and anchor
+failover.
+
 ## Fenced Writers
 
 `FencedRollbackProtectedStore` extends the rollback contract for a record that
@@ -76,7 +133,8 @@ The fence and data record use the same structured `StorageRecordKey`. A fenced
 compare-and-swap must revalidate exact token equality inside one atomic backend
 operation; a separate fence read followed by a write leaves a time-of-check,
 time-of-use gap. The fence backend and its failover behavior are therefore a
-security trust anchor.
+security trust anchor. Once a record has a nonzero fence, a plain
+compare-and-swap must fail rather than bypass the fenced write path.
 
 `splash-worker::WorkerJournalStore` has the same production requirement for a
 worker operation journal: `persist` must atomically compare the loaded

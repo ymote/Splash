@@ -1358,6 +1358,8 @@ mod tests {
     use splash_protocol::{
         OperationCompensationBinding, SessionKey, WorkerOperationState, AUTH_TAG_BYTES,
     };
+    #[cfg(feature = "sqlite")]
+    use splash_storage::{sqlite::AnchoredSqliteStore, VolatileRollbackAnchor};
     use splash_storage::{
         AuthenticatedStoreError, StorageKey, StorageKeyId, StorageKeyring, VolatileMemoryStore,
         VolatileMemoryStoreError, STORAGE_KEY_BYTES,
@@ -1568,6 +1570,17 @@ mod tests {
         let key_id = StorageKeyId::new("worker-storage-v1").unwrap();
         let store = AuthenticatedStore::new(
             VolatileMemoryStore::default(),
+            StorageKeyring::new(key_id, StorageKey::from_bytes([53; STORAGE_KEY_BYTES])),
+        );
+        AuthenticatedWorkerJournalStore::new(store, "worker-journal", "tenant-release").unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn anchored_sqlite_journal_store(
+    ) -> AuthenticatedWorkerJournalStore<AnchoredSqliteStore<VolatileRollbackAnchor>> {
+        let key_id = StorageKeyId::new("worker-storage-v1").unwrap();
+        let store = AuthenticatedStore::new(
+            AnchoredSqliteStore::open_in_memory(VolatileRollbackAnchor::default()).unwrap(),
             StorageKeyring::new(key_id, StorageKey::from_bytes([53; STORAGE_KEY_BYTES])),
         );
         AuthenticatedWorkerJournalStore::new(store, "worker-journal", "tenant-release").unwrap()
@@ -2225,6 +2238,41 @@ mod tests {
         assert_eq!(store.reserve_fence().unwrap(), 1);
         assert_eq!(store.reserve_fence().unwrap(), 2);
         assert_eq!(store.current_fence().unwrap(), 2);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn anchored_sqlite_journal_store_persists_and_fences_a_worker_scope() {
+        let mut store = anchored_sqlite_journal_store();
+        let snapshot = store.load().unwrap();
+        let lease = store.reserve_fence().unwrap();
+        let revision = store
+            .persist(
+                snapshot.journal(),
+                snapshot.revision(),
+                WorkerJournalLease::from_fencing_token(lease).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(revision, WorkerJournalRevision::new(1));
+        assert_eq!(store.load().unwrap().revision(), revision);
+
+        let replacement_lease = store.reserve_fence().unwrap();
+        assert_eq!(replacement_lease, 2);
+        assert!(matches!(
+            store.persist(
+                snapshot.journal(),
+                revision,
+                WorkerJournalLease::from_fencing_token(lease).unwrap(),
+            ),
+            Err(AuthenticatedWorkerJournalStoreError::Storage(
+                AuthenticatedStoreError::Backend(
+                    splash_storage::sqlite::AnchoredSqliteStoreError::FencingTokenRejected {
+                        current: 2,
+                        supplied: 1,
+                    }
+                )
+            ))
+        ));
     }
 
     #[test]

@@ -4,8 +4,8 @@ Run the Splash-owned quality gate:
 
 ```sh
 cargo fmt --check
-cargo clippy --all --workspace
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
 ```
 
 The Makepad compatibility import is deliberately outside the workspace lint
