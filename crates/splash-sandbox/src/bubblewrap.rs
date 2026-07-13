@@ -2190,8 +2190,9 @@ mod tests {
             linux_seccomp::evaluate_for_test(program, architecture, general::__NR_ioctl, [0; 6],),
             ptrace::SECCOMP_RET_ALLOW
         );
+        // This synthetic syscall remains below the x32 marker.
         assert_eq!(
-            linux_seccomp::evaluate_for_test(program, architecture, 0x7fff_ffff, [0; 6]),
+            linux_seccomp::evaluate_for_test(program, architecture, 0x3fff_ffff, [0; 6]),
             ptrace::SECCOMP_RET_ALLOW
         );
         assert_eq!(
