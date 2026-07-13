@@ -211,7 +211,11 @@ authentication failure poisons the channel or transport. The host must discard
 it with the session and open a fresh session instead of retrying on the same
 stream. The channel performs synchronous I/O, so the host must also enforce
 worker I/O deadlines, cancellation delivery, process termination, and resource
-limits through its platform backend.
+limits through its platform backend. A Bubblewrap host can retain the lifecycle
+value returned by `SpawnedBubblewrapWorker::into_lifecycle_parts` and call
+`terminate` to force-stop and reap a worker after the pipes move into this
+channel; that remains process control, not an authenticated cancellation result
+or an effect-recovery decision.
 
 ## Mobile and Embedded Profiles
 

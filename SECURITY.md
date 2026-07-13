@@ -116,20 +116,28 @@ reaps the child. This avoids exposing the key in argv or environment variables,
 but it is transfer only: it does not provide key exchange, encryption,
 attestation, or key storage.
 
+An explicit private `/tmp` can have a Bubblewrap `--size` allocation ceiling.
+That bounds only this tmpfs mount and must not be described as a process-memory,
+CPU, process-count, or general disk quota. After transport pipes move out of
+the startup handle, `BubblewrapWorkerLifecycle::terminate` force-terminates and
+reaps the worker. It is process control only: the host must drop the session and
+reconcile a durable effect rather than infer that process termination cancelled
+or rolled it back.
+
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no seccomp filter, cgroup or rlimit enforcement, per-origin
 network proxy, D-Bus mediation, secret broker, deadline enforcement,
 cancellation delivery, or post-exit recovery. A private `/tmp` is opt-in and
-unbounded unless the host separately applies a memory or disk policy. Its
-filesystem boundary is per worker session, not per individual invocation: an
-attenuated manifest should be narrowed before launch when per-call filesystem
-isolation is required. Policy source paths must be host-owned and immutable to
-untrusted actors between compilation and spawn; the current path-based launcher
-cannot eliminate that race. A fixed worker program also does not prevent a
-compromised worker from executing or reading other files deliberately exposed
-through a runtime mount; runtime mounts must be minimal and immutable until a
-seccomp policy is implemented. On a failure it does not fall back to an
-unrestricted worker. See
+unbounded unless the host selects its explicit Bubblewrap size limit; that limit
+does not replace a memory or disk policy. Its filesystem boundary is per worker
+session, not per individual invocation: an attenuated manifest should be
+narrowed before launch when per-call filesystem isolation is required. Policy
+source paths must be host-owned and immutable to untrusted actors between
+compilation and spawn; the current path-based launcher cannot eliminate that
+race. A fixed worker program also does not prevent a compromised worker from
+executing or reading other files deliberately exposed through a runtime mount;
+runtime mounts must be minimal and immutable until a seccomp policy is
+implemented. On a failure it does not fall back to an unrestricted worker. See
 [`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md) before enabling it for
 untrusted local effects.
 

@@ -11,8 +11,9 @@ use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout};
+use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
 
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
@@ -21,6 +22,8 @@ use splash_protocol::{
     CapabilityManifest, PrivatePipeWorkerBootstrap, PrivatePipeWorkerBootstrapError, ProtocolError,
     ResourceKind, ResourceSelector,
 };
+
+const MAX_PRIVATE_TMPFS_BYTES: usize = usize::MAX >> 1;
 
 /// Access mode for a host-selected file-root binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +114,26 @@ impl FileRootBinding {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateTmpfs {
+    Disabled,
+    Unbounded,
+    Bounded(NonZeroUsize),
+}
+
+impl PrivateTmpfs {
+    const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn maximum_bytes(self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Bounded(maximum_bytes) => Some(maximum_bytes),
+            Self::Disabled | Self::Unbounded => None,
+        }
+    }
+}
+
 /// Trusted configuration for one statically selected Bubblewrap worker.
 ///
 /// This configuration is intentionally constructed by host Rust code. It is
@@ -125,7 +148,7 @@ pub struct BubblewrapWorkerPolicy {
     worker_arguments: Vec<OsString>,
     runtime_mounts: Vec<ReadOnlyMount>,
     file_roots: BTreeMap<String, FileRootBinding>,
-    private_tmpfs: bool,
+    private_tmpfs: PrivateTmpfs,
 }
 
 impl BubblewrapWorkerPolicy {
@@ -148,7 +171,7 @@ impl BubblewrapWorkerPolicy {
             worker_arguments: Vec::new(),
             runtime_mounts: Vec::new(),
             file_roots: BTreeMap::new(),
-            private_tmpfs: false,
+            private_tmpfs: PrivateTmpfs::Disabled,
         })
     }
 
@@ -192,12 +215,35 @@ impl BubblewrapWorkerPolicy {
 
     /// Enables an empty private `tmpfs` at `/tmp` for the worker.
     ///
-    /// It is disabled by default because Bubblewrap alone does not assign a
-    /// memory quota. Hosts that enable it must supply an external resource
-    /// limit appropriate to their platform.
+    /// It is disabled by default and remains unbounded when enabled through
+    /// this method. Use [`Self::enable_private_tmpfs_with_maximum_bytes`] to
+    /// set Bubblewrap's per-`tmpfs` allocation ceiling. Neither option limits
+    /// process memory, CPU, process count, or writable mounts outside `/tmp`.
     pub fn enable_private_tmpfs(&mut self) -> &mut Self {
-        self.private_tmpfs = true;
+        self.private_tmpfs = PrivateTmpfs::Unbounded;
         self
+    }
+
+    /// Enables a private `/tmp` with a maximum Bubblewrap `tmpfs` allocation.
+    ///
+    /// The size is an OS-enforced ceiling only for this `tmpfs` mount. It does
+    /// not create a general worker memory, CPU, process-count, or disk quota.
+    /// Zero and values larger than Bubblewrap accepts are rejected rather than
+    /// silently requesting an unbounded or launch-failing policy.
+    pub fn enable_private_tmpfs_with_maximum_bytes(
+        &mut self,
+        maximum_bytes: usize,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
+        let Some(maximum_bytes) = NonZeroUsize::new(maximum_bytes) else {
+            return Err(BubblewrapPolicyError::InvalidPrivateTmpfsSize { maximum_bytes });
+        };
+        if maximum_bytes.get() > MAX_PRIVATE_TMPFS_BYTES {
+            return Err(BubblewrapPolicyError::InvalidPrivateTmpfsSize {
+                maximum_bytes: maximum_bytes.get(),
+            });
+        }
+        self.private_tmpfs = PrivateTmpfs::Bounded(maximum_bytes);
+        Ok(self)
     }
 
     /// Validates a manifest and creates an immutable Bubblewrap launch plan.
@@ -244,7 +290,11 @@ impl BubblewrapWorkerPolicy {
             }
         }
 
-        validate_mount_layout(&mut mounts, &self.worker_program, self.private_tmpfs)?;
+        validate_mount_layout(
+            &mut mounts,
+            &self.worker_program,
+            self.private_tmpfs.is_enabled(),
+        )?;
 
         let mut arguments = vec![
             OsString::from("--die-with-parent"),
@@ -258,7 +308,11 @@ impl BubblewrapWorkerPolicy {
             OsString::from("--chdir"),
             OsString::from("/"),
         ];
-        if self.private_tmpfs {
+        if let Some(maximum_bytes) = self.private_tmpfs.maximum_bytes() {
+            arguments.push(OsString::from("--size"));
+            arguments.push(OsString::from(maximum_bytes.get().to_string()));
+        }
+        if self.private_tmpfs.is_enabled() {
             arguments.push(OsString::from("--tmpfs"));
             arguments.push(OsString::from("/tmp"));
         }
@@ -340,11 +394,11 @@ impl BubblewrapCommand {
                 .stderr(Stdio::null());
             let mut child = command.spawn().map_err(BubblewrapSpawnError::Spawn)?;
             let Some(stdin) = child.stdin.take() else {
-                terminate_child(&mut child);
+                discard_child(&mut child);
                 return Err(BubblewrapSpawnError::MissingStdin);
             };
             let Some(stdout) = child.stdout.take() else {
-                terminate_child(&mut child);
+                discard_child(&mut child);
                 return Err(BubblewrapSpawnError::MissingStdout);
             };
             Ok(SpawnedBubblewrapWorker {
@@ -378,7 +432,7 @@ impl BubblewrapCommand {
 
         let mut worker = self.spawn().map_err(BubblewrapBootstrapError::Spawn)?;
         if let Err(error) = bootstrap.write_to(&mut worker.stdin) {
-            terminate_child(&mut worker.child);
+            discard_child(&mut worker.child);
             return Err(BubblewrapBootstrapError::Bootstrap(error));
         }
         Ok(worker)
@@ -399,6 +453,33 @@ impl SpawnedBubblewrapWorker {
         &mut self.child
     }
 
+    /// Force-terminates the host-side Bubblewrap child and reaps it before
+    /// returning.
+    ///
+    /// This is process lifecycle control, not an in-band worker-protocol
+    /// cancellation. A `Killed` result only means the Bubblewrap child was
+    /// alive when the host requested termination; it does not prove that an
+    /// adapter effect was not started or completed. Hosts must discard the
+    /// session and reconcile any durable effect through the authenticated
+    /// worker protocol.
+    pub fn terminate(&mut self) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
+        terminate_and_reap(&mut self.child)
+    }
+
+    /// Consumes the startup handle while retaining managed worker lifecycle
+    /// control separately from the private JSON-line pipes.
+    ///
+    /// A host that gives the pipes to `JsonLineWorkerChannel` should keep the
+    /// returned lifecycle handle so it can force-terminate and reap the worker
+    /// after a deadline, transport failure, or host cancellation.
+    pub fn into_lifecycle_parts(self) -> (BubblewrapWorkerLifecycle, ChildStdin, ChildStdout) {
+        (
+            BubblewrapWorkerLifecycle { child: self.child },
+            self.stdin,
+            self.stdout,
+        )
+    }
+
     /// Consumes the handle and returns the child plus its private input/output
     /// pipes. The caller can wrap these in `JsonLineWorkerChannel`.
     pub fn into_parts(self) -> (Child, ChildStdin, ChildStdout) {
@@ -406,10 +487,64 @@ impl SpawnedBubblewrapWorker {
     }
 }
 
+/// Host-owned lifecycle control for a worker after its private pipes move to a
+/// transport.
+#[derive(Debug)]
+pub struct BubblewrapWorkerLifecycle {
+    child: Child,
+}
+
+impl BubblewrapWorkerLifecycle {
+    /// Returns the worker process for host-controlled lifecycle integration.
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// Force-terminates the host-side Bubblewrap child and reaps it before
+    /// returning.
+    ///
+    /// This has the same effect and recovery requirements as
+    /// [`SpawnedBubblewrapWorker::terminate`].
+    pub fn terminate(&mut self) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
+        terminate_and_reap(&mut self.child)
+    }
+
+    /// Consumes this lifecycle handle and returns the raw child process.
+    pub fn into_child(self) -> Child {
+        self.child
+    }
+}
+
+/// Outcome after a host force-terminates a Bubblewrap worker.
+#[derive(Debug)]
+pub enum BubblewrapTermination {
+    /// The worker had already exited and was reaped by the status check.
+    AlreadyExited(ExitStatus),
+    /// The worker was alive, killed by the host, and then reaped.
+    Killed(ExitStatus),
+}
+
+impl BubblewrapTermination {
+    /// Returns the reaped child process exit status.
+    pub fn exit_status(&self) -> &ExitStatus {
+        match self {
+            Self::AlreadyExited(status) | Self::Killed(status) => status,
+        }
+    }
+
+    /// Returns whether this call killed a still-running worker process.
+    pub const fn was_killed(&self) -> bool {
+        matches!(self, Self::Killed(_))
+    }
+}
+
 /// Policy compilation failure.
 #[derive(Debug)]
 pub enum BubblewrapPolicyError {
     Protocol(ProtocolError),
+    InvalidPrivateTmpfsSize {
+        maximum_bytes: usize,
+    },
     InvalidPath {
         field: &'static str,
         path: PathBuf,
@@ -462,6 +597,10 @@ impl Display for BubblewrapPolicyError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Protocol(error) => write!(formatter, "invalid capability manifest: {error}"),
+            Self::InvalidPrivateTmpfsSize { maximum_bytes } => write!(
+                formatter,
+                "private tmpfs maximum must be within 1..={MAX_PRIVATE_TMPFS_BYTES} bytes; got {maximum_bytes}"
+            ),
             Self::InvalidPath {
                 field,
                 path,
@@ -541,7 +680,8 @@ impl std::error::Error for BubblewrapPolicyError {
         match self {
             Self::Protocol(error) => Some(error),
             Self::SourceIo { source, .. } => Some(source),
-            Self::InvalidPath { .. }
+            Self::InvalidPrivateTmpfsSize { .. }
+            | Self::InvalidPath { .. }
             | Self::InvalidSourceType { .. }
             | Self::RootMountForbidden { .. }
             | Self::DuplicateFileRoot { .. }
@@ -593,6 +733,39 @@ impl std::error::Error for BubblewrapBootstrapError {
             Self::Spawn(error) => Some(error),
             Self::Bootstrap(error) => Some(error),
             Self::SessionMismatch { .. } => None,
+        }
+    }
+}
+
+/// Failure while force-terminating and reaping a Bubblewrap worker.
+#[derive(Debug)]
+pub enum BubblewrapTerminationError {
+    Inspect(io::Error),
+    Kill(io::Error),
+    Wait(io::Error),
+}
+
+impl Display for BubblewrapTerminationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inspect(error) => {
+                write!(
+                    formatter,
+                    "could not inspect Bubblewrap worker status: {error}"
+                )
+            }
+            Self::Kill(error) => {
+                write!(formatter, "could not terminate Bubblewrap worker: {error}")
+            }
+            Self::Wait(error) => write!(formatter, "could not reap Bubblewrap worker: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BubblewrapTerminationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Inspect(error) | Self::Kill(error) | Self::Wait(error) => Some(error),
         }
     }
 }
@@ -889,7 +1062,30 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
     }
 }
 
-fn terminate_child(child: &mut Child) {
+fn terminate_and_reap(
+    child: &mut Child,
+) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(BubblewrapTerminationError::Inspect)?
+    {
+        return Ok(BubblewrapTermination::AlreadyExited(status));
+    }
+
+    if let Err(error) = child.kill() {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Ok(BubblewrapTermination::AlreadyExited(status));
+        }
+        return Err(BubblewrapTerminationError::Kill(error));
+    }
+
+    child
+        .wait()
+        .map(BubblewrapTermination::Killed)
+        .map_err(BubblewrapTerminationError::Wait)
+}
+
+fn discard_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -897,6 +1093,8 @@ fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use splash_protocol::{
@@ -1156,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn private_tmpfs_is_explicit() {
+    fn private_tmpfs_is_explicit_and_can_be_bounded() {
         let root = TestDirectory::new();
         let policy = base_policy(&root);
         let plan = policy.compile(&manifest([])).unwrap();
@@ -1168,6 +1366,29 @@ mod tests {
         let plan = policy.compile(&manifest([])).unwrap();
         let arguments = argument_strings(&plan);
         assert!(has_arguments(&arguments, &["--tmpfs", "/tmp"]));
+        assert!(!arguments.iter().any(|argument| argument == "--size"));
+
+        let mut policy = base_policy(&root);
+        policy
+            .enable_private_tmpfs_with_maximum_bytes(64 * 1024)
+            .unwrap();
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+        assert!(has_arguments(
+            &arguments,
+            &["--size", "65536", "--tmpfs", "/tmp"]
+        ));
+
+        let mut policy = base_policy(&root);
+        assert!(matches!(
+            policy.enable_private_tmpfs_with_maximum_bytes(0),
+            Err(BubblewrapPolicyError::InvalidPrivateTmpfsSize { maximum_bytes: 0 })
+        ));
+        assert!(matches!(
+            policy.enable_private_tmpfs_with_maximum_bytes(usize::MAX),
+            Err(BubblewrapPolicyError::InvalidPrivateTmpfsSize { maximum_bytes })
+                if maximum_bytes == usize::MAX
+        ));
     }
 
     #[test]
@@ -1221,6 +1442,30 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn force_termination_kills_and_reaps_a_running_worker() {
+        let (mut lifecycle, stdin, stdout) = test_worker("exec sleep 60").into_lifecycle_parts();
+        drop(stdin);
+        drop(stdout);
+        let outcome = lifecycle.terminate().unwrap();
+
+        assert!(outcome.was_killed());
+        assert!(!outcome.exit_status().success());
+        assert!(lifecycle.child_mut().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_termination_reports_an_already_exited_worker() {
+        let mut worker = test_worker("exit 0");
+        let expected_status = worker.child_mut().wait().unwrap();
+
+        let outcome = worker.terminate().unwrap();
+        assert!(!outcome.was_killed());
+        assert_eq!(outcome.exit_status(), &expected_status);
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -1255,6 +1500,24 @@ mod tests {
             let mut permissions = fs::metadata(path).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn test_worker(command: &str) -> SpawnedBubblewrapWorker {
+        let mut child = Command::new("sh")
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        SpawnedBubblewrapWorker {
+            child,
+            stdin,
+            stdout,
         }
     }
 }

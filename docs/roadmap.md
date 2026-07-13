@@ -48,6 +48,9 @@
 - Versioned private-pipe session bootstrap for a compiled Linux Bubblewrap
   worker. It checks the manifest session before launch and never places the
   host-generated key in command-line arguments or environment variables.
+- Optional bounded private `/tmp` capacity for Bubblewrap workers and a
+  lifecycle handle that force-terminates and reaps a worker. Neither is a
+  general resource quota or proof that an adapter effect was cancelled.
 
 ## Next: durable external operations
 
@@ -56,8 +59,9 @@
 
 ## Next: contained local effects
 
-- Resource quota, seccomp, and cancellation policy around the Linux Bubblewrap
-  launcher.
+- CPU, memory, process-count, and broader disk resource quotas; seccomp; and
+  authenticated in-band cancellation/deadline policy around the Linux
+  Bubblewrap launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

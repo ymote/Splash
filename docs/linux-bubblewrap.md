@@ -40,6 +40,7 @@ policy.add_file_root(
         FileRootAccess::ReadOnly,
     )?,
 )?;
+policy.enable_private_tmpfs_with_maximum_bytes(64 * 1024 * 1024)?;
 
 let command = policy.compile(&attenuated_manifest)?;
 // `trusted_session_key` comes from the host's CSPRNG/key authority.
@@ -53,7 +54,7 @@ let bootstrap = PrivatePipeWorkerBootstrap::new(
     trusted_session_key,
 )?;
 let worker = command.spawn_with_bootstrap(&bootstrap)?;
-let (child, worker_stdin, worker_stdout) = worker.into_parts();
+let (mut lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
 ```
 
 `spawn_with_bootstrap` binds the bootstrap session ID to the manifest used at
@@ -71,6 +72,23 @@ pipes in the bounded JSON-line transport, sends that frame with
 only delivery of a key that the host already generated and trusts; it is not key
 exchange, encrypted transport, worker attestation, or key storage.
 
+`enable_private_tmpfs_with_maximum_bytes` emits `--size BYTES` immediately
+before `--tmpfs /tmp`. Bubblewrap enforces that maximum only for allocations in
+this private `/tmp`; it is not a general process-memory, CPU, process-count, or
+disk quota. Zero and sizes above Bubblewrap's supported maximum are rejected
+rather than silently requesting an unbounded or launch-failing policy. Hosts
+that enable it must use a Bubblewrap version that
+supports `--size`; an unsupported option is a launch failure, never a fallback
+to an unbounded worker.
+
+After the pipes move into the JSON-line transport, retain `lifecycle` and call
+`lifecycle.terminate()` after a host deadline, cancellation decision, or
+poisoned transport. It force-kills and reaps the host-side Bubblewrap child, returning
+whether it was already exited or killed. This is not authenticated in-band
+cancellation and cannot establish whether an adapter effect began or completed.
+Discard the session and use the durable reconciliation or compensation path for
+any effectful operation.
+
 `compile` canonicalizes the source paths and fails closed when a source is
 missing, is the wrong type, resolves to `/`, overlaps another worker-visible
 destination, or conflicts with `/proc`, `/dev`, or an enabled private `/tmp`.
@@ -84,6 +102,8 @@ The resulting command uses:
   directory;
 - explicit `--ro-bind` runtime and read-only file roots, or explicit `--bind`
   read-write file roots; and
+- optional `--size BYTES` immediately before a private `--tmpfs /tmp`, limiting
+  only allocations in that mount; and
 - private stdin/stdout pipes, with stderr sent to `/dev/null` to prevent an
   undrained diagnostic pipe from blocking the worker.
 
@@ -134,13 +154,15 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- CPU, memory, process-count, disk, or tmpfs-size quotas; hosts must apply
-  cgroups, rlimits, or an equivalent platform policy;
+- CPU, process-memory, process-count, or broader disk quotas. A configured
+  private `/tmp` size limits only that Bubblewrap `tmpfs`; hosts still need
+  cgroups, rlimits, or an equivalent platform policy for broader resources;
 - seccomp policy, D-Bus mediation, device-specific policy, or a network proxy;
 - a safe per-origin network allowlist, arbitrary executable selection, secret
   broker, or filesystem access outside registered directory roots;
-- cancellation delivery, I/O deadlines, post-exit reconciliation, or durable
-  operation storage; and
+- authenticated in-band cancellation delivery, I/O deadlines, post-exit
+  reconciliation, or durable operation storage. `lifecycle.terminate()` is a
+  forceful process stop, not proof that an adapter effect was cancelled; and
 - protection from a trusted host changing a policy source path between plan
   compilation and process start. Policy sources must be owned and immutable to
   untrusted actors, or a future descriptor-based launcher must be used.

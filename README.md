@@ -54,6 +54,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - A one-shot, versioned private-pipe session bootstrap for Linux Bubblewrap
   workers that is bound to the compiled manifest and precedes JSON worker
   frames without exposing the key through argv or environment variables.
+- Optional bounded private `/tmp` capacity and a host lifecycle handle that
+  force-terminates and reaps a Bubblewrap worker without treating termination
+  as an adapter-effect result.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
