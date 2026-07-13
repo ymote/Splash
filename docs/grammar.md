@@ -178,9 +178,10 @@ The command prints one JSON object containing `valid`, a bounded
 checks that accepted source is compatible with the vendored VM. It never
 creates a capability runtime, loads a module, invokes a tool, or executes
 bytecode. Canonical profile nesting is bounded to 128 levels during this
-preflight.
+preflight, and the default lexical-token budget is 32,768.
 
 Rust hosts can call `splash_core::check_syntax` or
 `splash_core::check_syntax_named`. These functions apply the normal source-size
-limit but not instruction or deadline execution limits because they do not
-execute source.
+and syntax-token limits but not instruction or deadline execution limits
+because they do not execute source. Embedded hosts can lower either bound with
+`ExecutionLimits`.

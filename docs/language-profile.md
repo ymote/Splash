@@ -17,6 +17,8 @@ source. The check enforces the canonical v0.1 grammar rather than merely
 accepting the larger Makepad compatibility parser. Syntax preflight never
 resolves imports, creates a host, or grants a tool capability. A source that
 the canonical profile rejects never enters the inherited tokenizer or parser.
+The default preflight budget is 256 KiB of source and 32,768 lexical tokens;
+an embedded host can lower both through `ExecutionLimits`.
 
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
 execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape

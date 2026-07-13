@@ -13,8 +13,8 @@ pub(super) struct ProfileReport {
     pub(super) diagnostics_truncated: bool,
 }
 
-pub(super) fn check_canonical_profile(source: &str) -> ProfileReport {
-    let lexer = ProfileLexer::new(source);
+pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> ProfileReport {
+    let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, diagnostics, diagnostics_truncated) = lexer.tokenize();
     if !diagnostics.is_empty() || diagnostics_truncated {
         return ProfileReport {
@@ -56,26 +56,35 @@ struct ProfileLexer {
     index: usize,
     line: usize,
     column: usize,
+    max_tokens: usize,
     tokens: Vec<Token>,
     diagnostics: Vec<SyntaxDiagnostic>,
     diagnostics_truncated: bool,
+    token_limit_reported: bool,
 }
 
 impl ProfileLexer {
-    fn new(source: &str) -> Self {
+    fn new(source: &str, max_tokens: usize) -> Self {
         Self {
             chars: source.chars().collect(),
             index: 0,
             line: 1,
             column: 1,
+            max_tokens,
             tokens: Vec::new(),
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
+            token_limit_reported: false,
         }
     }
 
     fn tokenize(mut self) -> (Vec<Token>, Vec<SyntaxDiagnostic>, bool) {
         while let Some(character) = self.current() {
+            if self.tokens.len() >= self.max_tokens {
+                let (line, column) = self.location();
+                self.report_token_limit_at(line, column);
+                return (self.tokens, self.diagnostics, self.diagnostics_truncated);
+            }
             match character {
                 ' ' | '\t' | '\u{000C}' => {
                     self.advance();
@@ -144,7 +153,26 @@ impl ProfileLexer {
     }
 
     fn emit(&mut self, kind: TokenKind, line: usize, column: usize) {
+        if self.tokens.len() >= self.max_tokens {
+            self.report_token_limit_at(line, column);
+            return;
+        }
         self.tokens.push(Token { kind, line, column });
+    }
+
+    fn report_token_limit_at(&mut self, line: usize, column: usize) {
+        if self.token_limit_reported {
+            return;
+        }
+        self.report(
+            line,
+            column,
+            format!(
+                "canonical Splash token count exceeds the maximum of {}",
+                self.max_tokens
+            ),
+        );
+        self.token_limit_reported = true;
     }
 
     fn emit_single(&mut self, kind: TokenKind) {

@@ -18,6 +18,8 @@ use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024;
+/// Maximum canonical lexical tokens accepted by default during syntax preflight.
+pub const DEFAULT_MAX_SYNTAX_TOKENS: usize = 32 * 1024;
 pub const DEFAULT_INSTRUCTION_LIMIT: usize = 200_000;
 pub const DEFAULT_SOFT_TIMEOUT: Duration = Duration::from_millis(32);
 pub const DEFAULT_HARD_TIMEOUT: Duration = Duration::from_millis(64);
@@ -29,6 +31,7 @@ pub const MAX_SYNTAX_DIAGNOSTICS: usize = 32;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionLimits {
     pub max_source_bytes: usize,
+    pub max_syntax_tokens: usize,
     pub instruction_limit: usize,
     pub soft_timeout: Duration,
     pub hard_timeout: Duration,
@@ -39,6 +42,7 @@ impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
+            max_syntax_tokens: DEFAULT_MAX_SYNTAX_TOKENS,
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
             soft_timeout: DEFAULT_SOFT_TIMEOUT,
             hard_timeout: DEFAULT_HARD_TIMEOUT,
@@ -52,6 +56,11 @@ impl ExecutionLimits {
         if self.max_source_bytes == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_source_bytes must be greater than zero",
+            ));
+        }
+        if self.max_syntax_tokens == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_syntax_tokens must be greater than zero",
             ));
         }
         if self.instruction_limit == 0 {
@@ -311,7 +320,7 @@ pub fn check_syntax_named(
     let limits = limits.validate()?;
     validate_source_length(source, limits)?;
 
-    let profile = check_canonical_profile(source);
+    let profile = check_canonical_profile(source, limits.max_syntax_tokens);
     if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
         return Ok(SyntaxReport {
             valid: false,
@@ -662,6 +671,40 @@ mod tests {
     }
 
     #[test]
+    fn bounds_canonical_profile_token_count_before_vm_parsing() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 3,
+            ..ExecutionLimits::default()
+        };
+        let report = check_syntax_named("tokens.splash", ";;;;", limits).unwrap();
+
+        assert!(!report.valid);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].line, 1);
+        assert_eq!(report.diagnostics[0].column, 4);
+        assert!(report.diagnostics[0]
+            .message
+            .contains("canonical Splash token count exceeds the maximum of 3"));
+    }
+
+    #[test]
+    fn bounds_newline_tokens_emitted_from_block_comments() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 3,
+            ..ExecutionLimits::default()
+        };
+        let report = check_syntax_named("comment.splash", "/*\n\n\n\n*/", limits).unwrap();
+
+        assert!(!report.valid);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].line, 4);
+        assert_eq!(report.diagnostics[0].column, 1);
+        assert!(report.diagnostics[0]
+            .message
+            .contains("canonical Splash token count exceeds the maximum of 3"));
+    }
+
+    #[test]
     fn rejects_makepad_compatibility_syntax_outside_the_profile() {
         for (source, expected) in [
             (
@@ -776,6 +819,19 @@ mod tests {
                 actual: 5,
                 maximum: 4,
             }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_syntax_token_limit() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 0,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("tokens.splash", "let value = 1", limits).unwrap_err(),
+            RuntimeError::InvalidLimits("max_syntax_tokens must be greater than zero")
         );
     }
 
