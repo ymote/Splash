@@ -1,0 +1,13 @@
+[package]
+name = "splash-worker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Capability-scoped worker runtime for Splash Rust adapters"
+
+[lints]
+workspace = true
+
+[dependencies]
+splash-protocol = { version = "0.1.0", path = "../splash-protocol" }

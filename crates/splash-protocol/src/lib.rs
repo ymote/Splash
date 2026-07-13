@@ -17,6 +17,9 @@ pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
 pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
 pub const MAX_OPERATION_ERROR_BYTES: usize = 4 * 1024;
+/// Maximum accepted nesting depth for a JSON tool payload, including its root
+/// object or array.
+pub const MAX_JSON_PAYLOAD_DEPTH: usize = 32;
 /// Maximum serialized worker operation journal accepted from durable storage.
 pub const MAX_WORKER_OPERATION_JOURNAL_BYTES: usize = 512 * 1024;
 /// Maximum durable operation intents retained by one worker journal.
@@ -325,6 +328,7 @@ impl ToolPayload {
                 if !value.is_object() && !value.is_array() {
                     return Err(ProtocolError::InvalidJsonEnvelope);
                 }
+                validate_json_payload_depth(value, 1)?;
                 serde_json::to_vec(value)
                     .map(|encoded| encoded.len())
                     .map_err(|error| ProtocolError::Serialization(error.to_string()))
@@ -1136,6 +1140,68 @@ impl WorkerOperationJournal {
         Ok(observed)
     }
 
+    /// Verifies that a reconciliation request can inspect an operation already
+    /// owned by this journal.
+    ///
+    /// The journal deliberately does not allow a generic worker adapter to use
+    /// reconciliation as an unbounded lookup of arbitrary operation keys. The
+    /// caller must first have durably admitted the same tool and key in this
+    /// tenant scope.
+    pub fn validate_reconciliation(
+        &self,
+        authorized: &AuthorizedOperationReconciliation,
+    ) -> Result<(), ProtocolError> {
+        self.validate_and_bound()?;
+        let request = authorized.request();
+        let record = self
+            .operation(&request.operation_key)
+            .ok_or_else(|| ProtocolError::UnknownOperation(request.operation_key.clone()))?;
+        if record.tool != request.tool {
+            return Err(ProtocolError::OperationIdentityMismatch(
+                request.operation_key.clone(),
+            ));
+        }
+        validate_worker_operation_state_for_grant(&record.state, authorized.grant())
+    }
+
+    /// Records a trusted adapter's reconciliation observation.
+    ///
+    /// The observation is subject to the same transition and output bounds as
+    /// an initial dispatch. Callers must persist the updated journal before
+    /// returning a reconciliation result.
+    pub fn observe_reconciliation(
+        &mut self,
+        authorized: &AuthorizedOperationReconciliation,
+        status: OperationStatus,
+    ) -> Result<WorkerOperationState, ProtocolError> {
+        self.validate_reconciliation(authorized)?;
+        validate_operation_status_for_grant(&status, authorized.grant())?;
+        let request = authorized.request();
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.operation_key == request.operation_key)
+            .ok_or_else(|| ProtocolError::UnknownOperation(request.operation_key.clone()))?;
+        let record = &self.records[record_index];
+        let observed = WorkerOperationState::from_status(status);
+        if !record.state.accepts(&observed) {
+            return Err(ProtocolError::InvalidWorkerOperationTransition {
+                operation_key: request.operation_key.clone(),
+                current: record.state.kind(),
+                observed: observed.kind(),
+            });
+        }
+        if record.state == observed {
+            return Ok(observed);
+        }
+
+        let mut candidate = self.clone();
+        candidate.records[record_index].state = observed.clone();
+        candidate.validate_and_bound()?;
+        *self = candidate;
+        Ok(observed)
+    }
+
     /// Records a host-approved compensating intent before the worker adapter
     /// executes it. Exactly one compensation key is allowed for one original
     /// operation in this journal scope.
@@ -1721,6 +1787,27 @@ impl AuthorizedOperationInvocation {
     }
 }
 
+/// A reconciliation request the worker has validated against its active grant.
+///
+/// Reconciliation does not consume a normal capability call budget. Hosts must
+/// apply a separate bounded reconciliation policy because a status lookup may
+/// still perform adapter work.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorizedOperationReconciliation {
+    request: OperationReconcileRequest,
+    grant: CapabilityGrant,
+}
+
+impl AuthorizedOperationReconciliation {
+    pub fn request(&self) -> &OperationReconcileRequest {
+        &self.request
+    }
+
+    pub fn grant(&self) -> &CapabilityGrant {
+        &self.grant
+    }
+}
+
 /// A compensation request the host has validated against its active grant.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthorizedOperationCompensation {
@@ -1738,7 +1825,35 @@ impl AuthorizedOperationCompensation {
     }
 }
 
-/// Stateful host-side validation for a single capability manifest.
+/// Stable per-session identity for one compensation effect.
+///
+/// Request IDs remain one-use, but an exact retransmission under a fresh
+/// request ID must not consume another compensation budget before the worker
+/// journal can return its existing durable state.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompensationRequestIdentity {
+    tool: String,
+    operation_key: String,
+    compensation_key: String,
+    tenant_scope: String,
+    grant_fingerprint: String,
+    input_fingerprint: String,
+}
+
+impl CompensationRequestIdentity {
+    fn from_request(request: &OperationCompensationRequest) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            tool: request.tool.clone(),
+            operation_key: request.operation_key.clone(),
+            compensation_key: request.compensation_key.clone(),
+            tenant_scope: request.tenant_scope.clone(),
+            grant_fingerprint: request.grant_fingerprint.clone(),
+            input_fingerprint: worker_operation_input_fingerprint(&request.payload)?,
+        })
+    }
+}
+
+/// Stateful capability validation for a single session manifest.
 ///
 /// Authorization consumes call budget before dispatch. This intentionally
 /// prevents a timed-out or crashed worker from allowing a caller to retry past
@@ -1747,6 +1862,7 @@ pub struct SessionAuthorizer {
     manifest: CapabilityManifest,
     calls_by_tool: BTreeMap<String, u32>,
     compensations_by_tool: BTreeMap<String, u32>,
+    compensation_identities: BTreeSet<CompensationRequestIdentity>,
     seen_request_ids: BTreeSet<String>,
     completed_request_ids: BTreeSet<String>,
 }
@@ -1758,6 +1874,7 @@ impl SessionAuthorizer {
             manifest,
             calls_by_tool: BTreeMap::new(),
             compensations_by_tool: BTreeMap::new(),
+            compensation_identities: BTreeSet::new(),
             seen_request_ids: BTreeSet::new(),
             completed_request_ids: BTreeSet::new(),
         })
@@ -1809,6 +1926,33 @@ impl SessionAuthorizer {
         Ok(AuthorizedOperationInvocation { request, grant })
     }
 
+    /// Validates and reserves one bounded operation-reconciliation request.
+    ///
+    /// This verifies the current session and grant but intentionally does not
+    /// spend a normal effectful-call budget. A worker must impose a separate,
+    /// bounded reconciliation policy before it asks an adapter to query state.
+    pub fn authorize_reconciliation(
+        &mut self,
+        request: OperationReconcileRequest,
+    ) -> Result<AuthorizedOperationReconciliation, ProtocolError> {
+        request.validate()?;
+        if request.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(request.session_id));
+        }
+        let grant = self
+            .manifest
+            .grants
+            .iter()
+            .find(|grant| grant.tool == request.tool)
+            .cloned()
+            .ok_or_else(|| ProtocolError::UnknownTool(request.tool.clone()))?;
+        if self.seen_request_ids.contains(&request.request_id) {
+            return Err(ProtocolError::DuplicateRequest(request.request_id));
+        }
+        self.seen_request_ids.insert(request.request_id.clone());
+        Ok(AuthorizedOperationReconciliation { request, grant })
+    }
+
     /// Validates and reserves one host-approved compensation request.
     ///
     /// Compensation has a separate grant budget from ordinary calls. The
@@ -1846,18 +1990,23 @@ impl SessionAuthorizer {
         if self.seen_request_ids.contains(&request.request_id) {
             return Err(ProtocolError::DuplicateRequest(request.request_id));
         }
+        let identity = CompensationRequestIdentity::from_request(&request)?;
+        let already_authorized = self.compensation_identities.contains(&identity);
         let compensations = self
             .compensations_by_tool
             .entry(grant.tool.clone())
             .or_default();
-        if *compensations >= grant.max_compensations {
+        if !already_authorized && *compensations >= grant.max_compensations {
             return Err(ProtocolError::CompensationBudgetExhausted {
                 tool: grant.tool,
                 maximum: grant.max_compensations,
             });
         }
         self.seen_request_ids.insert(request.request_id.clone());
-        *compensations = compensations.saturating_add(1);
+        if !already_authorized {
+            self.compensation_identities.insert(identity);
+            *compensations = compensations.saturating_add(1);
+        }
         Ok(AuthorizedOperationCompensation { request, grant })
     }
 
@@ -1903,6 +2052,27 @@ impl SessionAuthorizer {
             return Err(ProtocolError::UnknownSession(result.session_id.clone()));
         }
         if !result.matches_dispatch(&authorized.request) {
+            return Err(ProtocolError::OperationResultMismatch);
+        }
+        if self.completed_request_ids.contains(&result.request_id) {
+            return Err(ProtocolError::DuplicateResult(result.request_id.clone()));
+        }
+        validate_operation_status_for_grant(&result.status, &authorized.grant)?;
+        self.completed_request_ids.insert(result.request_id.clone());
+        Ok(())
+    }
+
+    /// Validates a worker response to one authorized reconciliation request.
+    pub fn validate_reconciliation_result(
+        &mut self,
+        authorized: &AuthorizedOperationReconciliation,
+        result: &OperationReconcileResult,
+    ) -> Result<(), ProtocolError> {
+        result.validate()?;
+        if result.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(result.session_id.clone()));
+        }
+        if !result.matches_request(&authorized.request) {
             return Err(ProtocolError::OperationResultMismatch);
         }
         if self.completed_request_ids.contains(&result.request_id) {
@@ -2082,6 +2252,9 @@ pub enum ProtocolError {
         actual: EnvelopeFormat,
     },
     InvalidJsonEnvelope,
+    JsonPayloadTooDeep {
+        maximum: usize,
+    },
     InvalidOperationFailure,
     OperationFailureTooLarge {
         actual: usize,
@@ -2256,6 +2429,9 @@ impl Display for ProtocolError {
             Self::InvalidJsonEnvelope => {
                 formatter.write_str("JSON worker payload must be an object or array")
             }
+            Self::JsonPayloadTooDeep { maximum } => {
+                write!(formatter, "JSON worker payload exceeds nesting depth of {maximum}")
+            }
             Self::InvalidOperationFailure => {
                 formatter.write_str("worker operation failure message must not be empty")
             }
@@ -2323,6 +2499,28 @@ fn validate_protocol_version(protocol_version: u16) -> Result<(), ProtocolError>
         return Err(ProtocolError::UnsupportedVersion {
             actual: protocol_version,
         });
+    }
+    Ok(())
+}
+
+fn validate_json_payload_depth(value: &JsonValue, depth: usize) -> Result<(), ProtocolError> {
+    if depth > MAX_JSON_PAYLOAD_DEPTH {
+        return Err(ProtocolError::JsonPayloadTooDeep {
+            maximum: MAX_JSON_PAYLOAD_DEPTH,
+        });
+    }
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                validate_json_payload_depth(value, depth.saturating_add(1))?;
+            }
+        }
+        JsonValue::Object(values) => {
+            for value in values.values() {
+                validate_json_payload_depth(value, depth.saturating_add(1))?;
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {}
     }
     Ok(())
 }
@@ -2670,6 +2868,22 @@ mod tests {
     }
 
     #[test]
+    fn json_payload_depth_is_bounded_before_authorization_or_canonicalization() {
+        let mut nested = json!({});
+        for _ in 0..MAX_JSON_PAYLOAD_DEPTH {
+            nested = JsonValue::Array(vec![nested]);
+        }
+        assert_eq!(
+            ToolPayload::Json(nested)
+                .validate_for(EnvelopeFormat::Json)
+                .unwrap_err(),
+            ProtocolError::JsonPayloadTooDeep {
+                maximum: MAX_JSON_PAYLOAD_DEPTH,
+            }
+        );
+    }
+
+    #[test]
     fn result_must_match_the_authorized_request_and_output_limit() {
         let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
         let invocation = ToolInvocation::new(
@@ -2806,6 +3020,53 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_is_grant_checked_without_spending_an_effect_budget() {
+        let request = OperationReconcileRequest::new(
+            "session-1",
+            "reconcile-request-1",
+            "math.add",
+            "release-42-add",
+        )
+        .unwrap();
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer
+            .authorize_reconciliation(request.clone())
+            .unwrap();
+        assert_eq!(authorizer.calls_for("math.add"), 0);
+
+        let oversized = OperationReconcileResult::new(
+            "session-1",
+            "reconcile-request-1",
+            "math.add",
+            "release-42-add",
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(json!({"body": "x".repeat(256)})),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            authorizer.validate_reconciliation_result(&authorized, &oversized),
+            Err(ProtocolError::OutputTooLarge { .. })
+        ));
+
+        let running = OperationReconcileResult::new(
+            "session-1",
+            "reconcile-request-1",
+            "math.add",
+            "release-42-add",
+            OperationStatus::Running,
+        )
+        .unwrap();
+        authorizer
+            .validate_reconciliation_result(&authorized, &running)
+            .unwrap();
+        assert_eq!(
+            authorizer.authorize_reconciliation(request).unwrap_err(),
+            ProtocolError::DuplicateRequest("reconcile-request-1".to_owned())
+        );
+    }
+
+    #[test]
     fn compensation_requires_an_active_matching_grant_and_uses_its_own_budget() {
         let grant = compensation_grant();
         let manifest = CapabilityManifest::new("session-1", vec![grant.clone()]).unwrap();
@@ -2844,9 +3105,19 @@ mod tests {
             ProtocolError::DuplicateResult("compensation-request-1".to_owned())
         );
 
-        let exhausted = compensation_request(
+        let retransmission = compensation_request(
             "compensation-request-2",
             binding.clone(),
+            ToolPayload::Json(json!({"undo": "release"})),
+        );
+        authorizer.authorize_compensation(retransmission).unwrap();
+        assert_eq!(authorizer.compensations_for("math.add"), 1);
+
+        let mut different_binding = binding.clone();
+        different_binding.compensation_key = "cmp-release-42-add-other".to_owned();
+        let exhausted = compensation_request(
+            "compensation-request-3",
+            different_binding,
             ToolPayload::Json(json!({"undo": "release"})),
         );
         assert_eq!(
@@ -2866,7 +3137,7 @@ mod tests {
         assert_eq!(
             mismatch_authorizer
                 .authorize_compensation(compensation_request(
-                    "compensation-request-3",
+                    "compensation-request-4",
                     binding.clone(),
                     ToolPayload::Json(json!({"undo": "release"})),
                 ))
@@ -2879,7 +3150,7 @@ mod tests {
         assert_eq!(
             denied_authorizer
                 .authorize_compensation(compensation_request(
-                    "compensation-request-4",
+                    "compensation-request-5",
                     binding,
                     ToolPayload::Json(json!({"undo": "release"})),
                 ))
@@ -3141,6 +3412,75 @@ mod tests {
             }
         );
         assert_eq!(journal.records().len(), 1);
+    }
+
+    #[test]
+    fn worker_operation_journal_reconciliation_requires_an_owned_operation_and_persists_state() {
+        let request = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut operation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized_operation = operation_authorizer.authorize_operation(request).unwrap();
+        let reconciliation_request = OperationReconcileRequest::new(
+            "session-1",
+            "reconcile-request-1",
+            "math.add",
+            "release-42-add",
+        )
+        .unwrap();
+        let mut reconciliation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized_reconciliation = reconciliation_authorizer
+            .authorize_reconciliation(reconciliation_request)
+            .unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+
+        assert_eq!(
+            journal
+                .validate_reconciliation(&authorized_reconciliation)
+                .unwrap_err(),
+            ProtocolError::UnknownOperation("release-42-add".to_owned())
+        );
+
+        journal.admit(&authorized_operation).unwrap();
+        journal
+            .validate_reconciliation(&authorized_reconciliation)
+            .unwrap();
+        assert_eq!(
+            journal
+                .observe_reconciliation(&authorized_reconciliation, OperationStatus::Running)
+                .unwrap(),
+            WorkerOperationState::Running
+        );
+        assert_eq!(
+            journal
+                .observe_reconciliation(
+                    &authorized_reconciliation,
+                    OperationStatus::Succeeded {
+                        payload: ToolPayload::Json(json!({"total": 42})),
+                    },
+                )
+                .unwrap(),
+            WorkerOperationState::Succeeded {
+                payload: ToolPayload::Json(json!({"total": 42})),
+            }
+        );
+        assert_eq!(
+            journal
+                .observe_reconciliation(
+                    &authorized_reconciliation,
+                    OperationStatus::Failed {
+                        message: "late failure".to_owned(),
+                    },
+                )
+                .unwrap_err(),
+            ProtocolError::InvalidWorkerOperationTransition {
+                operation_key: "release-42-add".to_owned(),
+                current: WorkerOperationStateKind::Succeeded,
+                observed: WorkerOperationStateKind::Failed,
+            }
+        );
     }
 
     #[test]

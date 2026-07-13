@@ -1,0 +1,141 @@
+# Worker Adapter Runtime
+
+`splash-worker` is the worker-side Rust runtime for one authenticated Splash
+capability session. It is intended for mobile, embedded, and desktop hosts
+that want dynamic Splash workflows to invoke a small, explicit catalog of
+trusted Rust adapters without giving Splash source access to the Rust crate
+graph or ambient OS APIs.
+
+It is a protocol and sequencing layer, not a sandbox. An in-process use has
+the privileges of its embedding process. Production hosts must still put it
+behind a platform containment backend, provision the session key through a
+trusted bootstrap channel, resolve opaque resource selectors in host policy,
+and supply authenticated rollback-resistant journal storage.
+
+## Integration Boundary
+
+The host creates a `WorkerSession` only after it has received the
+host-authenticated `open_session` frame. It supplies four trusted inputs:
+
+- a `WorkerAdapterRegistry` with one Rust adapter per capability name;
+- a `WorkerOperationJournal` and `WorkerJournalRevision` loaded atomically for
+  one opaque tenant or policy scope;
+- `WorkerSessionAdmission`, which binds the authenticated session to that
+  scope, rejects stale or replayed session IDs, and issues the current
+  single-writer fencing lease; and
+- `WorkerJournalStore`, which compare-and-swaps journal state before an effect
+  and after every worker observation while enforcing that lease.
+
+```rust
+use splash_worker::{
+    WorkerAdapter, WorkerAdapterRegistry, WorkerJournalRevision,
+    WorkerJournalStore, WorkerSession, WorkerSessionAdmission,
+    WorkerSessionLimits,
+};
+
+// `admission` maps the authenticated session to the host-selected tenant
+// scope and records the session ID durably. `store` implements the strict
+// authenticated, rollback-resistant CAS and fencing contract documented by
+// Splash.
+let mut worker = WorkerSession::open(
+    worker_authenticator,
+    opening_frame,
+    restored_journal,
+    restored_revision,
+    adapters,
+    WorkerSessionLimits::default(),
+    &mut admission,
+)?;
+
+let response = worker.handle(host_frame, &mut store)?;
+```
+
+The adapter registry is intentionally explicit. An adapter receives the
+attenuated `CapabilityGrant` with each request and may resolve only the grant's
+opaque resource selectors through its embedding policy. It must not interpret
+script input as a file path, executable, network origin, credential, or crate
+name. This is how Splash uses the Rust ecosystem: a host compiles narrow,
+reviewed adapters against its chosen crates and exposes only their bounded data
+contracts to scripts. JSON payloads are object/array envelopes with a 32-level
+maximum nesting depth in addition to their grant byte limits.
+
+The runtime denies an adapter path until the adapter declares its contract.
+`WorkerAdapter::invocation_safety` must name `ReadOnly` or
+`IndependentlyIdempotent` before `invoke` can run.
+`WorkerAdapter::durable_operation_contract` must name a bounded
+`Reconciliation` strategy before dispatch or compensation can run. It covers
+dispatch status recovery by `operation_key`; compensation additionally needs
+the adapter-specific/manual recovery policy described below. The stronger
+`ProviderIdempotencyAndReconciliation` contract also requires forwarding the
+exact host `operation_key` unchanged to the provider's idempotency mechanism.
+These declarations are an explicit review surface; they do not make an
+unreviewed Rust adapter safe.
+
+`WorkerAdapter::invoke` deliberately has no durable journal entry. It is only
+available after the read-only/idempotent declaration above. A crash-sensitive
+external effect must go through `dispatch_operation`, which is a host-controlled
+workflow path rather than a directly script-created operation.
+
+## Effect Ordering
+
+For `dispatch_operation` and `compensate_operation`, the runtime performs:
+
+1. authenticate the frame and reauthorize it against the active manifest;
+2. update the journal to `pending` and durably persist that admission;
+3. call the registered adapter exactly once for a new admission;
+4. record the adapter status and durably persist the observation; and
+5. seal a matching authenticated result.
+
+An existing operation or compensation never calls the adapter again. Its
+identity is the exact tool, durable key, and canonical input fingerprint; a
+changed input or tool fails closed rather than receiving a cached outcome. Its
+stored state is revalidated against the current grant before it is returned.
+An existing `pending` state returns a pending/indeterminate error, never a
+synthesized success, and requires recovery.
+`WorkerAdapterError::Indeterminate`, an invalid post-effect observation, or a
+failed post-effect journal write produces an indeterminate runtime error. The
+runtime restores its in-memory journal to the last known state. A persistence
+failure also poisons the session, so the host must discard it and open a fresh
+authenticated session from an atomically loaded journal and revision before
+bounded reconciliation or adapter-specific/manual recovery. It must not resend
+the effect as a new operation.
+
+`reconcile_operation` has both worker-side per-tool and whole-session budgets,
+independent of the ordinary capability call budget. The runtime only
+reconciles a tool and operation key already owned by its journal, persists the
+observed state before it replies, and rejects contradictory terminal
+transitions. This prevents a worker adapter from becoming an unbounded status
+oracle or a source of unbounded journal write amplification.
+
+External exactly-once behavior remains adapter/provider specific. The runtime
+provides write-ahead intent, never reruns an existing durable key, and forces
+reconciliation for ambiguity. A durable adapter must also expose bounded status
+recovery by `operation_key`; when its provider supports idempotency keys, it
+must pass that exact key through rather than inventing a provider-local retry
+identity.
+
+Compensation recovery is deliberately narrower. After an indeterminate
+compensation, the host reuses the exact existing compensation intent under a
+fresh approval and invokes an adapter-specific status or manual-recovery
+policy. Splash does not define a universal inverse-status API.
+
+## Mobile and Embedded Profiles
+
+The crate has no async runtime, thread, socket, filesystem, process, or
+allocator-specific dependency. It can sit behind an app-owned message loop or
+an embedded transport as long as the host enforces frame-size limits, adapter
+I/O timeouts, storage semantics, and containment appropriate to the target.
+
+On mobile, the recommended profile is app-provided adapters only: do not
+expose arbitrary executable, filesystem, or network selectors to the worker.
+On embedded systems, select a small static adapter catalog and provide a
+platform durable store only when the hardware offers an authenticated
+anti-rollback primitive and atomic monotonic compare-and-swap. Otherwise use
+the runtime for bounded non-durable calls and treat durable effects as
+unavailable rather than claiming a storage guarantee the device cannot
+provide.
+
+See [worker protocol](worker-protocol.md), [worker durable
+operations](worker-operations.md), [durable worker
+compensation](worker-compensation.md), and [authenticated durable
+storage](durable-storage.md) for the surrounding contracts.

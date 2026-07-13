@@ -20,13 +20,40 @@ encrypt transport, or enforce an operating-system policy itself. The host must
 provide a trusted bootstrap channel and containment backend before an
 effectful adapter is considered contained.
 
+`splash-worker` is the worker-side implementation of that protocol boundary.
+It accepts only an explicitly registered Rust adapter for a granted capability,
+requires host admission to bind a fresh authenticated session to its tenant
+journal scope, and persists durable intent before an adapter effect through a
+monotonic compare-and-swap journal revision and a current host-issued fencing
+lease. The scope is host-selected and the admission boundary must validate the
+session/scope tenant binding together; a store rejects leases from superseded
+workers. It restores its in-memory journal and poisons the session when
+persistence fails; a post-effect failure also returns an indeterminate error
+and requires a fresh authenticated reload before bounded reconciliation or
+adapter-specific recovery. A duplicate pending operation remains pending and
+an exact durable key is bound to its canonical tool input, so changed input
+fails closed. It does not isolate adapters: embedding it in the interpreter
+process, a mobile app, or an unrestricted service leaves it with that process's
+ambient authority. Its journal-store trait is a contract, not a file/database
+implementation or anti-rollback mechanism.
+
+Worker adapters must explicitly declare read-only/idempotent safety before the
+non-durable `invoke` path is enabled, and a bounded reconciliation contract
+before durable dispatch or compensation is enabled. A declaration is a trusted
+Rust-code review obligation, not proof of external exactly-once behavior. A
+durable adapter must recover status by the host operation key and pass that key
+to a provider idempotency mechanism when one exists. The runtime's ordering
+prevents a duplicate adapter invocation for an existing journal key, but it
+cannot make an external provider idempotent or queryable.
+
 `ProtocolWorkerClient` connects that validation layer to a host-owned
 `WorkerTransport`; its registration rejects a local policy that is broader than
 the worker grant. This still does not make an in-process transport isolated.
 
 Each registered tool declares a stable identifier and limits for calls, input
 bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,
-over-budget, or malformed calls fail before a tool handler is invoked.
+over-budget, over-depth, or malformed calls fail before a tool handler is
+invoked.
 
 JSON capabilities are an explicit policy type. They accept only JSON object or
 array envelopes: envelope validation happens before the Rust handler is called,

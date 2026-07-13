@@ -2,10 +2,12 @@
 
 `splash-protocol` is the portable data contract between a trusted Splash host
 and a platform-contained worker. It defines capability attenuation, bounded
-JSON frames, and keyed message authentication. It does not create a process,
-establish a session key, apply an OS sandbox, or persist worker state. A host
-must select the containment backend and provision its key through a trusted
-platform channel before it sends an effectful invocation.
+JSON frames, and keyed message authentication. `splash-worker` implements the
+worker-side dispatch and journal sequencing atop this contract. Neither crate
+creates a process, establishes a session key, applies an OS sandbox, or
+supplies rollback-resistant persistence. A host must select the containment
+backend and provision its key through a trusted platform channel before it
+sends an effectful invocation.
 
 Version 4 is a breaking wire and durable-journal revision. Version 3 frames
 and version 1 worker journals are rejected rather than silently interpreted
@@ -50,7 +52,8 @@ only inside its chosen worker backend.
 
 JSON payloads must be objects or arrays. The protocol rejects scalar JSON at
 both input and result boundaries, matching Splash's portable JSON tool
-contract.
+contract. It also bounds JSON nesting to 32 levels, including the root object
+or array, before authorization, canonicalization, or adapter dispatch.
 
 `max_compensations` defaults to zero. A normal tool grant therefore does not
 authorize a compensating effect unless the host opts in explicitly.
@@ -107,6 +110,37 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
 Transport framing, worker lifecycle, cancellation delivery, durable replay,
 and OS policy remain backend responsibilities.
 
+## Rust Adapter Runtime
+
+`splash-worker::WorkerSession` is the baseline implementation for a trusted
+Rust adapter catalog. It opens only a host-authenticated `open_session` frame,
+requires `WorkerSessionAdmission` to bind the session ID and journal scope to
+the intended tenant and replay policy, issue a current single-writer fencing
+lease for that scope, and accepts only capability names explicitly registered
+in `WorkerAdapterRegistry`. The journal scope is host-selected state, not a
+field in an authenticated worker frame or a script input. The runtime
+reauthorizes every frame against the live manifest, validates every output
+against the corresponding grant, and owns bounded per-tool and whole-session
+reconciliation budgets.
+
+Before dispatching a request, the runtime also requires the registered adapter
+to declare its path-specific contract. `invoke` needs a read-only or
+independently-idempotent declaration. Durable dispatch and compensation need a
+bounded durable-recovery declaration; dispatch recovery is by `operation_key`,
+while compensation recovery remains adapter-specific. A provider-idempotency
+declaration means the adapter must pass the exact `operation_key` to the
+external provider as its idempotency key. These are trusted Rust adapter
+contracts, not properties a Splash script can claim.
+
+The runtime enforces worker journal ordering but runs with the privileges of
+its embedding process. A production host must place it in the selected
+contained worker and give it a `WorkerJournalStore` that meets the authenticated
+rollback-resistant compare-and-swap storage contract. The host loads the
+journal and its monotonic revision atomically, and each runtime persistence
+must advance that revision under the current scope fencing lease. The store
+rejects older leases, so a superseded session cannot write after a newer worker
+has been admitted. See [worker adapter runtime](worker-runtime.md).
+
 ## Durable Operation Dispatch
 
 `dispatch_operation` is the v4 path for an effect whose idempotency must
@@ -122,6 +156,22 @@ adapter run an effect. A new admission permits one dispatch. An exact duplicate
 returns its existing `pending`, `running`, or terminal state and must not run
 the adapter again. Reusing the same key with a different tool or canonical
 input is rejected.
+
+`splash-worker` returns `PendingOperation` for an existing `pending` record;
+it never turns an unconfirmed effect into success. A `running` or terminal
+state can be returned only after it is revalidated against the active grant.
+
+The ordinary `invoke` message has no durable journal identity. Its adapter
+handler is for read-only or independently idempotent work; use
+`dispatch_operation` for a crash-sensitive external effect.
+
+The baseline `splash-worker` runtime restores its in-memory journal to the
+last successfully persisted state if recording an adapter observation fails.
+It poisons that session and returns an indeterminate operation error rather
+than a terminal response; the host must reopen from a fresh atomically loaded
+journal and revision before it reconciles the same durable key. Its
+reconciliation path only queries an operation already admitted in that journal
+and persists a valid observation before replying.
 
 For a host workflow ledger, derive and record the input with
 `canonical_operation_input_bytes(&payload)` before it creates the dispatch

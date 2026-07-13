@@ -50,6 +50,22 @@ equivalent platform primitive that survives storage rollback.
 tests and local development. It loses both bytes and its floor at process exit,
 so it is never a production rollback defense.
 
+`splash-worker::WorkerJournalStore` has the same production requirement for a
+worker operation journal: `persist` must atomically compare the loaded
+`WorkerJournalRevision`, commit the new journal, and advance that revision
+through an authenticated rollback-resistant durable store, while rejecting an
+expired `WorkerJournalLease` from a superseded worker session. It is
+intentionally a narrow callback so the runtime cannot turn a file, SQLite row,
+or in-memory cache into a trusted backend by itself. Any persistence failure
+poisons the worker session; a failed post-effect write also returns an
+indeterminate worker error. Discard the session and reopen from a fresh atomic
+snapshot before bounded reconciliation or explicit adapter/operator policy.
+
+The admission service and the store must share one monotonic lease authority
+for each journal scope. On one host this may be a transaction guarded by the
+same durable backend; across hosts it needs a trusted coordination service or
+platform monotonic primitive. A process-local counter is not a fencing source.
+
 ## Key Rotation
 
 `StorageKeyring` has one active write key plus prior verification keys. To

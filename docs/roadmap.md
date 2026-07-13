@@ -28,6 +28,9 @@
 - Explicit, host-approved worker compensation intents with a separate bounded
   grant, exact grant fingerprint, one inverse effect per succeeded operation,
   and crash-safe worker-journal recovery.
+- Worker-side capability runtime with explicit Rust adapter registration,
+  fresh-session admission, durable journal ordering, bounded reconciliation,
+  and indeterminate-effect recovery.
 
 ## Next: durable external operations
 

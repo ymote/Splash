@@ -295,6 +295,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "splash-worker"
+version = "0.1.0"
+dependencies = [
+ "splash-protocol",
+]
+
+[[package]]
 name = "splash-workflow"
 version = "0.1.0"
 dependencies = [

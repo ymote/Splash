@@ -130,6 +130,14 @@ execution order is non-negotiable:
 5. Persist `running`, `succeeded`, `failed`, or `cancelled` after the adapter
    reports it, then send `CompensationResult`.
 
+`splash-worker::WorkerSession` restores its in-memory journal to the last
+successful persistence point and poisons its session when the adapter may have
+acted but the observed state cannot be made durable. It returns an
+indeterminate-compensation error; reopen from an atomic journal-and-revision
+snapshot with a fresh current fencing lease before the adapter-specific or
+manual recovery policy described below. That error is never permission to
+create another compensation key or rerun the inverse effect.
+
 For an exact duplicate, `admit_compensation` returns `Existing` with the
 stored state. The worker must report or reconcile that state; it must not run
 the adapter a second time. The journal rejects a second compensation key,

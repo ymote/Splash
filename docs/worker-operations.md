@@ -55,10 +55,26 @@ canonical JSON with object keys sorted recursively, so equivalent object key
 ordering does not produce a different operation identity. Credentials must
 remain opaque secret selectors or worker handles rather than request fields.
 
+The fingerprint is the full 256-bit BLAKE3 digest with a protocol domain tag.
+Canonical JSON preserves parsed string and number values, emits no whitespace,
+and sorts object keys by Rust string ordering. It does not apply Unicode
+normalization or coerce `1` and `1.0`; such a difference deliberately fails
+closed as changed input rather than silently treating distinct data as one
+effect.
+
 The operation key alone is not a multi-tenant namespace. Construct a journal
 with a host-controlled opaque scope such as a worker tenant or policy-domain
 identifier, and restore it with `from_json_for_scope`. Never share one journal
 scope between principals that must not deduplicate each other's effects.
+`splash-worker::WorkerSessionAdmission` must validate the authenticated session
+ID and that host-selected scope together, then issue a current fencing lease;
+the journal store rejects writes from a superseded lease. The scope is never
+accepted from Splash source or a worker request.
+
+All admission implementations sharing a scope must obtain leases from one
+monotonic authority, such as a transactional durable store, trusted lease
+service, or platform monotonic counter. A per-process counter is insufficient
+when more than one worker host can admit the same scope.
 
 ## State and Persistence
 
@@ -68,6 +84,20 @@ only when it is exactly identical. A contradictory later result is rejected.
 `pending` after a crash is deliberately ambiguous: the host must reconcile,
 compensate, or escalate according to the adapter's recovery policy rather than
 assuming the effect did or did not happen.
+
+An exact duplicate in `pending` returns an explicit pending error and does not
+run the adapter or manufacture a terminal result. A duplicate in `running` or
+a terminal state is only returned after its stored state passes the active
+grant's format and output bounds.
+
+`splash-worker::WorkerSession` restores its in-memory journal to the last
+successfully persisted version when it cannot persist an adapter observation.
+It poisons that session and returns an indeterminate-operation error instead
+of a terminal worker result. The host must discard it, reopen from an atomic
+journal-and-revision snapshot, then use the same operation key with bounded
+reconciliation. The runtime persists a valid reconciliation observation before
+returning it. This prevents a successful in-memory adapter result from
+bypassing durable recovery semantics.
 
 The journal retains a terminal success payload or failure message to answer an
 idempotent duplicate. That data is bounded, but it can still be sensitive.

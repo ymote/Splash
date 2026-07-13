@@ -26,6 +26,8 @@ and keeps UI support optional rather than making UI the language boundary.
   reconciliation for live external operations.
 - Authenticated durable-operation dispatch frames and a bounded worker journal
   for replay-safe idempotency across a worker restart.
+- A capability-scoped worker runtime that dispatches only explicitly
+  registered Rust adapters and enforces durable operation ordering.
 - Host-approved, current-policy-revalidated durable compensation intents with
   one inverse effect per succeeded operation and replay-safe worker recovery.
 - Bounded, data-only workflow checkpoints with fresh host approval required
@@ -113,6 +115,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
   boundary.
 - `splash-protocol`: portable worker messages, capability attenuation,
   keyed session framing, and host-side invocation/result validation.
+- `splash-worker`: worker-side session runtime and explicit Rust adapter
+  registry; it is not an OS sandbox or storage backend.
 - `splash-workflow`: host-owned planning, approval, checkpointing, durable
   operation records, and sequential execution.
 - `splash-cli`: local development CLI.
@@ -120,7 +124,7 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)
 for the import boundary. The [worker protocol](docs/worker-protocol.md)
-defines the handoff to future contained adapters. The [host tool catalog](docs/tool-catalog.md)
+defines the handoff to contained adapters. The [host tool catalog](docs/tool-catalog.md)
 defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schema-contracts.md)
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
@@ -143,3 +147,6 @@ worker-side replay and persistence boundary for effectful operation keys.
 [Durable worker compensation](docs/worker-compensation.md) defines the
 host-approval, worker-journal, and crash-recovery rules for one explicit
 inverse effect.
+
+[Worker adapter runtime](docs/worker-runtime.md) defines the worker-side Rust
+adapter boundary and the integration requirements for a contained backend.
