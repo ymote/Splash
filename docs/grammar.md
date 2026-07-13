@@ -138,8 +138,9 @@ The VM remains the execution engine, but `Runtime::eval` and
 `CapabilityRuntime::eval` now enforce this profile before evaluation. The
 explicit `Runtime::eval_vm_compatibility` escape hatch deliberately opts a
 trusted host into the inherited Makepad syntax; that method must not receive
-LLM-generated or otherwise untrusted source. The development CLI also performs
-this preflight automatically for `eval` and `run`.
+LLM-generated or otherwise untrusted source. A profile rejection returns before
+the inherited tokenizer or parser sees the source. The development CLI also
+performs this preflight automatically for `eval` and `run`.
 
 ## Canonical Workflow Source
 

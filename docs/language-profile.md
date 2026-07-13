@@ -15,7 +15,8 @@ marker, so generated code must not depend on Makepad widget-host framing.
 Run `splash check <file>` before execution when an LLM or editor produced the
 source. The check enforces the canonical v0.1 grammar rather than merely
 accepting the larger Makepad compatibility parser. Syntax preflight never
-resolves imports, creates a host, or grants a tool capability.
+resolves imports, creates a host, or grants a tool capability. A source that
+the canonical profile rejects never enters the inherited tokenizer or parser.
 
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
 execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape

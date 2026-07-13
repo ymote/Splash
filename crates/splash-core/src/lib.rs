@@ -299,9 +299,10 @@ pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
 /// Validates named canonical Splash source without executing it.
 ///
 /// This function rejects Makepad compatibility syntax outside the documented
-/// Splash v0.1 grammar, then asks the vendored VM parser to confirm runtime
-/// compatibility. `file` appears only in VM-parser diagnostics. It never loads
-/// a module, resolves an import, runs bytecode, or invokes a host tool.
+/// Splash v0.1 grammar. Only source accepted by that profile reaches the
+/// vendored VM parser for a compatibility check. `file` appears only in
+/// VM-parser diagnostics. It never loads a module, resolves an import, runs
+/// bytecode, or invokes a host tool.
 pub fn check_syntax_named(
     file: &str,
     source: &str,
@@ -311,8 +312,16 @@ pub fn check_syntax_named(
     validate_source_length(source, limits)?;
 
     let profile = check_canonical_profile(source);
-    let mut diagnostics = profile.diagnostics;
-    let mut diagnostics_truncated = profile.diagnostics_truncated;
+    if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
+        return Ok(SyntaxReport {
+            valid: false,
+            diagnostics: profile.diagnostics,
+            diagnostics_truncated: profile.diagnostics_truncated,
+        });
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut diagnostics_truncated = false;
 
     let mut base = vm::ScriptVmBase::new();
     let mut tokenizer = ScriptTokenizer::default();
@@ -718,14 +727,14 @@ mod tests {
     }
 
     #[test]
-    fn reports_unclosed_delimiters() {
+    fn reports_unclosed_blocks_from_the_canonical_profile() {
         let report = check_syntax("fn work() {\n    return 42").unwrap();
 
         assert!(!report.valid);
         assert!(report
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("unclosed `{`")));
+            .any(|diagnostic| diagnostic.message.contains("expected `}` to close a block")));
     }
 
     #[test]
@@ -740,14 +749,14 @@ mod tests {
     }
 
     #[test]
-    fn reports_parser_owned_errors_as_structured_diagnostics() {
+    fn profile_rejections_do_not_invoke_the_inherited_parser() {
         let report = check_syntax("let = 42").unwrap();
 
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("Let expected identifier")));
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(report.diagnostics[0]
+            .message
+            .contains("expected an identifier after `let`"));
         assert!(report
             .diagnostics
             .iter()
