@@ -1,4 +1,4 @@
-use splash_capabilities::{CapabilityRuntime, ToolPolicy};
+use splash_capabilities::{AuditOutcome, CapabilityRuntime, ToolPolicy};
 
 #[test]
 fn executes_shipped_canonical_fixtures_through_real_capability_bindings() {
@@ -53,4 +53,18 @@ fn executes_shipped_canonical_fixtures_through_real_capability_bindings() {
         "{:?}",
         pump.resumed[0].diagnostics
     );
+
+    // The grammar and construct fixtures assert their registered-tool results.
+    assert_eq!(
+        runtime
+            .audit()
+            .iter()
+            .map(|event| event.tool.as_str())
+            .collect::<Vec<_>>(),
+        vec!["math.add", "text.echo"]
+    );
+    assert!(runtime
+        .audit()
+        .iter()
+        .all(|event| event.outcome == AuditOutcome::Allowed));
 }
