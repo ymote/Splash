@@ -404,6 +404,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "splash-sandbox"
+version = "0.1.0"
+dependencies = [
+ "splash-protocol",
+]
+
+[[package]]
 name = "splash-schema"
 version = "0.1.0"
 dependencies = [

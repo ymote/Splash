@@ -46,6 +46,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Feature-gated bounded JSON-line worker channel and authenticated transport
   for host-provided contained-worker pipes; process creation, deadlines, and
   containment remain host policy.
+- Linux Bubblewrap worker-policy compiler and launcher for a fixed,
+  host-selected worker and manifest-selected file roots; it rejects network,
+  executable, and secret selectors rather than claiming unsupported policy.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
@@ -129,6 +132,8 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 - `splash-worker`: worker-side session runtime, explicit Rust adapter registry,
   and authenticated journal-store bridge; it is not an OS sandbox or platform
   storage backend.
+- `splash-sandbox`: target-specific worker containment policy; its initial
+  Bubblewrap backend is Linux-only and deliberately narrow.
 - `splash-workflow`: host-owned planning, approval, checkpointing, durable
   operation records, and sequential execution.
 - `splash-cli`: local development CLI.
@@ -162,3 +167,6 @@ inverse effect.
 
 [Worker adapter runtime](docs/worker-runtime.md) defines the worker-side Rust
 adapter boundary and the integration requirements for a contained backend.
+
+[Linux Bubblewrap workers](docs/linux-bubblewrap.md) define the first contained
+worker launcher, its capability mapping, and its explicit non-guarantees.

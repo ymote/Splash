@@ -41,6 +41,10 @@
 - Feature-gated bounded JSON-line frame channel and authenticated ordinary-call
   transport for host-provided contained-worker I/O; it does not launch or
   sandbox a process.
+- Linux Bubblewrap policy compiler and launcher for fixed workers and
+  manifest-selected file roots. It fails closed for network-origin,
+  executable, and secret selectors, and does not fall back to unrestricted
+  process launch.
 
 ## Next: durable external operations
 
@@ -49,10 +53,12 @@
 
 ## Next: contained local effects
 
-- Per-platform containment backends for desktop and embedded Linux.
-- Contained-worker implementations and process-launch policy for the bounded
-  JSON-line transport.
-- Filesystem-root, executable, and network-origin policies.
+- Resource quota, seccomp, target-specific key-bootstrap, and cancellation
+  policy around the Linux Bubblewrap launcher.
+- Per-platform containment backends for macOS, Windows, mobile, and embedded
+  Linux.
+- A mediated origin-aware network policy, secret broker, and audited executable
+  policy; they must remain denied until each can be enforced.
 - Mobile profile with app-provided tools only.
 
 ## Before a stable language release

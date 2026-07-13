@@ -6,12 +6,13 @@ untrusted. The runtime has two separate security boundaries:
 1. The language boundary exposes no ambient filesystem, process, network, or
    platform APIs. Scripts can reach a tool only through `tool.call` or an
    explicitly host-controlled `tool.start(...).await()` promise.
-2. The execution boundary must contain any adapter with OS effects. A future
-   production local-tool adapter will run in a dedicated worker with a
-   platform-specific sandbox, not in the interpreter process.
+2. The execution boundary must contain any adapter with OS effects. The current
+   Linux Bubblewrap backend launches a dedicated worker with a narrowly scoped
+   filesystem policy; other desktop, mobile, and embedded targets still need
+   their own platform-specific containment backend.
 
 `splash-protocol` defines the portable, attenuated handoff from a policy host
-to that future worker. It validates manifests, request uniqueness, formats,
+to a contained worker. It validates manifests, request uniqueness, formats,
 byte limits, and call budgets. Its `SessionAuthenticator` can also bind each
 worker frame to a host-provisioned BLAKE3 session key, directional role, and
 strict sequence number, rejecting tampering, reflection, and replay before a
@@ -93,6 +94,35 @@ invalid or unexpected worker response. A host must discard that session rather
 than retrying on the stream. This is protocol robustness, not containment: the
 host still owns trusted key provisioning, I/O deadlines, cancellation, child
 lifecycle, and the platform sandbox that restricts the worker's OS authority.
+
+`splash-sandbox::bubblewrap` is the first such platform sandbox integration.
+It accepts only a fixed host-selected worker executable and fixed arguments,
+constructs a fresh Bubblewrap mount namespace, clears the worker environment,
+creates a new session, binds the worker to its parent lifecycle, and mounts
+only read-only runtime paths plus active manifest-selected `file_root`
+directories. It uses `--unshare-all` and never emits `--share-net`, so it does
+not retain the host network namespace. It rejects `network_origin`,
+`executable`, and `secret` selectors because this backend cannot correctly
+enforce them. It also rejects overlapping or root mounts and requires the
+worker program to live in a read-only runtime mount, avoiding a writable grant
+as an executable source.
+
+Bubblewrap is a low-level sandbox constructor, not a complete security policy.
+This backend has no seccomp filter, cgroup or rlimit enforcement, per-origin
+network proxy, D-Bus mediation, secret broker, key exchange, process
+attestation, deadline enforcement, cancellation delivery, or post-exit
+recovery. A private `/tmp` is opt-in and unbounded unless the host separately
+applies a memory or disk policy. Its filesystem boundary is per worker session,
+not per individual invocation: an attenuated manifest should be narrowed before
+launch when per-call filesystem isolation is required. Policy source paths must
+be host-owned and immutable to untrusted actors between compilation and spawn;
+the current path-based launcher cannot eliminate that race. A fixed worker
+program also does not prevent a compromised worker from executing or reading
+other files deliberately exposed through a runtime mount; runtime mounts must
+be minimal and immutable until a seccomp policy is implemented. On a failure it
+does not fall back to an unrestricted worker. See
+[`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md) before enabling it for
+untrusted local effects.
 
 Each registered tool declares a stable identifier and limits for calls, input
 bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,
