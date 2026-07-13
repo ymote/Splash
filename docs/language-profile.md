@@ -1,15 +1,20 @@
 # Splash Language Profile v0.1
 
 This profile defines the portable, LLM-oriented subset exercised by the
-standalone runtime. The fixture at
-`crates/splash-core/tests/fixtures/workflow_language.splash` is normative for
-this first release; parser features outside the fixture remain compatibility
-features inherited from the upstream VM until separately specified.
+standalone runtime. [Splash Grammar v0.1](grammar.md) is the normative source
+producer contract. The fixture at
+`crates/splash-core/tests/fixtures/workflow_language.splash` is the normative
+runtime-compatibility regression for this first release; parser features
+outside the grammar and fixture remain compatibility features inherited from
+the upstream VM until separately specified.
 
 ## Source contract
 
 Provide normal Splash source. The runtime adds its own internal terminal
 marker, so generated code must not depend on Makepad widget-host framing.
+Run `splash check <file>` before execution when an LLM or editor produced the
+source. Syntax preflight never resolves imports, creates a host, or grants a
+tool capability.
 
 The current profile supports:
 
@@ -111,6 +116,8 @@ or mutate its keys, input digest, worker observation, or restart policy.
 
 - Generate source only; do not add Makepad widget wrappers or `runsplash`
   fences when targeting the CLI/runtime.
+- Follow the [canonical grammar](grammar.md), then use `splash check` before
+  requesting execution.
 - Import `mod.tool` before calling a tool.
 - Treat a denied tool call as a runtime error. Do not retry by attempting
   filesystem, process, or network imports.

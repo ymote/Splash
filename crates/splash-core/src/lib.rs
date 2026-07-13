@@ -11,12 +11,16 @@ use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 pub use makepad_script as vm;
+use vm::parser::ScriptParser;
+use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_INSTRUCTION_LIMIT: usize = 200_000;
 pub const DEFAULT_SOFT_TIMEOUT: Duration = Duration::from_millis(32);
 pub const DEFAULT_HARD_TIMEOUT: Duration = Duration::from_millis(64);
 pub const DEFAULT_BUDGET_SAMPLE_INTERVAL: u32 = 1_024;
+/// Maximum structured syntax diagnostics returned for one source check.
+pub const MAX_SYNTAX_DIAGNOSTICS: usize = 32;
 
 /// Bounds applied to one source evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +114,22 @@ pub struct Evaluation {
     pub suspended: bool,
 }
 
+/// One one-based location returned by the effect-free syntax checker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntaxDiagnostic {
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+}
+
+/// Result of parsing Splash source without executing its opcodes or tools.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntaxReport {
+    pub valid: bool,
+    pub diagnostics: Vec<SyntaxDiagnostic>,
+    pub diagnostics_truncated: bool,
+}
+
 impl Evaluation {
     pub fn succeeded(&self) -> bool {
         !self.value.is_err()
@@ -169,13 +189,17 @@ impl<H: Any, S: Any> Runtime<H, S> {
         self.with_vm(configure);
     }
 
+    /// Parses source without evaluating it or entering any host binding.
+    ///
+    /// This is suitable for LLM preflight and editor validation. It checks only
+    /// syntax; imports, capability grants, schemas, and tool names remain
+    /// host-policy decisions that are validated at execution time.
+    pub fn check_syntax(&self, source: &str) -> Result<SyntaxReport, RuntimeError> {
+        check_syntax_named("inline.splash", source, self.limits)
+    }
+
     pub fn eval(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
-        if source.len() > self.limits.max_source_bytes {
-            return Err(RuntimeError::SourceTooLarge {
-                actual: source.len(),
-                maximum: self.limits.max_source_bytes,
-            });
-        }
+        validate_source_length(source, self.limits)?;
 
         let limits = self.limits;
         self.with_vm(|vm| {
@@ -226,6 +250,189 @@ impl<H: Any, S: Any> Runtime<H, S> {
         let result = operation(&mut vm);
         self.vm = vm.bx;
         result
+    }
+}
+
+/// Parses source with the default source-size limit without executing it.
+pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
+    check_syntax_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Parses named source without executing it.
+///
+/// `file` appears only in parser-owned diagnostics. This function never loads
+/// a module, resolves an import, runs bytecode, or invokes a host tool.
+pub fn check_syntax_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<SyntaxReport, RuntimeError> {
+    let limits = limits.validate()?;
+    validate_source_length(source, limits)?;
+
+    let mut base = vm::ScriptVmBase::new();
+    let mut tokenizer = ScriptTokenizer::default();
+    tokenizer.tokenize(&format!("{source}\n;"), &mut base.heap);
+    let mut parser = ScriptParser::default();
+    parser.set_emit_errors(false);
+    parser.parse(&tokenizer, file, (0, 0), &[]);
+
+    let (mut diagnostics, mut diagnostics_truncated) = delimiter_diagnostics(&tokenizer);
+    for diagnostic in parser.diagnostics {
+        push_syntax_diagnostic(
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            SyntaxDiagnostic {
+                line: diagnostic.line as usize + 1,
+                column: diagnostic.column as usize + 1,
+                message: diagnostic.message,
+            },
+        );
+    }
+    diagnostics_truncated |= parser.diagnostics_truncated;
+
+    Ok(SyntaxReport {
+        valid: !parser.had_error && diagnostics.is_empty(),
+        diagnostics,
+        diagnostics_truncated,
+    })
+}
+
+fn validate_source_length(source: &str, limits: ExecutionLimits) -> Result<(), RuntimeError> {
+    if source.len() > limits.max_source_bytes {
+        return Err(RuntimeError::SourceTooLarge {
+            actual: source.len(),
+            maximum: limits.max_source_bytes,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Delimiter {
+    Curly,
+    Round,
+    Square,
+}
+
+impl Delimiter {
+    const fn opening(self) -> char {
+        match self {
+            Self::Curly => '{',
+            Self::Round => '(',
+            Self::Square => '[',
+        }
+    }
+
+    const fn closing(self) -> char {
+        match self {
+            Self::Curly => '}',
+            Self::Round => ')',
+            Self::Square => ']',
+        }
+    }
+}
+
+fn delimiter_diagnostics(tokenizer: &ScriptTokenizer) -> (Vec<SyntaxDiagnostic>, bool) {
+    let mut diagnostics = Vec::new();
+    let mut truncated = false;
+    let mut openings = Vec::new();
+
+    for (index, token_position) in tokenizer.tokens.iter().enumerate() {
+        let opening = match token_position.token {
+            ScriptToken::OpenCurly => Some(Delimiter::Curly),
+            ScriptToken::OpenRound => Some(Delimiter::Round),
+            ScriptToken::OpenSquare => Some(Delimiter::Square),
+            _ => None,
+        };
+        if let Some(opening) = opening {
+            openings.push((opening, index));
+            continue;
+        }
+
+        let closing = match token_position.token {
+            ScriptToken::CloseCurly => Some(Delimiter::Curly),
+            ScriptToken::CloseRound => Some(Delimiter::Round),
+            ScriptToken::CloseSquare => Some(Delimiter::Square),
+            ScriptToken::StringUnfinished => {
+                let (line, column) = token_location(tokenizer, index);
+                push_syntax_diagnostic(
+                    &mut diagnostics,
+                    &mut truncated,
+                    SyntaxDiagnostic {
+                        line,
+                        column,
+                        message: "unterminated string literal".to_owned(),
+                    },
+                );
+                None
+            }
+            _ => None,
+        };
+        let Some(closing) = closing else {
+            continue;
+        };
+        if openings
+            .last()
+            .is_some_and(|(opening, _)| *opening == closing)
+        {
+            openings.pop();
+            continue;
+        }
+        let (line, column) = token_location(tokenizer, index);
+        let message = openings.last().map_or_else(
+            || format!("unexpected `{}`", closing.closing()),
+            |(opening, _)| {
+                format!(
+                    "expected `{}` before `{}`",
+                    opening.closing(),
+                    closing.closing()
+                )
+            },
+        );
+        push_syntax_diagnostic(
+            &mut diagnostics,
+            &mut truncated,
+            SyntaxDiagnostic {
+                line,
+                column,
+                message,
+            },
+        );
+    }
+
+    for (opening, index) in openings.into_iter().rev() {
+        let (line, column) = token_location(tokenizer, index);
+        push_syntax_diagnostic(
+            &mut diagnostics,
+            &mut truncated,
+            SyntaxDiagnostic {
+                line,
+                column,
+                message: format!("unclosed `{}`", opening.opening()),
+            },
+        );
+    }
+
+    (diagnostics, truncated)
+}
+
+fn token_location(tokenizer: &ScriptTokenizer, index: usize) -> (usize, usize) {
+    tokenizer
+        .token_index_to_row_col(index as u32)
+        .map(|(line, column)| (line as usize + 1, column as usize + 1))
+        .unwrap_or((1, 1))
+}
+
+fn push_syntax_diagnostic(
+    diagnostics: &mut Vec<SyntaxDiagnostic>,
+    truncated: &mut bool,
+    diagnostic: SyntaxDiagnostic,
+) {
+    if diagnostics.len() < MAX_SYNTAX_DIAGNOSTICS {
+        diagnostics.push(diagnostic);
+    } else {
+        *truncated = true;
     }
 }
 
@@ -291,6 +498,84 @@ mod tests {
 
         assert_eq!(
             runtime.eval("hello").unwrap_err(),
+            RuntimeError::SourceTooLarge {
+                actual: 5,
+                maximum: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn checks_syntax_without_executing_source() {
+        let report = check_syntax("loop {}").unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn checks_tool_syntax_without_a_capability_host() {
+        let report = check_syntax("use mod.tool\ntool.call(\"text.echo\", \"hello\")").unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn checks_canonical_record_member_separators() {
+        let report = check_syntax(
+            "let values = [20, 22]\nlet request = {left: values[0], right: values[1]}",
+        )
+        .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn reports_unclosed_delimiters() {
+        let report = check_syntax("fn work() {\n    return 42").unwrap();
+
+        assert!(!report.valid);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unclosed `{`")));
+    }
+
+    #[test]
+    fn reports_unterminated_strings() {
+        let report = check_syntax("let value = \"unterminated").unwrap();
+
+        assert!(!report.valid);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("unterminated string")));
+    }
+
+    #[test]
+    fn reports_parser_owned_errors_as_structured_diagnostics() {
+        let report = check_syntax("let = 42").unwrap();
+
+        assert!(!report.valid);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Let expected identifier")));
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.line >= 1 && diagnostic.column >= 1));
+    }
+
+    #[test]
+    fn syntax_checks_respect_the_configured_source_limit() {
+        let limits = ExecutionLimits {
+            max_source_bytes: 4,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("limited.splash", "hello", limits).unwrap_err(),
             RuntimeError::SourceTooLarge {
                 actual: 5,
                 maximum: 4,

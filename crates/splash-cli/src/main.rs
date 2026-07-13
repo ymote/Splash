@@ -7,11 +7,13 @@ use std::process::ExitCode;
 use splash_capabilities::{
     json, CapabilityRuntime, JsonToolContract, ToolError, ToolMetadata, ToolPolicy,
 };
+use splash_core::{check_syntax_named, ExecutionLimits};
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
     Evaluate(String),
     Catalog,
+    Check { file: String, source: String },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -32,7 +34,38 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
-    let options = parse_args(args)?;
+    run_options(parse_args(args)?)
+}
+
+fn run_options(options: CliOptions) -> Result<(), String> {
+    if let CliCommand::Check { file, source } = &options.command {
+        let report = check_syntax_named(file, source, ExecutionLimits::default())
+            .map_err(|error| error.to_string())?;
+        let diagnostics = report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                json!({
+                    "line": diagnostic.line,
+                    "column": diagnostic.column,
+                    "message": diagnostic.message,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            json!({
+                "valid": report.valid,
+                "diagnostics_truncated": report.diagnostics_truncated,
+                "diagnostics": diagnostics,
+            })
+        );
+        return report
+            .valid
+            .then_some(())
+            .ok_or_else(|| "syntax check failed".to_owned());
+    }
+
     let mut runtime = CapabilityRuntime::default();
     if options.allow_echo {
         runtime
@@ -83,14 +116,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
 
-    let CliCommand::Evaluate(source) = options.command else {
-        println!(
-            "{}",
-            runtime
-                .tool_catalog_json()
-                .map_err(|error| error.to_string())?
-        );
-        return Ok(());
+    let source = match options.command {
+        CliCommand::Evaluate(source) => source,
+        CliCommand::Catalog => {
+            println!(
+                "{}",
+                runtime
+                    .tool_catalog_json()
+                    .map_err(|error| error.to_string())?
+            );
+            return Ok(());
+        }
+        CliCommand::Check { .. } => unreachable!("syntax checks return before creating a host"),
     };
 
     let mut report = runtime.eval(&source).map_err(|error| error.to_string())?;
@@ -132,7 +169,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
         match argument.as_str() {
             "--allow-echo" => allow_echo = true,
             "--allow-json-add" => allow_json_add = true,
-            "eval" | "run" | "catalog" => positional.push(argument),
+            "check" | "eval" | "run" | "catalog" => positional.push(argument),
             _ => positional.push(argument),
         }
     }
@@ -150,13 +187,23 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_json_add,
             })
             .map_err(|error| format!("cannot read {path}: {error}")),
+        [command, path] if command == "check" => fs::read_to_string(path)
+            .map(|source| CliOptions {
+                command: CliCommand::Check {
+                    file: path.clone(),
+                    source,
+                },
+                allow_echo,
+                allow_json_add,
+            })
+            .map_err(|error| format!("cannot read {path}: {error}")),
         [command] if command == "catalog" => Ok(CliOptions {
             command: CliCommand::Catalog,
             allow_echo,
             allow_json_add,
         }),
         _ => Err(
-            "usage: splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
+            "usage: splash check <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
         ),
     }
 }
@@ -192,6 +239,56 @@ mod tests {
                 allow_json_add: true,
             }
         );
+    }
+
+    #[test]
+    fn parses_a_check_invocation() {
+        let path = format!(
+            "{}/../splash-core/tests/fixtures/workflow_language.splash",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert_eq!(
+            parse_args(vec!["check".to_owned(), path.clone()]).unwrap(),
+            CliOptions {
+                command: CliCommand::Check {
+                    file: path,
+                    source: include_str!(
+                        "../../splash-core/tests/fixtures/workflow_language.splash"
+                    )
+                    .to_owned(),
+                },
+                allow_echo: false,
+                allow_json_add: false,
+            }
+        );
+    }
+
+    #[test]
+    fn checks_source_without_creating_a_capability_host() {
+        run_options(CliOptions {
+            command: CliCommand::Check {
+                file: "generated.splash".to_owned(),
+                source: "loop {}".to_owned(),
+            },
+            allow_echo: false,
+            allow_json_add: false,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_source_during_a_syntax_check() {
+        let error = run_options(CliOptions {
+            command: CliCommand::Check {
+                file: "generated.splash".to_owned(),
+                source: "fn work() {".to_owned(),
+            },
+            allow_echo: false,
+            allow_json_add: false,
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "syntax check failed");
     }
 
     #[test]

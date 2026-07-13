@@ -7,6 +7,8 @@ and keeps UI support optional rather than making UI the language boundary.
 ## Current baseline
 
 - A standalone, vendored VM and parser with upstream provenance.
+- An effect-free, bounded syntax preflight with structured diagnostics for
+  generated source and editor tooling.
 - A bounded evaluator with source, instruction, and deadline limits.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
@@ -117,6 +119,16 @@ Inspect the exact demo-tool catalog supplied to an LLM host with:
 ```sh
 cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 ```
+
+Validate generated source without creating a capability host or running any
+bytecode:
+
+```sh
+cargo run -p splash-cli -- check examples/deferred_tool_workflow.splash
+```
+
+The command emits JSON diagnostics and exits nonzero for invalid source. The
+portable source contract is [Splash Grammar v0.1](docs/grammar.md).
 
 ## Workspace
 

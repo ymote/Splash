@@ -2,7 +2,7 @@ use mod.std.assert
 
 let multiplier = 7
 let values = [1, 2, 3]
-let record = {answer: 42 items: values}
+let record = {answer: 42, items: values}
 
 fn add(left, right) {
     return left + right

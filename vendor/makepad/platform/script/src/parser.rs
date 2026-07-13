@@ -11,6 +11,22 @@ macro_rules! error {
     }
 }
 
+/// Structured parser feedback retained for hosts that need to validate source
+/// without executing it. Positions are zero-based and relative to the parser's
+/// configured source offsets.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScriptParserDiagnostic {
+    pub line: u32,
+    pub column: u32,
+    pub message: String,
+}
+
+/// Maximum retained diagnostics for one parser instance.
+///
+/// The parser still marks `had_error` after this limit so callers cannot treat
+/// a malformed source as valid just because feedback was bounded.
+pub const MAX_PARSER_DIAGNOSTICS: usize = 64;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum State {
     BeginStmt {
@@ -702,8 +718,11 @@ pub struct ScriptParser {
     pub opcodes: Vec<ScriptValue>,
     pub source_map: Vec<Option<u32>>,
     pub had_error: bool,
+    pub diagnostics: Vec<ScriptParserDiagnostic>,
+    pub diagnostics_truncated: bool,
 
     state: Vec<State>,
+    emit_errors: bool,
     pub file: String,
     pub line_offset: usize,
     pub col_offset: usize,
@@ -723,9 +742,12 @@ impl Default for ScriptParser {
             opcodes: Default::default(),
             source_map: Default::default(),
             had_error: false,
+            diagnostics: Default::default(),
+            diagnostics_truncated: false,
             state: vec![State::BeginStmt {
                 last_was_sep: false,
             }],
+            emit_errors: true,
             file: String::new(),
             line_offset: 0,
             col_offset: 0,
@@ -751,20 +773,42 @@ pub struct ParserCheckpoint {
 }
 
 impl ScriptParser {
+    /// Controls whether parser errors are forwarded to Makepad's global log.
+    /// Diagnostics remain available through [`Self::diagnostics`] either way.
+    pub fn set_emit_errors(&mut self, emit_errors: bool) {
+        self.emit_errors = emit_errors;
+    }
+
     pub fn report_error(&mut self, tokenizer: &ScriptTokenizer, msg: String) {
         self.had_error = true;
         let (line, col) = tokenizer
             .token_index_to_row_col(self.index)
             .unwrap_or((0, 0));
-        log_with_level(
-            &self.file,
-            line as u32 + self.line_offset as u32,
-            col as u32 + self.col_offset as u32,
-            line as u32 + self.line_offset as u32,
-            col as u32 + self.col_offset as u32,
-            msg,
-            LogLevel::Error,
-        );
+        let line = line + self.line_offset as u32;
+        let column = col + self.col_offset as u32;
+        if self.diagnostics.len() < MAX_PARSER_DIAGNOSTICS {
+            let message = msg
+                .split_once(" (from: ")
+                .map_or_else(|| msg.clone(), |(message, _)| message.to_owned());
+            self.diagnostics.push(ScriptParserDiagnostic {
+                line,
+                column,
+                message,
+            });
+        } else {
+            self.diagnostics_truncated = true;
+        }
+        if self.emit_errors {
+            log_with_level(
+                &self.file,
+                line,
+                column,
+                line,
+                column,
+                msg,
+                LogLevel::Error,
+            );
+        }
     }
 
     fn code_len(&self) -> u32 {

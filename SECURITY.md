@@ -268,10 +268,11 @@ in addition to authentication. The canonical-input digest is an unkeyed
 correlation value, so operation payloads must contain opaque secret selectors
 rather than credential values.
 
-This baseline does not yet provide filesystem adapters, network adapters,
-secret storage, worker-process isolation, signed packages, full JSON Schema,
-or mobile policy backends. Those features must not be inferred from the
-presence of the VM.
+This baseline does not yet provide filesystem or network tool adapters, a
+secret broker, signed packages, full JSON Schema, mobile policy backends, or
+general-purpose process containment. The Linux Bubblewrap launcher is a
+deliberately narrow worker policy, not a substitute for those missing
+boundaries. Those features must not be inferred from the presence of the VM.
 
 Tool descriptions and schemas are available only through the host-side
 catalog. They are not script-visible authority. Schemas registered solely as

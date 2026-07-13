@@ -383,6 +383,7 @@ name = "splash-cli"
 version = "0.1.0"
 dependencies = [
  "splash-capabilities",
+ "splash-core",
 ]
 
 [[package]]
