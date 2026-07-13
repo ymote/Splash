@@ -10,4 +10,6 @@ description = "Platform containment policies for Splash workers"
 workspace = true
 
 [dependencies]
+close_fds = "0.3.2"
+rustix = { version = "1.1.4", features = ["process"] }
 splash-protocol = { version = "0.1.0", path = "../splash-protocol" }

@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
 
@@ -24,6 +24,7 @@ use splash_protocol::{
 };
 
 const MAX_PRIVATE_TMPFS_BYTES: usize = usize::MAX >> 1;
+const MAX_FINITE_RESOURCE_LIMIT: u64 = u64::MAX - 1;
 
 /// Access mode for a host-selected file-root binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +48,261 @@ pub enum UserNamespacePolicy {
     BestEffort,
     /// Requires Bubblewrap to prevent further user namespaces for the worker.
     RequireNoFurtherUserNamespaces,
+}
+
+/// One Linux resource controlled by [`WorkerResourceLimits`].
+///
+/// These names describe the corresponding `RLIMIT_*` resource, not a cgroup
+/// policy. In particular, address space is not resident memory and process
+/// count is not an isolated cgroup PID limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WorkerResourceLimit {
+    CpuSeconds,
+    AddressSpaceBytes,
+    ProcessCount,
+    OpenFiles,
+    FileSizeBytes,
+}
+
+impl WorkerResourceLimit {
+    const fn runner_option(self) -> &'static str {
+        match self {
+            Self::CpuSeconds => "--cpu-seconds",
+            Self::AddressSpaceBytes => "--address-space-bytes",
+            Self::ProcessCount => "--process-count",
+            Self::OpenFiles => "--open-files",
+            Self::FileSizeBytes => "--file-size-bytes",
+        }
+    }
+}
+
+impl Display for WorkerResourceLimit {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.runner_option().trim_start_matches("--"))
+    }
+}
+
+/// Rejection while configuring a finite worker resource limit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WorkerResourceLimitError {
+    InvalidMaximum {
+        limit: WorkerResourceLimit,
+        maximum: u64,
+    },
+}
+
+impl Display for WorkerResourceLimitError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMaximum { limit, maximum } => write!(
+                formatter,
+                "{limit} maximum must be within 1..={MAX_FINITE_RESOURCE_LIMIT}; got {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkerResourceLimitError {}
+
+/// Host-selected Linux rlimits applied by `splash-limit-runner` before worker
+/// execution.
+///
+/// The runner installs each chosen value as both the soft and hard limit, and
+/// disables core dumps. An unprivileged worker cannot raise its hard limits;
+/// a process with `CAP_SYS_RESOURCE` in the initial user namespace can. Limits
+/// are inherited across `exec` and child processes. They are deliberately
+/// narrower than cgroups: CPU is cumulative CPU time, address space is virtual
+/// address space, process count uses Linux's per-real-UID `RLIMIT_NPROC`, and
+/// file size applies to individual files rather than aggregate writable
+/// storage.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkerResourceLimits {
+    cpu_seconds: Option<NonZeroU64>,
+    address_space_bytes: Option<NonZeroU64>,
+    process_count: Option<NonZeroU64>,
+    open_files: Option<NonZeroU64>,
+    file_size_bytes: Option<NonZeroU64>,
+}
+
+impl WorkerResourceLimits {
+    /// Sets a cumulative CPU-time ceiling in seconds (`RLIMIT_CPU`).
+    pub fn set_cpu_seconds(&mut self, maximum: u64) -> Result<&mut Self, WorkerResourceLimitError> {
+        self.cpu_seconds = Some(validate_resource_limit(
+            WorkerResourceLimit::CpuSeconds,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets a virtual-address-space ceiling in bytes (`RLIMIT_AS`).
+    pub fn set_address_space_bytes(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, WorkerResourceLimitError> {
+        self.address_space_bytes = Some(validate_resource_limit(
+            WorkerResourceLimit::AddressSpaceBytes,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets Linux's per-real-UID process-count ceiling (`RLIMIT_NPROC`).
+    ///
+    /// This counts threads for the real UID, can include processes outside the
+    /// worker, and is not enforced for real UID 0 or processes with
+    /// `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`. It is not a per-sandbox process
+    /// containment guarantee.
+    pub fn set_process_count(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, WorkerResourceLimitError> {
+        self.process_count = Some(validate_resource_limit(
+            WorkerResourceLimit::ProcessCount,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets the maximum number of open file descriptors (`RLIMIT_NOFILE`).
+    pub fn set_open_files(&mut self, maximum: u64) -> Result<&mut Self, WorkerResourceLimitError> {
+        self.open_files = Some(validate_resource_limit(
+            WorkerResourceLimit::OpenFiles,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets the maximum size of one created file in bytes (`RLIMIT_FSIZE`).
+    pub fn set_file_size_bytes(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, WorkerResourceLimitError> {
+        self.file_size_bytes = Some(validate_resource_limit(
+            WorkerResourceLimit::FileSizeBytes,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Returns the selected CPU-time ceiling.
+    pub const fn cpu_seconds(&self) -> Option<NonZeroU64> {
+        self.cpu_seconds
+    }
+
+    /// Returns the selected virtual-address-space ceiling.
+    pub const fn address_space_bytes(&self) -> Option<NonZeroU64> {
+        self.address_space_bytes
+    }
+
+    /// Returns the selected Linux per-real-UID process-count ceiling.
+    pub const fn process_count(&self) -> Option<NonZeroU64> {
+        self.process_count
+    }
+
+    /// Returns the selected open-file-descriptor ceiling.
+    pub const fn open_files(&self) -> Option<NonZeroU64> {
+        self.open_files
+    }
+
+    /// Returns the selected individual-file-size ceiling.
+    pub const fn file_size_bytes(&self) -> Option<NonZeroU64> {
+        self.file_size_bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cpu_seconds.is_none()
+            && self.address_space_bytes.is_none()
+            && self.process_count.is_none()
+            && self.open_files.is_none()
+            && self.file_size_bytes.is_none()
+    }
+
+    fn append_runner_arguments(&self, arguments: &mut Vec<OsString>) {
+        append_resource_limit(arguments, WorkerResourceLimit::CpuSeconds, self.cpu_seconds);
+        append_resource_limit(
+            arguments,
+            WorkerResourceLimit::AddressSpaceBytes,
+            self.address_space_bytes,
+        );
+        append_resource_limit(
+            arguments,
+            WorkerResourceLimit::ProcessCount,
+            self.process_count,
+        );
+        append_resource_limit(arguments, WorkerResourceLimit::OpenFiles, self.open_files);
+        append_resource_limit(
+            arguments,
+            WorkerResourceLimit::FileSizeBytes,
+            self.file_size_bytes,
+        );
+    }
+}
+
+fn validate_resource_limit(
+    limit: WorkerResourceLimit,
+    maximum: u64,
+) -> Result<NonZeroU64, WorkerResourceLimitError> {
+    let Some(maximum) = NonZeroU64::new(maximum) else {
+        return Err(WorkerResourceLimitError::InvalidMaximum { limit, maximum });
+    };
+    if maximum.get() > MAX_FINITE_RESOURCE_LIMIT {
+        return Err(WorkerResourceLimitError::InvalidMaximum {
+            limit,
+            maximum: maximum.get(),
+        });
+    }
+    Ok(maximum)
+}
+
+fn append_resource_limit(
+    arguments: &mut Vec<OsString>,
+    limit: WorkerResourceLimit,
+    maximum: Option<NonZeroU64>,
+) {
+    let Some(maximum) = maximum else {
+        return;
+    };
+    arguments.push(OsString::from(limit.runner_option()));
+    arguments.push(OsString::from(maximum.get().to_string()));
+}
+
+/// A fixed executable inside the worker sandbox that installs
+/// [`WorkerResourceLimits`] before it executes the configured worker.
+///
+/// Use the bundled `splash-limit-runner` binary or an equivalent reviewed
+/// executable. The path is worker-visible, not a host source path; compilation
+/// requires it to resolve through a read-only runtime mount.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceLimitRunner {
+    program: PathBuf,
+    limits: WorkerResourceLimits,
+}
+
+impl ResourceLimitRunner {
+    /// Creates a typed resource-limit runner configuration.
+    pub fn new(
+        program: impl Into<PathBuf>,
+        limits: WorkerResourceLimits,
+    ) -> Result<Self, BubblewrapPolicyError> {
+        let program = program.into();
+        validate_sandbox_path("resource limit runner", &program)?;
+        if limits.is_empty() {
+            return Err(BubblewrapPolicyError::EmptyResourceLimits);
+        }
+        Ok(Self { program, limits })
+    }
+
+    /// Returns the worker-visible runner executable path.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Returns the typed limits the runner receives.
+    pub fn limits(&self) -> &WorkerResourceLimits {
+        &self.limits
+    }
 }
 
 /// One trusted host path mounted read-only into a worker runtime.
@@ -167,6 +423,7 @@ pub struct BubblewrapWorkerPolicy {
     file_roots: BTreeMap<String, FileRootBinding>,
     private_tmpfs: PrivateTmpfs,
     user_namespace_policy: UserNamespacePolicy,
+    resource_limit_runner: Option<ResourceLimitRunner>,
 }
 
 impl BubblewrapWorkerPolicy {
@@ -191,6 +448,7 @@ impl BubblewrapWorkerPolicy {
             file_roots: BTreeMap::new(),
             private_tmpfs: PrivateTmpfs::Disabled,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
+            resource_limit_runner: None,
         })
     }
 
@@ -286,6 +544,18 @@ impl BubblewrapWorkerPolicy {
         self
     }
 
+    /// Runs the fixed worker through a typed resource-limit runner.
+    ///
+    /// Compilation requires both this runner and the worker to be executable
+    /// through read-only runtime mounts. The runner receives only fixed
+    /// policy-generated flags, then `--`, the fixed worker executable, and its
+    /// fixed arguments. A runner setup or `exec` failure must therefore stop
+    /// worker startup; hosts must never retry by launching the worker directly.
+    pub fn set_resource_limit_runner(&mut self, runner: ResourceLimitRunner) -> &mut Self {
+        self.resource_limit_runner = Some(runner);
+        self
+    }
+
     /// Validates a manifest and creates an immutable Bubblewrap launch plan.
     ///
     /// `file_root` selectors map only through host-registered bindings. This
@@ -330,11 +600,28 @@ impl BubblewrapWorkerPolicy {
             }
         }
 
-        validate_mount_layout(
-            &mut mounts,
+        validate_mount_layout(&mut mounts, self.private_tmpfs.is_enabled())?;
+        validate_runtime_program(
+            &mounts,
             &self.worker_program,
-            self.private_tmpfs.is_enabled(),
+            |program| BubblewrapPolicyError::WorkerProgramNotMounted { program },
+            |program| BubblewrapPolicyError::WorkerProgramNotExecutable { program },
+            "worker program source",
         )?;
+        if let Some(runner) = &self.resource_limit_runner {
+            if runner.program == self.worker_program {
+                return Err(BubblewrapPolicyError::ResourceLimitRunnerMatchesWorker {
+                    program: runner.program.clone(),
+                });
+            }
+            validate_runtime_program(
+                &mounts,
+                &runner.program,
+                |program| BubblewrapPolicyError::ResourceLimitRunnerNotMounted { program },
+                |program| BubblewrapPolicyError::ResourceLimitRunnerNotExecutable { program },
+                "resource limit runner source",
+            )?;
+        }
 
         let mut arguments = vec![
             OsString::from("--die-with-parent"),
@@ -371,6 +658,11 @@ impl BubblewrapWorkerPolicy {
             arguments.push(mount.destination.clone().into_os_string());
         }
         arguments.push(OsString::from("--"));
+        if let Some(runner) = &self.resource_limit_runner {
+            arguments.push(runner.program.clone().into_os_string());
+            runner.limits.append_runner_arguments(&mut arguments);
+            arguments.push(OsString::from("--"));
+        }
         arguments.push(self.worker_program.clone().into_os_string());
         arguments.extend(self.worker_arguments.iter().cloned());
 
@@ -591,6 +883,7 @@ pub enum BubblewrapPolicyError {
     InvalidPrivateTmpfsSize {
         maximum_bytes: usize,
     },
+    EmptyResourceLimits,
     InvalidPath {
         field: &'static str,
         path: PathBuf,
@@ -630,11 +923,20 @@ pub enum BubblewrapPolicyError {
     WorkerProgramNotMounted {
         program: PathBuf,
     },
+    ResourceLimitRunnerMatchesWorker {
+        program: PathBuf,
+    },
+    ResourceLimitRunnerNotMounted {
+        program: PathBuf,
+    },
     SourceNotExecutable {
         field: &'static str,
         path: PathBuf,
     },
     WorkerProgramNotExecutable {
+        program: PathBuf,
+    },
+    ResourceLimitRunnerNotExecutable {
         program: PathBuf,
     },
 }
@@ -647,6 +949,9 @@ impl Display for BubblewrapPolicyError {
                 formatter,
                 "private tmpfs maximum must be within 1..={MAX_PRIVATE_TMPFS_BYTES} bytes; got {maximum_bytes}"
             ),
+            Self::EmptyResourceLimits => {
+                formatter.write_str("resource limit runner requires at least one finite limit")
+            }
             Self::InvalidPath {
                 field,
                 path,
@@ -709,12 +1014,27 @@ impl Display for BubblewrapPolicyError {
                 "worker program {} is not visible through a read-only runtime mount",
                 program.display()
             ),
+            Self::ResourceLimitRunnerMatchesWorker { program } => write!(
+                formatter,
+                "resource limit runner {} must not be the worker program",
+                program.display()
+            ),
+            Self::ResourceLimitRunnerNotMounted { program } => write!(
+                formatter,
+                "resource limit runner {} is not visible through a read-only runtime mount",
+                program.display()
+            ),
             Self::SourceNotExecutable { field, path } => {
                 write!(formatter, "{field} {} must be executable", path.display())
             }
             Self::WorkerProgramNotExecutable { program } => write!(
                 formatter,
                 "worker program {} must be a regular executable file",
+                program.display()
+            ),
+            Self::ResourceLimitRunnerNotExecutable { program } => write!(
+                formatter,
+                "resource limit runner {} must be a regular executable file",
                 program.display()
             ),
         }
@@ -727,6 +1047,7 @@ impl std::error::Error for BubblewrapPolicyError {
             Self::Protocol(error) => Some(error),
             Self::SourceIo { source, .. } => Some(source),
             Self::InvalidPrivateTmpfsSize { .. }
+            | Self::EmptyResourceLimits
             | Self::InvalidPath { .. }
             | Self::InvalidSourceType { .. }
             | Self::RootMountForbidden { .. }
@@ -736,8 +1057,11 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::ReservedMountDestination { .. }
             | Self::OverlappingMountDestinations { .. }
             | Self::WorkerProgramNotMounted { .. }
+            | Self::ResourceLimitRunnerMatchesWorker { .. }
+            | Self::ResourceLimitRunnerNotMounted { .. }
             | Self::SourceNotExecutable { .. }
-            | Self::WorkerProgramNotExecutable { .. } => None,
+            | Self::WorkerProgramNotExecutable { .. }
+            | Self::ResourceLimitRunnerNotExecutable { .. } => None,
         }
     }
 }
@@ -854,23 +1178,23 @@ struct CompiledMount {
 }
 
 impl CompiledMount {
-    fn exposes_worker_program(&self, worker_program: &Path) -> bool {
+    fn exposes_program(&self, program: &Path) -> bool {
         if !self.is_runtime {
             return false;
         }
         match self.source_type {
-            MountSourceType::File => worker_program == self.destination,
-            MountSourceType::Directory => path_is_within(worker_program, &self.destination),
+            MountSourceType::File => program == self.destination,
+            MountSourceType::Directory => path_is_within(program, &self.destination),
         }
     }
 
-    fn worker_program_source(&self, worker_program: &Path) -> Option<PathBuf> {
-        if !self.exposes_worker_program(worker_program) {
+    fn program_source(&self, program: &Path) -> Option<PathBuf> {
+        if !self.exposes_program(program) {
             return None;
         }
         match self.source_type {
             MountSourceType::File => Some(self.source.clone()),
-            MountSourceType::Directory => worker_program
+            MountSourceType::Directory => program
                 .strip_prefix(&self.destination)
                 .ok()
                 .map(|relative| self.source.join(relative)),
@@ -1020,7 +1344,6 @@ fn source_type(
 
 fn validate_mount_layout(
     mounts: &mut [CompiledMount],
-    worker_program: &Path,
     private_tmpfs: bool,
 ) -> Result<(), BubblewrapPolicyError> {
     for mount in mounts.iter() {
@@ -1050,29 +1373,32 @@ fn validate_mount_layout(
         }
     }
 
-    let worker_mount = mounts
-        .iter()
-        .find(|mount| mount.exposes_worker_program(worker_program));
-    let Some(worker_mount) = worker_mount else {
-        return Err(BubblewrapPolicyError::WorkerProgramNotMounted {
-            program: worker_program.to_path_buf(),
-        });
+    Ok(())
+}
+
+fn validate_runtime_program(
+    mounts: &[CompiledMount],
+    program: &Path,
+    not_mounted: fn(PathBuf) -> BubblewrapPolicyError,
+    not_executable: fn(PathBuf) -> BubblewrapPolicyError,
+    source_field: &'static str,
+) -> Result<(), BubblewrapPolicyError> {
+    let program_mount = mounts.iter().find(|mount| mount.exposes_program(program));
+    let Some(program_mount) = program_mount else {
+        return Err(not_mounted(program.to_path_buf()));
     };
-    let worker_source = worker_mount
-        .worker_program_source(worker_program)
-        .ok_or_else(|| BubblewrapPolicyError::WorkerProgramNotMounted {
-            program: worker_program.to_path_buf(),
-        })?;
-    let metadata =
-        fs::symlink_metadata(&worker_source).map_err(|source| BubblewrapPolicyError::SourceIo {
-            field: "worker program source",
-            path: worker_source.clone(),
+    let program_source = program_mount
+        .program_source(program)
+        .ok_or_else(|| not_mounted(program.to_path_buf()))?;
+    let metadata = fs::symlink_metadata(&program_source).map_err(|source| {
+        BubblewrapPolicyError::SourceIo {
+            field: source_field,
+            path: program_source.clone(),
             source,
-        })?;
+        }
+    })?;
     if !metadata.file_type().is_file() || !is_executable(&metadata) {
-        return Err(BubblewrapPolicyError::WorkerProgramNotExecutable {
-            program: worker_program.to_path_buf(),
-        });
+        return Err(not_executable(program.to_path_buf()));
     }
     Ok(())
 }
@@ -1177,6 +1503,21 @@ mod tests {
         let mut policy = BubblewrapWorkerPolicy::new(bwrap, "/opt/splash/worker").unwrap();
         policy.add_runtime_mount(ReadOnlyMount::new(runtime, "/opt/splash").unwrap());
         policy
+    }
+
+    fn resource_limits() -> WorkerResourceLimits {
+        let mut limits = WorkerResourceLimits::default();
+        limits.set_cpu_seconds(30).unwrap();
+        limits.set_address_space_bytes(8 * 1024 * 1024).unwrap();
+        limits.set_process_count(4).unwrap();
+        limits.set_open_files(16).unwrap();
+        limits.set_file_size_bytes(64 * 1024).unwrap();
+        limits
+    }
+
+    fn resource_limit_runner(root: &TestDirectory) -> ResourceLimitRunner {
+        create_executable(&root.path().join("runtime/limit-runner"));
+        ResourceLimitRunner::new("/opt/splash/limit-runner", resource_limits()).unwrap()
     }
 
     fn binding(
@@ -1289,6 +1630,117 @@ mod tests {
             ]
         ));
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+    }
+
+    #[test]
+    fn resource_limit_runner_is_typed_and_precedes_the_fixed_worker() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root).with_worker_arguments(["--json-lines", "--fixed-mode"]);
+        policy.set_resource_limit_runner(resource_limit_runner(&root));
+
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--",
+                "/opt/splash/limit-runner",
+                "--cpu-seconds",
+                "30",
+                "--address-space-bytes",
+                "8388608",
+                "--process-count",
+                "4",
+                "--open-files",
+                "16",
+                "--file-size-bytes",
+                "65536",
+                "--",
+                "/opt/splash/worker",
+                "--json-lines",
+                "--fixed-mode",
+            ]
+        ));
+        assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+    }
+
+    #[test]
+    fn resource_limit_configuration_rejects_empty_or_unbounded_values() {
+        assert!(matches!(
+            ResourceLimitRunner::new("/opt/splash/limit-runner", WorkerResourceLimits::default()),
+            Err(BubblewrapPolicyError::EmptyResourceLimits)
+        ));
+
+        let mut limits = WorkerResourceLimits::default();
+        assert!(matches!(
+            limits.set_cpu_seconds(0),
+            Err(WorkerResourceLimitError::InvalidMaximum {
+                limit: WorkerResourceLimit::CpuSeconds,
+                maximum: 0,
+            })
+        ));
+        assert!(matches!(
+            limits.set_open_files(u64::MAX),
+            Err(WorkerResourceLimitError::InvalidMaximum {
+                limit: WorkerResourceLimit::OpenFiles,
+                maximum,
+            }) if maximum == u64::MAX
+        ));
+    }
+
+    #[test]
+    fn resource_limit_runner_must_be_distinct_and_readonly_mounted() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_resource_limit_runner(
+            ResourceLimitRunner::new("/opt/other/limit-runner", resource_limits()).unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::ResourceLimitRunnerNotMounted { program })
+                if program == Path::new("/opt/other/limit-runner")
+        ));
+
+        let mut policy = base_policy(&root);
+        policy.set_resource_limit_runner(
+            ResourceLimitRunner::new("/opt/splash/worker", resource_limits()).unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::ResourceLimitRunnerMatchesWorker { program })
+                if program == Path::new("/opt/splash/worker")
+        ));
+
+        let mut policy = base_policy(&root);
+        File::create(root.path().join("runtime/not-executable")).unwrap();
+        policy.set_resource_limit_runner(
+            ResourceLimitRunner::new("/opt/splash/not-executable", resource_limits()).unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::ResourceLimitRunnerNotExecutable { program })
+                if program == Path::new("/opt/splash/not-executable")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_limit_runner_must_not_be_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        symlink("worker", root.path().join("runtime/limit-runner")).unwrap();
+        policy.set_resource_limit_runner(
+            ResourceLimitRunner::new("/opt/splash/limit-runner", resource_limits()).unwrap(),
+        );
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::ResourceLimitRunnerNotExecutable { program })
+                if program == Path::new("/opt/splash/limit-runner")
+        ));
     }
 
     #[test]

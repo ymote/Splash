@@ -54,6 +54,9 @@
 - Optional Bubblewrap user-namespace hardening that requires a usable user
   namespace and prevents further user namespace creation, with no compatibility
   fallback to a weaker worker policy.
+- Optional fixed pre-exec Linux rlimit runner for worker CPU time, virtual
+  address space, per-real-UID process threads, open file descriptors, and
+  individual file size. It is not a cgroup quota or full containment policy.
 
 ## Next: durable external operations
 
@@ -62,9 +65,9 @@
 
 ## Next: contained local effects
 
-- CPU, memory, process-count, and broader disk resource quotas; seccomp; and
-  authenticated in-band cancellation/deadline policy around the Linux
-  Bubblewrap launcher.
+- Cgroup CPU, memory/RSS, process-tree, aggregate-disk, and wall-clock quotas;
+  seccomp; and authenticated in-band cancellation/deadline policy around the
+  Linux Bubblewrap launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

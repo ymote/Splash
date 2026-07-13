@@ -19,6 +19,7 @@ provide it.
 ```rust
 use splash_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, FileRootAccess, FileRootBinding, ReadOnlyMount,
+    ResourceLimitRunner, WorkerResourceLimits,
 };
 use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
 
@@ -42,6 +43,16 @@ policy.add_file_root(
 )?;
 policy.require_no_further_user_namespaces();
 policy.enable_private_tmpfs_with_maximum_bytes(64 * 1024 * 1024)?;
+
+let mut limits = WorkerResourceLimits::default();
+limits.set_cpu_seconds(30)?;
+limits.set_address_space_bytes(512 * 1024 * 1024)?;
+limits.set_open_files(64)?;
+limits.set_file_size_bytes(16 * 1024 * 1024)?;
+policy.set_resource_limit_runner(ResourceLimitRunner::new(
+    "/opt/splash/bin/splash-limit-runner",
+    limits,
+)?);
 
 let command = policy.compile(&attenuated_manifest)?;
 // `trusted_session_key` comes from the host's CSPRNG/key authority.
@@ -94,6 +105,59 @@ namespace internally to establish this restriction, so the mode does not claim
 that the worker is never inside one. It is not a seccomp, resource-limit, or
 general containment policy.
 
+`splash-limit-runner` is an optional Linux-only, fixed pre-exec runner. Build
+the bundled binary on the target Linux platform with:
+
+```sh
+cargo build --locked -p splash-sandbox --bin splash-limit-runner --release
+```
+
+Deploy that binary and every runtime dependency it needs in a read-only runtime
+mount, then configure its worker-visible path with `ResourceLimitRunner`. The
+compiler requires distinct worker-visible runner and worker paths, each
+resolving to an executable through a read-only runtime mount. It emits the
+runner, policy-generated limit flags,
+`--`, and then the fixed worker and fixed arguments. Splash source, tool
+payloads, selectors, and manifest data cannot select the runner, alter a limit,
+or add target arguments.
+
+Before its `exec`, the bundled runner rejects malformed, repeated, zero, and
+unbounded limits; sets every selected limit as both soft and hard; and disables
+core dumps. It also marks every inherited file descriptor from 3 onward
+close-on-exec, preserving only the host-configured standard-input/output/error
+streams when it replaces itself with the worker. This prevents a nonstandard
+host descriptor that Bubblewrap inherited from becoming worker authority. A
+setup or `exec` failure prevents the worker from starting. The host still must
+complete authenticated worker startup: spawning Bubblewrap only proves that the
+outer process was created, not that the runner applied limits or that the worker
+is healthy.
+
+The runner applies Linux `RLIMIT_*` ceilings to the worker process and its
+descendants, not cgroup quotas to the entire Bubblewrap session:
+
+- `cpu_seconds` is cumulative CPU seconds, not a wall-clock deadline or a CPU
+  share;
+- `address_space_bytes` is virtual address space, not resident memory;
+- `process_count` is `RLIMIT_NPROC`, a thread count for the real UID that can
+  include unrelated processes and is not enforced for real UID 0 or a process
+  with `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`;
+- `open_files` is the process's file-descriptor ceiling; and
+- `file_size_bytes` limits one created file, not total writable storage.
+
+An unprivileged worker cannot raise the selected hard limits, but a process
+with `CAP_SYS_RESOURCE` in the initial user namespace can. Do not treat these
+limits as a cgroup replacement, process-tree guarantee, memory-RSS ceiling,
+aggregate disk quota, seccomp policy, cancellation mechanism, or deadline.
+Use a dedicated non-root sandbox identity and cgroups when isolation needs any
+of those guarantees. See the Linux [`getrlimit(2)` manual](https://man7.org/linux/man-pages/man2/getrlimit.2.html)
+for exact kernel semantics.
+
+`RLIMIT_CPU` does not terminate a sleeping or blocked worker. A host that needs
+a wall-clock deadline must independently schedule
+`BubblewrapWorkerLifecycle::terminate()` on a monotonic timer, discard the
+session afterward, and reconcile any durable effect. The runner does not create
+that timer or turn process termination into in-band cancellation.
+
 After the pipes move into the JSON-line transport, retain `lifecycle` and call
 `lifecycle.terminate()` after a host deadline, cancellation decision, or
 poisoned transport. It force-kills and reaps the host-side Bubblewrap child, returning
@@ -120,6 +184,8 @@ The resulting command uses:
   read-write file roots; and
 - optional `--size BYTES` immediately before a private `--tmpfs /tmp`, limiting
   only allocations in that mount; and
+- optional `splash-limit-runner` invocation before the fixed worker, with only
+  host-selected rlimit flags and no script-controlled target or arguments; and
 - private stdin/stdout pipes, with stderr sent to `/dev/null` to prevent an
   undrained diagnostic pipe from blocking the worker.
 
@@ -170,18 +236,21 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- CPU, process-memory, process-count, or broader disk quotas. A configured
-  private `/tmp` size limits only that Bubblewrap `tmpfs`; hosts still need
-  cgroups, rlimits, or an equivalent platform policy for broader resources;
+- cgroup CPU, memory/RSS, process-tree, aggregate-disk, or wall-clock quotas.
+  An optional runner adds the narrower rlimits described above, and a configured
+  private `/tmp` size limits only that Bubblewrap `tmpfs`;
 - seccomp policy, D-Bus mediation, device-specific policy, or a network proxy;
 - a safe per-origin network allowlist, arbitrary executable selection, secret
   broker, or filesystem access outside registered directory roots;
 - authenticated in-band cancellation delivery, I/O deadlines, post-exit
   reconciliation, or durable operation storage. `lifecycle.terminate()` is a
-  forceful process stop, not proof that an adapter effect was cancelled; and
+  forceful process stop that the host must schedule for a wall-clock deadline,
+  not proof that an adapter effect was cancelled; and
 - protection from a trusted host changing a policy source path between plan
-  compilation and process start. Policy sources must be owned and immutable to
-  untrusted actors, or a future descriptor-based launcher must be used.
+  compilation and worker exit. Policy sources and their contents, including
+  executable and symlink targets, must be owned and immutable to untrusted
+  actors for that whole interval, or a future descriptor-based launcher must be
+  used.
 
 The default user-namespace policy retains Bubblewrap's best-effort
 `--unshare-all` behavior. Hosts requiring prevention of further user namespace

@@ -128,6 +128,38 @@ reaps the child. This avoids exposing the key in argv or environment variables,
 but it is transfer only: it does not provide key exchange, encryption,
 attestation, or key storage.
 
+An optional host-configured `splash-limit-runner` can execute the fixed worker
+only after applying selected Linux rlimits and disabling core dumps. The runner,
+limits, worker target, and worker arguments are all compiled from trusted Rust
+policy; Splash source and tool data cannot control any of them. It must be a
+distinct executable in a read-only runtime mount, and a setup or `exec` failure
+does not fall back to direct worker execution. The host still must reject a
+failed authenticated worker startup because Bubblewrap spawn alone does not
+prove that the runner applied its limits.
+
+Before it executes the worker, the bundled runner marks every descriptor from
+3 onward close-on-exec. The launcher's standard streams are explicitly
+configured as private input/output pipes and null stderr, so this prevents a
+nonstandard host descriptor inherited through Bubblewrap from becoming worker
+authority. It does not make the standard streams secret: the worker protocol
+and host logging policy must still treat their contents as sensitive.
+
+These are narrow per-process rlimits, not cgroup quotas: CPU is cumulative
+time, address space is virtual memory, open files are file descriptors, and
+file size is per created file. `RLIMIT_NPROC` is per-real-UID thread accounting,
+can include unrelated processes, and is not enforced for real UID 0 or a
+process with `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`. Hard limits prevent an
+unprivileged worker from raising them, but a process with `CAP_SYS_RESOURCE` in
+the initial user namespace can do so. Do not describe this as a worker-tree
+process limit, RSS ceiling, aggregate disk quota, wall-clock deadline, seccomp
+policy, cancellation mechanism, or complete sandbox. Use cgroups and a
+dedicated non-root sandbox identity where those properties are required.
+
+`RLIMIT_CPU` does not bound a sleeping or blocked worker. A host that needs a
+wall-clock deadline must independently schedule lifecycle termination on a
+monotonic timer, discard the session, and reconcile any durable effect. The
+runner does not implement that timer or authenticated in-band cancellation.
+
 An explicit private `/tmp` can have a Bubblewrap `--size` allocation ceiling.
 That bounds only this tmpfs mount and must not be described as a process-memory,
 CPU, process-count, or general disk quota. After transport pipes move out of
@@ -137,19 +169,21 @@ reconcile a durable effect rather than infer that process termination cancelled
 or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no seccomp filter, cgroup or rlimit enforcement, per-origin
-network proxy, D-Bus mediation, secret broker, deadline enforcement,
-cancellation delivery, or post-exit recovery. A private `/tmp` is opt-in and
-unbounded unless the host selects its explicit Bubblewrap size limit; that limit
-does not replace a memory or disk policy. Its filesystem boundary is per worker
-session, not per individual invocation: an attenuated manifest should be
-narrowed before launch when per-call filesystem isolation is required. Policy
-source paths must be host-owned and immutable to untrusted actors between
-compilation and spawn; the current path-based launcher cannot eliminate that
-race. A fixed worker program also does not prevent a compromised worker from
-executing or reading other files deliberately exposed through a runtime mount;
-runtime mounts must be minimal and immutable until a seccomp policy is
-implemented. On a failure it does not fall back to an unrestricted worker. See
+This backend has no seccomp filter, cgroup quotas, per-origin network proxy,
+D-Bus mediation, secret broker, deadline enforcement, cancellation delivery,
+or post-exit recovery. Its optional runner provides only the narrow rlimits
+described above. A private `/tmp` is opt-in and unbounded unless the host
+selects its explicit Bubblewrap size limit; that limit does not replace a memory
+or disk policy. Its filesystem boundary is per worker session, not per
+individual invocation: an attenuated manifest should be narrowed before launch
+when per-call filesystem isolation is required. Policy source paths must be
+host-owned and immutable to untrusted actors from compilation through worker
+exit, including their executable and symlink targets; the current path-based
+launcher cannot eliminate that race. A fixed worker program also does not
+prevent a compromised worker from executing or reading other files deliberately
+exposed through a runtime mount; runtime mounts must be minimal and immutable
+until a seccomp policy is implemented. On a failure it does not fall back to an
+unrestricted worker. See
 [`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md) before enabling it for
 untrusted local effects.
 
