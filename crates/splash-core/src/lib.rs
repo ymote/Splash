@@ -82,6 +82,7 @@ impl ExecutionLimits {
 pub enum RuntimeError {
     SourceTooLarge { actual: usize, maximum: usize },
     InvalidLimits(&'static str),
+    SyntaxRejected(SyntaxReport),
     EvaluationInProgress,
     UnknownThread { thread_index: usize },
 }
@@ -96,6 +97,18 @@ impl Display for RuntimeError {
                 )
             }
             Self::InvalidLimits(message) => formatter.write_str(message),
+            Self::SyntaxRejected(report) => {
+                let detail = report.diagnostics.first().map_or_else(
+                    || "source is not valid canonical Splash".to_owned(),
+                    |diagnostic| {
+                        format!(
+                            "line {}, column {}: {}",
+                            diagnostic.line, diagnostic.column, diagnostic.message
+                        )
+                    },
+                );
+                write!(formatter, "canonical Splash syntax rejected: {detail}")
+            }
             Self::EvaluationInProgress => {
                 formatter.write_str("a suspended Splash evaluation must be resumed first")
             }
@@ -204,7 +217,25 @@ impl<H: Any, S: Any> Runtime<H, S> {
         check_syntax_named("inline.splash", source, self.limits)
     }
 
+    /// Evaluates source only after it passes the canonical Splash v0.1 profile.
+    ///
+    /// This is the normal execution entry point for generated and user-authored
+    /// source. Use [`Self::eval_vm_compatibility`] only for a trusted host that
+    /// deliberately needs a Makepad compatibility construct outside Splash.
     pub fn eval(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
+        let report = self.check_syntax(source)?;
+        if !report.valid {
+            return Err(RuntimeError::SyntaxRejected(report));
+        }
+        self.eval_vm_compatibility(source)
+    }
+
+    /// Evaluates the vendored Makepad parser's broader compatibility syntax.
+    ///
+    /// This bypasses Splash's portable grammar contract and must not receive
+    /// LLM-generated or otherwise untrusted source. Prefer [`Self::eval`] for
+    /// all normal Splash execution.
+    pub fn eval_vm_compatibility(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
         validate_source_length(source, self.limits)?;
 
         let limits = self.limits;
@@ -504,6 +535,32 @@ mod tests {
 
         assert!(report.succeeded(), "{:?}", report.diagnostics);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn default_evaluation_rejects_makepad_compatibility_syntax() {
+        let mut runtime = Runtime::default();
+        let error = runtime.eval("var value = 42").unwrap_err();
+
+        assert!(matches!(
+            error,
+            RuntimeError::SyntaxRejected(report)
+                if report.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("reserved words cannot be used as expressions")
+                })
+        ));
+    }
+
+    #[test]
+    fn trusted_hosts_can_explicitly_opt_into_vm_compatibility() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval_vm_compatibility("var value = 42\nvalue")
+            .unwrap();
+
+        assert!(report.succeeded(), "{:?}", report.diagnostics);
     }
 
     #[test]

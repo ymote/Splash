@@ -134,12 +134,12 @@ The checker also rejects trailing commas where this grammar does not admit
 them. This keeps LLM output deterministic: valid source has one documented
 producer grammar rather than an inherited parser superset.
 
-The VM remains the execution engine. Hosts that call it directly without a
-preflight deliberately opt into its compatibility syntax; that source is not
-portable Splash v0.1 and must not be treated as an LLM-generation contract.
-The development CLI performs this preflight automatically for `eval` and
-`run`; embedded Rust hosts must call the preflight themselves before direct VM
-evaluation.
+The VM remains the execution engine, but `Runtime::eval` and
+`CapabilityRuntime::eval` now enforce this profile before evaluation. The
+explicit `Runtime::eval_vm_compatibility` escape hatch deliberately opts a
+trusted host into the inherited Makepad syntax; that method must not receive
+LLM-generated or otherwise untrusted source. The development CLI also performs
+this preflight automatically for `eval` and `run`.
 
 ## Canonical Workflow Source
 

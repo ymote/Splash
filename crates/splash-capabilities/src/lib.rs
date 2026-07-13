@@ -2162,6 +2162,9 @@ impl CapabilityRuntime {
         })
     }
 
+    /// Evaluates canonical Splash source against this runtime's explicit tool
+    /// catalog. Noncanonical Makepad compatibility syntax is rejected before a
+    /// capability can be invoked.
     pub fn eval(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
         self.runtime.eval(source)
     }
@@ -4139,6 +4142,15 @@ mod tests {
         assert_eq!(runtime.pending_tools(), 0);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn rejects_makepad_compatibility_syntax_before_a_capability_can_run() {
+        let mut runtime = CapabilityRuntime::default();
+        let error = runtime.eval("var value = tool.call(\"shell.exec\", \"whoami\")");
+
+        assert!(matches!(error, Err(RuntimeError::SyntaxRejected(_))));
+        assert!(runtime.audit().is_empty());
     }
 
     #[test]

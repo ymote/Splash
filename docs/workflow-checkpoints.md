@@ -44,11 +44,13 @@ or completed-step prefix differs. The resulting `Approval` retains an internal
 copy of the exact checkpoint, so replacing the checkpoint after approval is
 rejected. A regular `approve` result cannot be used with `resume`.
 
-When `execute` or `resume` returns `WorkflowError::StepFailed` or
-`WorkflowError::StepSuspended`, its `completed_steps` value identifies the
-completed prefix before the unfinished step. A host may use that number with
+When `execute` or `resume` returns `WorkflowError::StepRejected`,
+`WorkflowError::StepFailed`, or `WorkflowError::StepSuspended`, its
+`completed_steps` value identifies the completed prefix before the unfinished
+step. `StepRejected` carries the bounded, structured canonical-Splash syntax
+report and records no tool call. A host may use the count with
 `checkpoint_after` only after it has applied its own durable-success policy;
-the failing or suspended step is intentionally excluded.
+the rejected, failing, or suspended step is intentionally excluded.
 
 ## Security Boundary
 

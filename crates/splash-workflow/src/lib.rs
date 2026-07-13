@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use splash_capabilities::CapabilityRuntime;
-use splash_core::RuntimeError;
+use splash_core::{RuntimeError, SyntaxReport};
 use splash_protocol::{
     AuthenticatedWorkerMessage, CapabilityGrant, OperationCompensationBinding,
     OperationCompensationRequest, OperationCompensationResult, OperationDispatchRequest,
@@ -1411,6 +1411,12 @@ pub enum WorkflowEvent {
         step_id: String,
         completed_steps: usize,
     },
+    StepRejected {
+        plan_id: u64,
+        step_id: String,
+        report: SyntaxReport,
+        completed_steps: usize,
+    },
     StepFailed {
         plan_id: u64,
         step_id: String,
@@ -1431,9 +1437,14 @@ pub enum WorkflowError {
     ApprovalMismatch,
     Checkpoint(WorkflowCheckpointError),
     OperationLedger(WorkflowOperationLedgerError),
-    Runtime(String),
+    Runtime(RuntimeError),
     StepSuspended {
         step_id: String,
+        completed_steps: usize,
+    },
+    StepRejected {
+        step_id: String,
+        report: SyntaxReport,
         completed_steps: usize,
     },
     StepFailed {
@@ -1459,11 +1470,17 @@ impl Display for WorkflowError {
             Self::OperationLedger(error) => {
                 write!(formatter, "workflow operation ledger error: {error}")
             }
-            Self::Runtime(message) => write!(formatter, "runtime error: {message}"),
+            Self::Runtime(error) => write!(formatter, "runtime error: {error}"),
             Self::StepSuspended { step_id, .. } => {
                 write!(
                     formatter,
                     "workflow step suspended without runnable tool work: {step_id}"
+                )
+            }
+            Self::StepRejected { step_id, .. } => {
+                write!(
+                    formatter,
+                    "workflow step rejected by the Splash profile: {step_id}"
                 )
             }
             Self::StepFailed { step_id, .. } => {
@@ -1477,7 +1494,7 @@ impl std::error::Error for WorkflowError {}
 
 impl From<RuntimeError> for WorkflowError {
     fn from(error: RuntimeError) -> Self {
-        Self::Runtime(error.to_string())
+        Self::Runtime(error)
     }
 }
 
@@ -2371,7 +2388,23 @@ impl WorkflowEngine {
         completed_step_count: usize,
     ) -> Result<(), WorkflowError> {
         for (step_index, step) in plan.steps.iter().enumerate().skip(completed_step_count) {
-            let mut report = self.runtime.eval(&step.source)?;
+            let mut report = match self.runtime.eval(&step.source) {
+                Ok(report) => report,
+                Err(RuntimeError::SyntaxRejected(report)) => {
+                    self.events.push(WorkflowEvent::StepRejected {
+                        plan_id: plan.id,
+                        step_id: step.id.clone(),
+                        report: report.clone(),
+                        completed_steps: step_index,
+                    });
+                    return Err(WorkflowError::StepRejected {
+                        step_id: step.id.clone(),
+                        report,
+                        completed_steps: step_index,
+                    });
+                }
+                Err(error) => return Err(WorkflowError::Runtime(error)),
+            };
             while report.succeeded() && report.suspended {
                 let pumped = self.runtime.pump()?;
                 let Some(resumed) = pumped.resumed.into_iter().last() else {
@@ -3669,6 +3702,51 @@ mod tests {
         ));
         let checkpoint = engine.checkpoint_after(&plan, 1).unwrap();
         assert_eq!(checkpoint.completed_step_ids(), ["first"]);
+    }
+
+    #[test]
+    fn rejects_noncanonical_source_with_step_context_before_a_workflow_tool_runs() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let mut engine = WorkflowEngine::new(runtime);
+        let plan = engine
+            .plan(vec![
+                WorkflowStep::new(
+                    "reject",
+                    "var value = tool.call(\"text.echo\", \"must not run\")",
+                ),
+                WorkflowStep::new(
+                    "not-run",
+                    "use mod.tool\ntool.call(\"text.echo\", \"also must not run\")",
+                ),
+            ])
+            .unwrap();
+        let approval = engine.approve(&plan).unwrap();
+
+        let error = engine.execute(&plan, approval).unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkflowError::StepRejected {
+                ref step_id,
+                ref report,
+                completed_steps: 0,
+            } if step_id == "reject" && !report.valid && !report.diagnostics.is_empty()
+        ));
+        assert!(engine.runtime().audit().is_empty());
+        assert!(matches!(
+            engine.events().last(),
+            Some(WorkflowEvent::StepRejected {
+                step_id,
+                report,
+                completed_steps: 0,
+                ..
+            }) if step_id == "reject" && !report.valid
+        ));
     }
 
     #[test]

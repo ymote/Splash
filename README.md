@@ -9,6 +9,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A standalone, vendored VM and parser with upstream provenance.
 - An effect-free, bounded canonical-language preflight with structured
   diagnostics for generated source and editor tooling.
+- Default runtime and capability-host evaluation that rejects noncanonical
+  Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
