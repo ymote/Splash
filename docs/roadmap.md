@@ -45,6 +45,9 @@
   manifest-selected file roots. It fails closed for network-origin,
   executable, and secret selectors, and does not fall back to unrestricted
   process launch.
+- Versioned private-pipe session bootstrap for a compiled Linux Bubblewrap
+  worker. It checks the manifest session before launch and never places the
+  host-generated key in command-line arguments or environment variables.
 
 ## Next: durable external operations
 
@@ -53,8 +56,8 @@
 
 ## Next: contained local effects
 
-- Resource quota, seccomp, target-specific key-bootstrap, and cancellation
-  policy around the Linux Bubblewrap launcher.
+- Resource quota, seccomp, and cancellation policy around the Linux Bubblewrap
+  launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

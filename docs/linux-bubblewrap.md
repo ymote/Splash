@@ -20,6 +20,7 @@ provide it.
 use splash_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, FileRootAccess, FileRootBinding, ReadOnlyMount,
 };
+use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
 
 let mut policy = BubblewrapWorkerPolicy::new(
     "/usr/bin/bwrap",
@@ -41,15 +42,34 @@ policy.add_file_root(
 )?;
 
 let command = policy.compile(&attenuated_manifest)?;
-let worker = command.spawn()?;
+// `trusted_session_key` comes from the host's CSPRNG/key authority.
+let host_authenticator = SessionAuthenticator::new(
+    attenuated_manifest.session_id.clone(),
+    trusted_session_key.clone(),
+    SessionRole::Host,
+)?;
+let bootstrap = PrivatePipeWorkerBootstrap::new(
+    attenuated_manifest.session_id.clone(),
+    trusted_session_key,
+)?;
+let worker = command.spawn_with_bootstrap(&bootstrap)?;
 let (child, worker_stdin, worker_stdout) = worker.into_parts();
 ```
 
-The host then wraps the private pipes in the bounded JSON-line transport,
-provisions the worker session key through a separate trusted channel, sends the
-one-way authenticated `open_session` frame, and enforces its own deadlines and
-cancellation. The key must not be placed in command-line arguments, environment
-variables, Splash values, or a capability selector.
+`spawn_with_bootstrap` binds the bootstrap session ID to the manifest used at
+`compile` before it launches Bubblewrap. It then writes and flushes a versioned,
+non-JSON preamble to the private worker stdin pipe. A mismatch fails before
+launch; a write failure kills and reaps the child. The session key never appears
+in command-line arguments, environment variables, mount paths, Splash values,
+capability selectors, or ordinary JSON frames.
+
+The worker must read that preamble exactly once before it creates its JSON-line
+reader, construct its worker `SessionAuthenticator`, and use it to verify the
+one-way authenticated `open_session` frame. The host then wraps the returned
+pipes in the bounded JSON-line transport, sends that frame with
+`host_authenticator`, and enforces its own deadlines and cancellation. This is
+only delivery of a key that the host already generated and trusts; it is not key
+exchange, encrypted transport, worker attestation, or key storage.
 
 `compile` canonicalizes the source paths and fails closed when a source is
 missing, is the wrong type, resolves to `/`, overlaps another worker-visible
@@ -112,7 +132,8 @@ under their platform's own application sandbox.
 It does not yet provide:
 
 - worker attestation, authenticated key exchange, encrypted transport, or
-  session-key storage;
+  session-key storage. The private-pipe preamble only transfers a
+  host-generated key to a newly launched worker;
 - CPU, memory, process-count, disk, or tmpfs-size quotas; hosts must apply
   cgroups, rlimits, or an equivalent platform policy;
 - seccomp policy, D-Bus mediation, device-specific policy, or a network proxy;

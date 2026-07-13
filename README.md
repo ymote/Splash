@@ -51,6 +51,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Linux Bubblewrap worker-policy compiler and launcher for a fixed,
   host-selected worker and manifest-selected file roots; it rejects network,
   executable, and secret selectors rather than claiming unsupported policy.
+- A one-shot, versioned private-pipe session bootstrap for Linux Bubblewrap
+  workers that is bound to the compiled manifest and precedes JSON worker
+  frames without exposing the key through argv or environment variables.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

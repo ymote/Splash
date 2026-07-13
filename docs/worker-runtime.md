@@ -10,7 +10,9 @@ It is a protocol and sequencing layer, not a sandbox. An in-process use has
 the privileges of its embedding process. Production hosts must still put it
 behind a platform containment backend, provision the session key through a
 trusted bootstrap channel, resolve opaque resource selectors in host policy,
-and supply authenticated rollback-resistant journal storage.
+and supply authenticated rollback-resistant journal storage. A Linux Bubblewrap
+worker can receive its host-generated key in a bounded private-pipe preamble
+before JSON frames begin; that is not key exchange or worker attestation.
 
 ## Integration Boundary
 

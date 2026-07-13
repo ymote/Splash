@@ -16,10 +16,12 @@ to a contained worker. It validates manifests, request uniqueness, formats,
 byte limits, and call budgets. Its `SessionAuthenticator` can also bind each
 worker frame to a host-provisioned BLAKE3 session key, directional role, and
 strict sequence number, rejecting tampering, reflection, and replay before a
-message is used. It does not establish or protect that key, attest a worker,
-encrypt transport, or enforce an operating-system policy itself. The host must
-provide a trusted bootstrap channel and containment backend before an
-effectful adapter is considered contained.
+message is used. Its private-pipe bootstrap can carry that already-generated
+key and session ID once to a newly launched worker, but it does not generate or
+protect the key, establish an exchange, attest a worker, encrypt transport, or
+enforce an operating-system policy itself. The host must provide a trusted
+bootstrap channel and containment backend before an effectful adapter is
+considered contained.
 
 `splash-worker` is the worker-side implementation of that protocol boundary.
 It accepts only an explicitly registered Rust adapter for a granted capability,
@@ -107,20 +109,27 @@ enforce them. It also rejects overlapping or root mounts and requires the
 worker program to live in a read-only runtime mount, avoiding a writable grant
 as an executable source.
 
+`BubblewrapCommand::spawn_with_bootstrap` additionally checks that the private
+bootstrap session matches the compiled manifest before launch, then writes the
+versioned preamble to the dedicated child stdin pipe. A failed write kills and
+reaps the child. This avoids exposing the key in argv or environment variables,
+but it is transfer only: it does not provide key exchange, encryption,
+attestation, or key storage.
+
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no seccomp filter, cgroup or rlimit enforcement, per-origin
-network proxy, D-Bus mediation, secret broker, key exchange, process
-attestation, deadline enforcement, cancellation delivery, or post-exit
-recovery. A private `/tmp` is opt-in and unbounded unless the host separately
-applies a memory or disk policy. Its filesystem boundary is per worker session,
-not per individual invocation: an attenuated manifest should be narrowed before
-launch when per-call filesystem isolation is required. Policy source paths must
-be host-owned and immutable to untrusted actors between compilation and spawn;
-the current path-based launcher cannot eliminate that race. A fixed worker
-program also does not prevent a compromised worker from executing or reading
-other files deliberately exposed through a runtime mount; runtime mounts must
-be minimal and immutable until a seccomp policy is implemented. On a failure it
-does not fall back to an unrestricted worker. See
+network proxy, D-Bus mediation, secret broker, deadline enforcement,
+cancellation delivery, or post-exit recovery. A private `/tmp` is opt-in and
+unbounded unless the host separately applies a memory or disk policy. Its
+filesystem boundary is per worker session, not per individual invocation: an
+attenuated manifest should be narrowed before launch when per-call filesystem
+isolation is required. Policy source paths must be host-owned and immutable to
+untrusted actors between compilation and spawn; the current path-based launcher
+cannot eliminate that race. A fixed worker program also does not prevent a
+compromised worker from executing or reading other files deliberately exposed
+through a runtime mount; runtime mounts must be minimal and immutable until a
+seccomp policy is implemented. On a failure it does not fall back to an
+unrestricted worker. See
 [`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md) before enabling it for
 untrusted local effects.
 

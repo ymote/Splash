@@ -1352,11 +1352,13 @@ fn is_valid_tool_name(value: &str) -> bool {
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeSet;
+    use std::io::Cursor;
     use std::rc::Rc;
 
     use super::*;
     use splash_protocol::{
-        OperationCompensationBinding, SessionKey, WorkerOperationState, AUTH_TAG_BYTES,
+        OperationCompensationBinding, PrivatePipeWorkerBootstrap, SessionKey, WorkerOperationState,
+        AUTH_TAG_BYTES,
     };
     #[cfg(feature = "sqlite")]
     use splash_storage::{sqlite::AnchoredSqliteStore, VolatileRollbackAnchor};
@@ -1594,7 +1596,13 @@ mod tests {
         let key = SessionKey::from_bytes([31; AUTH_TAG_BYTES]).unwrap();
         let mut host =
             SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap();
-        let worker_auth = SessionAuthenticator::new("worker-1", key, SessionRole::Worker).unwrap();
+        let bootstrap = PrivatePipeWorkerBootstrap::new("worker-1", key).unwrap();
+        let mut bootstrap_bytes = Vec::new();
+        bootstrap.write_to(&mut bootstrap_bytes).unwrap();
+        let worker_auth = PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(bootstrap_bytes))
+            .unwrap()
+            .into_worker_authenticator()
+            .unwrap();
         let manifest = CapabilityManifest::new("worker-1", vec![grant]).unwrap();
         let opening = host.seal(WorkerMessage::OpenSession { manifest }).unwrap();
         let mut adapters = WorkerAdapterRegistry::default();

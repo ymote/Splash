@@ -4,10 +4,10 @@
 and a platform-contained worker. It defines capability attenuation, bounded
 JSON frames, and keyed message authentication. `splash-worker` implements the
 worker-side dispatch and journal sequencing atop this contract. Neither crate
-creates a process, establishes a session key, applies an OS sandbox, or
-supplies rollback-resistant persistence. A host must select the containment
-backend and provision its key through a trusted platform channel before it
-sends an effectful invocation.
+creates a process, generates a session key, establishes trust in a worker,
+applies an OS sandbox, or supplies rollback-resistant persistence. A host must
+select the containment backend and provision its key through a trusted platform
+channel before it sends an effectful invocation.
 
 Version 4 is a breaking wire and durable-journal revision. Version 3 frames
 and version 1 worker journals are rejected rather than silently interpreted
@@ -87,6 +87,24 @@ protocol provides no key exchange, worker identity attestation, key rotation,
 or confidentiality. It also cannot stop a peer that already holds the key;
 that peer must be contained by the selected worker backend.
 
+### Private-pipe bootstrap
+
+`PrivatePipeWorkerBootstrap` is a bounded, versioned binary preamble for a
+private host-to-worker pipe. It carries a validated session ID and an existing
+host-generated `SessionKey`, allowing the worker to call `read_from`, construct
+its worker-side authenticator with `into_worker_authenticator`, then verify the
+first authenticated `open_session` frame through `WorkerSession::open` or
+`SessionAuthenticator::open`. It rejects an invalid header or version, invalid
+session ID, invalid UTF-8, weak key, and truncation.
+
+It is not key generation, key exchange, encrypted transport, worker
+attestation, or secret storage. Use it only on a one-way private pipe before
+the JSON-line channel begins; do not put it in a socket, ordinary JSON frame,
+Splash value, log, manifest, command line, environment variable, or capability
+selector. When using a `BufReader`, retain that same reader for JSON frames so
+any bytes it prefetched are not lost. A bootstrap failure means the host and
+worker must discard the session rather than reuse the stream.
+
 `AuthenticatedWorkerMessage::to_json_line` and `from_json_line` cap each
 frame at 1 MiB. Decoding only validates wire syntax. Call
 `SessionAuthenticator::open` before acting on any decoded frame.
@@ -96,7 +114,8 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
 1. The trusted host validates a manifest and creates `SessionAuthorizer`.
 2. The host provisions a fresh session key to the selected contained worker,
    then creates host and worker `SessionAuthenticator` instances with opposite
-   roles.
+   roles. The Linux Bubblewrap launcher can write a matching private-pipe
+   bootstrap before it returns the worker pipes.
 3. The host sends an authenticated `open_session` frame. Before dispatching
    `invoke`, it calls `authorize`; this checks the session, request ID
    uniqueness, envelope format, byte limit, and call budget. Call budget is
@@ -307,7 +326,8 @@ transport also poisons itself on an invalid or unexpected response. Discard a
 poisoned channel/session rather than retrying on the same stream.
 
 The JSON-line adapter is not a process launcher, sandbox, timeout mechanism,
-key-exchange protocol, or worker attestation scheme. The host must provision
-the key via its trusted bootstrap path and apply its platform's process,
-filesystem, executable, network, resource, and cancellation policy before it
-sends an effectful call. See [worker adapter runtime](worker-runtime.md#bounded-json-line-transport).
+key-exchange protocol, or worker attestation scheme. A host using the Linux
+Bubblewrap private-pipe helper must bootstrap its worker before it creates this
+JSON channel. Every host must still apply its platform's process, filesystem,
+executable, network, resource, and cancellation policy before it sends an
+effectful call. See [worker adapter runtime](worker-runtime.md#bounded-json-line-transport).

@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
+use std::io::{self, Read, Write};
 
 use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,11 @@ use serde_json::Value as JsonValue;
 pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
 pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
+/// Current format version for a private host-to-worker session bootstrap.
+///
+/// This format is not a worker frame. It is a one-shot preamble that must be
+/// written to a private pipe before the first authenticated JSON frame.
+pub const PRIVATE_PIPE_WORKER_BOOTSTRAP_VERSION: u8 = 1;
 pub const MAX_OPERATION_ERROR_BYTES: usize = 4 * 1024;
 /// Maximum accepted nesting depth for a JSON tool payload, including its root
 /// object or array.
@@ -27,6 +33,8 @@ pub const MAX_WORKER_OPERATION_RECORDS: usize = 64;
 /// Current serialized worker operation journal format version.
 pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 2;
 const MAX_RESOURCES_PER_GRANT: usize = 64;
+const MAX_TOKEN_BYTES: usize = 128;
+const PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC: [u8; 8] = *b"SPLPBOOT";
 
 /// The format an adapter accepts and returns across the worker boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1530,6 +1538,190 @@ impl fmt::Debug for SessionKey {
     }
 }
 
+/// One trusted, one-shot bootstrap for a contained worker session.
+///
+/// The host supplies this value only over a private pipe before it sends the
+/// first JSON worker frame. It contains the validated session ID and the
+/// existing host-generated session key, so a worker can construct its
+/// [`SessionAuthenticator`] before it verifies the authenticated
+/// `open_session` frame. It is neither a key exchange nor an encrypted
+/// transport, and it must never be sent through a Splash value, manifest,
+/// command line, environment variable, log, or normal JSON worker channel.
+#[derive(Clone)]
+pub struct PrivatePipeWorkerBootstrap {
+    session_id: String,
+    key: SessionKey,
+}
+
+impl PrivatePipeWorkerBootstrap {
+    /// Creates a bootstrap bound to one validated worker session.
+    pub fn new(session_id: impl Into<String>, key: SessionKey) -> Result<Self, ProtocolError> {
+        let session_id = session_id.into();
+        validate_token("session id", &session_id)?;
+        Ok(Self { session_id, key })
+    }
+
+    /// Returns the non-secret session ID bound to this bootstrap.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Writes one fixed-format private-pipe preamble and flushes it.
+    ///
+    /// The peer must call [`Self::read_from`] before it begins JSON-line frame
+    /// processing. Callers must use a one-way private host-to-worker pipe and
+    /// enforce a bounded startup deadline outside this blocking I/O helper.
+    pub fn write_to<W: Write>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), PrivatePipeWorkerBootstrapError> {
+        let session_id = self.session_id.as_bytes();
+        let session_id_len = u8::try_from(session_id.len()).map_err(|_| {
+            PrivatePipeWorkerBootstrapError::InvalidSessionIdLength {
+                actual: session_id.len(),
+                maximum: MAX_TOKEN_BYTES,
+            }
+        })?;
+        writer
+            .write_all(&PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        writer
+            .write_all(&[PRIVATE_PIPE_WORKER_BOOTSTRAP_VERSION])
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        writer
+            .write_all(&[session_id_len])
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        writer
+            .write_all(session_id)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        writer
+            .write_all(&self.key.0)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        writer.flush().map_err(PrivatePipeWorkerBootstrapError::Io)
+    }
+
+    /// Reads and validates one private-pipe preamble.
+    ///
+    /// This consumes exactly the bootstrap bytes and leaves the reader at the
+    /// beginning of the first JSON worker frame. A failed read must cause the
+    /// worker session to be discarded; continuing on the same stream can no
+    /// longer prove frame alignment.
+    pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, PrivatePipeWorkerBootstrapError> {
+        let mut magic = [0; PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len()];
+        reader
+            .read_exact(&mut magic)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        if magic != PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC {
+            return Err(PrivatePipeWorkerBootstrapError::InvalidMagic);
+        }
+
+        let mut version = [0; 1];
+        reader
+            .read_exact(&mut version)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        if version[0] != PRIVATE_PIPE_WORKER_BOOTSTRAP_VERSION {
+            return Err(PrivatePipeWorkerBootstrapError::UnsupportedVersion(
+                version[0],
+            ));
+        }
+
+        let mut session_id_len = [0; 1];
+        reader
+            .read_exact(&mut session_id_len)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        let session_id_len = usize::from(session_id_len[0]);
+        if session_id_len == 0 || session_id_len > MAX_TOKEN_BYTES {
+            return Err(PrivatePipeWorkerBootstrapError::InvalidSessionIdLength {
+                actual: session_id_len,
+                maximum: MAX_TOKEN_BYTES,
+            });
+        }
+        let mut session_id = vec![0; session_id_len];
+        reader
+            .read_exact(&mut session_id)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        let session_id = String::from_utf8(session_id)
+            .map_err(|_| PrivatePipeWorkerBootstrapError::InvalidSessionIdEncoding)?;
+        validate_token("session id", &session_id)
+            .map_err(PrivatePipeWorkerBootstrapError::Protocol)?;
+
+        let mut key = [0; AUTH_TAG_BYTES];
+        reader
+            .read_exact(&mut key)
+            .map_err(PrivatePipeWorkerBootstrapError::Io)?;
+        let key = SessionKey::from_bytes(key).map_err(PrivatePipeWorkerBootstrapError::Protocol)?;
+        Ok(Self { session_id, key })
+    }
+
+    /// Consumes this bootstrap and constructs the worker-side authenticator.
+    ///
+    /// The returned authenticator has not accepted any message yet. Pass the
+    /// first decoded `open_session` frame to `WorkerSession::open` (or call
+    /// [`SessionAuthenticator::open`]) so its tag and sequence are verified.
+    pub fn into_worker_authenticator(self) -> Result<SessionAuthenticator, ProtocolError> {
+        SessionAuthenticator::new(self.session_id, self.key, SessionRole::Worker)
+    }
+}
+
+impl fmt::Debug for PrivatePipeWorkerBootstrap {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivatePipeWorkerBootstrap")
+            .field("session_id", &self.session_id)
+            .field("key", &self.key)
+            .finish()
+    }
+}
+
+/// Failure while writing or reading a private worker bootstrap preamble.
+#[derive(Debug)]
+pub enum PrivatePipeWorkerBootstrapError {
+    Io(io::Error),
+    InvalidMagic,
+    UnsupportedVersion(u8),
+    InvalidSessionIdLength { actual: usize, maximum: usize },
+    InvalidSessionIdEncoding,
+    Protocol(ProtocolError),
+}
+
+impl Display for PrivatePipeWorkerBootstrapError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "private worker bootstrap I/O failed: {error}"),
+            Self::InvalidMagic => formatter.write_str("private worker bootstrap header is invalid"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported private worker bootstrap version: {version}"
+                )
+            }
+            Self::InvalidSessionIdLength { actual, maximum } => write!(
+                formatter,
+                "private worker bootstrap session ID is {actual} bytes; maximum is {maximum}"
+            ),
+            Self::InvalidSessionIdEncoding => {
+                formatter.write_str("private worker bootstrap session ID is not valid UTF-8")
+            }
+            Self::Protocol(error) => {
+                write!(formatter, "private worker bootstrap is invalid: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PrivatePipeWorkerBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+            Self::InvalidMagic
+            | Self::UnsupportedVersion(_)
+            | Self::InvalidSessionIdLength { .. }
+            | Self::InvalidSessionIdEncoding => None,
+        }
+    }
+}
+
 /// A sequence-numbered worker message carrying a keyed authentication tag.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthenticatedWorkerMessage {
@@ -2479,7 +2671,6 @@ impl Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 fn validate_token(field: &'static str, value: &str) -> Result<(), ProtocolError> {
-    const MAX_TOKEN_BYTES: usize = 128;
     if value.is_empty()
         || value.len() > MAX_TOKEN_BYTES
         || !value.bytes().all(|byte| {
@@ -2655,6 +2846,8 @@ fn is_blake3_fingerprint(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Cursor, Read, Write};
+
     use super::*;
     use serde_json::json;
     use splash_storage::{
@@ -3643,6 +3836,134 @@ mod tests {
 
     fn session_key(byte: u8) -> SessionKey {
         SessionKey::from_bytes([byte; AUTH_TAG_BYTES]).unwrap()
+    }
+
+    #[test]
+    fn private_pipe_bootstrap_round_trips_before_the_opening_frame() {
+        let key = session_key(13);
+        let bootstrap = PrivatePipeWorkerBootstrap::new("session-1", key.clone()).unwrap();
+        let mut encoded = Vec::new();
+        bootstrap.write_to(&mut encoded).unwrap();
+        assert_eq!(
+            encoded.len(),
+            PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 2 + "session-1".len() + AUTH_TAG_BYTES
+        );
+        let bootstrap_len = encoded.len();
+        encoded.extend_from_slice(b"next-json-frame");
+
+        let mut reader = Cursor::new(encoded);
+        let bootstrap = PrivatePipeWorkerBootstrap::read_from(&mut reader).unwrap();
+        assert_eq!(bootstrap.session_id(), "session-1");
+        assert_eq!(reader.position(), bootstrap_len as u64);
+        let mut remaining = String::new();
+        reader.read_to_string(&mut remaining).unwrap();
+        assert_eq!(remaining, "next-json-frame");
+
+        let debug = format!("{bootstrap:?}");
+        assert!(debug.contains("SessionKey([redacted])"));
+        assert!(!debug.contains("[13, 13"));
+
+        let mut worker = bootstrap.into_worker_authenticator().unwrap();
+        let mut host = SessionAuthenticator::new("session-1", key, SessionRole::Host).unwrap();
+        let opening = host
+            .seal(WorkerMessage::OpenSession {
+                manifest: manifest(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            worker.open(opening),
+            Ok(WorkerMessage::OpenSession { .. })
+        ));
+    }
+
+    #[test]
+    fn private_pipe_bootstrap_rejects_malformed_or_weak_input() {
+        let bootstrap = PrivatePipeWorkerBootstrap::new("session-1", session_key(14)).unwrap();
+        let mut encoded = Vec::new();
+        bootstrap.write_to(&mut encoded).unwrap();
+
+        let mut invalid_magic = encoded.clone();
+        invalid_magic[0] ^= 1;
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(invalid_magic)),
+            Err(PrivatePipeWorkerBootstrapError::InvalidMagic)
+        ));
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len()] = 2;
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(unsupported_version)),
+            Err(PrivatePipeWorkerBootstrapError::UnsupportedVersion(2))
+        ));
+
+        let mut empty_session_id = encoded.clone();
+        empty_session_id[PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 1] = 0;
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(empty_session_id)),
+            Err(PrivatePipeWorkerBootstrapError::InvalidSessionIdLength {
+                actual: 0,
+                maximum: MAX_TOKEN_BYTES,
+            })
+        ));
+
+        let mut invalid_session_id = encoded.clone();
+        invalid_session_id[PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 2] = 0xff;
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(invalid_session_id)),
+            Err(PrivatePipeWorkerBootstrapError::InvalidSessionIdEncoding)
+        ));
+
+        let mut invalid_session_token = encoded.clone();
+        invalid_session_token[PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 2] = b' ';
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(invalid_session_token)),
+            Err(PrivatePipeWorkerBootstrapError::Protocol(
+                ProtocolError::InvalidToken {
+                    field: "session id",
+                    ..
+                }
+            ))
+        ));
+
+        let mut weak_key = encoded.clone();
+        let key_offset = PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 2 + "session-1".len();
+        weak_key[key_offset..].fill(0);
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(weak_key)),
+            Err(PrivatePipeWorkerBootstrapError::Protocol(
+                ProtocolError::WeakSessionKey
+            ))
+        ));
+
+        let truncated = encoded[..encoded.len() - 1].to_vec();
+        assert!(matches!(
+            PrivatePipeWorkerBootstrap::read_from(&mut Cursor::new(truncated)),
+            Err(PrivatePipeWorkerBootstrapError::Io(error))
+                if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn private_pipe_bootstrap_propagates_a_write_failure() {
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("write denied"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bootstrap = PrivatePipeWorkerBootstrap::new("session-1", session_key(15)).unwrap();
+        assert!(matches!(
+            bootstrap.write_to(&mut FailingWriter),
+            Err(PrivatePipeWorkerBootstrapError::Io(error))
+                if error.kind() == io::ErrorKind::Other
+        ));
     }
 
     #[test]
