@@ -13,8 +13,9 @@ the upstream VM until separately specified.
 Provide normal Splash source. The runtime adds its own internal terminal
 marker, so generated code must not depend on Makepad widget-host framing.
 Run `splash check <file>` before execution when an LLM or editor produced the
-source. Syntax preflight never resolves imports, creates a host, or grants a
-tool capability.
+source. The check enforces the canonical v0.1 grammar rather than merely
+accepting the larger Makepad compatibility parser. Syntax preflight never
+resolves imports, creates a host, or grants a tool capability.
 
 The current profile supports:
 
@@ -118,6 +119,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
   fences when targeting the CLI/runtime.
 - Follow the [canonical grammar](grammar.md), then use `splash check` before
   requesting execution.
+- Do not use Makepad compatibility syntax such as `var`, `match`, `try`, typed
+  or destructuring declarations, single-quoted strings, range operators, or
+  whitespace-separated record members; `splash check` rejects it.
 - Import `mod.tool` before calling a tool.
 - Treat a denied tool call as a runtime error. Do not retry by attempting
   filesystem, process, or network imports.

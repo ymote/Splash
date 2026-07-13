@@ -3,7 +3,9 @@
 This document specifies the portable source subset for Splash producers,
 formatters, editors, and LLMs. It is intentionally narrower than the
 vendored Makepad parser: compatibility syntax outside this document is not a
-stable Splash language promise.
+stable Splash language promise. `splash check` and
+`splash_core::check_syntax` enforce this profile before reporting VM parser
+compatibility.
 
 The parser accepts a few legacy separator and declaration forms for Makepad
 compatibility. Generated workflow source must use the canonical forms below.
@@ -15,18 +17,23 @@ Use [`splash check`](#syntax-preflight) before executing generated code.
 identifier       = identifier-start, { identifier-continue } ;
 identifier-start = "A"..."Z" | "a"..."z" | "_" ;
 identifier-continue = identifier-start | "0"..."9" ;
+digit            = "0"..."9" ;
+hex-digit        = digit | "a"..."f" | "A"..."F" ;
 
 integer          = digit, { digit } ;
 number           = integer, [ ".", integer ], [ exponent ] ;
 exponent         = ( "e" | "E" ), [ "+" | "-" ], integer ;
 string           = '"', { string-character | escape }, '"' ;
-escape           = "\\", ( '"' | "\\" | "n" | "r" | "t" | "u" ) ;
+escape           = "\\", ( '"' | "\\" | "n" | "r" | "t" | unicode-escape ) ;
+unicode-escape   = "u", hex-digit, hex-digit, hex-digit, hex-digit
+                 | "u", "{", hex-digit, { hex-digit }, "}" ;
 
 line-comment     = "//", { any-character-except-newline } ;
 block-comment    = "/*", { any-character }, "*/" ;
 ```
 
-Identifiers are case-sensitive. `if`, `elif`, `else`, `for`, `in`, `loop`,
+Identifiers are case-sensitive. Unicode escapes use either exactly four
+hexadecimal digits or one through six digits between braces. `if`, `elif`, `else`, `for`, `in`, `loop`,
 `while`, `fn`, `let`, `return`, `break`, `continue`, `use`, `true`, `false`,
 and `nil` are reserved in canonical source. Strings use double quotes.
 
@@ -59,6 +66,8 @@ Use a newline after every top-level and block statement. Semicolons are
 accepted when emitting a compact one-line program; commas are reserved for
 argument, array, record-member, and parameter separation. `let` bindings may
 be reassigned with an assignment operator such as `=`, `+=`, or `-=`.
+Multiline records may include leading, separating, and closing newlines, but
+not a trailing comma.
 
 ## Expressions
 
@@ -97,9 +106,11 @@ primary            = literal
                    | lambda ;
 literal            = number | string | "true" | "false" | "nil" ;
 array              = "[", [ expression, { ",", expression } ], "]" ;
-record             = "{", [ record-member, { record-separator, record-member } ], "}" ;
+record             = "{", { newline },
+                     [ record-member, { record-separator, record-member }, { newline } ],
+                     "}" ;
 record-member      = identifier, ":", expression ;
-record-separator   = "," | newline ;
+record-separator   = ",", { newline } | newline, { newline } ;
 lambda             = "||", lambda-body
                    | "|", identifier, { ",", identifier }, "|", lambda-body ;
 lambda-body        = block | expression ;
@@ -112,6 +123,23 @@ every inherited VM operator part of the language contract. Use parentheses
 when a generated expression mixes control expressions and operators. A tool
 promise is explicitly awaited with `tool.start(...).await()`; `await` is not a
 standalone keyword or scheduler.
+
+## Compatibility Boundary
+
+`splash check` rejects Makepad-only compatibility forms even when the vendored
+VM parser would accept them. This includes `var`, `match`, `try`/`ok`, typed or
+destructuring declarations, numeric suffixes, single-quoted strings, range and
+other noncanonical operators, and record members separated only by spaces.
+The checker also rejects trailing commas where this grammar does not admit
+them. This keeps LLM output deterministic: valid source has one documented
+producer grammar rather than an inherited parser superset.
+
+The VM remains the execution engine. Hosts that call it directly without a
+preflight deliberately opt into its compatibility syntax; that source is not
+portable Splash v0.1 and must not be treated as an LLM-generation contract.
+The development CLI performs this preflight automatically for `eval` and
+`run`; embedded Rust hosts must call the preflight themselves before direct VM
+evaluation.
 
 ## Canonical Workflow Source
 
@@ -145,8 +173,11 @@ cargo run -p splash-cli -- check workflow.splash
 
 The command prints one JSON object containing `valid`, a bounded
 `diagnostics` list with one-based `line` and `column` fields, and
-`diagnostics_truncated`. It never creates a capability runtime, loads a
-module, invokes a tool, or executes bytecode.
+`diagnostics_truncated`. It validates the canonical grammar first and then
+checks that accepted source is compatible with the vendored VM. It never
+creates a capability runtime, loads a module, invokes a tool, or executes
+bytecode. Canonical profile nesting is bounded to 128 levels during this
+preflight.
 
 Rust hosts can call `splash_core::check_syntax` or
 `splash_core::check_syntax_named`. These functions apply the normal source-size

@@ -1,6 +1,6 @@
 use mod.tool
 use mod.std.assert
 
-let response_json = tool.start_json("math.add", {left: 20 right: 22}).await()
+let response_json = tool.start_json("math.add", {left: 20, right: 22}).await()
 let response = response_json.parse_json()
 assert(response.total == 42)

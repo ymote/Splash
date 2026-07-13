@@ -39,31 +39,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
 fn run_options(options: CliOptions) -> Result<(), String> {
     if let CliCommand::Check { file, source } = &options.command {
-        let report = check_syntax_named(file, source, ExecutionLimits::default())
-            .map_err(|error| error.to_string())?;
-        let diagnostics = report
-            .diagnostics
-            .iter()
-            .map(|diagnostic| {
-                json!({
-                    "line": diagnostic.line,
-                    "column": diagnostic.column,
-                    "message": diagnostic.message,
-                })
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            json!({
-                "valid": report.valid,
-                "diagnostics_truncated": report.diagnostics_truncated,
-                "diagnostics": diagnostics,
-            })
-        );
-        return report
-            .valid
-            .then_some(())
-            .ok_or_else(|| "syntax check failed".to_owned());
+        return run_syntax_check(file, source);
+    }
+
+    if let CliCommand::Evaluate(source) = &options.command {
+        validate_evaluation_source(source)?;
     }
 
     let mut runtime = CapabilityRuntime::default();
@@ -160,6 +140,53 @@ fn run_options(options: CliOptions) -> Result<(), String> {
     }
 }
 
+fn run_syntax_check(file: &str, source: &str) -> Result<(), String> {
+    let report = check_syntax_named(file, source, ExecutionLimits::default())
+        .map_err(|error| error.to_string())?;
+    let diagnostics = report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "line": diagnostic.line,
+                "column": diagnostic.column,
+                "message": diagnostic.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        json!({
+            "valid": report.valid,
+            "diagnostics_truncated": report.diagnostics_truncated,
+            "diagnostics": diagnostics,
+        })
+    );
+    report
+        .valid
+        .then_some(())
+        .ok_or_else(|| "syntax check failed".to_owned())
+}
+
+fn validate_evaluation_source(source: &str) -> Result<(), String> {
+    let report = check_syntax_named("inline.splash", source, ExecutionLimits::default())
+        .map_err(|error| error.to_string())?;
+    if report.valid {
+        return Ok(());
+    }
+
+    let detail = report.diagnostics.first().map_or_else(
+        || "invalid source".to_owned(),
+        |diagnostic| {
+            format!(
+                "line {}, column {}: {}",
+                diagnostic.line, diagnostic.column, diagnostic.message
+            )
+        },
+    );
+    Err(format!("canonical Splash preflight failed: {detail}"))
+}
+
 fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
     let mut allow_echo = false;
     let mut allow_json_add = false;
@@ -242,6 +269,33 @@ mod tests {
     }
 
     #[test]
+    fn check_rejects_makepad_compatibility_syntax() {
+        let error = run_options(CliOptions {
+            command: CliCommand::Check {
+                file: "generated.splash".to_owned(),
+                source: "let request = {left: 20 right: 22}".to_owned(),
+            },
+            allow_echo: false,
+            allow_json_add: false,
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "syntax check failed");
+    }
+
+    #[test]
+    fn eval_rejects_makepad_compatibility_syntax() {
+        let error = run(vec![
+            "eval".to_owned(),
+            "let request = {left: 20 right: 22}".to_owned(),
+        ])
+        .unwrap_err();
+
+        assert!(error.starts_with("canonical Splash preflight failed:"));
+        assert!(error.contains("expected `,`, a newline, or `}`"));
+    }
+
+    #[test]
     fn parses_a_check_invocation() {
         let path = format!(
             "{}/../splash-core/tests/fixtures/workflow_language.splash",
@@ -305,7 +359,7 @@ mod tests {
     fn runs_a_json_tool_when_the_capability_is_granted() {
         run(vec![
             "eval".to_owned(),
-            "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)".to_owned(),
+            "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)".to_owned(),
             "--allow-json-add".to_owned(),
         ])
         .unwrap();

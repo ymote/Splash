@@ -6,11 +6,14 @@
 //! limits and diagnostic capture; effectful APIs belong to a separate host
 //! crate and must be explicitly installed by trusted Rust code.
 
+mod profile;
+
 use std::any::Any;
 use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 pub use makepad_script as vm;
+use profile::check_canonical_profile;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
@@ -122,7 +125,8 @@ pub struct SyntaxDiagnostic {
     pub message: String,
 }
 
-/// Result of parsing Splash source without executing its opcodes or tools.
+/// Result of validating canonical Splash source without executing opcodes or
+/// tools.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyntaxReport {
     pub valid: bool,
@@ -189,11 +193,13 @@ impl<H: Any, S: Any> Runtime<H, S> {
         self.with_vm(configure);
     }
 
-    /// Parses source without evaluating it or entering any host binding.
+    /// Validates canonical Splash source without evaluating it or entering any
+    /// host binding.
     ///
-    /// This is suitable for LLM preflight and editor validation. It checks only
-    /// syntax; imports, capability grants, schemas, and tool names remain
-    /// host-policy decisions that are validated at execution time.
+    /// This is suitable for LLM preflight and editor validation. It checks the
+    /// portable Splash v0.1 grammar, then confirms VM compatibility. Imports,
+    /// capability grants, schemas, and tool names remain host-policy decisions
+    /// that are validated at execution time.
     pub fn check_syntax(&self, source: &str) -> Result<SyntaxReport, RuntimeError> {
         check_syntax_named("inline.splash", source, self.limits)
     }
@@ -253,14 +259,17 @@ impl<H: Any, S: Any> Runtime<H, S> {
     }
 }
 
-/// Parses source with the default source-size limit without executing it.
+/// Validates canonical Splash source with the default source-size limit without
+/// executing it.
 pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
     check_syntax_named("inline.splash", source, ExecutionLimits::default())
 }
 
-/// Parses named source without executing it.
+/// Validates named canonical Splash source without executing it.
 ///
-/// `file` appears only in parser-owned diagnostics. This function never loads
+/// This function rejects Makepad compatibility syntax outside the documented
+/// Splash v0.1 grammar, then asks the vendored VM parser to confirm runtime
+/// compatibility. `file` appears only in VM-parser diagnostics. It never loads
 /// a module, resolves an import, runs bytecode, or invokes a host tool.
 pub fn check_syntax_named(
     file: &str,
@@ -270,6 +279,10 @@ pub fn check_syntax_named(
     let limits = limits.validate()?;
     validate_source_length(source, limits)?;
 
+    let profile = check_canonical_profile(source);
+    let mut diagnostics = profile.diagnostics;
+    let mut diagnostics_truncated = profile.diagnostics_truncated;
+
     let mut base = vm::ScriptVmBase::new();
     let mut tokenizer = ScriptTokenizer::default();
     tokenizer.tokenize(&format!("{source}\n;"), &mut base.heap);
@@ -277,7 +290,12 @@ pub fn check_syntax_named(
     parser.set_emit_errors(false);
     parser.parse(&tokenizer, file, (0, 0), &[]);
 
-    let (mut diagnostics, mut diagnostics_truncated) = delimiter_diagnostics(&tokenizer);
+    let (delimiter_diagnostics, delimiter_diagnostics_truncated) =
+        delimiter_diagnostics(&tokenizer);
+    for diagnostic in delimiter_diagnostics {
+        push_syntax_diagnostic(&mut diagnostics, &mut diagnostics_truncated, diagnostic);
+    }
+    diagnostics_truncated |= delimiter_diagnostics_truncated;
     for diagnostic in parser.diagnostics {
         push_syntax_diagnostic(
             &mut diagnostics,
@@ -528,6 +546,118 @@ mod tests {
         .unwrap();
 
         assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn accepts_the_canonical_control_and_dataflow_profile() {
+        let report = check_syntax(
+            "let values = [20, 22]\n\
+             let request = {\n\
+                 left: values[0]\n\
+                 right: values[1]\n\
+             }\n\
+             let result = if request.left < request.right {\n\
+                 request.right\n\
+             } else {\n\
+                 request.left\n\
+             }\n\
+             let doubled = |value| value * 2\n\
+             doubled(result)",
+        )
+        .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn preserves_field_access_after_numeric_literals_and_comment_newlines() {
+        let report = check_syntax(
+            "let field = 1.value\n\
+             let first = 1 /* a block comment\n\
+             */\n\
+             let second = 2",
+        )
+        .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn bounds_canonical_profile_nesting() {
+        let source = format!("let value = {}0{}", "(".repeat(129), ")".repeat(129));
+        let report = check_syntax(&source).unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("canonical Splash nesting exceeds the maximum")
+        }));
+    }
+
+    #[test]
+    fn rejects_makepad_compatibility_syntax_outside_the_profile() {
+        for (source, expected) in [
+            (
+                "let request = {left: 20 right: 22}",
+                "expected `,`, a newline, or `}` after a record member",
+            ),
+            (
+                "var value = 42",
+                "reserved words cannot be used as expressions here",
+            ),
+            (
+                "let value: Number = 42",
+                "expected `=` or a statement end after a `let` declaration",
+            ),
+            (
+                "let [left, right] = [20, 22]",
+                "expected an identifier after `let`",
+            ),
+            (
+                "let value = 'single quoted'",
+                "only double-quoted strings are part of the canonical Splash profile",
+            ),
+            (
+                "let value = 42u32",
+                "numeric literal suffixes are not part of the canonical Splash profile",
+            ),
+            (
+                "let values = 1..3",
+                "operator `..` is not part of the canonical Splash profile",
+            ),
+            ("let value = ! !false", "expected an expression"),
+            (
+                "for value, in [1] {}",
+                "trailing commas are not part of the canonical `for` binding grammar",
+            ),
+        ] {
+            let report = check_syntax(source).unwrap();
+
+            assert!(!report.valid, "unexpectedly accepted: {source}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(expected)),
+                "missing `{expected}` for {source}: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn reports_canonical_profile_locations() {
+        let report = check_syntax("let first = 1\nlet record = {first: first second: 2}").unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.line == 2
+                && diagnostic.column == 28
+                && diagnostic
+                    .message
+                    .contains("expected `,`, a newline, or `}`")
+        }));
     }
 
     #[test]

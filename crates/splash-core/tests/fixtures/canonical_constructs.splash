@@ -1,0 +1,49 @@
+use mod.tool
+use mod.std.assert
+
+let pending
+let scalar = 1.25e+2
+let text = "line\n\u{0041}"
+let flags = [true, false, nil]
+let record = {
+    scalar: scalar,
+    flags: flags
+}
+
+fn choose(left, right) {
+    if left > right {
+        return left
+    } elif left == right {
+        return 0
+    } else {
+        return right
+    }
+}
+
+let zero = || 0
+let doubled = |value| value * 2
+let total = choose(record.scalar, doubled(2))
+total += flags[0]
+
+for value in flags {
+    continue
+}
+
+for index, value in flags {
+    break
+}
+
+for first, second, third in flags {
+    break
+}
+
+while false {
+    break
+}
+
+loop {
+    break
+}
+
+let started = tool.start("text.echo", text).await()
+assert(started == text)

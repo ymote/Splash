@@ -3807,7 +3807,7 @@ mod tests {
         let plan = engine
             .plan(vec![WorkflowStep::new(
                 "deferred-json-add",
-                "use mod.tool\nuse mod.std.assert\nlet raw = tool.start_json(\"math.add\", {left: 20 right: 22}).await()\nlet response = raw.parse_json()\nassert(response.total == 42)",
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.start_json(\"math.add\", {left: 20, right: 22}).await()\nlet response = raw.parse_json()\nassert(response.total == 42)",
             )])
             .unwrap();
         let approval = engine.approve(&plan).unwrap();

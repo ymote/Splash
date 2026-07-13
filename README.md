@@ -7,8 +7,8 @@ and keeps UI support optional rather than making UI the language boundary.
 ## Current baseline
 
 - A standalone, vendored VM and parser with upstream provenance.
-- An effect-free, bounded syntax preflight with structured diagnostics for
-  generated source and editor tooling.
+- An effect-free, bounded canonical-language preflight with structured
+  diagnostics for generated source and editor tooling.
 - A bounded evaluator with source, instruction, and deadline limits.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
@@ -99,13 +99,13 @@ return `serde_json::Value`; Splash turns records and arrays into JSON with
 use mod.tool
 use mod.std.assert
 
-let response_json = tool.call_json("math.add", {left: 20 right: 22})
+let response_json = tool.call_json("math.add", {left: 20, right: 22})
 let response = response_json.parse_json()
 assert(response.total == 42)
 ```
 
 ```sh
-cargo run -p splash-cli -- eval --allow-echo 'use mod.tool tool.call("text.echo", "hello")'
+cargo run -p splash-cli -- eval --allow-echo 'use mod.tool; tool.call("text.echo", "hello")'
 ```
 
 The deferred example is runnable with:
@@ -126,14 +126,15 @@ Inspect the exact demo-tool catalog supplied to an LLM host with:
 cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 ```
 
-Validate generated source without creating a capability host or running any
-bytecode:
+Validate generated source against the canonical Splash v0.1 profile without
+creating a capability host or running any bytecode:
 
 ```sh
 cargo run -p splash-cli -- check examples/deferred_tool_workflow.splash
 ```
 
-The command emits JSON diagnostics and exits nonzero for invalid source. The
+The command emits JSON diagnostics and exits nonzero for invalid source,
+including Makepad compatibility syntax outside the portable contract. The
 portable source contract is [Splash Grammar v0.1](docs/grammar.md).
 
 ## Workspace

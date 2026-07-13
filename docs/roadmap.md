@@ -3,7 +3,7 @@
 ## Baseline complete
 
 - Standalone VM workspace with upstream provenance.
-- Bounded evaluation and structured diagnostics.
+- Bounded evaluation and canonical grammar diagnostics.
 - Deny-by-default, audited string-tool bridge.
 - Bounded, host-pumped deferred tool promises.
 - Host-owned plan, approval, and sequential workflow execution.

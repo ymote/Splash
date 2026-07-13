@@ -2759,7 +2759,7 @@ mod tests {
 
         let report = runtime
             .eval(
-                "use mod.tool\nuse mod.std.assert\nlet response_json = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = response_json.parse_json()\nassert(response.total == 42)",
+                "use mod.tool\nuse mod.std.assert\nlet response_json = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet response = response_json.parse_json()\nassert(response.total == 42)",
             )
             .unwrap();
 
@@ -3322,7 +3322,7 @@ mod tests {
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
 
         let initial = runtime
-            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20 right: 22}).await()")
+            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20, right: 22}).await()")
             .unwrap();
         assert!(initial.suspended);
         let invocation = runtime.claim_next_external_tool().unwrap();
@@ -3602,7 +3602,7 @@ mod tests {
             )
             .unwrap();
         let initial = runtime
-            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20 right: 22}).await()")
+            .eval("use mod.tool\ntool.start_json(\"math.add\", {left: 20, right: 22}).await()")
             .unwrap();
         assert!(initial.suspended);
         let invocation = runtime.claim_next_external_tool().unwrap();
@@ -3711,7 +3711,7 @@ mod tests {
 
         let allowed = runtime
             .eval(
-                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
             )
             .unwrap();
 
@@ -3733,7 +3733,7 @@ mod tests {
             .unwrap();
 
         let report = runtime
-            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20 right: 22})")
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20, right: 22})")
             .unwrap();
 
         assert!(!report.succeeded());
@@ -3845,7 +3845,7 @@ mod tests {
 
         let report = runtime
             .eval(
-                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20 right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
             )
             .unwrap();
 
@@ -3889,7 +3889,7 @@ mod tests {
 
         let initial = runtime
             .eval(
-                "use mod.tool\nuse mod.std.assert\nlet raw = tool.start_json(\"math.add\", {left: 20 right: 22}).await()\nlet response = raw.parse_json()\nassert(response.total == 42)",
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.start_json(\"math.add\", {left: 20, right: 22}).await()\nlet response = raw.parse_json()\nassert(response.total == 42)",
             )
             .unwrap();
 
@@ -3978,7 +3978,7 @@ mod tests {
             .unwrap();
 
         let report = runtime
-            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20 right: 22})")
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20, right: 22})")
             .unwrap();
 
         assert!(!report.succeeded());
@@ -4012,7 +4012,7 @@ mod tests {
 
         let initial = runtime
             .eval(
-                "use mod.tool\nuse mod.std.assert\nlet response_json = tool.start_json(\"math.add\", {left: 20 right: 22}).await()\nlet response = response_json.parse_json()\nassert(response.total == 42)",
+                "use mod.tool\nuse mod.std.assert\nlet response_json = tool.start_json(\"math.add\", {left: 20, right: 22}).await()\nlet response = response_json.parse_json()\nassert(response.total == 42)",
             )
             .unwrap();
 
