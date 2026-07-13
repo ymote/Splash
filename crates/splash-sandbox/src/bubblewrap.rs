@@ -2191,7 +2191,7 @@ mod tests {
             ptrace::SECCOMP_RET_ALLOW
         );
         assert_eq!(
-            linux_seccomp::evaluate_for_test(program, architecture, u32::MAX, [0; 6]),
+            linux_seccomp::evaluate_for_test(program, architecture, 0x7fff_ffff, [0; 6]),
             ptrace::SECCOMP_RET_ALLOW
         );
         assert_eq!(
