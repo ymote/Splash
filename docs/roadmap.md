@@ -71,6 +71,6 @@
 ## Before a stable language release
 
 - Formatter and LSP support for the published [v0.1 grammar](grammar.md).
-- Fuzzing and resource-exhaustion coverage.
+- Parser/VM differential fuzzing and resource-exhaustion coverage.
 - Durable event storage, replay, and compensation actions.
 - Independent security review of effectful adapters.

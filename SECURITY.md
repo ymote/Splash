@@ -11,6 +11,13 @@ untrusted. The runtime has two separate security boundaries:
    filesystem policy; other desktop, mobile, and embedded targets still need
    their own platform-specific containment backend.
 
+The canonical Splash profile is an effect-free preflight in front of the
+vendored Makepad parser. A profile rejection never reaches that parser or a
+host binding; a profile acceptance is then independently parsed by the VM
+before evaluation. The runtime carries executable canonical-fixture regression
+coverage, but the two parsers are not formally proven equivalent. Parser/VM
+differential fuzzing is required before a stable language release.
+
 `splash-protocol` defines the portable, attenuated handoff from a policy host
 to a contained worker. It validates manifests, request uniqueness, formats,
 byte limits, and call budgets. Its `SessionAuthenticator` can also bind each
