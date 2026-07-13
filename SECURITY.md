@@ -124,6 +124,20 @@ The persisted input fingerprint is an unkeyed correlation digest, not encrypted
 secret storage; hosts must pass opaque secret selectors rather than credential
 values into the ledger identity.
 
+An operation ledger may hold one compensation intent only after its original
+operation is durably `succeeded`. That intent binds a separate `cmp-` key,
+canonical-input digest, tenant scope, and active capability-grant fingerprint;
+it never stores raw compensation input, output, an approval, or a grant.
+Compensation approvals are process-local, one-use, session-bound host values.
+They must be issued only after the intent is durably persisted and must be
+reissued after a restart for the exact same record. A changed tenant, key,
+input, or grant fails closed. The ledger cannot prove an inverse effect is
+semantically correct or automatically restart a workflow.
+`CompensationGrantVerifier` is invoked by the workflow host before approval
+and again before frame sealing, so a production host must connect it to current
+tenant policy, revocation, and any grant-lease state rather than treating a
+stored fingerprint as a still-valid capability.
+
 `splash-storage` authenticates host-owned record bytes with a provisioned
 BLAKE3 key and binds them to an opaque record namespace, name, revision, and
 key ID. It supports verification-key rotation, but it does not encrypt payloads
@@ -136,20 +150,22 @@ database, or mobile key-value adapter must not claim rollback protection unless
 it has a separate platform trust anchor and the required atomic semantics.
 Generated Splash source receives neither a store nor a key.
 
-Worker protocol v3 adds a distinct authenticated operation-dispatch frame that
-carries a host-owned durable operation key. A contained worker's
-`WorkerOperationJournal` records only the tool, key, canonical-input digest,
-and state before its adapter runs the effect. An exact duplicate returns the
-stored state; a changed tool or input for the same key is rejected. The journal
-must be scoped to one host-controlled worker tenant or policy domain and
-persisted through an authenticated, rollback-resistant backend before an
-effect. It retains terminal result data for idempotent replies, so its storage
-may need encryption in addition to authentication. The host should reconcile
-an ambiguous response rather than blindly re-dispatch. This is a worker
-idempotency primitive, not compensation, key exchange, process containment, or
-an authorization grant to Splash source. The canonical-input digest is an
-unkeyed correlation value, so operation payloads must contain opaque secret
-selectors rather than credential values.
+Worker protocol v4 adds authenticated operation-dispatch and explicit
+compensation frames. A contained worker's `WorkerOperationJournal` records
+the tool, key, canonical-input digest, state, and at most one compensation
+record before its adapter runs an effect. A compensation is admitted only for
+a succeeded original operation under the same tool and tenant scope, with an
+exact active-grant fingerprint and a separately bounded nonzero compensation
+grant. An exact duplicate returns the stored compensation state; a changed
+tool, key, input, grant, scope, or contradictory terminal result is rejected.
+The host should reconcile an ambiguous response rather than blindly
+re-dispatching or creating another inverse effect. This remains a worker
+idempotency primitive, not semantic rollback, key exchange, process
+containment, or authorization granted to Splash source. The journal retains
+terminal result data for idempotent replies, so its storage may need encryption
+in addition to authentication. The canonical-input digest is an unkeyed
+correlation value, so operation payloads must contain opaque secret selectors
+rather than credential values.
 
 This baseline does not yet provide filesystem adapters, network adapters,
 secret storage, worker-process isolation, signed packages, full JSON Schema,

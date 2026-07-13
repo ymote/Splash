@@ -66,7 +66,9 @@ key attestation.
 ## Workflow Integration
 
 Persist the serialized ledger under a stable host record key before dispatch
-and after each reconciliation mutation. On restart, open the authenticated
+and after each reconciliation or compensation mutation. A compensation intent
+must be written with compare-and-swap storage before the host issues its
+one-use approval or sends a worker frame. On restart, open the authenticated
 record first, parse the ledger, recreate the trusted plan, and validate both
 the plan binding and the ledger's own revision policy.
 

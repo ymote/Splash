@@ -1,6 +1,6 @@
 # Worker Durable Operations
 
-Worker protocol v3 gives a contained adapter a durable operation identity
+Worker protocol v4 gives a contained adapter a durable operation identity
 without exposing worker state, a journal, or a storage key to Splash source.
 It complements the host-side [workflow operation ledger](workflow-operations.md):
 the host decides whether an effect is allowed, while the worker makes an exact
@@ -81,9 +81,35 @@ result.
 
 ## Compensation Boundary
 
-This version supplies idempotency and recovery state only. It intentionally
-does not make compensation automatic: compensation is another effect and must
-be an explicit host-approved capability with its own adapter policy, audit, and
-durable record. A future protocol revision will add that narrow handler
-boundary rather than treating a failed operation as authorization to run an
-arbitrary rollback command.
+Compensation is a separate worker operation, never an automatic follow-up to a
+failure. A worker admits it only after the original journal entry is
+`succeeded`, with the same tool, exact tenant scope, exact grant fingerprint,
+and a single `cmp-` key. `max_compensations` is a separate capability budget;
+it defaults to zero and cannot be increased through attenuation.
+
+Persist the compensation admission before invoking a dedicated adapter
+compensation handler, then persist each state observation before responding:
+
+~~~rust
+let authorized = authorizer.authorize_compensation(request)?;
+match journal.admit_compensation(&authorized)? {
+    WorkerCompensationAdmission::Dispatch => {
+        persist_journal(&journal)?; // must complete before the inverse effect
+        let status = adapter.compensate(authorized.request())?;
+        journal.observe_compensation(&authorized, status.clone())?;
+        persist_journal(&journal)?;
+        send_compensation_result(status)?;
+    }
+    WorkerCompensationAdmission::Existing { state } => {
+        recover_or_report_existing_compensation(state)?;
+    }
+}
+~~~
+
+An exact replay after a transport loss returns `Existing`; it does not rerun
+the adapter. A new compensation key, changed input, stale grant fingerprint,
+wrong tenant, or contradictory terminal result fails closed. The adapter must
+define what its compensation payload means and how it validates that payload;
+the protocol cannot infer a semantic inverse from a normal tool request. See
+[durable worker compensation](worker-compensation.md) for the host approval
+and restart policy.

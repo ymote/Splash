@@ -11,7 +11,8 @@ The ledger contains only bounded metadata:
 - a format version and monotonic revision;
 - the BLAKE3 fingerprint of the trusted workflow plan;
 - for each operation: its step ID, tool name, durable operation key, BLAKE3
-  input fingerprint, and worker-observed state.
+  input fingerprint, worker-observed state, and at most one separately bound
+  compensation intent.
 
 It never stores raw input, output, error text, raw secret values, source, an approval,
 capability grant, VM state, promise, stream chunk, or `ExternalToolId`.
@@ -69,7 +70,7 @@ identity: pass opaque secret selectors or handles to the worker policy instead.
 Authenticated durable storage remains required even when no raw secret appears
 in the ledger.
 
-When dispatching through worker protocol v3, record
+When dispatching through worker protocol v4, record
 `canonical_operation_input_bytes(&payload)` rather than an ad hoc JSON string.
 `operation_dispatch_request` recreates those same bytes and rejects a payload
 whose durable identity differs from the ledger entry.
@@ -133,6 +134,40 @@ terminal payload against the current tool contract, decide whether the effect
 is sufficient to advance the plan, and issue fresh workflow approval before it
 runs a suffix. The ledger intentionally retains no worker output with which to
 make that decision automatically.
+
+## Explicit Compensation
+
+Compensation is an optional, separate effect. A host can record it only after
+the original operation is durably `succeeded`; `pending`, `running`, `failed`,
+and `cancelled` originals are deliberately ineligible. Each original operation
+holds at most one compensation record, whose `cmp-` key, input fingerprint,
+tenant scope, active-grant fingerprint, and lifecycle state are retained
+without raw input, output, or error text.
+
+The host derives a `WorkflowCompensationPolicy` from an active
+`CapabilityGrant` with a nonzero `max_compensations`, records the intent with
+`record_derived_compensation`, and persists the ledger with authenticated
+compare-and-swap storage before issuing any approval. A
+`WorkflowCompensationTarget` binds the original operation, policy, active
+grant, and a trusted `CompensationGrantVerifier`; the verifier must check the
+current tenant policy, revocation state, and any grant lease. It runs before
+both approval and frame sealing. `WorkflowCompensationDispatch` carries the
+bounded payload and request ID. `approve_compensation` creates a one-use,
+session-bound approval that also binds the ledger revision.
+`prepare_authenticated_operation_compensation` rejects policy, tenant, grant,
+key, input, session, or revision drift before it seals a worker frame.
+
+After a crash, create a fresh session and fresh approval only for the existing
+durable compensation intent. Reuse the same `cmp-` key and exact input; do not
+generate a second intent. A lost response is reconciled by the worker journal,
+which returns the existing compensation state rather than rerunning the
+adapter. A changed grant fingerprint, tenant scope, original state, or input
+is a stop condition that requires an explicit host recovery decision.
+
+The ledger cannot prove that an inverse effect is semantically correct or that
+it reached the outside world. It never resumes a VM promise or workflow suffix
+automatically. See [durable worker compensation](worker-compensation.md) for
+the complete worker ordering and failure policy.
 
 ## Security Boundary
 

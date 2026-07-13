@@ -22,11 +22,12 @@ pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 pub use splash_protocol::{
     canonical_operation_input_bytes, AuthenticatedWorkerMessage, CapabilityManifest,
+    OperationCompensationBinding, OperationCompensationRequest, OperationCompensationResult,
     OperationDispatchRequest, OperationReconcileRequest, OperationReconcileResult, OperationStatus,
     ProtocolError, SessionAuthenticator, SessionKey, SessionRole,
     ToolInvocation as WorkerInvocation, ToolPayload as WorkerPayload, ToolResult as WorkerResult,
-    WorkerMessage, WorkerOperationAdmission, WorkerOperationJournal, WorkerOperationState,
-    WorkerOperationStateKind,
+    WorkerCompensationAdmission, WorkerCompensationRecord, WorkerMessage, WorkerOperationAdmission,
+    WorkerOperationJournal, WorkerOperationState, WorkerOperationStateKind,
 };
 use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 pub use splash_schema::{JsonSchema, SchemaError};

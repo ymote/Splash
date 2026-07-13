@@ -26,6 +26,8 @@ and keeps UI support optional rather than making UI the language boundary.
   reconciliation for live external operations.
 - Authenticated durable-operation dispatch frames and a bounded worker journal
   for replay-safe idempotency across a worker restart.
+- Host-approved, current-policy-revalidated durable compensation intents with
+  one inverse effect per succeeded operation and replay-safe worker recovery.
 - Bounded, data-only workflow checkpoints with fresh host approval required
   for a restart to run the remaining plan suffix.
 - Plan-bound durable external-operation ledgers with input fingerprints,
@@ -123,7 +125,7 @@ defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schem
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
 
-[Worker protocol v3](docs/worker-protocol.md) also defines keyed worker frames
+[Worker protocol v4](docs/worker-protocol.md) also defines keyed worker frames
 and the live-operation reconciliation boundary.
 
 [Workflow checkpoints](docs/workflow-checkpoints.md) define the durable
@@ -137,3 +139,7 @@ record boundary used to persist those host-owned records.
 
 [Worker durable operations](docs/worker-operations.md) define the contained
 worker-side replay and persistence boundary for effectful operation keys.
+
+[Durable worker compensation](docs/worker-compensation.md) defines the
+host-approval, worker-journal, and crash-recovery rules for one explicit
+inverse effect.

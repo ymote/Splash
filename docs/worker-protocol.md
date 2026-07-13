@@ -1,4 +1,4 @@
-# Worker Protocol v3
+# Worker Protocol v4
 
 `splash-protocol` is the portable data contract between a trusted Splash host
 and a platform-contained worker. It defines capability attenuation, bounded
@@ -7,6 +7,11 @@ establish a session key, apply an OS sandbox, or persist worker state. A host
 must select the containment backend and provision its key through a trusted
 platform channel before it sends an effectful invocation.
 
+Version 4 is a breaking wire and durable-journal revision. Version 3 frames
+and version 1 worker journals are rejected rather than silently interpreted
+under the new compensation rules. A host upgrading a live system must make an
+explicit migration or recovery decision for any unfinished v3 operation.
+
 ## Capability manifest
 
 A `CapabilityManifest` binds one `session_id` to named `CapabilityGrant`s. A
@@ -14,6 +19,7 @@ grant defines:
 
 - its tool name and `text` or `json` envelope format;
 - call, input-byte, and output-byte limits;
+- a separate maximum for explicitly host-approved compensation effects; and
 - opaque resource selectors.
 
 Resource selectors have a kind (`file_root`, `executable`, `network_origin`,
@@ -23,7 +29,7 @@ only inside its chosen worker backend.
 
 ```json
 {
-  "protocol_version": 3,
+  "protocol_version": 4,
   "session_id": "release-42",
   "grants": [
     {
@@ -32,6 +38,7 @@ only inside its chosen worker backend.
       "max_calls": 1,
       "max_input_bytes": 16384,
       "max_output_bytes": 65536,
+      "max_compensations": 1,
       "resources": [
         {"kind": "network_origin", "id": "release-api"},
         {"kind": "secret", "id": "release-token"}
@@ -45,12 +52,16 @@ JSON payloads must be objects or arrays. The protocol rejects scalar JSON at
 both input and result boundaries, matching Splash's portable JSON tool
 contract.
 
+`max_compensations` defaults to zero. A normal tool grant therefore does not
+authorize a compensating effect unless the host opts in explicitly.
+
 ## Attenuation
 
-`CapabilityGrant::attenuate` can lower byte or call limits and select a subset
-of resources. `CapabilityManifest::attenuate` can also remove tools entirely.
-It rejects any attempt to increase a limit, add a selector, or name a tool the
-parent did not grant. An empty allowed-tool set produces a valid
+`CapabilityGrant::attenuate` can lower byte, call, or compensation limits and
+select a subset of resources. It may reduce `max_compensations` to zero, but
+can never increase it. `CapabilityManifest::attenuate` can also remove tools
+entirely. It rejects any attempt to increase a limit, add a selector, or name
+a tool the parent did not grant. An empty allowed-tool set produces a valid
 zero-capability session.
 
 ## Authenticated framing
@@ -98,7 +109,7 @@ and OS policy remain backend responsibilities.
 
 ## Durable Operation Dispatch
 
-`dispatch_operation` is the v3 path for an effect whose idempotency must
+`dispatch_operation` is the v4 path for an effect whose idempotency must
 survive a worker restart. It carries the normal session, request ID, tool, and
 bounded text or JSON payload plus a host-owned non-authorizing `operation_key`.
 The worker returns `operation_result` using the existing operation status
@@ -123,6 +134,50 @@ storage, and validates that scope on load. A terminal result is retained so a
 duplicate can receive the same output; use encryption if that output is
 sensitive. See [worker durable operations](worker-operations.md) for the
 complete state machine and restart sequence.
+
+## Explicit Compensation
+
+`compensate_operation` is the narrow v4 path for one inverse effect of a
+previously succeeded durable operation. It is not exposed to Splash source and
+it is not a generic retry or rollback command. The trusted host must first
+persist a compensation intent in its workflow ledger, then issue a one-use,
+session-bound approval before it seals an authenticated request. The host must
+also reauthorize current tenant policy and grant revocation immediately before
+approval and frame sealing; a durable grant fingerprint establishes identity,
+not a perpetual authorization lease.
+
+An `OperationCompensationRequest` repeats the original tool and operation key,
+adds a `cmp-` compensation key, opaque tenant scope, and the BLAKE3 fingerprint
+of the exact active `CapabilityGrant`. A contained worker accepts it only when
+all of the following hold:
+
+- the grant has a nonzero `max_compensations` budget and the request consumes
+  that separate session budget;
+- the request fingerprint exactly matches the active grant;
+- the worker journal scope equals the request tenant scope;
+- the original operation exists, uses the same tool, and is durably
+  `succeeded`; and
+- the compensation key and canonical input exactly match any existing
+  compensation record for that original operation.
+
+The worker calls `SessionAuthorizer::authorize_compensation`, then
+`WorkerOperationJournal::admit_compensation`, and persists a new admission
+before its adapter performs the inverse effect. A duplicate exact request
+returns the existing `pending`, `running`, or terminal compensation state;
+the adapter must not run again. It persists each observed compensation state
+before returning `compensation_result`. Contradictory terminal observations,
+input drift, grant drift, tenant drift, a second compensation key, and a
+non-succeeded original are rejected.
+
+The protocol ensures bounded, capability-scoped delivery and replay behavior;
+it cannot prove that an adapter payload is a valid semantic inverse. A worker
+adapter must expose a dedicated compensation handler for the tool and define
+its own validation, audit, I/O deadline, and manual-recovery behavior. A host
+must reconcile ambiguous delivery by reusing the same durable compensation key
+under a fresh session and approval, never by inventing a second compensation
+or automatically replaying an unknown effect. See
+[durable worker compensation](worker-compensation.md) for the full recovery
+sequence.
 
 ## External operation reconciliation
 

@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use splash_capabilities::CapabilityRuntime;
 use splash_core::RuntimeError;
 use splash_protocol::{
-    AuthenticatedWorkerMessage, OperationDispatchRequest, OperationReconcileRequest,
-    OperationReconcileResult, OperationStatus, ProtocolError, SessionAuthenticator, SessionRole,
-    ToolPayload, WorkerMessage,
+    AuthenticatedWorkerMessage, CapabilityGrant, OperationCompensationBinding,
+    OperationCompensationRequest, OperationCompensationResult, OperationDispatchRequest,
+    OperationReconcileRequest, OperationReconcileResult, OperationStatus, ProtocolError,
+    SessionAuthenticator, SessionRole, ToolPayload, WorkerMessage,
 };
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
@@ -39,7 +40,7 @@ pub const MAX_WORKFLOW_OPERATION_INPUT_BYTES: usize = 256 * 1024;
 /// Maximum host-supplied nonce size used to derive a durable operation key.
 pub const MAX_WORKFLOW_OPERATION_NONCE_BYTES: usize = 128;
 /// Current serialized operation ledger format version.
-pub const WORKFLOW_OPERATION_LEDGER_FORMAT_VERSION: u8 = 1;
+pub const WORKFLOW_OPERATION_LEDGER_FORMAT_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowStep {
@@ -305,6 +306,271 @@ impl WorkflowOperationState {
     }
 }
 
+/// Host-selected worker policy binding for one compensation intent.
+///
+/// The policy is derived from the exact active worker grant. A changed grant,
+/// tenant, or tool cannot silently reuse a durable compensation record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowCompensationPolicy {
+    tool: String,
+    tenant_scope: String,
+    grant_fingerprint: String,
+}
+
+impl WorkflowCompensationPolicy {
+    pub fn new(
+        tenant_scope: impl Into<String>,
+        grant: &CapabilityGrant,
+    ) -> Result<Self, WorkflowOperationLedgerError> {
+        let tenant_scope = tenant_scope.into();
+        if !is_valid_operation_token(&tenant_scope) {
+            return Err(WorkflowOperationLedgerError::InvalidCompensationTenantScope(tenant_scope));
+        }
+        grant
+            .validate()
+            .map_err(WorkflowOperationLedgerError::Protocol)?;
+        if grant.max_compensations == 0 {
+            return Err(WorkflowOperationLedgerError::CompensationNotGranted(
+                grant.tool.clone(),
+            ));
+        }
+        let grant_fingerprint = grant
+            .compensation_fingerprint()
+            .map_err(WorkflowOperationLedgerError::Protocol)?;
+        Ok(Self {
+            tool: grant.tool.clone(),
+            tenant_scope,
+            grant_fingerprint,
+        })
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn tenant_scope(&self) -> &str {
+        &self.tenant_scope
+    }
+
+    pub fn grant_fingerprint(&self) -> &str {
+        &self.grant_fingerprint
+    }
+
+    fn matches_grant(&self, grant: &CapabilityGrant) -> Result<bool, WorkflowOperationLedgerError> {
+        Ok(grant.tool == self.tool
+            && grant.max_compensations > 0
+            && grant
+                .compensation_fingerprint()
+                .map_err(WorkflowOperationLedgerError::Protocol)?
+                == self.grant_fingerprint)
+    }
+
+    fn validate_syntax(&self) -> Result<(), WorkflowOperationLedgerError> {
+        if !is_valid_operation_token(&self.tool) {
+            return Err(WorkflowOperationLedgerError::InvalidTool(self.tool.clone()));
+        }
+        if !is_valid_operation_token(&self.tenant_scope) {
+            return Err(
+                WorkflowOperationLedgerError::InvalidCompensationTenantScope(
+                    self.tenant_scope.clone(),
+                ),
+            );
+        }
+        if !is_plan_fingerprint(&self.grant_fingerprint) {
+            return Err(WorkflowOperationLedgerError::InvalidCompensationGrantFingerprint);
+        }
+        Ok(())
+    }
+}
+
+/// Trusted host policy hook used to reauthorize a compensation grant when the
+/// host approves and when it seals an execution frame.
+///
+/// Implementations should consult current tenant policy, revocation state, and
+/// any platform-specific grant lease. A stored grant fingerprint establishes
+/// durable identity; it is not a revocation mechanism by itself.
+pub trait CompensationGrantVerifier {
+    fn verify_compensation_grant(
+        &self,
+        tenant_scope: &str,
+        grant: &CapabilityGrant,
+    ) -> Result<(), WorkflowOperationLedgerError>;
+}
+
+/// The operation, policy, and current grant that a host is considering for
+/// compensation.
+///
+/// The engine validates the complete binding before it issues an approval or
+/// creates a worker frame. Keeping these values together prevents a caller
+/// from accidentally pairing an operation with another tool's grant.
+#[derive(Clone, Copy)]
+pub struct WorkflowCompensationTarget<'a> {
+    operation_key: &'a str,
+    policy: &'a WorkflowCompensationPolicy,
+    grant: &'a CapabilityGrant,
+    verifier: &'a dyn CompensationGrantVerifier,
+}
+
+impl fmt::Debug for WorkflowCompensationTarget<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowCompensationTarget")
+            .field("operation_key", &self.operation_key)
+            .field("policy", &self.policy)
+            .field("grant", &self.grant)
+            .field("verifier", &"[trusted host policy]")
+            .finish()
+    }
+}
+
+impl<'a> WorkflowCompensationTarget<'a> {
+    pub fn new(
+        operation_key: &'a str,
+        policy: &'a WorkflowCompensationPolicy,
+        grant: &'a CapabilityGrant,
+        verifier: &'a dyn CompensationGrantVerifier,
+    ) -> Self {
+        Self {
+            operation_key,
+            policy,
+            grant,
+            verifier,
+        }
+    }
+
+    pub fn operation_key(self) -> &'a str {
+        self.operation_key
+    }
+
+    pub fn policy(self) -> &'a WorkflowCompensationPolicy {
+        self.policy
+    }
+
+    pub fn grant(self) -> &'a CapabilityGrant {
+        self.grant
+    }
+
+    fn verify_current(self) -> Result<(), WorkflowOperationLedgerError> {
+        self.policy.validate_syntax()?;
+        if !self.policy.matches_grant(self.grant)? {
+            return Err(WorkflowOperationLedgerError::CompensationPolicyMismatch(
+                self.operation_key.to_owned(),
+            ));
+        }
+        self.verifier
+            .verify_compensation_grant(self.policy.tenant_scope(), self.grant)
+    }
+}
+
+/// Data that becomes one authenticated compensation request.
+///
+/// Construction does not grant authority. `WorkflowEngine` validates the
+/// payload, request ID, and durable input fingerprint before sealing a frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowCompensationDispatch {
+    request_id: String,
+    payload: ToolPayload,
+}
+
+impl WorkflowCompensationDispatch {
+    pub fn new(request_id: impl Into<String>, payload: ToolPayload) -> Self {
+        Self {
+            request_id: request_id.into(),
+            payload,
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn payload(&self) -> &ToolPayload {
+        &self.payload
+    }
+}
+
+/// Bounded durable intent for the inverse of one succeeded operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCompensation {
+    compensation_key: String,
+    input_fingerprint: String,
+    tenant_scope: String,
+    grant_fingerprint: String,
+    state: WorkflowOperationState,
+}
+
+impl WorkflowCompensation {
+    pub fn compensation_key(&self) -> &str {
+        &self.compensation_key
+    }
+
+    pub fn input_fingerprint(&self) -> &str {
+        &self.input_fingerprint
+    }
+
+    pub fn tenant_scope(&self) -> &str {
+        &self.tenant_scope
+    }
+
+    pub fn grant_fingerprint(&self) -> &str {
+        &self.grant_fingerprint
+    }
+
+    pub fn state(&self) -> WorkflowOperationState {
+        self.state
+    }
+
+    pub fn matches_input(&self, input: &[u8]) -> bool {
+        input.len() <= MAX_WORKFLOW_OPERATION_INPUT_BYTES
+            && self.input_fingerprint == workflow_operation_input_fingerprint(input)
+    }
+
+    fn verify_input(&self, input: &[u8]) -> Result<(), WorkflowOperationLedgerError> {
+        if input.len() > MAX_WORKFLOW_OPERATION_INPUT_BYTES {
+            return Err(WorkflowOperationLedgerError::InputTooLarge {
+                actual: input.len(),
+                maximum: MAX_WORKFLOW_OPERATION_INPUT_BYTES,
+            });
+        }
+        if !self.matches_input(input) {
+            return Err(
+                WorkflowOperationLedgerError::CompensationInputFingerprintMismatch(
+                    self.compensation_key.clone(),
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn matches_policy(&self, policy: &WorkflowCompensationPolicy) -> bool {
+        self.tenant_scope == policy.tenant_scope
+            && self.grant_fingerprint == policy.grant_fingerprint
+    }
+
+    fn validate_syntax(&self) -> Result<(), WorkflowOperationLedgerError> {
+        if !is_valid_compensation_key(&self.compensation_key) {
+            return Err(WorkflowOperationLedgerError::InvalidCompensationKey(
+                self.compensation_key.clone(),
+            ));
+        }
+        if !is_plan_fingerprint(&self.input_fingerprint) {
+            return Err(WorkflowOperationLedgerError::InvalidInputFingerprint);
+        }
+        if !is_valid_operation_token(&self.tenant_scope) {
+            return Err(
+                WorkflowOperationLedgerError::InvalidCompensationTenantScope(
+                    self.tenant_scope.clone(),
+                ),
+            );
+        }
+        if !is_plan_fingerprint(&self.grant_fingerprint) {
+            return Err(WorkflowOperationLedgerError::InvalidCompensationGrantFingerprint);
+        }
+        Ok(())
+    }
+}
+
 /// A bounded, data-only record of one host-dispatched external operation.
 ///
 /// It intentionally stores an input fingerprint rather than raw input, and
@@ -318,6 +584,8 @@ pub struct WorkflowOperation {
     operation_key: String,
     input_fingerprint: String,
     state: WorkflowOperationState,
+    #[serde(default)]
+    compensation: Option<WorkflowCompensation>,
 }
 
 impl WorkflowOperation {
@@ -339,6 +607,10 @@ impl WorkflowOperation {
 
     pub fn state(&self) -> WorkflowOperationState {
         self.state
+    }
+
+    pub fn compensation(&self) -> Option<&WorkflowCompensation> {
+        self.compensation.as_ref()
     }
 
     /// Returns whether this record was created for exactly these input bytes.
@@ -379,6 +651,17 @@ impl WorkflowOperation {
         if !is_plan_fingerprint(&self.input_fingerprint) {
             return Err(WorkflowOperationLedgerError::InvalidInputFingerprint);
         }
+        if let Some(compensation) = &self.compensation {
+            if self.state != WorkflowOperationState::Succeeded {
+                return Err(
+                    WorkflowOperationLedgerError::CompensationRequiresSucceededOperation {
+                        operation_key: self.operation_key.clone(),
+                        state: self.state,
+                    },
+                );
+            }
+            compensation.validate_syntax()?;
+        }
         Ok(())
     }
 }
@@ -410,6 +693,13 @@ pub struct AuthenticatedWorkflowReconciliationRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthenticatedWorkflowOperationDispatch {
     pub request: OperationDispatchRequest,
+    pub frame: AuthenticatedWorkerMessage,
+}
+
+/// A keyed worker frame for a host-approved compensation request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthenticatedWorkflowOperationCompensation {
+    pub request: OperationCompensationRequest,
     pub frame: AuthenticatedWorkerMessage,
 }
 
@@ -515,6 +805,7 @@ impl WorkflowOperationLedger {
             operation_key: operation_key.into(),
             input_fingerprint: workflow_operation_input_fingerprint(input),
             state: WorkflowOperationState::Pending,
+            compensation: None,
         };
         operation.validate_syntax()?;
         if self
@@ -529,6 +820,143 @@ impl WorkflowOperationLedger {
         self.operations.push(operation);
         self.revision = next_revision;
         Ok(())
+    }
+
+    /// Records one host-approved compensation intent for a succeeded operation.
+    ///
+    /// The compensation key is deliberately separate from the original
+    /// operation key and can be recorded only once per original operation.
+    /// Persist this mutation through authenticated compare-and-swap storage
+    /// before a host issues a compensation approval or sends a worker frame.
+    pub fn record_compensation(
+        &mut self,
+        operation_key: &str,
+        policy: &WorkflowCompensationPolicy,
+        compensation_key: impl Into<String>,
+        input: &[u8],
+    ) -> Result<(), WorkflowOperationLedgerError> {
+        self.validate_syntax()?;
+        policy.validate_syntax()?;
+        if input.len() > MAX_WORKFLOW_OPERATION_INPUT_BYTES {
+            return Err(WorkflowOperationLedgerError::InputTooLarge {
+                actual: input.len(),
+                maximum: MAX_WORKFLOW_OPERATION_INPUT_BYTES,
+            });
+        }
+        let operation_index = self
+            .operations
+            .iter()
+            .position(|operation| operation.operation_key == operation_key)
+            .ok_or_else(|| {
+                WorkflowOperationLedgerError::UnknownOperation(operation_key.to_owned())
+            })?;
+        let operation = &self.operations[operation_index];
+        if operation.state != WorkflowOperationState::Succeeded {
+            return Err(
+                WorkflowOperationLedgerError::CompensationRequiresSucceededOperation {
+                    operation_key: operation.operation_key.clone(),
+                    state: operation.state,
+                },
+            );
+        }
+        if operation.tool != policy.tool {
+            return Err(WorkflowOperationLedgerError::CompensationPolicyMismatch(
+                operation.operation_key.clone(),
+            ));
+        }
+        if operation.compensation.is_some() {
+            return Err(WorkflowOperationLedgerError::CompensationAlreadyRecorded(
+                operation.operation_key.clone(),
+            ));
+        }
+        let compensation_key = compensation_key.into();
+        if !is_valid_compensation_key(&compensation_key) {
+            return Err(WorkflowOperationLedgerError::InvalidCompensationKey(
+                compensation_key,
+            ));
+        }
+        let next_revision = self.next_revision()?;
+        self.operations[operation_index].compensation = Some(WorkflowCompensation {
+            compensation_key,
+            input_fingerprint: workflow_operation_input_fingerprint(input),
+            tenant_scope: policy.tenant_scope.clone(),
+            grant_fingerprint: policy.grant_fingerprint.clone(),
+            state: WorkflowOperationState::Pending,
+        });
+        self.revision = next_revision;
+        Ok(())
+    }
+
+    /// Applies a worker compensation observation after transport authentication.
+    ///
+    /// The ledger retains only the compensation state, never terminal output or
+    /// error text. A terminal observation does not authorize workflow resume.
+    pub fn apply_verified_compensation(
+        &mut self,
+        request: &OperationCompensationRequest,
+        result: &OperationCompensationResult,
+    ) -> Result<WorkflowOperationState, WorkflowOperationLedgerError> {
+        self.validate_syntax()?;
+        request
+            .validate()
+            .map_err(WorkflowOperationLedgerError::Protocol)?;
+        result
+            .validate()
+            .map_err(WorkflowOperationLedgerError::Protocol)?;
+        if !result.matches_request(request) {
+            return Err(WorkflowOperationLedgerError::CompensationRequestMismatch);
+        }
+        let operation_index = self
+            .operations
+            .iter()
+            .position(|operation| operation.operation_key == request.operation_key)
+            .ok_or_else(|| {
+                WorkflowOperationLedgerError::UnknownOperation(request.operation_key.clone())
+            })?;
+        let operation = &self.operations[operation_index];
+        if operation.tool != request.tool {
+            return Err(WorkflowOperationLedgerError::CompensationRequestMismatch);
+        }
+        let compensation = operation.compensation.as_ref().ok_or_else(|| {
+            WorkflowOperationLedgerError::UnknownCompensation(request.operation_key.clone())
+        })?;
+        let input = request
+            .canonical_input_bytes()
+            .map_err(WorkflowOperationLedgerError::Protocol)?;
+        compensation.verify_input(&input)?;
+        if compensation.compensation_key != request.compensation_key
+            || compensation.tenant_scope != request.tenant_scope
+            || compensation.grant_fingerprint != request.grant_fingerprint
+        {
+            return Err(WorkflowOperationLedgerError::CompensationRequestMismatch);
+        }
+        let observed = match &result.status {
+            OperationStatus::Running => WorkflowOperationState::Running,
+            OperationStatus::Succeeded { .. } => WorkflowOperationState::Succeeded,
+            OperationStatus::Failed { .. } => WorkflowOperationState::Failed,
+            OperationStatus::Cancelled => WorkflowOperationState::Cancelled,
+        };
+        if !compensation.state.accepts(observed) {
+            return Err(
+                WorkflowOperationLedgerError::InvalidCompensationStateTransition {
+                    compensation_key: compensation.compensation_key.clone(),
+                    current: compensation.state,
+                    observed,
+                },
+            );
+        }
+        if compensation.state != observed {
+            let next_revision = self.next_revision()?;
+            let persisted_compensation = self.operations[operation_index]
+                .compensation
+                .as_mut()
+                .ok_or_else(|| {
+                    WorkflowOperationLedgerError::UnknownCompensation(request.operation_key.clone())
+                })?;
+            persisted_compensation.state = observed;
+            self.revision = next_revision;
+        }
+        Ok(observed)
     }
 
     /// Builds a protocol reconciliation request for a recorded operation.
@@ -672,6 +1100,13 @@ impl WorkflowOperationLedger {
             bytes = bytes.checked_add(operation.tool.len())?;
             bytes = bytes.checked_add(operation.operation_key.len())?;
             bytes = bytes.checked_add(operation.input_fingerprint.len())?;
+            if let Some(compensation) = &operation.compensation {
+                bytes = bytes.checked_add(320)?;
+                bytes = bytes.checked_add(compensation.compensation_key.len())?;
+                bytes = bytes.checked_add(compensation.input_fingerprint.len())?;
+                bytes = bytes.checked_add(compensation.tenant_scope.len())?;
+                bytes = bytes.checked_add(compensation.grant_fingerprint.len())?;
+            }
         }
         Some(bytes)
     }
@@ -710,6 +1145,30 @@ pub enum WorkflowOperationLedgerError {
     InvalidOperationKey(String),
     InvalidInputFingerprint,
     InputFingerprintMismatch(String),
+    InvalidCompensationKey(String),
+    InvalidCompensationTenantScope(String),
+    InvalidCompensationGrantFingerprint,
+    CompensationGrantDenied {
+        tool: String,
+        tenant_scope: String,
+    },
+    CompensationNotGranted(String),
+    CompensationInputFingerprintMismatch(String),
+    CompensationAlreadyRecorded(String),
+    CompensationRequiresSucceededOperation {
+        operation_key: String,
+        state: WorkflowOperationState,
+    },
+    CompensationPolicyMismatch(String),
+    UnknownCompensation(String),
+    CompensationRequestMismatch,
+    CompensationDispatchRequiresHostAuthenticator,
+    UnexpectedCompensationMessage,
+    InvalidCompensationStateTransition {
+        compensation_key: String,
+        current: WorkflowOperationState,
+        observed: WorkflowOperationState,
+    },
     DuplicateOperationKey(String),
     PlanMismatch,
     UnknownStep(String),
@@ -774,6 +1233,58 @@ impl Display for WorkflowOperationLedgerError {
             Self::InputFingerprintMismatch(key) => {
                 write!(formatter, "workflow operation input does not match record: {key}")
             }
+            Self::InvalidCompensationKey(key) => {
+                write!(formatter, "invalid workflow compensation key: {key}")
+            }
+            Self::InvalidCompensationTenantScope(scope) => {
+                write!(formatter, "invalid workflow compensation tenant scope: {scope}")
+            }
+            Self::InvalidCompensationGrantFingerprint => {
+                formatter.write_str("workflow compensation has an invalid grant fingerprint")
+            }
+            Self::CompensationGrantDenied { tool, tenant_scope } => write!(
+                formatter,
+                "current host policy denied compensation grant {tool} for tenant {tenant_scope}"
+            ),
+            Self::CompensationNotGranted(tool) => {
+                write!(formatter, "workflow tool has no compensation grant: {tool}")
+            }
+            Self::CompensationInputFingerprintMismatch(key) => {
+                write!(formatter, "workflow compensation input does not match record: {key}")
+            }
+            Self::CompensationAlreadyRecorded(key) => {
+                write!(formatter, "workflow compensation is already recorded: {key}")
+            }
+            Self::CompensationRequiresSucceededOperation {
+                operation_key,
+                state,
+            } => write!(
+                formatter,
+                "workflow compensation requires succeeded operation {operation_key}; observed {state:?}"
+            ),
+            Self::CompensationPolicyMismatch(key) => {
+                write!(formatter, "workflow compensation policy does not match record: {key}")
+            }
+            Self::UnknownCompensation(key) => {
+                write!(formatter, "unknown workflow compensation: {key}")
+            }
+            Self::CompensationRequestMismatch => {
+                formatter.write_str("worker compensation does not match the durable record")
+            }
+            Self::CompensationDispatchRequiresHostAuthenticator => {
+                formatter.write_str("durable compensation dispatch requires a host session authenticator")
+            }
+            Self::UnexpectedCompensationMessage => {
+                formatter.write_str("authenticated worker frame is not a compensation result")
+            }
+            Self::InvalidCompensationStateTransition {
+                compensation_key,
+                current,
+                observed,
+            } => write!(
+                formatter,
+                "worker observation cannot change compensation {compensation_key} from {current:?} to {observed:?}"
+            ),
             Self::DuplicateOperationKey(key) => {
                 write!(formatter, "duplicate workflow operation key: {key}")
             }
@@ -823,6 +1334,18 @@ pub struct Approval {
 enum ApprovalKind {
     Plan,
     Checkpoint(WorkflowCheckpoint),
+    Compensation(CompensationApproval),
+}
+
+#[derive(Debug)]
+struct CompensationApproval {
+    ledger_revision: u64,
+    operation_key: String,
+    compensation_key: String,
+    input_fingerprint: String,
+    tenant_scope: String,
+    grant_fingerprint: String,
+    session_id: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -850,6 +1373,22 @@ pub enum WorkflowEvent {
         plan_id: u64,
         step_id: String,
         tool: String,
+        state: WorkflowOperationState,
+    },
+    CompensationRecorded {
+        plan_id: u64,
+        operation_key: String,
+        compensation_key: String,
+    },
+    CompensationApproved {
+        plan_id: u64,
+        operation_key: String,
+        compensation_key: String,
+    },
+    CompensationObserved {
+        plan_id: u64,
+        operation_key: String,
+        compensation_key: String,
         state: WorkflowOperationState,
     },
     ResumeApproved {
@@ -1184,6 +1723,134 @@ impl WorkflowEngine {
         Ok(operation_key)
     }
 
+    /// Derives a tenant-scoped durable compensation key for one succeeded
+    /// operation. Compensation keys are deliberately in the `cmp-` namespace
+    /// so they cannot collide with normal `op-` operation identities.
+    pub fn derive_compensation_key(
+        &self,
+        plan: &WorkflowPlan,
+        ledger: &WorkflowOperationLedger,
+        operation_key: &str,
+        policy: &WorkflowCompensationPolicy,
+        input: &[u8],
+        compensation_nonce: &[u8],
+    ) -> Result<String, WorkflowError> {
+        self.validate_operation_ledger(plan, ledger)?;
+        policy
+            .validate_syntax()
+            .map_err(WorkflowError::OperationLedger)?;
+        let operation = ledger.operation(operation_key).ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownOperation(
+                operation_key.to_owned(),
+            ))
+        })?;
+        if operation.state != WorkflowOperationState::Succeeded {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationRequiresSucceededOperation {
+                    operation_key: operation.operation_key.clone(),
+                    state: operation.state,
+                },
+            ));
+        }
+        if operation.tool != policy.tool {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationPolicyMismatch(
+                    operation.operation_key.clone(),
+                ),
+            ));
+        }
+        if input.len() > MAX_WORKFLOW_OPERATION_INPUT_BYTES {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::InputTooLarge {
+                    actual: input.len(),
+                    maximum: MAX_WORKFLOW_OPERATION_INPUT_BYTES,
+                },
+            ));
+        }
+        if compensation_nonce.is_empty() {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::EmptyOperationNonce,
+            ));
+        }
+        if compensation_nonce.len() > MAX_WORKFLOW_OPERATION_NONCE_BYTES {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::OperationNonceTooLarge {
+                    actual: compensation_nonce.len(),
+                    maximum: MAX_WORKFLOW_OPERATION_NONCE_BYTES,
+                },
+            ));
+        }
+        Ok(derived_workflow_compensation_key(
+            plan.fingerprint(),
+            &operation.operation_key,
+            &operation.tool,
+            &policy.tenant_scope,
+            &policy.grant_fingerprint,
+            input,
+            compensation_nonce,
+        ))
+    }
+
+    /// Records the one durable compensation intent permitted for a succeeded
+    /// operation. Persist the ledger through compare-and-swap storage before
+    /// creating an approval or sending the resulting worker frame.
+    pub fn record_compensation(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &mut WorkflowOperationLedger,
+        operation_key: &str,
+        policy: &WorkflowCompensationPolicy,
+        compensation_key: impl Into<String>,
+        input: &[u8],
+    ) -> Result<(), WorkflowError> {
+        if !self.owns_plan(plan) {
+            return Err(WorkflowError::PlanOwnershipMismatch);
+        }
+        ledger
+            .validate_for(plan)
+            .map_err(WorkflowError::OperationLedger)?;
+        let compensation_key = compensation_key.into();
+        ledger
+            .record_compensation(operation_key, policy, compensation_key.clone(), input)
+            .map_err(WorkflowError::OperationLedger)?;
+        self.events.push(WorkflowEvent::CompensationRecorded {
+            plan_id: plan.id,
+            operation_key: operation_key.to_owned(),
+            compensation_key,
+        });
+        Ok(())
+    }
+
+    /// Derives and records a durable compensation intent for a succeeded
+    /// operation.
+    pub fn record_derived_compensation(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &mut WorkflowOperationLedger,
+        operation_key: &str,
+        policy: &WorkflowCompensationPolicy,
+        input: &[u8],
+        compensation_nonce: &[u8],
+    ) -> Result<String, WorkflowError> {
+        let compensation_key = self.derive_compensation_key(
+            plan,
+            ledger,
+            operation_key,
+            policy,
+            input,
+            compensation_nonce,
+        )?;
+        self.record_compensation(
+            plan,
+            ledger,
+            operation_key,
+            policy,
+            compensation_key.clone(),
+            input,
+        )?;
+        Ok(compensation_key)
+    }
+
     /// Builds a worker operation-dispatch request for a persisted durable
     /// intent.
     ///
@@ -1224,7 +1891,7 @@ impl WorkflowEngine {
         Ok(request)
     }
 
-    /// Creates an authenticated v3 worker dispatch frame for a persisted
+    /// Creates an authenticated v4 worker dispatch frame for a persisted
     /// durable operation.
     ///
     /// This is the preferred bridge for a contained worker's
@@ -1261,6 +1928,229 @@ impl WorkflowEngine {
                 WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
             })?;
         Ok(AuthenticatedWorkflowOperationDispatch { request, frame })
+    }
+
+    /// Issues a one-use, session-bound host approval for an already persisted
+    /// compensation intent.
+    ///
+    /// A fresh approval may be issued after a crash, but only for the same
+    /// ledger record, tenant scope, grant fingerprint, and compensation key.
+    /// The worker journal then returns the existing pending or terminal state
+    /// instead of executing a second inverse effect.
+    pub fn approve_compensation(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &WorkflowOperationLedger,
+        target: WorkflowCompensationTarget<'_>,
+        input: &[u8],
+        authenticator: &SessionAuthenticator,
+    ) -> Result<Approval, WorkflowError> {
+        let operation_key = target.operation_key();
+        let policy = target.policy();
+        if authenticator.role() != SessionRole::Host {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationDispatchRequiresHostAuthenticator,
+            ));
+        }
+        self.validate_operation_ledger(plan, ledger)?;
+        target
+            .verify_current()
+            .map_err(WorkflowError::OperationLedger)?;
+        let operation = ledger.operation(operation_key).ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownOperation(
+                operation_key.to_owned(),
+            ))
+        })?;
+        if operation.state != WorkflowOperationState::Succeeded {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationRequiresSucceededOperation {
+                    operation_key: operation.operation_key.clone(),
+                    state: operation.state,
+                },
+            ));
+        }
+        if operation.tool != policy.tool {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationPolicyMismatch(
+                    operation.operation_key.clone(),
+                ),
+            ));
+        }
+        let compensation = operation.compensation.as_ref().ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownCompensation(
+                operation.operation_key.clone(),
+            ))
+        })?;
+        if !compensation.matches_policy(policy) {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationPolicyMismatch(
+                    operation.operation_key.clone(),
+                ),
+            ));
+        }
+        compensation
+            .verify_input(input)
+            .map_err(WorkflowError::OperationLedger)?;
+
+        let approval = self.issue_approval(
+            plan,
+            ApprovalKind::Compensation(CompensationApproval {
+                ledger_revision: ledger.revision,
+                operation_key: operation.operation_key.clone(),
+                compensation_key: compensation.compensation_key.clone(),
+                input_fingerprint: compensation.input_fingerprint.clone(),
+                tenant_scope: compensation.tenant_scope.clone(),
+                grant_fingerprint: compensation.grant_fingerprint.clone(),
+                session_id: authenticator.session_id().to_owned(),
+            }),
+        );
+        self.events.push(WorkflowEvent::CompensationApproved {
+            plan_id: plan.id,
+            operation_key: operation.operation_key.clone(),
+            compensation_key: compensation.compensation_key.clone(),
+        });
+        Ok(approval)
+    }
+
+    /// Creates an authenticated v4 compensation frame from a persisted intent
+    /// and one-use host approval.
+    pub fn prepare_authenticated_operation_compensation(
+        &self,
+        plan: &WorkflowPlan,
+        ledger: &WorkflowOperationLedger,
+        target: WorkflowCompensationTarget<'_>,
+        dispatch: WorkflowCompensationDispatch,
+        approval: Approval,
+        authenticator: &mut SessionAuthenticator,
+    ) -> Result<AuthenticatedWorkflowOperationCompensation, WorkflowError> {
+        let operation_key = target.operation_key();
+        let policy = target.policy();
+        if authenticator.role() != SessionRole::Host {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationDispatchRequiresHostAuthenticator,
+            ));
+        }
+        self.validate_operation_ledger(plan, ledger)?;
+        target
+            .verify_current()
+            .map_err(WorkflowError::OperationLedger)?;
+        if !self.approval_matches(plan, &approval) {
+            return Err(WorkflowError::ApprovalMismatch);
+        }
+        let ApprovalKind::Compensation(bound) = &approval.kind else {
+            return Err(WorkflowError::ApprovalMismatch);
+        };
+        if bound.ledger_revision != ledger.revision
+            || bound.operation_key != operation_key
+            || bound.tenant_scope != policy.tenant_scope
+            || bound.grant_fingerprint != policy.grant_fingerprint
+            || bound.session_id != authenticator.session_id()
+        {
+            return Err(WorkflowError::ApprovalMismatch);
+        }
+        let operation = ledger.operation(operation_key).ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownOperation(
+                operation_key.to_owned(),
+            ))
+        })?;
+        if operation.state != WorkflowOperationState::Succeeded || operation.tool != policy.tool {
+            return Err(WorkflowError::ApprovalMismatch);
+        }
+        let compensation = operation.compensation.as_ref().ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownCompensation(
+                operation.operation_key.clone(),
+            ))
+        })?;
+        if compensation.compensation_key != bound.compensation_key
+            || compensation.input_fingerprint != bound.input_fingerprint
+            || !compensation.matches_policy(policy)
+        {
+            return Err(WorkflowError::ApprovalMismatch);
+        }
+        let binding = OperationCompensationBinding::new(
+            operation.tool.clone(),
+            operation.operation_key.clone(),
+            compensation.compensation_key.clone(),
+            compensation.tenant_scope.clone(),
+            compensation.grant_fingerprint.clone(),
+        )
+        .map_err(|error| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+        })?;
+        let request = OperationCompensationRequest::new(
+            authenticator.session_id().to_owned(),
+            dispatch.request_id,
+            binding,
+            dispatch.payload,
+        )
+        .map_err(|error| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+        })?;
+        let input = request.canonical_input_bytes().map_err(|error| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+        })?;
+        compensation
+            .verify_input(&input)
+            .map_err(WorkflowError::OperationLedger)?;
+        let frame = authenticator
+            .seal(WorkerMessage::CompensateOperation {
+                request: request.clone(),
+            })
+            .map_err(|error| {
+                WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+            })?;
+        Ok(AuthenticatedWorkflowOperationCompensation { request, frame })
+    }
+
+    /// Applies a verified worker compensation observation to the host ledger.
+    pub fn apply_verified_operation_compensation(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &mut WorkflowOperationLedger,
+        request: &OperationCompensationRequest,
+        result: &OperationCompensationResult,
+    ) -> Result<WorkflowOperationState, WorkflowError> {
+        if !self.owns_plan(plan) {
+            return Err(WorkflowError::PlanOwnershipMismatch);
+        }
+        ledger
+            .validate_for(plan)
+            .map_err(WorkflowError::OperationLedger)?;
+        let state = ledger
+            .apply_verified_compensation(request, result)
+            .map_err(WorkflowError::OperationLedger)?;
+        self.events.push(WorkflowEvent::CompensationObserved {
+            plan_id: plan.id,
+            operation_key: request.operation_key.clone(),
+            compensation_key: request.compensation_key.clone(),
+            state,
+        });
+        Ok(state)
+    }
+
+    /// Opens an authenticated worker compensation frame and records its state.
+    pub fn apply_authenticated_operation_compensation(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &mut WorkflowOperationLedger,
+        request: &OperationCompensationRequest,
+        authenticator: &mut SessionAuthenticator,
+        frame: AuthenticatedWorkerMessage,
+    ) -> Result<WorkflowOperationState, WorkflowError> {
+        if authenticator.role() != SessionRole::Host {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationDispatchRequiresHostAuthenticator,
+            ));
+        }
+        let message = authenticator.open(frame).map_err(|error| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::Protocol(error))
+        })?;
+        let WorkerMessage::CompensationResult { result } = message else {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::UnexpectedCompensationMessage,
+            ));
+        };
+        self.apply_verified_operation_compensation(plan, ledger, request, &result)
     }
 
     /// Builds a reconciliation request for a durable operation in this plan.
@@ -1569,12 +2459,37 @@ fn derived_workflow_operation_key(
     format!("op-{}", hasher.finalize().to_hex())
 }
 
+fn derived_workflow_compensation_key(
+    plan_fingerprint: &str,
+    operation_key: &str,
+    tool: &str,
+    tenant_scope: &str,
+    grant_fingerprint: &str,
+    input: &[u8],
+    compensation_nonce: &[u8],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"splash-workflow-compensation-key-v1");
+    update_plan_fingerprint_component(&mut hasher, plan_fingerprint.as_bytes());
+    update_plan_fingerprint_component(&mut hasher, operation_key.as_bytes());
+    update_plan_fingerprint_component(&mut hasher, tool.as_bytes());
+    update_plan_fingerprint_component(&mut hasher, tenant_scope.as_bytes());
+    update_plan_fingerprint_component(&mut hasher, grant_fingerprint.as_bytes());
+    update_plan_fingerprint_component(&mut hasher, input);
+    update_plan_fingerprint_component(&mut hasher, compensation_nonce);
+    format!("cmp-{}", hasher.finalize().to_hex())
+}
+
 fn is_valid_operation_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
+}
+
+fn is_valid_compensation_key(value: &str) -> bool {
+    value.starts_with("cmp-") && is_valid_operation_token(value)
 }
 
 fn is_valid_step_id(id: &str) -> bool {
@@ -1618,6 +2533,33 @@ mod tests {
             SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap(),
             SessionAuthenticator::new("worker-1", key, SessionRole::Worker).unwrap(),
         )
+    }
+
+    struct AllowCompensationGrantVerifier;
+
+    impl CompensationGrantVerifier for AllowCompensationGrantVerifier {
+        fn verify_compensation_grant(
+            &self,
+            _tenant_scope: &str,
+            _grant: &CapabilityGrant,
+        ) -> Result<(), WorkflowOperationLedgerError> {
+            Ok(())
+        }
+    }
+
+    struct DenyCompensationGrantVerifier;
+
+    impl CompensationGrantVerifier for DenyCompensationGrantVerifier {
+        fn verify_compensation_grant(
+            &self,
+            tenant_scope: &str,
+            grant: &CapabilityGrant,
+        ) -> Result<(), WorkflowOperationLedgerError> {
+            Err(WorkflowOperationLedgerError::CompensationGrantDenied {
+                tool: grant.tool.clone(),
+                tenant_scope: tenant_scope.to_owned(),
+            })
+        }
     }
 
     #[test]
@@ -1965,6 +2907,268 @@ mod tests {
             WorkflowError::OperationLedger(WorkflowOperationLedgerError::InputFingerprintMismatch(
                 operation_key,
             ))
+        );
+    }
+
+    #[test]
+    fn compensation_is_host_approved_bound_and_applied_once() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![WorkflowStep::new("publish", "let release = true")])
+            .unwrap();
+        let mut ledger = engine.operation_ledger(&plan).unwrap();
+        let operation_payload = ToolPayload::Json(serde_json::json!({"version": "1.2.3"}));
+        let operation_input = canonical_operation_input_bytes(&operation_payload).unwrap();
+        let operation_key = engine
+            .record_derived_operation(
+                &plan,
+                &mut ledger,
+                "publish",
+                "release.publish",
+                &operation_input,
+                b"release-42:publish:1",
+            )
+            .unwrap();
+        let original_request = OperationReconcileRequest::new(
+            "worker-1",
+            "original-status-1",
+            "release.publish",
+            operation_key.clone(),
+        )
+        .unwrap();
+        let original_result = OperationReconcileResult::new(
+            "worker-1",
+            "original-status-1",
+            "release.publish",
+            operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(serde_json::json!({"published": true})),
+            },
+        )
+        .unwrap();
+        engine
+            .apply_verified_operation_reconciliation(
+                &plan,
+                &mut ledger,
+                &original_request,
+                &original_result,
+            )
+            .unwrap();
+
+        let grant = CapabilityGrant::json("release.publish").with_compensation_limit(1);
+        let policy = WorkflowCompensationPolicy::new("tenant-release", &grant).unwrap();
+        let verifier = AllowCompensationGrantVerifier;
+        let target = WorkflowCompensationTarget::new(&operation_key, &policy, &grant, &verifier);
+        let compensation_payload = ToolPayload::Json(serde_json::json!({"undo": "release"}));
+        let compensation_input = canonical_operation_input_bytes(&compensation_payload).unwrap();
+        let (mut host, mut worker) = operation_reconciliation_authenticators();
+
+        let compensation_key = engine
+            .record_derived_compensation(
+                &plan,
+                &mut ledger,
+                &operation_key,
+                &policy,
+                &compensation_input,
+                b"release-42:publish:undo:1",
+            )
+            .unwrap();
+        let drift_approval = engine
+            .approve_compensation(&plan, &ledger, target, &compensation_input, &host)
+            .unwrap();
+        assert_eq!(
+            engine
+                .prepare_authenticated_operation_compensation(
+                    &plan,
+                    &ledger,
+                    target,
+                    WorkflowCompensationDispatch::new(
+                        "compensation-request-drift",
+                        ToolPayload::Json(serde_json::json!({"undo": "different"})),
+                    ),
+                    drift_approval,
+                    &mut host,
+                )
+                .unwrap_err(),
+            WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationInputFingerprintMismatch(
+                    compensation_key.clone(),
+                ),
+            )
+        );
+        let approval = engine
+            .approve_compensation(&plan, &ledger, target, &compensation_input, &host)
+            .unwrap();
+        let outbound = engine
+            .prepare_authenticated_operation_compensation(
+                &plan,
+                &ledger,
+                target,
+                WorkflowCompensationDispatch::new(
+                    "compensation-request-1",
+                    compensation_payload.clone(),
+                ),
+                approval,
+                &mut host,
+            )
+            .unwrap();
+        let WorkerMessage::CompensateOperation { request } = worker.open(outbound.frame).unwrap()
+        else {
+            panic!("host must send a compensation request");
+        };
+        assert_eq!(request.compensation_key, compensation_key);
+        let binding = OperationCompensationBinding::new(
+            request.tool.clone(),
+            request.operation_key.clone(),
+            request.compensation_key.clone(),
+            request.tenant_scope.clone(),
+            request.grant_fingerprint.clone(),
+        )
+        .unwrap();
+        let result = OperationCompensationResult::new(
+            request.session_id.clone(),
+            request.request_id.clone(),
+            binding,
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(serde_json::json!({"undone": true})),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::CompensationResult { result })
+            .unwrap();
+        assert_eq!(
+            engine
+                .apply_authenticated_operation_compensation(
+                    &plan,
+                    &mut ledger,
+                    &outbound.request,
+                    &mut host,
+                    response,
+                )
+                .unwrap(),
+            WorkflowOperationState::Succeeded
+        );
+        assert_eq!(
+            ledger
+                .operation(&operation_key)
+                .unwrap()
+                .compensation()
+                .unwrap()
+                .state(),
+            WorkflowOperationState::Succeeded
+        );
+        assert!(matches!(
+            engine.events().last(),
+            Some(WorkflowEvent::CompensationObserved {
+                plan_id,
+                operation_key: observed_operation_key,
+                compensation_key: observed_compensation_key,
+                state: WorkflowOperationState::Succeeded,
+            }) if *plan_id == plan.id()
+                && observed_operation_key == &operation_key
+                && observed_compensation_key == &compensation_key
+        ));
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_str(&ledger.to_json().unwrap()).unwrap();
+        persisted["operations"][0]["state"] = serde_json::json!("running");
+        let malformed = serde_json::to_string(&persisted).unwrap();
+        assert_eq!(
+            WorkflowOperationLedger::from_json(&malformed).unwrap_err(),
+            WorkflowOperationLedgerError::CompensationRequiresSucceededOperation {
+                operation_key,
+                state: WorkflowOperationState::Running,
+            }
+        );
+    }
+
+    #[test]
+    fn compensation_cannot_be_recorded_before_original_success() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![WorkflowStep::new("publish", "let release = true")])
+            .unwrap();
+        let mut ledger = engine.operation_ledger(&plan).unwrap();
+        let payload = ToolPayload::Json(serde_json::json!({"version": "1.2.3"}));
+        let input = canonical_operation_input_bytes(&payload).unwrap();
+        let operation_key = engine
+            .record_derived_operation(
+                &plan,
+                &mut ledger,
+                "publish",
+                "release.publish",
+                &input,
+                b"release-42:publish:1",
+            )
+            .unwrap();
+        let grant = CapabilityGrant::json("release.publish").with_compensation_limit(1);
+        let policy = WorkflowCompensationPolicy::new("tenant-release", &grant).unwrap();
+        let compensation_input = canonical_operation_input_bytes(&ToolPayload::Json(
+            serde_json::json!({"undo": "release"}),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .record_derived_compensation(
+                    &plan,
+                    &mut ledger,
+                    &operation_key,
+                    &policy,
+                    &compensation_input,
+                    b"release-42:publish:undo:1",
+                )
+                .unwrap_err(),
+            WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::CompensationRequiresSucceededOperation {
+                    operation_key,
+                    state: WorkflowOperationState::Pending,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn compensation_rechecks_current_grant_policy_before_approval_and_dispatch() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![WorkflowStep::new("publish", "let release = true")])
+            .unwrap();
+        let ledger = engine.operation_ledger(&plan).unwrap();
+        let grant = CapabilityGrant::json("release.publish").with_compensation_limit(1);
+        let policy = WorkflowCompensationPolicy::new("tenant-release", &grant).unwrap();
+        let verifier = DenyCompensationGrantVerifier;
+        let target = WorkflowCompensationTarget::new("op-release-42", &policy, &grant, &verifier);
+        let (mut host, _) = operation_reconciliation_authenticators();
+        let expected =
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::CompensationGrantDenied {
+                tool: "release.publish".to_owned(),
+                tenant_scope: "tenant-release".to_owned(),
+            });
+
+        assert_eq!(
+            engine
+                .approve_compensation(&plan, &ledger, target, b"undo", &host)
+                .unwrap_err(),
+            expected
+        );
+        let approval = engine.approve(&plan).unwrap();
+        assert_eq!(
+            engine
+                .prepare_authenticated_operation_compensation(
+                    &plan,
+                    &ledger,
+                    target,
+                    WorkflowCompensationDispatch::new(
+                        "compensation-request-1",
+                        ToolPayload::Json(serde_json::json!({"undo": "release"})),
+                    ),
+                    approval,
+                    &mut host,
+                )
+                .unwrap_err(),
+            expected
         );
     }
 

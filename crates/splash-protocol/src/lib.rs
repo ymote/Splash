@@ -13,7 +13,7 @@ use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
 pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
 pub const MAX_OPERATION_ERROR_BYTES: usize = 4 * 1024;
@@ -22,7 +22,7 @@ pub const MAX_WORKER_OPERATION_JOURNAL_BYTES: usize = 512 * 1024;
 /// Maximum durable operation intents retained by one worker journal.
 pub const MAX_WORKER_OPERATION_RECORDS: usize = 64;
 /// Current serialized worker operation journal format version.
-pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 1;
+pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 2;
 const MAX_RESOURCES_PER_GRANT: usize = 64;
 
 /// The format an adapter accepts and returns across the worker boundary.
@@ -74,6 +74,10 @@ pub struct CapabilityGrant {
     pub max_calls: u32,
     pub max_input_bytes: u32,
     pub max_output_bytes: u32,
+    /// Number of host-approved compensating effects permitted in this session.
+    /// Zero, the default, denies compensation for this capability.
+    #[serde(default)]
+    pub max_compensations: u32,
     #[serde(default)]
     pub resources: BTreeSet<ResourceSelector>,
 }
@@ -86,6 +90,7 @@ impl CapabilityGrant {
             max_calls: 1,
             max_input_bytes: 16 * 1024,
             max_output_bytes: 64 * 1024,
+            max_compensations: 0,
             resources: BTreeSet::new(),
         }
     }
@@ -95,6 +100,27 @@ impl CapabilityGrant {
             format: EnvelopeFormat::Json,
             ..Self::text(tool)
         }
+    }
+
+    /// Enables a bounded number of separately authorized compensation effects.
+    pub fn with_compensation_limit(mut self, max_compensations: u32) -> Self {
+        self.max_compensations = max_compensations;
+        self
+    }
+
+    /// Stable BLAKE3 binding of the current compensation-relevant grant.
+    ///
+    /// This excludes a session ID, so a durable compensation intent can be
+    /// recovered under a fresh session only when the active grant is unchanged.
+    pub fn compensation_fingerprint(&self) -> Result<String, ProtocolError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| ProtocolError::Serialization(error.to_string()))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"splash-compensation-grant-v1");
+        hasher.update(&(encoded.len() as u64).to_be_bytes());
+        hasher.update(&encoded);
+        Ok(hasher.finalize().to_hex().to_string())
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -128,6 +154,9 @@ impl CapabilityGrant {
         let max_output_bytes = attenuation
             .max_output_bytes
             .unwrap_or(self.max_output_bytes);
+        let max_compensations = attenuation
+            .max_compensations
+            .unwrap_or(self.max_compensations);
         if max_calls == 0 || max_input_bytes == 0 || max_output_bytes == 0 {
             return Err(ProtocolError::InvalidGrant(
                 "attenuated limits must be greater than zero",
@@ -136,6 +165,7 @@ impl CapabilityGrant {
         if max_calls > self.max_calls
             || max_input_bytes > self.max_input_bytes
             || max_output_bytes > self.max_output_bytes
+            || max_compensations > self.max_compensations
         {
             return Err(ProtocolError::AttenuationWidensLimits);
         }
@@ -154,6 +184,7 @@ impl CapabilityGrant {
             max_calls,
             max_input_bytes,
             max_output_bytes,
+            max_compensations,
             resources,
         };
         grant.validate()?;
@@ -170,6 +201,8 @@ pub struct GrantAttenuation {
     pub max_input_bytes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_compensations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<BTreeSet<ResourceSelector>>,
 }
@@ -427,6 +460,177 @@ impl OperationDispatchRequest {
     }
 }
 
+/// An explicitly host-approved compensating effect for one durable operation.
+///
+/// The compensation uses the same tool as its original operation. A distinct
+/// `compensation_key` keeps its deduplication namespace disjoint from normal
+/// operation keys. `tenant_scope` and `grant_fingerprint` bind recovery to the
+/// intended worker domain and current compensation policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCompensationBinding {
+    pub tool: String,
+    pub operation_key: String,
+    pub compensation_key: String,
+    pub tenant_scope: String,
+    pub grant_fingerprint: String,
+}
+
+impl OperationCompensationBinding {
+    pub fn new(
+        tool: impl Into<String>,
+        operation_key: impl Into<String>,
+        compensation_key: impl Into<String>,
+        tenant_scope: impl Into<String>,
+        grant_fingerprint: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        let binding = Self {
+            tool: tool.into(),
+            operation_key: operation_key.into(),
+            compensation_key: compensation_key.into(),
+            tenant_scope: tenant_scope.into(),
+            grant_fingerprint: grant_fingerprint.into(),
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)?;
+        validate_compensation_key(&self.compensation_key)?;
+        validate_token("tenant scope", &self.tenant_scope)?;
+        if !is_blake3_fingerprint(&self.grant_fingerprint) {
+            return Err(ProtocolError::InvalidCompensationGrantFingerprint);
+        }
+        Ok(())
+    }
+}
+
+/// An explicitly host-approved compensating effect for one durable operation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationCompensationRequest {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub operation_key: String,
+    pub compensation_key: String,
+    pub tenant_scope: String,
+    pub grant_fingerprint: String,
+    pub payload: ToolPayload,
+}
+
+impl OperationCompensationRequest {
+    pub fn new(
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        binding: OperationCompensationBinding,
+        payload: ToolPayload,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            request_id: request_id.into(),
+            tool: binding.tool,
+            operation_key: binding.operation_key,
+            compensation_key: binding.compensation_key,
+            tenant_scope: binding.tenant_scope,
+            grant_fingerprint: binding.grant_fingerprint,
+            payload,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate_header(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)?;
+        validate_compensation_key(&self.compensation_key)?;
+        validate_token("tenant scope", &self.tenant_scope)?;
+        if !is_blake3_fingerprint(&self.grant_fingerprint) {
+            return Err(ProtocolError::InvalidCompensationGrantFingerprint);
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.validate_header()?;
+        self.payload.validate_for(self.payload.format()).map(|_| ())
+    }
+
+    /// Returns the stable canonical bytes bound to this compensation input.
+    pub fn canonical_input_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        canonical_operation_input_bytes(&self.payload)
+    }
+}
+
+/// A worker status for an explicitly approved compensation request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationCompensationResult {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub operation_key: String,
+    pub compensation_key: String,
+    pub tenant_scope: String,
+    pub grant_fingerprint: String,
+    pub status: OperationStatus,
+}
+
+impl OperationCompensationResult {
+    pub fn new(
+        session_id: impl Into<String>,
+        request_id: impl Into<String>,
+        binding: OperationCompensationBinding,
+        status: OperationStatus,
+    ) -> Result<Self, ProtocolError> {
+        let result = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            request_id: request_id.into(),
+            tool: binding.tool,
+            operation_key: binding.operation_key,
+            compensation_key: binding.compensation_key,
+            tenant_scope: binding.tenant_scope,
+            grant_fingerprint: binding.grant_fingerprint,
+            status,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn matches_request(&self, request: &OperationCompensationRequest) -> bool {
+        self.protocol_version == request.protocol_version
+            && self.session_id == request.session_id
+            && self.request_id == request.request_id
+            && self.tool == request.tool
+            && self.operation_key == request.operation_key
+            && self.compensation_key == request.compensation_key
+            && self.tenant_scope == request.tenant_scope
+            && self.grant_fingerprint == request.grant_fingerprint
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        validate_token("operation key", &self.operation_key)?;
+        validate_compensation_key(&self.compensation_key)?;
+        validate_token("tenant scope", &self.tenant_scope)?;
+        if !is_blake3_fingerprint(&self.grant_fingerprint) {
+            return Err(ProtocolError::InvalidCompensationGrantFingerprint);
+        }
+        self.status.validate()
+    }
+}
+
 /// A host request to recover the status of one externally dispatched operation.
 ///
 /// `operation_key` is an idempotency or durable workflow key supplied by the
@@ -664,6 +868,8 @@ pub struct WorkerOperationRecord {
     operation_key: String,
     input_fingerprint: String,
     state: WorkerOperationState,
+    #[serde(default)]
+    compensation: Option<WorkerCompensationRecord>,
 }
 
 impl WorkerOperationRecord {
@@ -683,13 +889,27 @@ impl WorkerOperationRecord {
         &self.state
     }
 
+    pub fn compensation(&self) -> Option<&WorkerCompensationRecord> {
+        self.compensation.as_ref()
+    }
+
     fn validate(&self) -> Result<(), ProtocolError> {
         validate_token("tool", &self.tool)?;
         validate_token("operation key", &self.operation_key)?;
         if !is_blake3_fingerprint(&self.input_fingerprint) {
             return Err(ProtocolError::InvalidOperationFingerprint);
         }
-        self.state.validate()
+        self.state.validate()?;
+        if let Some(compensation) = &self.compensation {
+            if self.state.kind() != WorkerOperationStateKind::Succeeded {
+                return Err(ProtocolError::CompensationRequiresSucceededOperation {
+                    operation_key: self.operation_key.clone(),
+                    state: self.state.kind(),
+                });
+            }
+            compensation.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -700,6 +920,58 @@ impl fmt::Debug for WorkerOperationRecord {
             .field("tool", &self.tool)
             .field("operation_key", &self.operation_key)
             .field("input_fingerprint", &self.input_fingerprint)
+            .field("state", &self.state)
+            .field("has_compensation", &self.compensation.is_some())
+            .finish()
+    }
+}
+
+/// One bounded compensating effect associated with an original worker operation.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCompensationRecord {
+    compensation_key: String,
+    input_fingerprint: String,
+    grant_fingerprint: String,
+    state: WorkerOperationState,
+}
+
+impl WorkerCompensationRecord {
+    pub fn compensation_key(&self) -> &str {
+        &self.compensation_key
+    }
+
+    pub fn input_fingerprint(&self) -> &str {
+        &self.input_fingerprint
+    }
+
+    pub fn grant_fingerprint(&self) -> &str {
+        &self.grant_fingerprint
+    }
+
+    pub fn state(&self) -> &WorkerOperationState {
+        &self.state
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        validate_compensation_key(&self.compensation_key)?;
+        if !is_blake3_fingerprint(&self.input_fingerprint) {
+            return Err(ProtocolError::InvalidOperationFingerprint);
+        }
+        if !is_blake3_fingerprint(&self.grant_fingerprint) {
+            return Err(ProtocolError::InvalidCompensationGrantFingerprint);
+        }
+        self.state.validate()
+    }
+}
+
+impl fmt::Debug for WorkerCompensationRecord {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerCompensationRecord")
+            .field("compensation_key", &self.compensation_key)
+            .field("input_fingerprint", &self.input_fingerprint)
+            .field("grant_fingerprint", &self.grant_fingerprint)
             .field("state", &self.state)
             .finish()
     }
@@ -819,6 +1091,7 @@ impl WorkerOperationJournal {
             operation_key: request.operation_key.clone(),
             input_fingerprint,
             state: WorkerOperationState::Pending,
+            compensation: None,
         });
         candidate.validate_and_bound()?;
         *self = candidate;
@@ -858,6 +1131,98 @@ impl WorkerOperationJournal {
 
         let mut candidate = self.clone();
         candidate.records[record_index].state = observed.clone();
+        candidate.validate_and_bound()?;
+        *self = candidate;
+        Ok(observed)
+    }
+
+    /// Records a host-approved compensating intent before the worker adapter
+    /// executes it. Exactly one compensation key is allowed for one original
+    /// operation in this journal scope.
+    pub fn admit_compensation(
+        &mut self,
+        authorized: &AuthorizedOperationCompensation,
+    ) -> Result<WorkerCompensationAdmission, ProtocolError> {
+        self.validate_and_bound()?;
+        let request = authorized.request();
+        self.validate_scope(&request.tenant_scope)?;
+        let input_fingerprint = worker_operation_input_fingerprint(&request.payload)?;
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.operation_key == request.operation_key)
+            .ok_or_else(|| ProtocolError::UnknownOperation(request.operation_key.clone()))?;
+        let operation = &self.records[record_index];
+        ensure_compensation_target(operation, request)?;
+        if operation.state.kind() != WorkerOperationStateKind::Succeeded {
+            return Err(ProtocolError::CompensationRequiresSucceededOperation {
+                operation_key: request.operation_key.clone(),
+                state: operation.state.kind(),
+            });
+        }
+        if let Some(compensation) = &operation.compensation {
+            ensure_compensation_identity(compensation, request, &input_fingerprint)?;
+            validate_worker_operation_state_for_grant(&compensation.state, authorized.grant())?;
+            return Ok(WorkerCompensationAdmission::Existing {
+                state: compensation.state.clone(),
+            });
+        }
+
+        let mut candidate = self.clone();
+        candidate.records[record_index].compensation = Some(WorkerCompensationRecord {
+            compensation_key: request.compensation_key.clone(),
+            input_fingerprint,
+            grant_fingerprint: request.grant_fingerprint.clone(),
+            state: WorkerOperationState::Pending,
+        });
+        candidate.validate_and_bound()?;
+        *self = candidate;
+        Ok(WorkerCompensationAdmission::Dispatch)
+    }
+
+    /// Records a worker observation after an admitted compensating effect.
+    /// Terminal compensation states are idempotent only when their complete
+    /// payload or failure message matches exactly.
+    pub fn observe_compensation(
+        &mut self,
+        authorized: &AuthorizedOperationCompensation,
+        status: OperationStatus,
+    ) -> Result<WorkerOperationState, ProtocolError> {
+        self.validate_and_bound()?;
+        validate_operation_status_for_grant(&status, authorized.grant())?;
+        let request = authorized.request();
+        self.validate_scope(&request.tenant_scope)?;
+        let input_fingerprint = worker_operation_input_fingerprint(&request.payload)?;
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.operation_key == request.operation_key)
+            .ok_or_else(|| ProtocolError::UnknownOperation(request.operation_key.clone()))?;
+        let operation = &self.records[record_index];
+        ensure_compensation_target(operation, request)?;
+        let compensation = operation
+            .compensation
+            .as_ref()
+            .ok_or_else(|| ProtocolError::UnknownCompensation(request.operation_key.clone()))?;
+        ensure_compensation_identity(compensation, request, &input_fingerprint)?;
+        let observed = WorkerOperationState::from_status(status);
+        if !compensation.state.accepts(&observed) {
+            return Err(ProtocolError::InvalidWorkerCompensationTransition {
+                operation_key: request.operation_key.clone(),
+                current: compensation.state.kind(),
+                observed: observed.kind(),
+            });
+        }
+        if compensation.state == observed {
+            return Ok(observed);
+        }
+
+        let mut candidate = self.clone();
+        let candidate_compensation = candidate.records[record_index]
+            .compensation
+            .as_mut()
+            .ok_or_else(|| ProtocolError::UnknownCompensation(request.operation_key.clone()))?;
+        candidate_compensation.state = observed.clone();
         candidate.validate_and_bound()?;
         *self = candidate;
         Ok(observed)
@@ -916,6 +1281,15 @@ pub enum WorkerOperationAdmission {
     Existing { state: WorkerOperationState },
 }
 
+/// Admission outcome for [`WorkerOperationJournal::admit_compensation`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkerCompensationAdmission {
+    /// Persist the journal before allowing the adapter to execute compensation.
+    Dispatch,
+    /// The exact compensation already exists; do not execute it again.
+    Existing { state: WorkerOperationState },
+}
+
 /// Framed protocol messages for a future pipe, socket, or platform IPC layer.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -934,6 +1308,12 @@ pub enum WorkerMessage {
     },
     OperationResult {
         result: OperationReconcileResult,
+    },
+    CompensateOperation {
+        request: OperationCompensationRequest,
+    },
+    CompensationResult {
+        result: OperationCompensationResult,
     },
     ReconcileOperation {
         request: OperationReconcileRequest,
@@ -960,6 +1340,8 @@ impl WorkerMessage {
             Self::Result { result } => result.validate_header(),
             Self::DispatchOperation { request } => request.validate(),
             Self::OperationResult { result } => result.validate(),
+            Self::CompensateOperation { request } => request.validate(),
+            Self::CompensationResult { result } => result.validate(),
             Self::ReconcileOperation { request } => request.validate(),
             Self::ReconciledOperation { result } => result.validate(),
             Self::Cancel {
@@ -989,6 +1371,8 @@ impl WorkerMessage {
             Self::Result { result } => &result.session_id,
             Self::DispatchOperation { request } => &request.session_id,
             Self::OperationResult { result } => &result.session_id,
+            Self::CompensateOperation { request } => &request.session_id,
+            Self::CompensationResult { result } => &result.session_id,
             Self::ReconcileOperation { request } => &request.session_id,
             Self::ReconciledOperation { result } => &result.session_id,
             Self::Cancel { session_id, .. } | Self::CloseSession { session_id, .. } => session_id,
@@ -1246,7 +1630,7 @@ fn authentication_tag(
     message: &WorkerMessage,
 ) -> Result<[u8; AUTH_TAG_BYTES], ProtocolError> {
     let encoded = serde_json::to_vec(&AuthenticationPayload {
-        domain: "splash-worker-auth-v3",
+        domain: "splash-worker-auth-v4",
         protocol_version: PROTOCOL_VERSION,
         sender: sender.tag(),
         sequence,
@@ -1337,6 +1721,23 @@ impl AuthorizedOperationInvocation {
     }
 }
 
+/// A compensation request the host has validated against its active grant.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorizedOperationCompensation {
+    request: OperationCompensationRequest,
+    grant: CapabilityGrant,
+}
+
+impl AuthorizedOperationCompensation {
+    pub fn request(&self) -> &OperationCompensationRequest {
+        &self.request
+    }
+
+    pub fn grant(&self) -> &CapabilityGrant {
+        &self.grant
+    }
+}
+
 /// Stateful host-side validation for a single capability manifest.
 ///
 /// Authorization consumes call budget before dispatch. This intentionally
@@ -1345,6 +1746,7 @@ impl AuthorizedOperationInvocation {
 pub struct SessionAuthorizer {
     manifest: CapabilityManifest,
     calls_by_tool: BTreeMap<String, u32>,
+    compensations_by_tool: BTreeMap<String, u32>,
     seen_request_ids: BTreeSet<String>,
     completed_request_ids: BTreeSet<String>,
 }
@@ -1355,6 +1757,7 @@ impl SessionAuthorizer {
         Ok(Self {
             manifest,
             calls_by_tool: BTreeMap::new(),
+            compensations_by_tool: BTreeMap::new(),
             seen_request_ids: BTreeSet::new(),
             completed_request_ids: BTreeSet::new(),
         })
@@ -1366,6 +1769,13 @@ impl SessionAuthorizer {
 
     pub fn calls_for(&self, tool: &str) -> u32 {
         self.calls_by_tool.get(tool).copied().unwrap_or_default()
+    }
+
+    pub fn compensations_for(&self, tool: &str) -> u32 {
+        self.compensations_by_tool
+            .get(tool)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn authorize(
@@ -1397,6 +1807,58 @@ impl SessionAuthorizer {
             &request.payload,
         )?;
         Ok(AuthorizedOperationInvocation { request, grant })
+    }
+
+    /// Validates and reserves one host-approved compensation request.
+    ///
+    /// Compensation has a separate grant budget from ordinary calls. The
+    /// request must carry the exact fingerprint of the active grant so a stale
+    /// durable recovery policy cannot silently run under a broader or changed
+    /// capability configuration.
+    pub fn authorize_compensation(
+        &mut self,
+        request: OperationCompensationRequest,
+    ) -> Result<AuthorizedOperationCompensation, ProtocolError> {
+        request.validate_header()?;
+        if request.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(request.session_id));
+        }
+        let grant = self
+            .manifest
+            .grants
+            .iter()
+            .find(|grant| grant.tool == request.tool)
+            .cloned()
+            .ok_or_else(|| ProtocolError::UnknownTool(request.tool.clone()))?;
+        if grant.max_compensations == 0 {
+            return Err(ProtocolError::CompensationNotGranted(grant.tool));
+        }
+        if grant.compensation_fingerprint()? != request.grant_fingerprint {
+            return Err(ProtocolError::CompensationGrantMismatch);
+        }
+        let input_bytes = request.payload.validate_for(grant.format)?;
+        if input_bytes > grant.max_input_bytes as usize {
+            return Err(ProtocolError::InputTooLarge {
+                actual: input_bytes,
+                maximum: grant.max_input_bytes as usize,
+            });
+        }
+        if self.seen_request_ids.contains(&request.request_id) {
+            return Err(ProtocolError::DuplicateRequest(request.request_id));
+        }
+        let compensations = self
+            .compensations_by_tool
+            .entry(grant.tool.clone())
+            .or_default();
+        if *compensations >= grant.max_compensations {
+            return Err(ProtocolError::CompensationBudgetExhausted {
+                tool: grant.tool,
+                maximum: grant.max_compensations,
+            });
+        }
+        self.seen_request_ids.insert(request.request_id.clone());
+        *compensations = compensations.saturating_add(1);
+        Ok(AuthorizedOperationCompensation { request, grant })
     }
 
     pub fn validate_result(
@@ -1442,6 +1904,27 @@ impl SessionAuthorizer {
         }
         if !result.matches_dispatch(&authorized.request) {
             return Err(ProtocolError::OperationResultMismatch);
+        }
+        if self.completed_request_ids.contains(&result.request_id) {
+            return Err(ProtocolError::DuplicateResult(result.request_id.clone()));
+        }
+        validate_operation_status_for_grant(&result.status, &authorized.grant)?;
+        self.completed_request_ids.insert(result.request_id.clone());
+        Ok(())
+    }
+
+    /// Validates a worker response to one authorized compensation request.
+    pub fn validate_compensation_result(
+        &mut self,
+        authorized: &AuthorizedOperationCompensation,
+        result: &OperationCompensationResult,
+    ) -> Result<(), ProtocolError> {
+        result.validate()?;
+        if result.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(result.session_id.clone()));
+        }
+        if !result.matches_request(&authorized.request) {
+            return Err(ProtocolError::CompensationResultMismatch);
         }
         if self.completed_request_ids.contains(&result.request_id) {
             return Err(ProtocolError::DuplicateResult(result.request_id.clone()));
@@ -1552,6 +2035,27 @@ pub enum ProtocolError {
     DuplicateRequest(String),
     DuplicateResult(String),
     OperationResultMismatch,
+    InvalidCompensationKey,
+    InvalidCompensationGrantFingerprint,
+    CompensationNotGranted(String),
+    CompensationBudgetExhausted {
+        tool: String,
+        maximum: u32,
+    },
+    CompensationGrantMismatch,
+    CompensationResultMismatch,
+    CompensationToolMismatch(String),
+    CompensationRequiresSucceededOperation {
+        operation_key: String,
+        state: WorkerOperationStateKind,
+    },
+    UnknownCompensation(String),
+    CompensationIdentityMismatch(String),
+    InvalidWorkerCompensationTransition {
+        operation_key: String,
+        current: WorkerOperationStateKind,
+        observed: WorkerOperationStateKind,
+    },
     UnsupportedOperationJournalVersion(u8),
     OperationJournalTooLarge {
         actual: usize,
@@ -1663,6 +2167,51 @@ impl Display for ProtocolError {
             Self::OperationResultMismatch => {
                 formatter.write_str("worker operation result does not match its dispatch")
             }
+            Self::InvalidCompensationKey => {
+                formatter.write_str("compensation key must use the cmp- namespace")
+            }
+            Self::InvalidCompensationGrantFingerprint => {
+                formatter.write_str("invalid compensation grant fingerprint")
+            }
+            Self::CompensationNotGranted(tool) => {
+                write!(formatter, "worker tool is not granted compensation: {tool}")
+            }
+            Self::CompensationBudgetExhausted { tool, maximum } => write!(
+                formatter,
+                "worker tool {tool} exhausted its {maximum} compensation budget"
+            ),
+            Self::CompensationGrantMismatch => {
+                formatter.write_str("compensation request does not match the active grant")
+            }
+            Self::CompensationResultMismatch => {
+                formatter.write_str("worker compensation result does not match its request")
+            }
+            Self::CompensationToolMismatch(operation_key) => write!(
+                formatter,
+                "compensation tool does not match original operation: {operation_key}"
+            ),
+            Self::CompensationRequiresSucceededOperation {
+                operation_key,
+                state,
+            } => write!(
+                formatter,
+                "compensation requires a succeeded original operation {operation_key}; observed {state:?}"
+            ),
+            Self::UnknownCompensation(operation_key) => {
+                write!(formatter, "unknown worker compensation: {operation_key}")
+            }
+            Self::CompensationIdentityMismatch(operation_key) => write!(
+                formatter,
+                "worker compensation was reused with a different key, grant, or input: {operation_key}"
+            ),
+            Self::InvalidWorkerCompensationTransition {
+                operation_key,
+                current,
+                observed,
+            } => write!(
+                formatter,
+                "invalid worker compensation transition for {operation_key}: {current:?} to {observed:?}"
+            ),
             Self::UnsupportedOperationJournalVersion(version) => {
                 write!(formatter, "unsupported worker operation journal version: {version}")
             }
@@ -1791,6 +2340,42 @@ fn ensure_operation_identity(
     Ok(())
 }
 
+fn validate_compensation_key(value: &str) -> Result<(), ProtocolError> {
+    validate_token("compensation key", value)?;
+    if !value.starts_with("cmp-") {
+        return Err(ProtocolError::InvalidCompensationKey);
+    }
+    Ok(())
+}
+
+fn ensure_compensation_target(
+    operation: &WorkerOperationRecord,
+    request: &OperationCompensationRequest,
+) -> Result<(), ProtocolError> {
+    if operation.tool != request.tool {
+        return Err(ProtocolError::CompensationToolMismatch(
+            request.operation_key.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_compensation_identity(
+    compensation: &WorkerCompensationRecord,
+    request: &OperationCompensationRequest,
+    input_fingerprint: &str,
+) -> Result<(), ProtocolError> {
+    if compensation.compensation_key != request.compensation_key
+        || compensation.input_fingerprint != input_fingerprint
+        || compensation.grant_fingerprint != request.grant_fingerprint
+    {
+        return Err(ProtocolError::CompensationIdentityMismatch(
+            request.operation_key.clone(),
+        ));
+    }
+    Ok(())
+}
+
 fn worker_operation_input_fingerprint(payload: &ToolPayload) -> Result<String, ProtocolError> {
     let input = canonical_operation_input_bytes(payload)?;
     let mut hasher = blake3::Hasher::new();
@@ -1904,24 +2489,42 @@ mod tests {
 
     #[test]
     fn attenuation_only_reduces_authority() {
-        let grant = json_grant();
+        let grant = json_grant().with_compensation_limit(2);
         let kept_resource = ResourceSelector::new(ResourceKind::NetworkOrigin, "math-api").unwrap();
         let narrowed = grant
             .attenuate(&GrantAttenuation {
                 max_calls: Some(1),
                 max_input_bytes: Some(64),
                 max_output_bytes: Some(64),
+                max_compensations: Some(1),
                 resources: Some(BTreeSet::from([kept_resource])),
             })
             .unwrap();
 
         assert_eq!(narrowed.max_calls, 1);
         assert_eq!(narrowed.max_input_bytes, 64);
+        assert_eq!(narrowed.max_compensations, 1);
         assert_eq!(narrowed.resources.len(), 1);
+        let compensation_disabled = grant
+            .attenuate(&GrantAttenuation {
+                max_compensations: Some(0),
+                ..GrantAttenuation::default()
+            })
+            .unwrap();
+        assert_eq!(compensation_disabled.max_compensations, 0);
         assert_eq!(
             grant
                 .attenuate(&GrantAttenuation {
                     max_calls: Some(3),
+                    ..GrantAttenuation::default()
+                })
+                .unwrap_err(),
+            ProtocolError::AttenuationWidensLimits
+        );
+        assert_eq!(
+            grant
+                .attenuate(&GrantAttenuation {
+                    max_compensations: Some(3),
                     ..GrantAttenuation::default()
                 })
                 .unwrap_err(),
@@ -2115,6 +2718,29 @@ mod tests {
             .unwrap()
     }
 
+    fn compensation_grant() -> CapabilityGrant {
+        json_grant().with_compensation_limit(1)
+    }
+
+    fn compensation_binding(grant: &CapabilityGrant) -> OperationCompensationBinding {
+        OperationCompensationBinding::new(
+            "math.add",
+            "release-42-add",
+            "cmp-release-42-add-undo",
+            "tenant-release",
+            grant.compensation_fingerprint().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn compensation_request(
+        request_id: &str,
+        binding: OperationCompensationBinding,
+        payload: ToolPayload,
+    ) -> OperationCompensationRequest {
+        OperationCompensationRequest::new("session-1", request_id, binding, payload).unwrap()
+    }
+
     #[test]
     fn operation_dispatch_is_capability_checked_and_binds_its_status() {
         let request = operation_request(
@@ -2177,6 +2803,271 @@ mod tests {
         let message = WorkerMessage::DispatchOperation { request };
         let encoded = message.to_json_line().unwrap();
         assert_eq!(WorkerMessage::from_json_line(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn compensation_requires_an_active_matching_grant_and_uses_its_own_budget() {
+        let grant = compensation_grant();
+        let manifest = CapabilityManifest::new("session-1", vec![grant.clone()]).unwrap();
+        let binding = compensation_binding(&grant);
+        let request = compensation_request(
+            "compensation-request-1",
+            binding.clone(),
+            ToolPayload::Json(json!({"undo": "release"})),
+        );
+        let mut authorizer = SessionAuthorizer::new(manifest).unwrap();
+        let authorized = authorizer.authorize_compensation(request.clone()).unwrap();
+        assert_eq!(authorizer.calls_for("math.add"), 0);
+        assert_eq!(authorizer.compensations_for("math.add"), 1);
+        let message = WorkerMessage::CompensateOperation {
+            request: request.clone(),
+        };
+        let encoded = message.to_json_line().unwrap();
+        assert_eq!(WorkerMessage::from_json_line(&encoded).unwrap(), message);
+
+        let result = OperationCompensationResult::new(
+            "session-1",
+            "compensation-request-1",
+            binding.clone(),
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(json!({"undone": true})),
+            },
+        )
+        .unwrap();
+        authorizer
+            .validate_compensation_result(&authorized, &result)
+            .unwrap();
+        assert_eq!(
+            authorizer
+                .validate_compensation_result(&authorized, &result)
+                .unwrap_err(),
+            ProtocolError::DuplicateResult("compensation-request-1".to_owned())
+        );
+
+        let exhausted = compensation_request(
+            "compensation-request-2",
+            binding.clone(),
+            ToolPayload::Json(json!({"undo": "release"})),
+        );
+        assert_eq!(
+            authorizer.authorize_compensation(exhausted).unwrap_err(),
+            ProtocolError::CompensationBudgetExhausted {
+                tool: "math.add".to_owned(),
+                maximum: 1,
+            }
+        );
+
+        let mut changed_grant = grant.clone();
+        changed_grant.max_output_bytes = 64;
+        let mut mismatch_authorizer = SessionAuthorizer::new(
+            CapabilityManifest::new("session-1", vec![changed_grant]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            mismatch_authorizer
+                .authorize_compensation(compensation_request(
+                    "compensation-request-3",
+                    binding.clone(),
+                    ToolPayload::Json(json!({"undo": "release"})),
+                ))
+                .unwrap_err(),
+            ProtocolError::CompensationGrantMismatch
+        );
+
+        let no_compensation = CapabilityManifest::new("session-1", vec![json_grant()]).unwrap();
+        let mut denied_authorizer = SessionAuthorizer::new(no_compensation).unwrap();
+        assert_eq!(
+            denied_authorizer
+                .authorize_compensation(compensation_request(
+                    "compensation-request-4",
+                    binding,
+                    ToolPayload::Json(json!({"undo": "release"})),
+                ))
+                .unwrap_err(),
+            ProtocolError::CompensationNotGranted("math.add".to_owned())
+        );
+    }
+
+    #[test]
+    fn worker_journal_requires_a_succeeded_original_for_compensation() {
+        let grant = compensation_grant();
+        let manifest = CapabilityManifest::new("session-1", vec![grant.clone()]).unwrap();
+        let operation = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut operation_authorizer = SessionAuthorizer::new(manifest.clone()).unwrap();
+        let authorized_operation = operation_authorizer.authorize_operation(operation).unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+        journal.admit(&authorized_operation).unwrap();
+
+        let mut compensation_authorizer = SessionAuthorizer::new(manifest).unwrap();
+        let authorized_compensation = compensation_authorizer
+            .authorize_compensation(compensation_request(
+                "compensation-request-1",
+                compensation_binding(&grant),
+                ToolPayload::Json(json!({"undo": "release"})),
+            ))
+            .unwrap();
+        assert_eq!(
+            journal
+                .admit_compensation(&authorized_compensation)
+                .unwrap_err(),
+            ProtocolError::CompensationRequiresSucceededOperation {
+                operation_key: "release-42-add".to_owned(),
+                state: WorkerOperationStateKind::Pending,
+            }
+        );
+
+        journal
+            .observe(
+                &authorized_operation,
+                OperationStatus::Succeeded {
+                    payload: ToolPayload::Json(json!({"total": 42})),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            journal
+                .admit_compensation(&authorized_compensation)
+                .unwrap(),
+            WorkerCompensationAdmission::Dispatch
+        );
+        journal
+            .observe_compensation(
+                &authorized_compensation,
+                OperationStatus::Succeeded {
+                    payload: ToolPayload::Json(json!({"undone": true})),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            journal
+                .observe_compensation(
+                    &authorized_compensation,
+                    OperationStatus::Failed {
+                        message: "late failure".to_owned(),
+                    },
+                )
+                .unwrap_err(),
+            ProtocolError::InvalidWorkerCompensationTransition {
+                operation_key: "release-42-add".to_owned(),
+                current: WorkerOperationStateKind::Succeeded,
+                observed: WorkerOperationStateKind::Failed,
+            }
+        );
+
+        let mut persisted: JsonValue = serde_json::from_str(&journal.to_json().unwrap()).unwrap();
+        persisted["records"][0]["state"] = json!({"state": "running"});
+        let malformed = serde_json::to_string(&persisted).unwrap();
+        assert_eq!(
+            WorkerOperationJournal::from_json(&malformed).unwrap_err(),
+            ProtocolError::CompensationRequiresSucceededOperation {
+                operation_key: "release-42-add".to_owned(),
+                state: WorkerOperationStateKind::Running,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_operation_journal_deduplicates_one_compensation_after_success() {
+        let grant = compensation_grant();
+        let manifest = CapabilityManifest::new("session-1", vec![grant.clone()]).unwrap();
+        let operation = operation_request(
+            "operation-request-1",
+            "release-42-add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let mut operation_authorizer = SessionAuthorizer::new(manifest.clone()).unwrap();
+        let authorized_operation = operation_authorizer.authorize_operation(operation).unwrap();
+        let mut journal = WorkerOperationJournal::new("tenant-release").unwrap();
+        journal.admit(&authorized_operation).unwrap();
+        journal
+            .observe(
+                &authorized_operation,
+                OperationStatus::Succeeded {
+                    payload: ToolPayload::Json(json!({"total": 42})),
+                },
+            )
+            .unwrap();
+
+        let binding = compensation_binding(&grant);
+        let request = compensation_request(
+            "compensation-request-1",
+            binding.clone(),
+            ToolPayload::Json(json!({"undo": "release"})),
+        );
+        let mut compensation_authorizer = SessionAuthorizer::new(manifest).unwrap();
+        let authorized = compensation_authorizer
+            .authorize_compensation(request.clone())
+            .unwrap();
+        assert_eq!(
+            journal.admit_compensation(&authorized).unwrap(),
+            WorkerCompensationAdmission::Dispatch
+        );
+        assert_eq!(
+            journal.admit_compensation(&authorized).unwrap(),
+            WorkerCompensationAdmission::Existing {
+                state: WorkerOperationState::Pending,
+            }
+        );
+        assert_eq!(
+            journal
+                .observe_compensation(&authorized, OperationStatus::Running)
+                .unwrap(),
+            WorkerOperationState::Running
+        );
+        assert_eq!(
+            journal
+                .observe_compensation(
+                    &authorized,
+                    OperationStatus::Succeeded {
+                        payload: ToolPayload::Json(json!({"undone": true})),
+                    },
+                )
+                .unwrap(),
+            WorkerOperationState::Succeeded {
+                payload: ToolPayload::Json(json!({"undone": true})),
+            }
+        );
+
+        let changed_input = compensation_request(
+            "compensation-request-2",
+            binding.clone(),
+            ToolPayload::Json(json!({"undo": "different"})),
+        );
+        let mut changed_authorizer = SessionAuthorizer::new(
+            CapabilityManifest::new("session-1", vec![grant.clone()]).unwrap(),
+        )
+        .unwrap();
+        let changed = changed_authorizer
+            .authorize_compensation(changed_input)
+            .unwrap();
+        assert_eq!(
+            journal.admit_compensation(&changed).unwrap_err(),
+            ProtocolError::CompensationIdentityMismatch("release-42-add".to_owned())
+        );
+
+        let mut wrong_scope = binding;
+        wrong_scope.tenant_scope = "tenant-other".to_owned();
+        let mut scope_authorizer =
+            SessionAuthorizer::new(CapabilityManifest::new("session-1", vec![grant]).unwrap())
+                .unwrap();
+        let scope_request = scope_authorizer
+            .authorize_compensation(compensation_request(
+                "compensation-request-3",
+                wrong_scope,
+                ToolPayload::Json(json!({"undo": "release"})),
+            ))
+            .unwrap();
+        assert_eq!(
+            journal.admit_compensation(&scope_request).unwrap_err(),
+            ProtocolError::OperationJournalScopeMismatch {
+                expected: "tenant-other".to_owned(),
+                actual: "tenant-release".to_owned(),
+            }
+        );
     }
 
     #[test]

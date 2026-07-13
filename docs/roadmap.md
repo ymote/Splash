@@ -25,12 +25,14 @@
   rollback-protected storage backend contract.
 - Authenticated durable-operation dispatch frames and a bounded worker journal
   with input-drift rejection and tenant scope validation.
+- Explicit, host-approved worker compensation intents with a separate bounded
+  grant, exact grant fingerprint, one inverse effect per succeeded operation,
+  and crash-safe worker-journal recovery.
 
 ## Next: durable external operations
 
 - Platform durable-storage adapters with compare-and-swap and rollback
   protection.
-- Explicit worker compensation handlers and host recovery policy.
 
 ## Next: contained local effects
 
