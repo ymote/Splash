@@ -39,6 +39,13 @@ pub use splash_schema::{JsonSchema, SchemaError};
 #[cfg(feature = "in-process-worker")]
 pub mod in_process_worker;
 
+/// Bounded JSON-line worker transport for host-provided pipe or socket I/O.
+///
+/// This optional module authenticates ordinary worker frames but does not
+/// create or contain a process.
+#[cfg(feature = "json-line-worker")]
+pub mod json_line_worker;
+
 /// Maximum number of tool promises a runtime may retain at once.
 ///
 /// Hosts that need a lower bound for a constrained device can choose one with

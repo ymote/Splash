@@ -43,6 +43,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Feature-gated authenticated in-process worker transport for app-provided
   mobile and embedded adapters; it preserves ordinary invocation framing but
   is not OS containment.
+- Feature-gated bounded JSON-line worker channel and authenticated transport
+  for host-provided contained-worker pipes; process creation, deadlines, and
+  containment remain host policy.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

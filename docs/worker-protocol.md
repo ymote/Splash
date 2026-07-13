@@ -293,3 +293,21 @@ ordinary `invoke`/`result` host-to-worker-to-host frames in one process,
 including session ID, role, sequence, and key-tag verification. It supplies no
 process, memory, syscall, or resource isolation and must not be described as a
 sandbox. See [worker adapter runtime](worker-runtime.md#authenticated-in-process-transport).
+
+For a separately started worker, the optional
+`splash-capabilities/json-line-worker` feature provides
+`JsonLineWorkerChannel` over host-supplied buffered input/output handles and
+`AuthenticatedFrameWorkerTransport` over that channel. The host first sends
+the one-way authenticated `open_session` frame, then moves the same advanced
+host authenticator and channel into the call transport. It writes exactly one
+JSON frame plus `\n` per outbound message and reads exactly one bounded frame
+per response. The channel rejects a line longer than 1 MiB before decoding and
+poisons itself on any I/O, decoding, or framing failure; the authenticated
+transport also poisons itself on an invalid or unexpected response. Discard a
+poisoned channel/session rather than retrying on the same stream.
+
+The JSON-line adapter is not a process launcher, sandbox, timeout mechanism,
+key-exchange protocol, or worker attestation scheme. The host must provision
+the key via its trusted bootstrap path and apply its platform's process,
+filesystem, executable, network, resource, and cancellation policy before it
+sends an effectful call. See [worker adapter runtime](worker-runtime.md#bounded-json-line-transport).

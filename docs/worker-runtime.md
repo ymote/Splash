@@ -176,6 +176,41 @@ operation dispatch, reconciliation, and compensation need their own
 host-controlled transport API and the authenticated rollback-resistant journal
 storage contract; this adapter does not weaken either requirement.
 
+## Bounded JSON-Line Transport
+
+The optional `splash-capabilities` feature `json-line-worker` provides a
+`JsonLineWorkerChannel<R, W>` for a host-owned buffered reader and writer,
+plus `AuthenticatedFrameWorkerTransport<C>` for ordinary `invoke`/`result`
+calls. It is the pipe boundary for a worker process that the host has already
+started and placed in an appropriate platform sandbox; it does not spawn,
+attest, or contain that process itself.
+
+Session startup remains explicit because `open_session` is one-way. The host
+seals and sends it using the same `SessionAuthenticator` that it then moves
+into the authenticated call transport:
+
+```rust
+use std::io::BufReader;
+
+use splash_capabilities::json_line_worker::{
+    AuthenticatedFrameWorkerTransport, JsonLineWorkerChannel, WorkerFrameChannel,
+};
+use splash_capabilities::WorkerMessage;
+
+let mut channel = JsonLineWorkerChannel::new(BufReader::new(child_stdout), child_stdin);
+let opening = host_authenticator.seal(WorkerMessage::OpenSession { manifest })?;
+channel.send_frame(opening)?;
+let transport = AuthenticatedFrameWorkerTransport::new(host_authenticator, channel)?;
+```
+
+Each line is bounded to the protocol's 1 MiB frame limit before decoding. A
+write, flush, read, malformed frame, oversized frame, invalid response, or
+authentication failure poisons the channel or transport. The host must discard
+it with the session and open a fresh session instead of retrying on the same
+stream. The channel performs synchronous I/O, so the host must also enforce
+worker I/O deadlines, cancellation delivery, process termination, and resource
+limits through its platform backend.
+
 ## Mobile and Embedded Profiles
 
 The crate has no async runtime, thread, socket, filesystem, process, or

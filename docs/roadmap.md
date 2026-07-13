@@ -38,6 +38,9 @@
 - Feature-gated authenticated in-process worker transport for a fixed mobile
   or embedded adapter catalog, with authenticated ordinary-invocation framing
   but no containment.
+- Feature-gated bounded JSON-line frame channel and authenticated ordinary-call
+  transport for host-provided contained-worker I/O; it does not launch or
+  sandbox a process.
 
 ## Next: durable external operations
 
@@ -47,8 +50,8 @@
 ## Next: contained local effects
 
 - Per-platform containment backends for desktop and embedded Linux.
-- Out-of-process authenticated worker transports and contained-worker
-  implementations.
+- Contained-worker implementations and process-launch policy for the bounded
+  JSON-line transport.
 - Filesystem-root, executable, and network-origin policies.
 - Mobile profile with app-provided tools only.
 

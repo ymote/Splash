@@ -20,3 +20,4 @@ splash-worker = { version = "0.1.0", path = "../splash-worker", optional = true 
 
 [features]
 in-process-worker = ["dep:splash-worker"]
+json-line-worker = []

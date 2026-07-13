@@ -85,6 +85,15 @@ trusted mobile or embedded adapter catalog. It confers no OS, memory, process,
 or resource containment; the adapter retains all authority of the embedding
 application. Do not use it to run untrusted local-tool workloads.
 
+The optional JSON-line worker channel carries one bounded authenticated frame
+at a time over host-provided I/O. It limits a line to 1 MiB before decoding and
+poisons the channel after any write, flush, read, decode, size, or framing
+failure; the authenticated call transport likewise poisons itself after an
+invalid or unexpected worker response. A host must discard that session rather
+than retrying on the stream. This is protocol robustness, not containment: the
+host still owns trusted key provisioning, I/O deadlines, cancellation, child
+lifecycle, and the platform sandbox that restricts the worker's OS authority.
+
 Each registered tool declares a stable identifier and limits for calls, input
 bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,
 over-budget, over-depth, or malformed calls fail before a tool handler is
