@@ -1943,8 +1943,8 @@ mod linux_seccomp {
                     && offset
                         < SECCOMP_DATA_ARGUMENTS_OFFSET
                             + SECCOMP_DATA_ARGUMENT_SIZE * arguments.len() as u32
-                    && (offset - SECCOMP_DATA_ARGUMENTS_OFFSET) % SECCOMP_DATA_ARGUMENT_SIZE
-                        == 0 =>
+                    && (offset - SECCOMP_DATA_ARGUMENTS_OFFSET)
+                        .is_multiple_of(SECCOMP_DATA_ARGUMENT_SIZE) =>
             {
                 arguments[((offset - SECCOMP_DATA_ARGUMENTS_OFFSET) / SECCOMP_DATA_ARGUMENT_SIZE)
                     as usize] as u32
