@@ -16,3 +16,7 @@ serde_json = "1.0.150"
 splash-core = { path = "../splash-core" }
 splash-protocol = { version = "0.1.0", path = "../splash-protocol" }
 splash-schema = { version = "0.1.0", path = "../splash-schema" }
+splash-worker = { version = "0.1.0", path = "../splash-worker", optional = true }
+
+[features]
+in-process-worker = ["dep:splash-worker"]

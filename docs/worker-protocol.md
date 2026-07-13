@@ -282,4 +282,14 @@ manifest before the transport is invoked.
 
 `ProtocolWorkerClient` is an in-process adapter boundary, not a containment
 implementation. Production local-tool adapters still need a separately
-contained worker and authenticated transport.
+contained worker and authenticated transport. It maps a transport failure to a
+generic Splash error, so transport, adapter, persistence, or authentication
+details stay on the trusted host side.
+
+For a fixed, app-provided mobile or embedded adapter catalog, the optional
+`splash-capabilities/in-process-worker` feature supplies
+`InProcessAuthenticatedWorkerTransport`. It exercises the authenticated
+ordinary `invoke`/`result` host-to-worker-to-host frames in one process,
+including session ID, role, sequence, and key-tag verification. It supplies no
+process, memory, syscall, or resource isolation and must not be described as a
+sandbox. See [worker adapter runtime](worker-runtime.md#authenticated-in-process-transport).

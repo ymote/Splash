@@ -35,6 +35,9 @@
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of
   uncommitted candidates; it requires a host-provided rollback anchor.
+- Feature-gated authenticated in-process worker transport for a fixed mobile
+  or embedded adapter catalog, with authenticated ordinary-invocation framing
+  but no containment.
 
 ## Next: durable external operations
 
@@ -44,7 +47,8 @@
 ## Next: contained local effects
 
 - Per-platform containment backends for desktop and embedded Linux.
-- Authenticated worker transports and contained-worker implementations.
+- Out-of-process authenticated worker transports and contained-worker
+  implementations.
 - Filesystem-root, executable, and network-origin policies.
 - Mobile profile with app-provided tools only.
 

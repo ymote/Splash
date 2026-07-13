@@ -137,6 +137,45 @@ compensation, the host reuses the exact existing compensation intent under a
 fresh approval and invokes an adapter-specific status or manual-recovery
 policy. Splash does not define a universal inverse-status API.
 
+## Authenticated In-Process Transport
+
+The optional `splash-capabilities` feature `in-process-worker` provides
+`InProcessAuthenticatedWorkerTransport` for an application that embeds a
+fixed worker adapter catalog in the same process. It dispatches every ordinary
+tool invocation through the real authenticated-frame lifecycle:
+
+1. the host authenticator seals `invoke`;
+2. `WorkerSession` opens, authorizes, and handles it; and
+3. the host authenticator opens the matching `result`.
+
+The constructor requires a host-role authenticator and the same public session
+ID as the opened worker session. Pass the exact host authenticator that sealed
+that worker's `open_session` frame; the first dispatch verifies the shared
+secret key through the normal frame tag.
+
+```rust
+use splash_capabilities::in_process_worker::InProcessAuthenticatedWorkerTransport;
+
+let transport = InProcessAuthenticatedWorkerTransport::new(
+    host_authenticator,
+    worker_session,
+    journal_store,
+)?;
+```
+
+This is an integration convenience, not a containment boundary. The worker
+and its adapters retain the application process's ambient authority, and a
+memory-corruption or arbitrary-code-execution compromise crosses this adapter
+boundary directly. Use it only for a static, reviewed, app-provided adapter
+catalog with no arbitrary executable, filesystem, network-origin, plugin, or
+crate selectors. Untrusted local effects still require a separately contained
+worker and a real IPC transport.
+
+`WorkerTransport` currently carries only ordinary `invoke` messages. Durable
+operation dispatch, reconciliation, and compensation need their own
+host-controlled transport API and the authenticated rollback-resistant journal
+storage contract; this adapter does not weaken either requirement.
+
 ## Mobile and Embedded Profiles
 
 The crate has no async runtime, thread, socket, filesystem, process, or

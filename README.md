@@ -40,6 +40,9 @@ and keeps UI support optional rather than making UI the language boundary.
   anchor, including durable revision and fencing commitments.
 - Fenced authenticated worker-journal storage that binds durable worker state
   to a host-selected record, revision, and current writer lease.
+- Feature-gated authenticated in-process worker transport for app-provided
+  mobile and embedded adapters; it preserves ordinary invocation framing but
+  is not OS containment.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No filesystem, subprocess, raw socket, HTTP server, or Makepad platform

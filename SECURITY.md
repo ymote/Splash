@@ -79,6 +79,11 @@ cannot make an external provider idempotent or queryable.
 `ProtocolWorkerClient` connects that validation layer to a host-owned
 `WorkerTransport`; its registration rejects a local policy that is broader than
 the worker grant. This still does not make an in-process transport isolated.
+The optional `InProcessAuthenticatedWorkerTransport` authenticates every
+ordinary worker invocation in-process, but it is only suitable for a static,
+trusted mobile or embedded adapter catalog. It confers no OS, memory, process,
+or resource containment; the adapter retains all authority of the embedding
+application. Do not use it to run untrusted local-tool workloads.
 
 Each registered tool declares a stable identifier and limits for calls, input
 bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,

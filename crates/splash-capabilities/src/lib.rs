@@ -32,6 +32,13 @@ pub use splash_protocol::{
 use splash_protocol::{EnvelopeFormat, SessionAuthorizer};
 pub use splash_schema::{JsonSchema, SchemaError};
 
+/// Authenticated in-process worker transport for app-provided adapters.
+///
+/// This optional module is useful for mobile and embedded hosts that run a
+/// static adapter catalog inside their application. It is not OS containment.
+#[cfg(feature = "in-process-worker")]
+pub mod in_process_worker;
+
 /// Maximum number of tool promises a runtime may retain at once.
 ///
 /// Hosts that need a lower bound for a constrained device can choose one with
@@ -527,8 +534,12 @@ impl std::error::Error for StreamConfigurationError {}
 ///
 /// Implementations may use a contained child process, a platform IPC service,
 /// or an embedded app-provided adapter. Scripts never receive this transport.
+/// The implementation owns its error type so it can retain transport-specific
+/// failure details for trusted host handling.
 pub trait WorkerTransport {
-    fn dispatch(&mut self, invocation: WorkerInvocation) -> Result<WorkerResult, ProtocolError>;
+    type Error: Display;
+
+    fn dispatch(&mut self, invocation: WorkerInvocation) -> Result<WorkerResult, Self::Error>;
 }
 
 /// Host-side client for a capability-attenuated worker session.
@@ -580,7 +591,7 @@ impl<T: WorkerTransport> ProtocolWorkerClient<T> {
             request.name.clone(),
             WorkerPayload::Json(request.input.clone()),
         )
-        .map_err(worker_failed)?;
+        .map_err(worker_protocol_failed)?;
         let authorized = self
             .authorizer
             .authorize(invocation)
@@ -588,10 +599,10 @@ impl<T: WorkerTransport> ProtocolWorkerClient<T> {
         let result = self
             .transport
             .dispatch(authorized.invocation().clone())
-            .map_err(worker_failed)?;
+            .map_err(|_| worker_transport_failed())?;
         self.authorizer
             .validate_result(&authorized, &result)
-            .map_err(worker_failed)?;
+            .map_err(worker_protocol_failed)?;
 
         match result.payload {
             WorkerPayload::Json(value) => Ok(value),
@@ -606,8 +617,12 @@ fn worker_denied(error: ProtocolError) -> ToolError {
     ToolError::Denied(format!("worker capability denied: {error}"))
 }
 
-fn worker_failed(error: ProtocolError) -> ToolError {
+fn worker_protocol_failed(error: ProtocolError) -> ToolError {
     ToolError::Failed(format!("worker protocol failed: {error}"))
+}
+
+fn worker_transport_failed() -> ToolError {
+    ToolError::Failed("worker transport failed".to_owned())
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -2649,6 +2664,8 @@ mod tests {
     struct AddWorker;
 
     impl WorkerTransport for AddWorker {
+        type Error = ProtocolError;
+
         fn dispatch(
             &mut self,
             invocation: WorkerInvocation,
@@ -2669,6 +2686,16 @@ mod tests {
                 request_id,
                 WorkerPayload::Json(serde_json::json!({"total": left + right})),
             )
+        }
+    }
+
+    struct LeakyWorker;
+
+    impl WorkerTransport for LeakyWorker {
+        type Error = &'static str;
+
+        fn dispatch(&mut self, _invocation: WorkerInvocation) -> Result<WorkerResult, Self::Error> {
+            Err("adapter connection secret: production-token")
         }
     }
 
@@ -3818,6 +3845,27 @@ mod tests {
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn protocol_worker_client_hides_transport_error_details_from_splash() {
+        let manifest =
+            CapabilityManifest::new("worker-1", vec![CapabilityGrant::json("math.add")]).unwrap();
+        let mut client = ProtocolWorkerClient::new(manifest, LeakyWorker).unwrap();
+
+        let error = client
+            .dispatch_json(&JsonToolRequest {
+                name: "math.add".to_owned(),
+                input: serde_json::json!({"left": 20, "right": 22}),
+                call_index: 1,
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolError::Failed("worker transport failed".to_owned())
+        );
+        assert!(!error.to_string().contains("production-token"));
     }
 
     #[test]
