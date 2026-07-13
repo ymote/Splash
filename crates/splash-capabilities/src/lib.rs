@@ -17,7 +17,7 @@ use makepad_script::{
     LiveId, ScriptHandle, ScriptHandleGc, ScriptHandleType, ScriptIp, ScriptThreadId, ScriptValue,
     NIL,
 };
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 pub use splash_protocol::{
@@ -691,6 +691,25 @@ fn schema_validator(schema: JsonSchema, direction: &'static str) -> ToolValidato
     })
 }
 
+/// Compiles the Rust-side half of a typed JSON capability into an input
+/// validator. The JSON Schema remains the authoritative wire contract, so it
+/// is checked before Serde sees the value.
+fn typed_input_validator<I>(schema: JsonSchema) -> ToolValidator
+where
+    I: DeserializeOwned + 'static,
+{
+    Box::new(move |encoded| {
+        let value = serde_json::from_str(encoded)
+            .map_err(|_| ToolError::Denied("input is not valid JSON for its schema".to_owned()))?;
+        schema.validate(&value).map_err(|violation| {
+            ToolError::Denied(format!("input does not match its schema: {violation}"))
+        })?;
+        serde_json::from_value::<I>(value).map(|_| ()).map_err(|_| {
+            ToolError::Denied("input does not match its registered Rust type".to_owned())
+        })
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ToolRegistrationError {
     Duplicate(String),
@@ -1067,6 +1086,71 @@ impl CapabilityHost {
             Some(schema_validator(contract.input, "input")),
             Some(schema_validator(contract.output, "output")),
             handler,
+        )
+    }
+
+    /// Registers a JSON capability that converts its contract-validated wire
+    /// envelope into Rust input and output types through Serde.
+    ///
+    /// The [`JsonToolContract`] remains authoritative: its input schema is
+    /// checked before deserialization and its output schema is checked after
+    /// serialization. This prevents Rust type defaults or unknown-field
+    /// behavior from widening the script-visible capability boundary.
+    pub fn register_typed_json_tool<I, O, F>(
+        &mut self,
+        policy: ToolPolicy,
+        contract: JsonToolContract,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        I: DeserializeOwned + 'static,
+        O: Serialize + 'static,
+        F: FnMut(I) -> Result<O, ToolError> + 'static,
+    {
+        self.register_typed_json_tool_with_metadata(
+            policy,
+            ToolMetadata::default(),
+            contract,
+            handler,
+        )
+    }
+
+    /// Registers a documented typed JSON capability backed by trusted Rust
+    /// code. Use [`Self::register_typed_json_tool`] when no description or
+    /// additional metadata is needed.
+    pub fn register_typed_json_tool_with_metadata<I, O, F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+        mut handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        I: DeserializeOwned + 'static,
+        O: Serialize + 'static,
+        F: FnMut(I) -> Result<O, ToolError> + 'static,
+    {
+        let metadata = metadata
+            .with_input_schema(contract.input_schema.clone())
+            .with_output_schema(contract.output_schema.clone());
+        self.register_json_tool_with_validators(
+            policy,
+            metadata,
+            Some(typed_input_validator::<I>(contract.input)),
+            Some(schema_validator(contract.output, "output")),
+            move |request| {
+                let input = serde_json::from_value(request.input.clone()).map_err(|_| {
+                    ToolError::Failed(
+                        "validated typed JSON input could not be deserialized".to_owned(),
+                    )
+                })?;
+                let output = handler(input)?;
+                serde_json::to_value(output).map_err(|_| {
+                    ToolError::Failed(
+                        "typed Rust output could not be serialized as JSON".to_owned(),
+                    )
+                })
+            },
         )
     }
 
@@ -2097,6 +2181,43 @@ impl CapabilityRuntime {
             .register_validated_json_tool(policy, metadata, contract, handler)
     }
 
+    /// Registers a JSON capability that receives and returns Rust types
+    /// through Serde while preserving an executable wire contract.
+    pub fn register_typed_json_tool<I, O, F>(
+        &mut self,
+        policy: ToolPolicy,
+        contract: JsonToolContract,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        I: DeserializeOwned + 'static,
+        O: Serialize + 'static,
+        F: FnMut(I) -> Result<O, ToolError> + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_typed_json_tool(policy, contract, handler)
+    }
+
+    /// Registers a documented typed JSON capability. The JSON contract is
+    /// validated before deserialization and after serialization.
+    pub fn register_typed_json_tool_with_metadata<I, O, F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        I: DeserializeOwned + 'static,
+        O: Serialize + 'static,
+        F: FnMut(I) -> Result<O, ToolError> + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_typed_json_tool_with_metadata(policy, metadata, contract, handler)
+    }
+
     /// Registers a deferred-only JSON capability with no in-process handler.
     pub fn register_external_json_tool(
         &mut self,
@@ -2776,6 +2897,28 @@ mod tests {
         .unwrap()
     }
 
+    #[derive(serde::Deserialize)]
+    struct AddInput {
+        left: i64,
+        right: i64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct AddOutput {
+        total: i64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct StringAddInput {
+        left: String,
+        right: String,
+    }
+
+    #[derive(serde::Serialize)]
+    struct StringAddOutput {
+        total: String,
+    }
+
     #[test]
     fn calls_only_a_registered_tool() {
         let mut runtime = CapabilityRuntime::default();
@@ -2815,6 +2958,82 @@ mod tests {
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn typed_json_tools_validate_before_and_after_serde_conversion() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_typed_json_tool_with_metadata(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two integer fields through a Rust type."),
+                add_contract(),
+                |input: AddInput| {
+                    Ok(AddOutput {
+                        total: input.left + input.right,
+                    })
+                },
+            )
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn typed_json_tools_reject_rust_input_type_mismatches_before_spending_budget() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_typed_json_tool(
+                ToolPolicy::json("math.add"),
+                add_contract(),
+                move |input: StringAddInput| {
+                    calls.set(calls.get() + 1);
+                    let StringAddInput { left, right } = input;
+                    let _ = (left, right);
+                    Ok(AddOutput { total: 42 })
+                },
+            )
+            .unwrap();
+
+        let report = runtime
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20, right: 22})")
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(observed_calls.get(), 0);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn typed_json_tools_reject_serialized_output_outside_the_wire_contract() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_typed_json_tool(
+                ToolPolicy::json("math.add"),
+                add_contract(),
+                |_input: AddInput| {
+                    Ok(StringAddOutput {
+                        total: "forty-two".to_owned(),
+                    })
+                },
+            )
+            .unwrap();
+
+        let report = runtime
+            .eval("use mod.tool\ntool.call_json(\"math.add\", {left: 20, right: 22})")
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
     }
 
     #[test]

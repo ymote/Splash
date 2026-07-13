@@ -478,6 +478,8 @@ dependencies = [
 name = "splash-worker"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "splash-protocol",
  "splash-storage",
 ]

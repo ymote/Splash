@@ -227,7 +227,9 @@ and before a result is returned to Splash. `JsonToolContract` adds an
 executable, bounded schema subset at the same boundary. Input contract failure
 does not invoke a handler or consume a call; output contract failure does not
 reach Splash. This is a data contract, not a way to deserialize arbitrary Rust
-types or grant a script access to a crate.
+types or grant a script access to a crate. The typed Serde bridge requires a
+`JsonToolContract` and validates that contract before input deserialization and
+after output serialization; a Rust struct is never the authoritative policy.
 
 Host-pump deferred tool promises are bounded per runtime and run only when the
 trusted host calls `CapabilityRuntime::pump`; one default pump tick processes

@@ -16,6 +16,7 @@ and keeps UI support optional rather than making UI the language boundary.
   tools through `mod.tool`.
 - Audited tool calls with input/output and call-count limits.
 - Bounded executable JSON contracts for structured tool inputs and outputs.
+- Schema-required Serde bridges for reviewed Rust input and output types.
 - Bounded, host-pumped deferred tool promises for cooperative mobile and
   embedded event loops.
 - Deferred-only external tools that hosts claim, complete, or cancel without
@@ -96,8 +97,9 @@ Rust applications integrate their existing crate ecosystem by registering a
 narrow, policy-bound adapter for each effect. Splash does not import crates or
 ambient OS APIs directly.
 
-JSON capabilities use object or array envelopes. Rust adapters receive and
-return `serde_json::Value`; Splash turns records and arrays into JSON with
+JSON capabilities use object or array envelopes. Rust adapters can receive and
+return `serde_json::Value`, or use the schema-required typed Serde bridge for
+reviewed structs; Splash turns records and arrays into JSON with
 `tool.call_json` or `tool.start_json`.
 
 ```splash

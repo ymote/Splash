@@ -79,6 +79,52 @@ reviewed adapters against its chosen crates and exposes only their bounded data
 contracts to scripts. JSON payloads are object/array envelopes with a 32-level
 maximum nesting depth in addition to their grant byte limits.
 
+## Typed Rust adapters
+
+`TypedJsonWorkerAdapter` adapts a statically linked Rust function with Serde
+types for an ordinary `invoke` request. It is a convenience for a reviewed
+crate integration, not dynamic crate loading or a sandbox:
+
+```rust
+use serde::{Deserialize, Serialize};
+use splash_worker::{
+    TypedJsonWorkerAdapter, WorkerAdapterRegistry, WorkerInvocationSafety,
+};
+
+#[derive(Deserialize)]
+struct AddInput {
+    left: i64,
+    right: i64,
+}
+
+#[derive(Serialize)]
+struct AddOutput {
+    total: i64,
+}
+
+let mut adapters = WorkerAdapterRegistry::default();
+adapters.register(
+    "math.add",
+    TypedJsonWorkerAdapter::new(
+        WorkerInvocationSafety::ReadOnly,
+        |input: AddInput, _grant| {
+            Ok(AddOutput {
+                total: input.left + input.right,
+            })
+        },
+    ),
+)?;
+```
+
+The adapter rejects non-object/array JSON envelopes and failed Serde
+conversions. Register its host-facing counterpart with
+`register_validated_protocol_json_tool` and a `JsonToolContract`; the host
+must validate the same wire data before it reaches the worker and after the
+worker serializes a result. The worker adapter does not own or infer JSON
+Schema policy. It supports only `invoke`, so a crash-sensitive external effect
+still needs a custom adapter using the durable dispatch and reconciliation
+methods.
+
 The runtime denies an adapter path until the adapter declares its contract.
 `WorkerAdapter::invocation_safety` must name `ReadOnly` or
 `IndependentlyIdempotent` before `invoke` can run.
@@ -237,6 +283,10 @@ semantics, and containment appropriate to the target.
 
 On mobile, the recommended profile is app-provided adapters only: do not
 expose arbitrary executable, filesystem, or network selectors to the worker.
+On these in-process targets, the adapter set is part of the trusted computing
+base: an unreviewed or compromised Rust adapter has the embedding app's
+authority despite protocol grants. Grants constrain protocol dispatch; they do
+not provide runtime confinement for ordinary Rust code.
 On embedded systems, select a small static adapter catalog and provide a
 platform durable store only when the hardware offers an authenticated
 anti-rollback primitive and atomic monotonic compare-and-swap. Otherwise use

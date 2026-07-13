@@ -31,6 +31,8 @@
 - Worker-side capability runtime with explicit Rust adapter registration,
   fresh-session admission, durable journal ordering, bounded reconciliation,
   and indeterminate-effect recovery.
+- Schema-required Serde host and worker bridges for statically linked,
+  reviewed Rust adapters; JSON Schema remains the script-visible wire policy.
 - Fenced rollback-protected storage extension and an authenticated worker
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of

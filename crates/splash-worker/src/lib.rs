@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
+use std::marker::PhantomData;
 
+use serde::{de::DeserializeOwned, Serialize};
 use splash_protocol::{
     AuthenticatedWorkerMessage, CapabilityGrant, CapabilityManifest, OperationCompensationRequest,
     OperationCompensationResult, OperationDispatchRequest, OperationReconcileRequest,
@@ -423,6 +425,9 @@ impl<E> std::error::Error for AuthenticatedWorkerJournalStoreError<E> where
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerAdapterError {
     Unsupported(&'static str),
+    InvalidJsonInput,
+    InvalidJsonOutput,
+    Failed,
     Indeterminate,
 }
 
@@ -432,6 +437,13 @@ impl Display for WorkerAdapterError {
             Self::Unsupported(operation) => {
                 write!(formatter, "worker adapter does not implement {operation}")
             }
+            Self::InvalidJsonInput => {
+                formatter.write_str("worker adapter rejected its typed JSON input")
+            }
+            Self::InvalidJsonOutput => {
+                formatter.write_str("worker adapter produced invalid typed JSON output")
+            }
+            Self::Failed => formatter.write_str("worker adapter failed"),
             Self::Indeterminate => {
                 formatter.write_str("worker adapter could not determine external effect state")
             }
@@ -460,6 +472,65 @@ pub enum WorkerDurableOperationContract {
     /// The adapter propagates `operation_key` to its provider as an
     /// idempotency key and also implements bounded status recovery.
     ProviderIdempotencyAndReconciliation,
+}
+
+/// A Serde-backed adapter for a statically linked Rust function.
+///
+/// This adapter implements only [`WorkerAdapter::invoke`]. It is therefore
+/// suitable only for work declared [`WorkerInvocationSafety::ReadOnly`] or
+/// [`WorkerInvocationSafety::IndependentlyIdempotent`]. Crash-sensitive
+/// effects must use a custom adapter with the durable operation methods and
+/// reconciliation contract.
+///
+/// The host's validated protocol registration remains the wire policy
+/// boundary. This helper converts a previously authorized JSON object or
+/// array to Rust types; it does not grant filesystem, network, process, or
+/// crate-selection authority.
+pub struct TypedJsonWorkerAdapter<I, O, F> {
+    invocation_safety: WorkerInvocationSafety,
+    handler: F,
+    marker: PhantomData<fn(I) -> O>,
+}
+
+impl<I, O, F> TypedJsonWorkerAdapter<I, O, F> {
+    /// Creates a typed adapter around one reviewed Rust handler.
+    pub fn new(invocation_safety: WorkerInvocationSafety, handler: F) -> Self {
+        Self {
+            invocation_safety,
+            handler,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<I, O, F> WorkerAdapter for TypedJsonWorkerAdapter<I, O, F>
+where
+    I: DeserializeOwned + 'static,
+    O: Serialize + 'static,
+    F: FnMut(I, &CapabilityGrant) -> Result<O, WorkerAdapterError> + 'static,
+{
+    fn invocation_safety(&self) -> Option<WorkerInvocationSafety> {
+        Some(self.invocation_safety)
+    }
+
+    fn invoke(
+        &mut self,
+        request: &ToolInvocation,
+        grant: &CapabilityGrant,
+    ) -> Result<ToolPayload, WorkerAdapterError> {
+        let ToolPayload::Json(input) = &request.payload else {
+            return Err(WorkerAdapterError::InvalidJsonInput);
+        };
+        let input = serde_json::from_value(input.clone())
+            .map_err(|_| WorkerAdapterError::InvalidJsonInput)?;
+        let output = (self.handler)(input, grant)?;
+        let output =
+            serde_json::to_value(output).map_err(|_| WorkerAdapterError::InvalidJsonOutput)?;
+        if !output.is_object() && !output.is_array() {
+            return Err(WorkerAdapterError::InvalidJsonOutput);
+        }
+        Ok(ToolPayload::Json(output))
+    }
 }
 
 /// Explicit Rust implementation for one registered worker tool.
@@ -1503,6 +1574,17 @@ mod tests {
 
     struct UnqualifiedAdapter;
 
+    #[derive(serde::Deserialize)]
+    struct AddInput {
+        left: i64,
+        right: i64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct AddOutput {
+        total: i64,
+    }
+
     impl WorkerAdapter for UnqualifiedAdapter {}
 
     impl WorkerAdapter for TestAdapter {
@@ -1560,6 +1642,64 @@ mod tests {
             self.counts.borrow_mut().reconciliations += 1;
             Ok(OperationStatus::Running)
         }
+    }
+
+    #[test]
+    fn typed_json_worker_adapters_convert_only_json_object_or_array_envelopes() {
+        let mut adapter = TypedJsonWorkerAdapter::new(
+            WorkerInvocationSafety::ReadOnly,
+            |input: AddInput, _grant: &CapabilityGrant| {
+                Ok(AddOutput {
+                    total: input.left + input.right,
+                })
+            },
+        );
+        let grant = CapabilityGrant::json("math.add");
+        let request = ToolInvocation::new(
+            "worker-1",
+            "invoke-1",
+            "math.add",
+            ToolPayload::Json(serde_json::json!({"left": 20, "right": 22})),
+        )
+        .unwrap();
+
+        assert_eq!(
+            adapter.invoke(&request, &grant).unwrap(),
+            ToolPayload::Json(serde_json::json!({"total": 42}))
+        );
+
+        let type_mismatch = ToolInvocation::new(
+            "worker-1",
+            "invoke-2",
+            "math.add",
+            ToolPayload::Json(serde_json::json!({"left": "20", "right": "22"})),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.invoke(&type_mismatch, &grant),
+            Err(WorkerAdapterError::InvalidJsonInput)
+        );
+
+        let text_payload = ToolInvocation::new(
+            "worker-1",
+            "invoke-3",
+            "math.add",
+            ToolPayload::Text("not-json".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter.invoke(&text_payload, &grant),
+            Err(WorkerAdapterError::InvalidJsonInput)
+        );
+
+        let mut scalar_output = TypedJsonWorkerAdapter::new(
+            WorkerInvocationSafety::ReadOnly,
+            |_input: AddInput, _grant: &CapabilityGrant| Ok(42),
+        );
+        assert_eq!(
+            scalar_output.invoke(&request, &grant),
+            Err(WorkerAdapterError::InvalidJsonOutput)
+        );
     }
 
     fn grant() -> CapabilityGrant {
