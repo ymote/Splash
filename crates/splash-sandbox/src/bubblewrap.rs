@@ -22,7 +22,7 @@ use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use rustix::io::{fcntl_setfd, FdFlags};
@@ -796,42 +796,66 @@ impl BubblewrapCommand {
 
         #[cfg(target_os = "linux")]
         {
-            let seccomp_descriptor = self
-                .seccomp_program
-                .as_ref()
-                .map(SeccompProgram::open_for_bubblewrap)
-                .transpose()?;
-            let mut command = Command::new(&self.bwrap_program);
-            if let Some(descriptor) = &seccomp_descriptor {
-                command
-                    .arg("--seccomp")
-                    .arg(descriptor.as_raw_fd().to_string());
-            }
+            self.spawn_with_stderr(Stdio::null())
+                .map(|(worker, _)| worker)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_with_stderr(
+        &self,
+        stderr: Stdio,
+    ) -> Result<(SpawnedBubblewrapWorker, Option<ChildStderr>), BubblewrapSpawnError> {
+        let seccomp_descriptor = self
+            .seccomp_program
+            .as_ref()
+            .map(SeccompProgram::open_for_bubblewrap)
+            .transpose()?;
+        let mut command = Command::new(&self.bwrap_program);
+        if let Some(descriptor) = &seccomp_descriptor {
             command
-                .args(&self.arguments)
-                .env_clear()
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-            let mut child = command.spawn().map_err(BubblewrapSpawnError::Spawn)?;
-            // The worker-side copy is owned and closed by Bubblewrap while it
-            // reads the program. Close our deliberately inherited copy before
-            // any later host process launch can observe it.
-            drop(seccomp_descriptor);
-            let Some(stdin) = child.stdin.take() else {
-                discard_child(&mut child);
-                return Err(BubblewrapSpawnError::MissingStdin);
-            };
-            let Some(stdout) = child.stdout.take() else {
-                discard_child(&mut child);
-                return Err(BubblewrapSpawnError::MissingStdout);
-            };
-            Ok(SpawnedBubblewrapWorker {
+                .arg("--seccomp")
+                .arg(descriptor.as_raw_fd().to_string());
+        }
+        command
+            .args(&self.arguments)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr);
+        let mut child = command.spawn().map_err(BubblewrapSpawnError::Spawn)?;
+        // The worker-side copy is owned and closed by Bubblewrap while it
+        // reads the program. Close our deliberately inherited copy before
+        // any later host process launch can observe it.
+        drop(seccomp_descriptor);
+        let Some(stdin) = child.stdin.take() else {
+            discard_child(&mut child);
+            return Err(BubblewrapSpawnError::MissingStdin);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            discard_child(&mut child);
+            return Err(BubblewrapSpawnError::MissingStdout);
+        };
+        let stderr = child.stderr.take();
+        Ok((
+            SpawnedBubblewrapWorker {
                 child,
                 stdin,
                 stdout,
-            })
-        }
+            },
+            stderr,
+        ))
+    }
+
+    #[cfg(all(target_os = "linux", test))]
+    fn spawn_capturing_stderr(
+        &self,
+    ) -> Result<(SpawnedBubblewrapWorker, ChildStderr), BubblewrapSpawnError> {
+        let (worker, stderr) = self.spawn_with_stderr(Stdio::piped())?;
+        let Some(stderr) = stderr else {
+            unreachable!("a piped Bubblewrap standard-error stream must be available")
+        };
+        Ok((worker, stderr))
     }
 
     /// Starts a worker and writes its authenticated session bootstrap before
@@ -2215,6 +2239,89 @@ mod tests {
             ),
             ptrace::SECCOMP_RET_KILL_PROCESS
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_attaches_the_host_owned_seccomp_filter_before_worker_exec() {
+        use std::io::Read;
+
+        let python = fs::canonicalize("/usr/bin/python3").unwrap();
+        let mut policy = BubblewrapWorkerPolicy::new("/usr/bin/bwrap", python)
+            .unwrap()
+            .with_worker_arguments(["-c", seccomp_test_worker_script()]);
+        policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
+        add_seccomp_test_library_mounts(&mut policy);
+        policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
+
+        let manifest =
+            CapabilityManifest::new("seccomp-integration", vec![CapabilityGrant::json("tool")])
+                .unwrap();
+        let plan = policy.compile(&manifest).unwrap();
+        let (worker, mut standard_error) = plan.spawn_capturing_stderr().unwrap();
+        let (mut child, stdin, mut stdout) = worker.into_parts();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        let mut standard_error_output = String::new();
+        standard_error
+            .read_to_string(&mut standard_error_output)
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "worker failed: {status}; stdout: {output:?}; stderr: {standard_error_output:?}"
+        );
+        assert_eq!(output, "seccomp-active\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_seccomp_test_library_mounts(policy: &mut BubblewrapWorkerPolicy) {
+        for path in ["/lib", "/lib64"] {
+            if Path::new(path).exists() {
+                policy.add_runtime_mount(ReadOnlyMount::new(path, path).unwrap());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn seccomp_test_worker_script() -> &'static str {
+        r#"
+import ctypes
+import errno
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.unshare(0) != -1 or ctypes.get_errno() != errno.EPERM:
+    print(f"unshare was not denied with EPERM: {ctypes.get_errno()}")
+    sys.exit(67)
+
+with open("/proc/self/status", encoding="utf-8") as status_file:
+    status = status_file.read()
+if "Seccomp:\t2" not in status:
+    print("seccomp filter is not active")
+    sys.exit(68)
+if "NoNewPrivs:\t1" not in status:
+    print("Bubblewrap did not set no_new_privs")
+    sys.exit(69)
+
+# Bubblewrap consumes and closes the launch-only Unix socket that carried the
+# cBPF bytes. Any remaining socket descriptor would be unexpected worker
+# authority.
+for descriptor in os.listdir("/proc/self/fd"):
+    try:
+        target = os.readlink(f"/proc/self/fd/{descriptor}")
+    except FileNotFoundError:
+        continue
+    if target.startswith("socket:"):
+        print(f"unexpected socket descriptor: {descriptor}")
+        sys.exit(70)
+
+print("seccomp-active")
+"#
     }
 
     #[cfg(not(target_os = "linux"))]
