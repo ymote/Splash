@@ -262,14 +262,15 @@ frame while a call is blocked waiting for its result. On Linux, the optional
 `bubblewrap-watchdog` feature connects a
 `BubblewrapWorkerLifecycle::into_watchdog` lifecycle to the generic
 `BoundedWorkerTransport`. It arms a trusted host-selected nonzero deadline
-before each `invoke`; expiry force-stops and reaps Bubblewrap from a separate
-host thread. An explicit host lifecycle control can do the same. Both outcomes
-are deliberately reported as indeterminate, poison the transport session, and
-require the host to discard it and reconcile any durable effect. This is a
-wall-clock process-stop mechanism, not authenticated cooperative cancellation,
-an adapter acknowledgement, or a durable recovery decision. Other platforms
-must supply their own process, I/O, deadline, cancellation, and resource
-policy.
+before each `invoke`; `BubblewrapWorkerSessionDeadline` can additionally bound
+the worker's total lifetime from spawn, including idle time. Either expiry
+force-stops and reaps Bubblewrap from a separate host thread. An explicit host
+lifecycle control can do the same. All outcomes are deliberately reported as
+indeterminate, poison the transport session, and require the host to discard
+it and reconcile any durable effect. This is a wall-clock process-stop
+mechanism, not authenticated cooperative cancellation, an adapter
+acknowledgement, or a durable recovery decision. Other platforms must supply
+their own process, I/O, deadline, cancellation, and resource policy.
 
 ## Mobile and Embedded Profiles
 

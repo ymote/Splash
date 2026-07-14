@@ -103,9 +103,10 @@ invalid or unexpected worker response. A host must discard that session rather
 than retrying on the stream. This is protocol robustness, not containment: the
 host still owns trusted key provisioning, cancellation semantics, child
 lifecycle, and the platform sandbox that restricts the worker's OS authority.
-The optional Bubblewrap watchdog can enforce a host-selected wall-clock
-force-stop for one synchronous transport invocation, but it is not an
-authenticated cancellation acknowledgement or effect-recovery decision.
+The optional Bubblewrap watchdog can enforce host-selected wall-clock force
+stops for one synchronous transport invocation and for a whole worker session
+measured from spawn, but it is not an authenticated cancellation
+acknowledgement or effect-recovery decision.
 
 `splash-sandbox::bubblewrap` is the first such platform sandbox integration.
 It accepts only a fixed host-selected worker executable and fixed arguments,
@@ -212,13 +213,15 @@ non-root sandbox identity where the available cgroup properties are required.
 `RLIMIT_CPU` does not bound a sleeping or blocked worker. A host using the
 optional `BubblewrapWorkerWatchdog` through `BoundedWorkerTransport` can arm a
 nonzero trusted wall-clock deadline for one synchronous transport invocation.
-The watchdog owns the child in a separate host thread, force-stops and reaps it
-on expiry, and treats a response race as indeterminate. It is not
-authenticated in-band cancellation and does not establish whether an adapter
-effect occurred. A host that does not use the watchdog must independently
-schedule lifecycle termination on a monotonic timer, discard the session, and
-reconcile any durable effect. The runner does not implement that timer or a
-worker cancellation acknowledgement.
+`BubblewrapWorkerSessionDeadline` can separately force-stop a whole worker
+session from its spawn time, including idle time. The watchdog owns the child
+in a separate host thread, force-stops and reaps it on either expiry, and
+treats a response race as indeterminate. It is not authenticated in-band
+cancellation and does not establish whether an adapter effect occurred. A host
+that does not use the watchdog must independently schedule lifecycle
+termination on a monotonic timer, discard the session, and reconcile any
+durable effect. The runner does not implement that timer or a worker
+cancellation acknowledgement.
 
 An explicit private `/tmp` can have a Bubblewrap `--size` allocation ceiling.
 That bounds only this tmpfs mount and must not be described as a process-memory,
@@ -229,15 +232,15 @@ reconcile a durable effect rather than infer that process termination cancelled
 or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no worker-specific syscall allowlist, aggregate-disk, device,
-or session-wide wall-clock quota, per-origin network proxy, D-Bus mediation,
-secret broker, authenticated cancellation delivery, or post-exit recovery. Its
-optional watchdog supplies only the narrow host wall-clock force-stop described
-above, its optional runner provides only the narrow rlimits described above,
-and its cgroup profile supplies only the CPU, memory, swap, task, and selected
-per-device I/O controls described above. The per-device I/O control is neither
-a filesystem quota nor a guarantee that buffered writeback will be attributed
-to the worker on every filesystem.
+This backend has no worker-specific syscall allowlist, aggregate-disk or device
+quota, per-origin network proxy, D-Bus mediation, secret broker, authenticated
+cancellation delivery, or post-exit recovery. Its optional watchdog supplies
+only trusted wall-clock process stops described above, its optional runner
+provides only the narrow rlimits described above, and its cgroup profile
+supplies only the CPU, memory, swap, task, and selected per-device I/O controls
+described above. The per-device I/O control is neither a filesystem quota nor a
+guarantee that buffered writeback will be attributed to the worker on every
+filesystem.
 `DenyKnownEscapeSurface` provides only the fixed default-allow hardening
 described above. A private `/tmp` is opt-in and unbounded unless the host
 selects its explicit Bubblewrap size limit; that limit does not replace a

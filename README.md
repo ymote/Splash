@@ -66,8 +66,8 @@ and keeps UI support optional rather than making UI the language boundary.
   memory, swap, task, and per-device I/O limits; a fixed runner joins the
   cgroup before Bubblewrap starts, and managed lifecycle teardown kills the
   whole worker process tree.
-- Optional Bubblewrap watchdog and generic bounded worker transport that apply
-  a host-selected wall-clock deadline to one synchronous invocation; deadline
+- Optional Bubblewrap watchdog and generic bounded worker transport with
+  host-selected per-invocation and total-session wall-clock deadlines; expiry
   or host termination poisons the session and remains indeterminate.
 - A small `splash` CLI for local evaluation and the workflow example.
 

@@ -69,9 +69,10 @@
   with trusted cBPF transport, ABI/x32 checks, and a fixed default-allow deny
   set. It is defense in depth, not a worker-specific syscall allowlist.
 - Optional host-owned Bubblewrap watchdog plus generic bounded worker transport
-  for nonzero per-invocation wall-clock deadlines. A timeout or trusted
-  force-stop poisons the session and is indeterminate, never a cancellation
-  acknowledgement or durable recovery result.
+  for nonzero per-invocation and spawn-anchored session-wide wall-clock
+  deadlines. A timeout or trusted force-stop poisons the session and is
+  indeterminate, never a cancellation acknowledgement or durable recovery
+  result.
 
 ## Next: durable external operations
 
@@ -80,9 +81,9 @@
 
 ## Next: contained local effects
 
-- Aggregate-disk and session-wide wall-clock quotas; worker-specific seccomp
-  allowlists; authenticated in-band cancellation; and durable post-stop
-  recovery policy around the Linux Bubblewrap launcher.
+- Aggregate-disk quotas; worker-specific seccomp allowlists; authenticated
+  in-band cancellation; and durable post-stop recovery policy around the Linux
+  Bubblewrap launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

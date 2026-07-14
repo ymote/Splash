@@ -877,6 +877,9 @@ impl BubblewrapCommand {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(stderr);
+        // Start the lifetime immediately before process creation so a session
+        // deadline never gains an unenforced launch-time extension.
+        let started_at = Instant::now();
         let mut child = command.spawn().map_err(BubblewrapSpawnError::Spawn)?;
         // The worker-side copy is owned and closed by Bubblewrap while it
         // reads the program. Close our deliberately inherited copy before
@@ -907,6 +910,7 @@ impl BubblewrapCommand {
                 stdin,
                 stdout,
                 cgroup,
+                started_at,
             },
             stderr,
         ))
@@ -1038,6 +1042,7 @@ pub struct SpawnedBubblewrapWorker {
     stdin: ChildStdin,
     stdout: ChildStdout,
     cgroup: Option<CgroupV2Session>,
+    started_at: Instant,
 }
 
 impl SpawnedBubblewrapWorker {
@@ -1070,10 +1075,42 @@ impl SpawnedBubblewrapWorker {
             BubblewrapWorkerLifecycle {
                 child: self.child,
                 cgroup: self.cgroup,
+                started_at: self.started_at,
             },
             self.stdin,
             self.stdout,
         )
+    }
+
+    /// Transfers the worker lifecycle and private pipes to a watchdog with a
+    /// session-wide deadline measured from worker spawn.
+    ///
+    /// This is the preferred handoff when a host needs a bounded worker
+    /// lifetime: it starts the watchdog before returning either pipe. If the
+    /// watchdog thread cannot start, the returned error retains the lifecycle
+    /// so the host can terminate and reap the worker; the private pipes are
+    /// dropped rather than returned without deadline enforcement.
+    pub fn into_session_watchdog_parts(
+        self,
+        deadline: BubblewrapWorkerSessionDeadline,
+    ) -> Result<
+        (BubblewrapWorkerWatchdog, ChildStdin, ChildStdout),
+        BubblewrapWorkerWatchdogStartError,
+    > {
+        let Self {
+            child,
+            stdin,
+            stdout,
+            cgroup,
+            started_at,
+        } = self;
+        let lifecycle = BubblewrapWorkerLifecycle {
+            child,
+            cgroup,
+            started_at,
+        };
+        let watchdog = lifecycle.into_watchdog_with_session_deadline(deadline)?;
+        Ok((watchdog, stdin, stdout))
     }
 
     /// Consumes the handle and returns the child plus its private input/output
@@ -1095,6 +1132,7 @@ impl SpawnedBubblewrapWorker {
 pub struct BubblewrapWorkerLifecycle {
     child: Child,
     cgroup: Option<CgroupV2Session>,
+    started_at: Instant,
 }
 
 impl BubblewrapWorkerLifecycle {
@@ -1125,7 +1163,24 @@ impl BubblewrapWorkerLifecycle {
     pub fn into_watchdog(
         self,
     ) -> Result<BubblewrapWorkerWatchdog, BubblewrapWorkerWatchdogStartError> {
-        BubblewrapWorkerWatchdog::new(self)
+        BubblewrapWorkerWatchdog::new(self, None)
+    }
+
+    /// Transfers this lifecycle to a watchdog with a fixed session-wide
+    /// deadline measured from worker spawn.
+    ///
+    /// The deadline applies while the worker is idle as well as while one
+    /// invocation is active. Expiry force-stops and reaps the worker; it is
+    /// not a protocol cancellation acknowledgement and any active effect is
+    /// indeterminate.
+    pub fn into_watchdog_with_session_deadline(
+        self,
+        deadline: BubblewrapWorkerSessionDeadline,
+    ) -> Result<BubblewrapWorkerWatchdog, BubblewrapWorkerWatchdogStartError> {
+        let Some(session_deadline) = deadline.at(self.started_at) else {
+            return Err(BubblewrapWorkerWatchdogStartError::deadline_overflow(self));
+        };
+        BubblewrapWorkerWatchdog::new(self, Some(session_deadline))
     }
 
     /// Consumes this lifecycle handle and returns the raw child process.
@@ -1137,6 +1192,63 @@ impl BubblewrapWorkerLifecycle {
         self.child
     }
 }
+
+/// A nonzero host-selected upper bound for one Bubblewrap worker session.
+///
+/// A session deadline is measured from process spawn and remains active while
+/// the worker is idle or serving a request. It is trusted host configuration:
+/// Splash source cannot inspect, reset, or extend it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BubblewrapWorkerSessionDeadline {
+    maximum: Duration,
+}
+
+impl BubblewrapWorkerSessionDeadline {
+    /// Creates a session deadline that can be represented by the monotonic
+    /// clock on this host.
+    pub fn new(maximum: Duration) -> Result<Self, BubblewrapWorkerSessionDeadlineError> {
+        if maximum.is_zero() {
+            return Err(BubblewrapWorkerSessionDeadlineError::Zero);
+        }
+        if Instant::now().checked_add(maximum).is_none() {
+            return Err(BubblewrapWorkerSessionDeadlineError::Unrepresentable);
+        }
+        Ok(Self { maximum })
+    }
+
+    /// Returns the host-selected maximum worker lifetime.
+    pub const fn maximum(self) -> Duration {
+        self.maximum
+    }
+
+    fn at(self, started_at: Instant) -> Option<Instant> {
+        started_at.checked_add(self.maximum)
+    }
+}
+
+/// Rejection while creating a [`BubblewrapWorkerSessionDeadline`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BubblewrapWorkerSessionDeadlineError {
+    /// A zero-duration deadline cannot establish a usable worker session.
+    Zero,
+    /// The host monotonic clock cannot represent the requested deadline.
+    Unrepresentable,
+}
+
+impl Display for BubblewrapWorkerSessionDeadlineError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => {
+                formatter.write_str("Bubblewrap worker session deadline must be greater than zero")
+            }
+            Self::Unrepresentable => formatter.write_str(
+                "Bubblewrap worker session deadline cannot be represented by the monotonic clock",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BubblewrapWorkerSessionDeadlineError {}
 
 /// Outcome after a host force-terminates a Bubblewrap worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1181,6 +1293,7 @@ pub struct BubblewrapWorkerWatchdog {
 impl BubblewrapWorkerWatchdog {
     fn new(
         lifecycle: BubblewrapWorkerLifecycle,
+        session_deadline: Option<Instant>,
     ) -> Result<Self, BubblewrapWorkerWatchdogStartError> {
         let (sender, receiver) = mpsc::channel();
         // Retain the lifecycle outside the closure until the OS confirms that
@@ -1192,12 +1305,12 @@ impl BubblewrapWorkerWatchdog {
             .name("splash-bwrap-watchdog".to_owned())
             .spawn(move || {
                 let lifecycle = take_pending_lifecycle(&thread_lifecycle);
-                run_watchdog_thread(lifecycle, receiver);
+                run_watchdog_thread(lifecycle, receiver, session_deadline);
             }) {
             Ok(join) => join,
             Err(source) => {
                 return Err(BubblewrapWorkerWatchdogStartError {
-                    source,
+                    source: Some(source),
                     lifecycle: take_pending_lifecycle(&pending_lifecycle),
                 });
             }
@@ -1327,6 +1440,9 @@ pub enum BubblewrapWorkerInvocationOutcome {
     Completed,
     /// The deadline elapsed and the watchdog force-stopped the worker.
     DeadlineElapsed(BubblewrapTermination),
+    /// The worker session lifetime elapsed and the watchdog force-stopped the
+    /// worker. Any active adapter effect is indeterminate.
+    SessionDeadlineElapsed(BubblewrapTermination),
     /// Trusted host lifecycle control force-stopped the worker.
     Terminated(BubblewrapTermination),
 }
@@ -1334,11 +1450,18 @@ pub enum BubblewrapWorkerInvocationOutcome {
 /// Failure while transferring a worker lifecycle into a watchdog thread.
 #[derive(Debug)]
 pub struct BubblewrapWorkerWatchdogStartError {
-    source: io::Error,
+    source: Option<io::Error>,
     lifecycle: BubblewrapWorkerLifecycle,
 }
 
 impl BubblewrapWorkerWatchdogStartError {
+    fn deadline_overflow(lifecycle: BubblewrapWorkerLifecycle) -> Self {
+        Self {
+            source: None,
+            lifecycle,
+        }
+    }
+
     /// Returns the worker lifecycle so the caller can terminate and reap it.
     pub fn into_lifecycle(self) -> BubblewrapWorkerLifecycle {
         self.lifecycle
@@ -1347,17 +1470,23 @@ impl BubblewrapWorkerWatchdogStartError {
 
 impl Display for BubblewrapWorkerWatchdogStartError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "could not start Bubblewrap worker watchdog: {}",
-            self.source
-        )
+        match &self.source {
+            Some(source) => write!(
+                formatter,
+                "could not start Bubblewrap worker watchdog: {source}",
+            ),
+            None => formatter.write_str(
+                "Bubblewrap worker session deadline cannot be represented by the monotonic clock",
+            ),
+        }
     }
 }
 
 impl std::error::Error for BubblewrapWorkerWatchdogStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -1370,6 +1499,7 @@ pub enum BubblewrapWorkerWatchdogError {
     InvocationMismatch,
     InvocationSequenceExhausted,
     NoActiveInvocation,
+    SessionDeadlineElapsed(BubblewrapTermination),
     SessionTerminated(BubblewrapTermination),
     LifecycleFailed,
     Unavailable,
@@ -1397,6 +1527,9 @@ impl Display for BubblewrapWorkerWatchdogError {
             Self::NoActiveInvocation => {
                 formatter.write_str("Bubblewrap worker has no active invocation deadline")
             }
+            Self::SessionDeadlineElapsed(_) => {
+                formatter.write_str("Bubblewrap worker session deadline elapsed")
+            }
             Self::SessionTerminated(_) => {
                 formatter.write_str("Bubblewrap worker process has already terminated")
             }
@@ -1423,6 +1556,7 @@ impl std::error::Error for BubblewrapWorkerWatchdogError {
             | Self::InvocationMismatch
             | Self::InvocationSequenceExhausted
             | Self::NoActiveInvocation
+            | Self::SessionDeadlineElapsed(_)
             | Self::SessionTerminated(_)
             | Self::LifecycleFailed
             | Self::Unavailable
@@ -1452,6 +1586,7 @@ enum WatchdogCommand {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WatchdogTerminationReason {
     DeadlineElapsed,
+    SessionDeadlineElapsed,
     HostTerminated,
     Shutdown,
     ProcessExited,
@@ -1497,9 +1632,10 @@ fn request_termination(
 fn run_watchdog_thread(
     mut lifecycle: BubblewrapWorkerLifecycle,
     receiver: mpsc::Receiver<WatchdogCommand>,
+    session_deadline: Option<Instant>,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_watchdog_loop(&mut lifecycle, receiver);
+        run_watchdog_loop(&mut lifecycle, receiver, session_deadline);
     }));
     // A panic or disconnected controller must never leave the child behind.
     let _ = lifecycle.terminate();
@@ -1508,32 +1644,27 @@ fn run_watchdog_thread(
 fn run_watchdog_loop(
     lifecycle: &mut BubblewrapWorkerLifecycle,
     receiver: mpsc::Receiver<WatchdogCommand>,
+    session_deadline: Option<Instant>,
 ) {
     let mut state = WatchdogState::Idle;
     let mut next_sequence = 1;
     loop {
-        let active_deadline = match &state {
-            WatchdogState::Active { deadline, .. } => Some(*deadline),
-            WatchdogState::Idle | WatchdogState::Terminated { .. } | WatchdogState::Failed => None,
-        };
-        let command = match active_deadline {
-            Some(deadline) if Instant::now() >= deadline => {
-                let _ = terminate_watchdog_worker(
-                    lifecycle,
-                    &mut state,
-                    WatchdogTerminationReason::DeadlineElapsed,
-                );
+        let deadline = next_watchdog_deadline(&state, session_deadline);
+        let command = match expired_watchdog_reason(&state, session_deadline, Instant::now()) {
+            Some(reason) => {
+                let _ = terminate_watchdog_worker(lifecycle, &mut state, reason);
                 continue;
             }
-            Some(deadline) => {
-                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            None => match deadline {
+                Some(deadline) => match receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
                     Ok(command) => command,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = terminate_watchdog_worker(
-                            lifecycle,
-                            &mut state,
-                            WatchdogTerminationReason::DeadlineElapsed,
-                        );
+                        let reason =
+                            expired_watchdog_reason(&state, session_deadline, Instant::now())
+                                .unwrap_or(WatchdogTerminationReason::DeadlineElapsed);
+                        let _ = terminate_watchdog_worker(lifecycle, &mut state, reason);
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1544,24 +1675,79 @@ fn run_watchdog_loop(
                         );
                         break;
                     }
-                }
-            }
-            None => match receiver.recv() {
-                Ok(command) => command,
-                Err(_) => {
-                    let _ = terminate_watchdog_worker(
-                        lifecycle,
-                        &mut state,
-                        WatchdogTerminationReason::Shutdown,
-                    );
-                    break;
-                }
+                },
+                None => match receiver.recv() {
+                    Ok(command) => command,
+                    Err(_) => {
+                        let _ = terminate_watchdog_worker(
+                            lifecycle,
+                            &mut state,
+                            WatchdogTerminationReason::Shutdown,
+                        );
+                        break;
+                    }
+                },
             },
         };
 
-        if handle_watchdog_command(command, lifecycle, &mut state, &mut next_sequence) {
+        if let Some(reason) = expired_watchdog_reason(&state, session_deadline, Instant::now()) {
+            let _ = terminate_watchdog_worker(lifecycle, &mut state, reason);
+        }
+
+        if handle_watchdog_command(
+            command,
+            lifecycle,
+            &mut state,
+            &mut next_sequence,
+            session_deadline,
+        ) {
             break;
         }
+    }
+}
+
+fn next_watchdog_deadline(
+    state: &WatchdogState,
+    session_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let active_deadline = match state {
+        WatchdogState::Active { deadline, .. } => Some(*deadline),
+        WatchdogState::Idle | WatchdogState::Terminated { .. } | WatchdogState::Failed => None,
+    };
+    let session_deadline = match state {
+        WatchdogState::Idle | WatchdogState::Active { .. } => session_deadline,
+        WatchdogState::Terminated { .. } | WatchdogState::Failed => None,
+    };
+    match (active_deadline, session_deadline) {
+        (Some(active), Some(session)) => Some(active.min(session)),
+        (Some(active), None) => Some(active),
+        (None, Some(session)) => Some(session),
+        (None, None) => None,
+    }
+}
+
+fn expired_watchdog_reason(
+    state: &WatchdogState,
+    session_deadline: Option<Instant>,
+    now: Instant,
+) -> Option<WatchdogTerminationReason> {
+    match state {
+        WatchdogState::Idle | WatchdogState::Active { .. } => {
+            if session_deadline.is_some_and(|deadline| now >= deadline) {
+                return Some(WatchdogTerminationReason::SessionDeadlineElapsed);
+            }
+        }
+        WatchdogState::Terminated { .. } | WatchdogState::Failed => return None,
+    }
+
+    match state {
+        WatchdogState::Active { deadline, .. } if now >= *deadline => {
+            Some(WatchdogTerminationReason::DeadlineElapsed)
+        }
+        WatchdogState::Idle
+        | WatchdogState::Active { .. }
+        | WatchdogState::Terminated { .. }
+        | WatchdogState::Failed => None,
     }
 }
 
@@ -1570,14 +1756,26 @@ fn handle_watchdog_command(
     lifecycle: &mut BubblewrapWorkerLifecycle,
     state: &mut WatchdogState,
     next_sequence: &mut u64,
+    session_deadline: Option<Instant>,
 ) -> bool {
     match command {
         WatchdogCommand::Arm { maximum, reply } => {
-            let _ = reply.send(arm_watchdog_call(lifecycle, state, next_sequence, maximum));
+            let _ = reply.send(arm_watchdog_call(
+                lifecycle,
+                state,
+                next_sequence,
+                maximum,
+                session_deadline,
+            ));
             false
         }
         WatchdogCommand::Disarm { sequence, reply } => {
-            let _ = reply.send(finish_watchdog_call(lifecycle, state, sequence));
+            let _ = reply.send(finish_watchdog_call(
+                lifecycle,
+                state,
+                sequence,
+                session_deadline,
+            ));
             false
         }
         WatchdogCommand::Terminate { reply } => {
@@ -1604,9 +1802,13 @@ fn arm_watchdog_call(
     state: &mut WatchdogState,
     next_sequence: &mut u64,
     maximum: Duration,
+    session_deadline: Option<Instant>,
 ) -> Result<u64, BubblewrapWorkerWatchdogError> {
     if maximum.is_zero() {
         return Err(BubblewrapWorkerWatchdogError::InvalidDeadline);
+    }
+    if let Some(reason) = expired_watchdog_reason(state, session_deadline, Instant::now()) {
+        let _ = terminate_watchdog_worker(lifecycle, state, reason)?;
     }
     match state {
         WatchdogState::Idle => {
@@ -1641,6 +1843,12 @@ fn arm_watchdog_call(
             Ok(sequence)
         }
         WatchdogState::Active { .. } => Err(BubblewrapWorkerWatchdogError::InvocationAlreadyActive),
+        WatchdogState::Terminated {
+            reason: WatchdogTerminationReason::SessionDeadlineElapsed,
+            outcome,
+        } => Err(BubblewrapWorkerWatchdogError::SessionDeadlineElapsed(
+            outcome.clone(),
+        )),
         WatchdogState::Terminated { outcome, .. } => Err(
             BubblewrapWorkerWatchdogError::SessionTerminated(outcome.clone()),
         ),
@@ -1652,7 +1860,11 @@ fn finish_watchdog_call(
     lifecycle: &mut BubblewrapWorkerLifecycle,
     state: &mut WatchdogState,
     sequence: u64,
+    session_deadline: Option<Instant>,
 ) -> Result<BubblewrapWorkerInvocationOutcome, BubblewrapWorkerWatchdogError> {
+    if let Some(reason) = expired_watchdog_reason(state, session_deadline, Instant::now()) {
+        let _ = terminate_watchdog_worker(lifecycle, state, reason)?;
+    }
     match state {
         WatchdogState::Idle => Err(BubblewrapWorkerWatchdogError::NoActiveInvocation),
         WatchdogState::Active {
@@ -1710,6 +1922,9 @@ fn invocation_outcome(
     match reason {
         WatchdogTerminationReason::DeadlineElapsed => {
             BubblewrapWorkerInvocationOutcome::DeadlineElapsed(outcome)
+        }
+        WatchdogTerminationReason::SessionDeadlineElapsed => {
+            BubblewrapWorkerInvocationOutcome::SessionDeadlineElapsed(outcome)
         }
         WatchdogTerminationReason::HostTerminated
         | WatchdogTerminationReason::Shutdown
@@ -3695,6 +3910,92 @@ print("seccomp-active")
 
     #[cfg(unix)]
     #[test]
+    fn session_deadline_force_stops_an_idle_worker() {
+        let deadline = BubblewrapWorkerSessionDeadline::new(Duration::from_millis(25)).unwrap();
+        let (mut watchdog, stdin, stdout) = test_worker("exec sleep 60")
+            .into_session_watchdog_parts(deadline)
+            .unwrap();
+        drop(stdin);
+        drop(stdout);
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(
+            watchdog.begin_call(Duration::from_secs(1)),
+            Err(BubblewrapWorkerWatchdogError::SessionDeadlineElapsed(termination))
+                if termination.was_killed()
+        ));
+        assert!(watchdog.close().unwrap().was_killed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_deadline_marks_an_active_call_indeterminate() {
+        let deadline = BubblewrapWorkerSessionDeadline::new(Duration::from_millis(25)).unwrap();
+        let (mut watchdog, stdin, stdout) = test_worker("exec sleep 60")
+            .into_session_watchdog_parts(deadline)
+            .unwrap();
+        drop(stdin);
+        drop(stdout);
+
+        let call = watchdog.begin_call(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(
+            watchdog.finish_call(call).unwrap(),
+            BubblewrapWorkerInvocationOutcome::SessionDeadlineElapsed(termination)
+                if termination.was_killed()
+        ));
+        assert!(watchdog.close().unwrap().was_killed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invocation_deadline_wins_when_it_precedes_the_session_deadline() {
+        let session_deadline =
+            BubblewrapWorkerSessionDeadline::new(Duration::from_secs(1)).unwrap();
+        let (mut watchdog, stdin, stdout) = test_worker("exec sleep 60")
+            .into_session_watchdog_parts(session_deadline)
+            .unwrap();
+        drop(stdin);
+        drop(stdout);
+
+        let call = watchdog.begin_call(Duration::from_millis(25)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(
+            watchdog.finish_call(call).unwrap(),
+            BubblewrapWorkerInvocationOutcome::DeadlineElapsed(termination)
+                if termination.was_killed()
+        ));
+        assert!(watchdog.close().unwrap().was_killed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_deadline_is_measured_from_spawn_not_watchdog_handoff() {
+        let worker = test_worker("exec sleep 60");
+        std::thread::sleep(Duration::from_millis(100));
+        let deadline = BubblewrapWorkerSessionDeadline::new(Duration::from_millis(25)).unwrap();
+        let (mut watchdog, stdin, stdout) = worker.into_session_watchdog_parts(deadline).unwrap();
+        drop(stdin);
+        drop(stdout);
+
+        assert!(matches!(
+            watchdog.begin_call(Duration::from_secs(1)),
+            Err(BubblewrapWorkerWatchdogError::SessionDeadlineElapsed(termination))
+                if termination.was_killed()
+        ));
+        assert!(watchdog.close().unwrap().was_killed());
+    }
+
+    #[test]
+    fn session_deadline_rejects_zero_duration() {
+        assert_eq!(
+            BubblewrapWorkerSessionDeadline::new(Duration::ZERO),
+            Err(BubblewrapWorkerSessionDeadlineError::Zero)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn watchdog_control_force_stops_an_active_call() {
         let (lifecycle, stdin, stdout) = test_worker("exec sleep 60").into_lifecycle_parts();
         drop(stdin);
@@ -3780,6 +4081,7 @@ print("seccomp-active")
             stdin,
             stdout,
             cgroup: None,
+            started_at: Instant::now(),
         }
     }
 }

@@ -177,17 +177,19 @@ managed lifecycle; `SpawnedBubblewrapWorker::into_parts` and
 `BubblewrapWorkerLifecycle::into_child` deliberately relinquish that
 process-tree teardown and cleanup handle.
 
-This is not an aggregate-disk, device, network, or session-wide wall-clock
-policy. Per-device `io.max` is not a filesystem quota, and neither controller
-proves an adapter effect was cancelled or rolled back. See the Linux [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+This is not an aggregate-disk, device, or network policy. Per-device `io.max`
+is not a filesystem quota, and neither controller proves an adapter effect was
+cancelled or rolled back. A Bubblewrap watchdog can separately enforce a
+host-selected session-wide wall-clock deadline. See the Linux [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 for the kernel controller semantics.
 
 ## Host Wall-Clock Watchdog
 
 For a synchronous JSON-line worker, enable both
 `splash-capabilities/json-line-worker` and
-`splash-capabilities/bubblewrap-watchdog`. Move the lifecycle into the
-watchdog before sending effectful work, then wrap the authenticated transport:
+`splash-capabilities/bubblewrap-watchdog`. Move the spawned worker directly
+into the watchdog before sending effectful work, then wrap the authenticated
+transport:
 
 ```rust
 use std::io::BufReader;
@@ -200,8 +202,11 @@ use splash_capabilities::json_line_worker::{
     AuthenticatedFrameWorkerTransport, JsonLineWorkerChannel, WorkerFrameChannel,
 };
 use splash_capabilities::WorkerMessage;
+use splash_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
 
-let watchdog = lifecycle.into_watchdog()?;
+let session_deadline = BubblewrapWorkerSessionDeadline::new(Duration::from_secs(300))?;
+let (watchdog, worker_stdin, worker_stdout) =
+    worker.into_session_watchdog_parts(session_deadline)?;
 let stop = watchdog.control(); // Trusted host lifecycle control only.
 let mut channel = JsonLineWorkerChannel::new(BufReader::new(worker_stdout), worker_stdin);
 let opening = host_authenticator.seal(WorkerMessage::OpenSession {
@@ -214,19 +219,23 @@ let transport = BoundedWorkerTransport::new(transport, watchdog, deadline);
 ```
 
 `BoundedWorkerTransport` arms the watchdog before it sends each synchronous
-`invoke` frame and disarms it only after the frame transport has returned. On
-expiry, the watchdog force-stops and reaps Bubblewrap while the caller can
-still be blocked reading a pipe. `stop.terminate()` performs the same process
-operation for a host cancellation decision. Neither path writes
-`WorkerMessage::Cancel`, waits for a worker acknowledgement, or establishes
-that an adapter effect did not happen. A timeout or force-stop always poisons
+`invoke` frame and disarms it only after the frame transport has returned. The
+session deadline starts when the worker process is spawned, remains active
+while the worker is idle or serving an invocation, and the direct handoff above
+starts the watchdog before either pipe is returned. On either deadline expiry,
+the watchdog force-stops and reaps Bubblewrap while the caller can still be
+blocked reading a pipe. `stop.terminate()` performs the same process operation
+for a host cancellation decision. Neither path writes `WorkerMessage::Cancel`,
+waits for a worker acknowledgement, or establishes that an adapter effect did
+not happen. A per-call timeout, session expiry, or force-stop always poisons
 the session and produces an indeterminate transport error, even when a result
 races with termination. Discard the session; use the durable reconciliation or
 compensation path before deciding how to recover an effect.
 
-The watchdog bounds one host transport invocation, not the worker's total
-resource consumption, a child process tree, or an adapter's downstream I/O.
-The deadline is trusted host configuration and is never a Splash value.
+The watchdog bounds host wall-clock time, not the worker's aggregate disk or
+device use or an adapter's downstream I/O. Keep cgroup-backed workers in their
+managed lifecycle when process-tree teardown is required. Both deadlines are
+trusted host configuration and are never Splash values.
 
 `enable_private_tmpfs_with_maximum_bytes` emits `--size BYTES` immediately
 before `--tmpfs /tmp`. Bubblewrap enforces that maximum only for allocations in
@@ -422,11 +431,11 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- aggregate-disk, device, or session-wide wall-clock quotas. An optional
-  cgroup-v2 policy adds CPU bandwidth, memory, swap, task, and per-device I/O
-  controls; it is not a filesystem quota. An optional runner adds the narrower
-  rlimits, and a configured private `/tmp` size limits only that Bubblewrap
-  `tmpfs`;
+- aggregate-disk or device quotas. An optional cgroup-v2 policy adds CPU
+  bandwidth, memory, swap, task, and per-device I/O controls; it is not a
+  filesystem quota. An optional runner adds the narrower rlimits, a configured
+  private `/tmp` size limits only that Bubblewrap `tmpfs`, and the watchdog
+  adds a process-lifetime wall-clock deadline;
 - a worker-specific syscall allowlist, D-Bus mediation, device-specific policy,
   or a network proxy. `DenyKnownEscapeSurface` is a narrow default-allow
   hardening filter, not a replacement for any of these;

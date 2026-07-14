@@ -69,6 +69,9 @@ pub enum WorkerInvocationOutcome<T> {
     Completed,
     /// The host deadline elapsed and the supervisor terminated the worker.
     DeadlineElapsed(T),
+    /// The worker session lifetime elapsed and the supervisor terminated the
+    /// worker. Any active adapter effect is indeterminate.
+    SessionDeadlineElapsed(T),
     /// A host lifecycle control terminated the worker while the call was live.
     Terminated(T),
 }
@@ -110,6 +113,8 @@ pub trait WorkerExecutionSupervisor {
 pub enum WorkerIndeterminateCause {
     /// The host wall-clock deadline elapsed before the transport disarmed it.
     DeadlineElapsed,
+    /// The worker's host-selected total session lifetime elapsed.
+    SessionDeadlineElapsed,
     /// Trusted host lifecycle control force-stopped the worker.
     WorkerTerminated,
 }
@@ -208,6 +213,14 @@ where
                     termination,
                 })
             }
+            Ok(WorkerInvocationOutcome::SessionDeadlineElapsed(termination)) => {
+                self.poisoned = true;
+                self.transport.discard();
+                Err(BoundedWorkerTransportError::Indeterminate {
+                    cause: WorkerIndeterminateCause::SessionDeadlineElapsed,
+                    termination,
+                })
+            }
             Ok(WorkerInvocationOutcome::Terminated(termination)) => {
                 self.poisoned = true;
                 self.transport.discard();
@@ -288,6 +301,12 @@ impl<TE: Display, SE: Display, ST> Display for BoundedWorkerTransportError<TE, S
                 ..
             } => formatter
                 .write_str("worker invocation exceeded its host deadline and may have completed"),
+            Self::Indeterminate {
+                cause: WorkerIndeterminateCause::SessionDeadlineElapsed,
+                ..
+            } => formatter.write_str(
+                "worker session exceeded its host deadline and its invocation may have completed",
+            ),
             Self::Indeterminate {
                 cause: WorkerIndeterminateCause::WorkerTerminated,
                 ..
@@ -459,6 +478,32 @@ mod tests {
                 cause: WorkerIndeterminateCause::DeadlineElapsed,
                 termination: 7,
             })
+        ));
+        assert!(bounded.is_poisoned());
+
+        let (transport, supervisor) = bounded.into_parts();
+        assert!(transport.discarded);
+        assert_eq!(supervisor.termination_count, 0);
+    }
+
+    #[test]
+    fn treats_a_session_deadline_as_indeterminate_and_discards_the_session() {
+        let transport = TestTransport {
+            result: Ok(result()),
+            dispatches: 0,
+            discarded: false,
+        };
+        let supervisor = supervisor(Ok(WorkerInvocationOutcome::SessionDeadlineElapsed(8)));
+        let mut bounded = BoundedWorkerTransport::new(transport, supervisor, deadline());
+
+        let error = bounded.dispatch(invocation()).unwrap_err();
+        assert!(error.is_indeterminate());
+        assert!(matches!(
+            error,
+            BoundedWorkerTransportError::Indeterminate {
+                cause: WorkerIndeterminateCause::SessionDeadlineElapsed,
+                termination: 8,
+            }
         ));
         assert!(bounded.is_poisoned());
 

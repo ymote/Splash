@@ -35,6 +35,9 @@ impl WorkerExecutionSupervisor for BubblewrapWorkerWatchdog {
             BubblewrapWorkerInvocationOutcome::DeadlineElapsed(termination) => {
                 Ok(WorkerInvocationOutcome::DeadlineElapsed(termination))
             }
+            BubblewrapWorkerInvocationOutcome::SessionDeadlineElapsed(termination) => {
+                Ok(WorkerInvocationOutcome::SessionDeadlineElapsed(termination))
+            }
             BubblewrapWorkerInvocationOutcome::Terminated(termination) => {
                 Ok(WorkerInvocationOutcome::Terminated(termination))
             }
