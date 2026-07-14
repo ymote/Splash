@@ -206,3 +206,12 @@ would change the source. Rust hosts can call `splash_core::format_source` or
 `splash_core::format_source_named`; both use the supplied `ExecutionLimits`
 source and syntax-token bounds, cap output at four times the source budget,
 and never evaluate code.
+
+## Editor protocol
+
+`splash-lsp` exposes the same effect-free validation and formatting operations
+over stdio LSP. It uses UTF-16 positions, requests full-document sync, and
+supports `textDocument/didOpen`, `textDocument/didChange`,
+`textDocument/didClose`, and `textDocument/formatting`. It does not open the
+URI supplied by the client or run source; all diagnostics and edits derive from
+the client-provided document text.

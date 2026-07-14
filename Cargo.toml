@@ -9,6 +9,7 @@ members = [
     "crates/splash-worker",
     "crates/splash-workflow",
     "crates/splash-cli",
+    "crates/splash-lsp",
 ]
 default-members = [
     "crates/splash-core",
@@ -20,6 +21,7 @@ default-members = [
     "crates/splash-worker",
     "crates/splash-workflow",
     "crates/splash-cli",
+    "crates/splash-lsp",
 ]
 exclude = ["vendor/makepad"]
 resolver = "2"

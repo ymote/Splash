@@ -19,6 +19,21 @@ cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
 This keeps failures in source owned by Splash actionable while preserving
 separate behavioral coverage for the imported VM.
 
+## Language server
+
+`splash-lsp` is a host-only stdio server for editor clients. It advertises
+UTF-16 positions, full document synchronization, syntax diagnostics, and
+whole-document canonical formatting:
+
+```sh
+cargo run -p splash-lsp
+```
+
+It receives document text through LSP notifications only. It does not read the
+document URI, evaluate Splash code, construct a capability host, or load a
+Rust adapter. The server retains at most 128 open documents and refuses to
+retain document text above the normal 256 KiB Splash source cap.
+
 ## Syntax fuzzing
 
 The standalone `fuzz` package differentially exercises the canonical profile

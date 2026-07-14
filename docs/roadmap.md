@@ -5,6 +5,8 @@
 - Standalone VM workspace with upstream provenance.
 - Bounded evaluation and canonical grammar diagnostics.
 - Canonical source formatting that preserves comments and literal spellings.
+- Host-only LSP diagnostics and full-document canonical formatting for the
+  published v0.1 grammar.
 - Deny-by-default, audited string-tool bridge.
 - Bounded, host-pumped deferred tool promises.
 - Host-owned plan, approval, and sequential workflow execution.
@@ -92,7 +94,7 @@
 
 ## Before a stable language release
 
-- LSP support for the published [v0.1 grammar](grammar.md).
+- Semantic editor features beyond syntax diagnostics and canonical formatting.
 - Parser/VM differential fuzzing and resource-exhaustion coverage.
 - Durable event storage, replay, and compensation actions.
 - Independent security review of effectful adapters.
