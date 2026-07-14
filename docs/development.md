@@ -24,9 +24,11 @@ separate behavioral coverage for the imported VM.
 The standalone `fuzz` package differentially exercises the canonical profile
 and the vendored VM parser. It uses a 16 KiB source cap and a 2,048-token cap,
 then asserts that every source accepted by the canonical preflight is also
-accepted by the VM parser. Its tracked `.splash` seeds cover canonical
-dataflow, deferred tools, loops, and lambdas; generated corpus entries and
-crash artifacts stay local.
+accepted by the VM parser. It also checks that a successful canonical format is
+accepted again and idempotent; deliberately bounded formatter-output rejection
+is the only accepted formatting failure for a canonical input. Its tracked
+`.splash` seeds cover canonical dataflow, deferred tools, loops, and lambdas;
+generated corpus entries and crash artifacts stay local.
 
 Install `cargo-fuzz` once, then run the target with nightly Rust:
 

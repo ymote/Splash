@@ -185,3 +185,24 @@ Rust hosts can call `splash_core::check_syntax` or
 and syntax-token limits but not instruction or deadline execution limits
 because they do not execute source. Embedded hosts can lower either bound with
 `ExecutionLimits`.
+
+## Formatting
+
+Format canonical source through the same profile and VM-compatibility checks:
+
+```sh
+cargo run -p splash-cli -- format workflow.splash
+```
+
+The formatter writes to standard output and never modifies the input file. It
+preserves comments and the spelling of identifiers, numbers, and string
+literals, while normalizing horizontal whitespace, existing-line indentation,
+line endings, and trailing whitespace. It is idempotent. It rejects invalid
+source and Makepad-only compatibility syntax instead of applying recovery or
+rewriting it into a different language contract.
+
+Use `splash format --check workflow.splash` to exit nonzero when formatting
+would change the source. Rust hosts can call `splash_core::format_source` or
+`splash_core::format_source_named`; both use the supplied `ExecutionLimits`
+source and syntax-token bounds, cap output at four times the source budget,
+and never evaluate code.

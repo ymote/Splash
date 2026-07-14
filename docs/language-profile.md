@@ -20,6 +20,14 @@ the canonical profile rejects never enters the inherited tokenizer or parser.
 The default preflight budget is 256 KiB of source and 32,768 lexical tokens;
 an embedded host can lower both through `ExecutionLimits`.
 
+`splash format <file>` applies the same profile and compatibility checks, then
+writes canonical whitespace to standard output without evaluating source or
+creating a capability host. It preserves comments and literal spellings;
+`splash format --check <file>` is the non-writing CI/editor form. Format before
+requesting execution, then use `splash check` when a structured diagnostic
+report is needed. Formatted output is capped at four times the configured
+source budget.
+
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
 execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape
 hatch for Makepad migration code; do not expose it to generated source or a
@@ -134,8 +142,8 @@ or mutate its keys, input digest, worker observation, or restart policy.
 
 - Generate source only; do not add Makepad widget wrappers or `runsplash`
   fences when targeting the CLI/runtime.
-- Follow the [canonical grammar](grammar.md), then use `splash check` before
-  requesting execution.
+- Follow the [canonical grammar](grammar.md), run `splash format`, then use
+  `splash check` before requesting execution.
 - Do not use Makepad compatibility syntax such as `var`, `match`, `try`, typed
   or destructuring declarations, single-quoted strings, range operators, or
   whitespace-separated record members; `splash check` rejects it.

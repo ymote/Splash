@@ -13,11 +13,15 @@ use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 pub use makepad_script as vm;
-use profile::check_canonical_profile;
+use profile::{check_canonical_profile, format_canonical_source, ProfileFormatError};
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024;
+const FORMAT_OUTPUT_MULTIPLIER: usize = 4;
+/// Maximum formatted output size under the default source budget.
+pub const DEFAULT_MAX_FORMATTED_SOURCE_BYTES: usize =
+    DEFAULT_MAX_SOURCE_BYTES * FORMAT_OUTPUT_MULTIPLIER;
 /// Maximum canonical lexical tokens accepted by default during syntax preflight.
 pub const DEFAULT_MAX_SYNTAX_TOKENS: usize = 32 * 1024;
 pub const DEFAULT_INSTRUCTION_LIMIT: usize = 200_000;
@@ -90,6 +94,7 @@ impl ExecutionLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     SourceTooLarge { actual: usize, maximum: usize },
+    FormattedSourceTooLarge { actual: usize, maximum: usize },
     InvalidLimits(&'static str),
     SyntaxRejected(SyntaxReport),
     EvaluationInProgress,
@@ -103,6 +108,12 @@ impl Display for RuntimeError {
                 write!(
                     formatter,
                     "source is {actual} bytes; maximum is {maximum} bytes"
+                )
+            }
+            Self::FormattedSourceTooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "formatted source is {actual} bytes; maximum is {maximum} bytes"
                 )
             }
             Self::InvalidLimits(message) => formatter.write_str(message),
@@ -226,6 +237,16 @@ impl<H: Any, S: Any> Runtime<H, S> {
         check_syntax_named("inline.splash", source, self.limits)
     }
 
+    /// Formats canonical Splash source without evaluating it or entering any
+    /// host binding.
+    ///
+    /// Formatting validates both the portable profile and VM compatibility
+    /// first. Unsupported Makepad compatibility syntax is rejected instead of
+    /// being silently rewritten into a different language contract.
+    pub fn format_source(&self, source: &str) -> Result<String, RuntimeError> {
+        format_source_named("inline.splash", source, self.limits)
+    }
+
     /// Evaluates source only after it passes the canonical Splash v0.1 profile.
     ///
     /// This is the normal execution entry point for generated and user-authored
@@ -305,6 +326,15 @@ pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
     check_syntax_named("inline.splash", source, ExecutionLimits::default())
 }
 
+/// Formats canonical Splash source with default bounds without evaluating it.
+///
+/// This preserves strings and comments while normalizing token spacing,
+/// indentation, line endings, and trailing whitespace. It rejects invalid or
+/// Makepad-compatibility-only source rather than attempting error recovery.
+pub fn format_source(source: &str) -> Result<String, RuntimeError> {
+    format_source_named("inline.splash", source, ExecutionLimits::default())
+}
+
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing {
@@ -370,6 +400,47 @@ pub fn check_syntax_named(
         diagnostics,
         diagnostics_truncated,
     })
+}
+
+/// Formats named canonical Splash source without evaluating it.
+///
+/// `file` is used only while confirming compatibility with the vendored VM
+/// parser. A rejected source is returned as [`RuntimeError::SyntaxRejected`]
+/// with the same structured diagnostics exposed by [`check_syntax_named`].
+pub fn format_source_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<String, RuntimeError> {
+    let limits = limits.validate()?;
+    let report = check_syntax_named(file, source, limits)?;
+    if !report.valid {
+        return Err(RuntimeError::SyntaxRejected(report));
+    }
+
+    match format_canonical_source(
+        source,
+        limits.max_syntax_tokens,
+        max_formatted_source_bytes(limits),
+    ) {
+        Ok(formatted) => Ok(formatted),
+        Err(ProfileFormatError::Profile(profile)) => {
+            Err(RuntimeError::SyntaxRejected(SyntaxReport {
+                valid: false,
+                diagnostics: profile.diagnostics,
+                diagnostics_truncated: profile.diagnostics_truncated,
+            }))
+        }
+        Err(ProfileFormatError::OutputTooLarge { actual, maximum }) => {
+            Err(RuntimeError::FormattedSourceTooLarge { actual, maximum })
+        }
+    }
+}
+
+fn max_formatted_source_bytes(limits: ExecutionLimits) -> usize {
+    limits
+        .max_source_bytes
+        .saturating_mul(FORMAT_OUTPUT_MULTIPLIER)
 }
 
 fn check_profile_named(
@@ -641,6 +712,116 @@ mod tests {
         let report = check_syntax("use mod.tool\ntool.call(\"text.echo\", \"hello\")").unwrap();
 
         assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn formats_canonical_source_idempotently() {
+        let source = "fn add(left,right){\nreturn left+right\n}\nlet record={left:1,right:2}\nadd(record.left,record.right)";
+
+        let formatted = format_source(source).unwrap();
+        assert_eq!(
+            formatted,
+            "fn add(left, right) {\n    return left + right\n}\nlet record = {left: 1, right: 2}\nadd(record.left, record.right)\n"
+        );
+        assert!(check_syntax(&formatted).unwrap().valid);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formatter_preserves_comments_literals_and_block_comment_newlines() {
+        let source = "fn describe(){/* opening note\nstill note */\nlet text=\"// literal\"\n// line note\nreturn text\n}";
+
+        let formatted = format_source(source).unwrap();
+
+        assert!(formatted.contains("/* opening note\n    still note */"));
+        assert!(formatted.contains("    // line note\n"));
+        assert!(formatted.contains("let text = \"// literal\""));
+        assert!(check_syntax(&formatted).unwrap().valid);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formatter_distinguishes_literals_indexes_and_lambda_delimiters() {
+        let source = "let values=[1,2]\r\nlet transform = |value| value*2\r\nlet first=values[0]";
+
+        assert_eq!(
+            format_source(source).unwrap(),
+            "let values = [1, 2]\nlet transform = |value| value * 2\nlet first = values[0]\n"
+        );
+    }
+
+    #[test]
+    fn formatter_rejects_noncanonical_source_without_recovery() {
+        assert!(matches!(
+            format_source("var value = 42"),
+            Err(RuntimeError::SyntaxRejected(report)) if !report.valid
+        ));
+    }
+
+    #[test]
+    fn formatter_obeys_source_and_token_limits() {
+        let limits = ExecutionLimits {
+            max_source_bytes: 4,
+            ..ExecutionLimits::default()
+        };
+        assert_eq!(
+            format_source_named("limited.splash", "hello", limits).unwrap_err(),
+            RuntimeError::SourceTooLarge {
+                actual: 5,
+                maximum: 4,
+            }
+        );
+
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 3,
+            ..ExecutionLimits::default()
+        };
+        assert!(matches!(
+            format_source_named("tokens.splash", "let value = 1", limits),
+            Err(RuntimeError::SyntaxRejected(report)) if !report.valid
+        ));
+
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 4,
+            ..ExecutionLimits::default()
+        };
+        let formatted = format_source_named("tokens.splash", "let value=1", limits).unwrap();
+        assert_eq!(formatted, "let value = 1");
+        assert!(
+            check_syntax_named("tokens.splash", &formatted, limits)
+                .unwrap()
+                .valid
+        );
+    }
+
+    #[test]
+    fn formatter_bounds_indentation_expansion() {
+        let mut source = "fn nested() {\n".to_owned();
+        for _ in 0..20 {
+            source.push_str("if true {\n");
+        }
+        for _ in 0..200 {
+            source.push_str("let value = 0\n");
+        }
+        for _ in 0..20 {
+            source.push_str("}\n");
+        }
+        source.push('}');
+
+        let limits = ExecutionLimits {
+            max_source_bytes: source.len(),
+            ..ExecutionLimits::default()
+        };
+        assert!(
+            check_syntax_named("nested.splash", &source, limits)
+                .unwrap()
+                .valid
+        );
+        assert!(matches!(
+            format_source_named("nested.splash", &source, limits),
+            Err(RuntimeError::FormattedSourceTooLarge { maximum, .. })
+                if maximum == source.len() * FORMAT_OUTPUT_MULTIPLIER
+        ));
     }
 
     #[test]

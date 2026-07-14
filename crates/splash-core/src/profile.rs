@@ -13,6 +13,11 @@ pub(super) struct ProfileReport {
     pub(super) diagnostics_truncated: bool,
 }
 
+pub(super) enum ProfileFormatError {
+    Profile(ProfileReport),
+    OutputTooLarge { actual: usize, maximum: usize },
+}
+
 pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> ProfileReport {
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, diagnostics, diagnostics_truncated) = lexer.tokenize();
@@ -24,6 +29,37 @@ pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> Profil
     }
 
     CanonicalParser::new(tokens).parse()
+}
+
+/// Formats source after validating the canonical grammar without evaluating it.
+///
+/// The formatter preserves lexical token spellings and comments. It only
+/// normalizes whitespace around canonical tokens, so it never has to invent a
+/// second expression parser or rewrite a literal.
+pub(super) fn format_canonical_source(
+    source: &str,
+    max_tokens: usize,
+    max_output_bytes: usize,
+) -> Result<String, ProfileFormatError> {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, diagnostics, diagnostics_truncated) = lexer.tokenize();
+    if !diagnostics.is_empty() || diagnostics_truncated {
+        return Err(ProfileFormatError::Profile(ProfileReport {
+            diagnostics,
+            diagnostics_truncated,
+        }));
+    }
+
+    let profile = CanonicalParser::new(tokens.clone()).parse();
+    if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
+        return Err(ProfileFormatError::Profile(profile));
+    }
+
+    // A newline is a lexical token. Preserve validity under an exact token
+    // budget by omitting only the otherwise conventional final newline when
+    // the input already consumed every token slot.
+    let append_terminal_newline = tokens.len() <= max_tokens;
+    CanonicalFormatter::new(source, tokens, max_output_bytes, append_terminal_newline).format()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,10 +85,14 @@ struct Token {
     kind: TokenKind,
     line: usize,
     column: usize,
+    start_byte: usize,
+    end_byte: usize,
 }
 
-struct ProfileLexer {
+struct ProfileLexer<'source> {
+    source: &'source str,
     chars: Vec<char>,
+    byte_offsets: Vec<usize>,
     index: usize,
     line: usize,
     column: usize,
@@ -63,10 +103,20 @@ struct ProfileLexer {
     token_limit_reported: bool,
 }
 
-impl ProfileLexer {
-    fn new(source: &str, max_tokens: usize) -> Self {
+impl<'source> ProfileLexer<'source> {
+    fn new(source: &'source str, max_tokens: usize) -> Self {
+        let mut chars = Vec::new();
+        let mut byte_offsets = Vec::new();
+        for (byte_offset, character) in source.char_indices() {
+            chars.push(character);
+            byte_offsets.push(byte_offset);
+        }
+        byte_offsets.push(source.len());
+
         Self {
-            chars: source.chars().collect(),
+            source,
+            chars,
+            byte_offsets,
             index: 0,
             line: 1,
             column: 1,
@@ -119,6 +169,8 @@ impl ProfileLexer {
             kind: TokenKind::End,
             line: self.line,
             column: self.column,
+            start_byte: self.source.len(),
+            end_byte: self.source.len(),
         });
         (self.tokens, self.diagnostics, self.diagnostics_truncated)
     }
@@ -147,12 +199,25 @@ impl ProfileLexer {
         Some(character)
     }
 
-    fn emit(&mut self, kind: TokenKind, line: usize, column: usize) {
+    fn emit(
+        &mut self,
+        kind: TokenKind,
+        line: usize,
+        column: usize,
+        start_index: usize,
+        end_index: usize,
+    ) {
         if self.tokens.len() >= self.max_tokens {
             self.report_token_limit_at(line, column);
             return;
         }
-        self.tokens.push(Token { kind, line, column });
+        self.tokens.push(Token {
+            kind,
+            line,
+            column,
+            start_byte: self.byte_offsets[start_index],
+            end_byte: self.byte_offsets[end_index],
+        });
     }
 
     fn report_token_limit_at(&mut self, line: usize, column: usize) {
@@ -172,18 +237,21 @@ impl ProfileLexer {
 
     fn emit_single(&mut self, kind: TokenKind) {
         let (line, column) = self.location();
+        let start_index = self.index;
         self.advance();
-        self.emit(kind, line, column);
+        self.emit(kind, line, column, start_index, self.index);
     }
 
     fn emit_newline(&mut self) {
         let (line, column) = self.location();
+        let start_index = self.index;
         self.advance();
-        self.emit(TokenKind::Newline, line, column);
+        self.emit(TokenKind::Newline, line, column, start_index, self.index);
     }
 
     fn emit_carriage_return_newline(&mut self) {
         let (line, column) = self.location();
+        let start_index = self.index;
         self.advance();
         if self.current() == Some('\n') {
             self.advance();
@@ -191,7 +259,7 @@ impl ProfileLexer {
             self.line += 1;
             self.column = 1;
         }
-        self.emit(TokenKind::Newline, line, column);
+        self.emit(TokenKind::Newline, line, column, start_index, self.index);
     }
 
     fn scan_identifier(&mut self) {
@@ -205,11 +273,18 @@ impl ProfileLexer {
             self.advance();
         }
         let identifier = self.chars[start..self.index].iter().collect();
-        self.emit(TokenKind::Identifier(identifier), line, column);
+        self.emit(
+            TokenKind::Identifier(identifier),
+            line,
+            column,
+            start,
+            self.index,
+        );
     }
 
     fn scan_number(&mut self) {
         let (line, column) = self.location();
+        let start = self.index;
         self.consume_ascii_digits();
 
         if self.current() == Some('.')
@@ -259,7 +334,7 @@ impl ProfileLexer {
             );
         }
 
-        self.emit(TokenKind::Number, line, column);
+        self.emit(TokenKind::Number, line, column, start, self.index);
     }
 
     fn consume_ascii_digits(&mut self) {
@@ -273,6 +348,7 @@ impl ProfileLexer {
 
     fn scan_string(&mut self) {
         let (line, column) = self.location();
+        let start = self.index;
         self.advance();
         let mut terminated = false;
 
@@ -300,7 +376,7 @@ impl ProfileLexer {
         if !terminated && self.current().is_none() {
             self.report(line, column, "unterminated string literal");
         }
-        self.emit(TokenKind::StringLiteral, line, column);
+        self.emit(TokenKind::StringLiteral, line, column, start, self.index);
     }
 
     fn scan_escape_sequence(&mut self, string_line: usize, string_column: usize) {
@@ -439,7 +515,13 @@ impl ProfileLexer {
         }
         let operator: String = self.chars[start..self.index].iter().collect();
         if is_canonical_operator(&operator) {
-            self.emit(TokenKind::Operator(operator), line, column);
+            self.emit(
+                TokenKind::Operator(operator),
+                line,
+                column,
+                start,
+                self.index,
+            );
         } else {
             self.report(
                 line,
@@ -511,6 +593,238 @@ fn is_canonical_operator(operator: &str) -> bool {
             | ":"
             | "|"
     )
+}
+
+const FORMAT_INDENT: &str = "    ";
+
+struct CanonicalFormatter<'source> {
+    source: &'source str,
+    tokens: Vec<Token>,
+    max_output_bytes: usize,
+    append_terminal_newline: bool,
+    output: String,
+    indentation: usize,
+    at_line_start: bool,
+    previous: Option<TokenKind>,
+    lambda_parameters_open: bool,
+    previous_lambda_delimiter_closed: bool,
+}
+
+impl<'source> CanonicalFormatter<'source> {
+    fn new(
+        source: &'source str,
+        tokens: Vec<Token>,
+        max_output_bytes: usize,
+        append_terminal_newline: bool,
+    ) -> Self {
+        Self {
+            source,
+            tokens,
+            max_output_bytes,
+            append_terminal_newline,
+            output: String::with_capacity(source.len()),
+            indentation: 0,
+            at_line_start: true,
+            previous: None,
+            lambda_parameters_open: false,
+            previous_lambda_delimiter_closed: false,
+        }
+    }
+
+    fn format(mut self) -> Result<String, ProfileFormatError> {
+        let source = self.source;
+        let tokens = std::mem::take(&mut self.tokens);
+        let mut cursor = 0;
+
+        for token in tokens {
+            if matches!(&token.kind, TokenKind::End) {
+                break;
+            }
+
+            let raw_gap = &source[cursor..token.start_byte];
+            let preserved_gap = self.write_raw_gap(raw_gap);
+            self.ensure_output_limit()?;
+
+            if matches!(&token.kind, TokenKind::Newline) {
+                self.write_newline();
+                self.ensure_output_limit()?;
+                self.previous = None;
+                self.previous_lambda_delimiter_closed = false;
+                cursor = token.end_byte;
+                continue;
+            }
+
+            if matches!(&token.kind, TokenKind::CloseCurly) {
+                self.indentation = self.indentation.saturating_sub(1);
+            }
+            if self.at_line_start {
+                self.write_indentation();
+            } else if !preserved_gap
+                && self.previous.as_ref().is_some_and(|previous| {
+                    needs_space(
+                        previous,
+                        &token.kind,
+                        self.previous_lambda_delimiter_closed,
+                        is_operator(&token.kind, "|") && self.lambda_parameters_open,
+                    )
+                })
+            {
+                self.output.push(' ');
+            }
+
+            self.output
+                .push_str(&source[token.start_byte..token.end_byte]);
+            self.ensure_output_limit()?;
+            if matches!(&token.kind, TokenKind::OpenCurly) {
+                self.indentation += 1;
+            }
+            self.previous_lambda_delimiter_closed =
+                is_operator(&token.kind, "|") && self.lambda_parameters_open;
+            if is_operator(&token.kind, "|") {
+                self.lambda_parameters_open = !self.lambda_parameters_open;
+            }
+            self.previous = Some(token.kind.clone());
+            self.at_line_start = false;
+            cursor = token.end_byte;
+        }
+
+        self.write_raw_gap(&source[cursor..]);
+        self.ensure_output_limit()?;
+        self.trim_trailing_horizontal_whitespace();
+        if self.append_terminal_newline && !self.output.is_empty() && !self.output.ends_with('\n') {
+            self.output.push('\n');
+            self.ensure_output_limit()?;
+        }
+        Ok(self.output)
+    }
+
+    /// Preserve a comment fragment while discarding ordinary horizontal
+    /// whitespace. Block comments can cross newline tokens, so a fragment may
+    /// contain only the closing `*/` portion of an original comment.
+    fn write_raw_gap(&mut self, gap: &str) -> bool {
+        if gap.chars().all(is_horizontal_whitespace) {
+            return false;
+        }
+
+        if self.at_line_start {
+            self.write_indentation();
+            self.output
+                .push_str(gap.trim_start_matches(is_horizontal_whitespace));
+        } else {
+            self.output.push_str(gap);
+        }
+        self.at_line_start = false;
+        true
+    }
+
+    fn write_indentation(&mut self) {
+        if !self.at_line_start {
+            return;
+        }
+        for _ in 0..self.indentation {
+            self.output.push_str(FORMAT_INDENT);
+        }
+        self.at_line_start = false;
+    }
+
+    fn write_newline(&mut self) {
+        self.trim_trailing_horizontal_whitespace();
+        self.output.push('\n');
+        self.at_line_start = true;
+    }
+
+    fn trim_trailing_horizontal_whitespace(&mut self) {
+        while self
+            .output
+            .chars()
+            .last()
+            .is_some_and(is_horizontal_whitespace)
+        {
+            let _ = self.output.pop();
+        }
+    }
+
+    fn ensure_output_limit(&self) -> Result<(), ProfileFormatError> {
+        if self.output.len() > self.max_output_bytes {
+            return Err(ProfileFormatError::OutputTooLarge {
+                actual: self.output.len(),
+                maximum: self.max_output_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_horizontal_whitespace(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\u{000C}')
+}
+
+fn needs_space(
+    previous: &TokenKind,
+    current: &TokenKind,
+    previous_lambda_delimiter_closed: bool,
+    current_lambda_delimiter_closes: bool,
+) -> bool {
+    if is_operator(current, "|") && current_lambda_delimiter_closes {
+        return false;
+    }
+    if is_operator(previous, "|") {
+        return previous_lambda_delimiter_closed;
+    }
+    if matches!(previous, TokenKind::OpenRound | TokenKind::OpenSquare)
+        || is_operator(previous, ".")
+        || matches!(
+            current,
+            TokenKind::CloseRound
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+        )
+        || is_operator(current, ".")
+        || is_operator(current, ":")
+    {
+        return false;
+    }
+
+    if matches!(current, TokenKind::OpenRound) {
+        return is_control_keyword(previous);
+    }
+    if matches!(current, TokenKind::OpenSquare) {
+        return !matches!(
+            previous,
+            TokenKind::Identifier(_)
+                | TokenKind::Number
+                | TokenKind::StringLiteral
+                | TokenKind::OpenRound
+                | TokenKind::OpenSquare
+                | TokenKind::CloseRound
+                | TokenKind::CloseSquare
+                | TokenKind::CloseCurly
+        );
+    }
+    if matches!(current, TokenKind::OpenCurly) {
+        return !matches!(previous, TokenKind::OpenCurly);
+    }
+    if matches!(previous, TokenKind::OpenCurly) {
+        return false;
+    }
+    if matches!(previous, TokenKind::Comma | TokenKind::Semicolon) || is_operator(previous, ":") {
+        return true;
+    }
+    if matches!(previous, TokenKind::Operator(_)) || matches!(current, TokenKind::Operator(_)) {
+        return true;
+    }
+
+    true
+}
+
+fn is_operator(token: &TokenKind, operator: &str) -> bool {
+    matches!(token, TokenKind::Operator(actual) if actual == operator)
+}
+
+fn is_control_keyword(token: &TokenKind) -> bool {
+    matches!(token, TokenKind::Identifier(identifier) if matches!(identifier.as_str(), "if" | "elif" | "while"))
 }
 
 struct CanonicalParser {

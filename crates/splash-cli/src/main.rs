@@ -7,13 +7,21 @@ use std::process::ExitCode;
 use splash_capabilities::{
     json, CapabilityRuntime, JsonToolContract, ToolError, ToolMetadata, ToolPolicy,
 };
-use splash_core::{check_syntax_named, ExecutionLimits};
+use splash_core::{check_syntax_named, format_source_named, ExecutionLimits};
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
     Evaluate(String),
     Catalog,
-    Check { file: String, source: String },
+    Check {
+        file: String,
+        source: String,
+    },
+    Format {
+        file: String,
+        source: String,
+        check: bool,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -40,6 +48,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
 fn run_options(options: CliOptions) -> Result<(), String> {
     if let CliCommand::Check { file, source } = &options.command {
         return run_syntax_check(file, source);
+    }
+    if let CliCommand::Format {
+        file,
+        source,
+        check,
+    } = &options.command
+    {
+        return run_formatter(file, source, *check);
     }
 
     if let CliCommand::Evaluate(source) = &options.command {
@@ -107,7 +123,9 @@ fn run_options(options: CliOptions) -> Result<(), String> {
             );
             return Ok(());
         }
-        CliCommand::Check { .. } => unreachable!("syntax checks return before creating a host"),
+        CliCommand::Check { .. } | CliCommand::Format { .. } => {
+            unreachable!("source-only commands return before creating a host")
+        }
     };
 
     let mut report = runtime.eval(&source).map_err(|error| error.to_string())?;
@@ -168,6 +186,19 @@ fn run_syntax_check(file: &str, source: &str) -> Result<(), String> {
         .ok_or_else(|| "syntax check failed".to_owned())
 }
 
+fn run_formatter(file: &str, source: &str, check: bool) -> Result<(), String> {
+    let formatted = format_source_named(file, source, ExecutionLimits::default())
+        .map_err(|error| error.to_string())?;
+    if check {
+        return (formatted == source)
+            .then_some(())
+            .ok_or_else(|| "source is not formatted".to_owned());
+    }
+
+    print!("{formatted}");
+    Ok(())
+}
+
 fn validate_evaluation_source(source: &str) -> Result<(), String> {
     let report = check_syntax_named("inline.splash", source, ExecutionLimits::default())
         .map_err(|error| error.to_string())?;
@@ -190,15 +221,21 @@ fn validate_evaluation_source(source: &str) -> Result<(), String> {
 fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
     let mut allow_echo = false;
     let mut allow_json_add = false;
+    let mut format_check = false;
     let mut positional = Vec::new();
 
     for argument in args {
         match argument.as_str() {
             "--allow-echo" => allow_echo = true,
             "--allow-json-add" => allow_json_add = true,
-            "check" | "eval" | "run" | "catalog" => positional.push(argument),
+            "--check" => format_check = true,
+            "check" | "eval" | "run" | "format" | "catalog" => positional.push(argument),
             _ => positional.push(argument),
         }
+    }
+
+    if format_check && positional.first().is_none_or(|command| command != "format") {
+        return Err("--check is only valid with splash format".to_owned());
     }
 
     match positional.as_slice() {
@@ -224,13 +261,24 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_json_add,
             })
             .map_err(|error| format!("cannot read {path}: {error}")),
+        [command, path] if command == "format" => fs::read_to_string(path)
+            .map(|source| CliOptions {
+                command: CliCommand::Format {
+                    file: path.clone(),
+                    source,
+                    check: format_check,
+                },
+                allow_echo,
+                allow_json_add,
+            })
+            .map_err(|error| format!("cannot read {path}: {error}")),
         [command] if command == "catalog" => Ok(CliOptions {
             command: CliCommand::Catalog,
             allow_echo,
             allow_json_add,
         }),
         _ => Err(
-            "usage: splash check <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
+            "usage: splash check <file> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
         ),
     }
 }
@@ -315,6 +363,69 @@ mod tests {
                 allow_json_add: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_a_format_check_invocation() {
+        let path = format!(
+            "{}/../splash-core/tests/fixtures/workflow_language.splash",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert_eq!(
+            parse_args(vec![
+                "format".to_owned(),
+                "--check".to_owned(),
+                path.clone()
+            ])
+            .unwrap(),
+            CliOptions {
+                command: CliCommand::Format {
+                    file: path,
+                    source: include_str!(
+                        "../../splash-core/tests/fixtures/workflow_language.splash"
+                    )
+                    .to_owned(),
+                    check: true,
+                },
+                allow_echo: false,
+                allow_json_add: false,
+            }
+        );
+        assert_eq!(
+            parse_args(vec![
+                "eval".to_owned(),
+                "--check".to_owned(),
+                "1".to_owned()
+            ])
+            .unwrap_err(),
+            "--check is only valid with splash format"
+        );
+    }
+
+    #[test]
+    fn format_check_rejects_noncanonical_whitespace() {
+        let error = run_options(CliOptions {
+            command: CliCommand::Format {
+                file: "generated.splash".to_owned(),
+                source: "let value=1".to_owned(),
+                check: true,
+            },
+            allow_echo: false,
+            allow_json_add: false,
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "source is not formatted");
+        run_options(CliOptions {
+            command: CliCommand::Format {
+                file: "generated.splash".to_owned(),
+                source: "let value = 1\n".to_owned(),
+                check: true,
+            },
+            allow_echo: false,
+            allow_json_add: false,
+        })
+        .unwrap();
     }
 
     #[test]

@@ -9,6 +9,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A standalone, vendored VM and parser with upstream provenance.
 - An effect-free, bounded canonical-language preflight with structured
   diagnostics for generated source and editor tooling.
+- An effect-free canonical formatter that preserves comments and literal
+  spellings while normalizing valid Splash source for LLM and editor workflows.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -147,6 +149,20 @@ cargo run -p splash-cli -- check examples/deferred_tool_workflow.splash
 The command emits JSON diagnostics and exits nonzero for invalid source,
 including Makepad compatibility syntax outside the portable contract. The
 portable source contract is [Splash Grammar v0.1](docs/grammar.md).
+
+Format valid canonical source without creating a capability host or rewriting
+the input file:
+
+```sh
+cargo run -p splash-cli -- format examples/deferred_tool_workflow.splash
+```
+
+Use `--check` in an editor or CI workflow to require the canonical formatting
+result without printing it:
+
+```sh
+cargo run -p splash-cli -- format --check examples/deferred_tool_workflow.splash
+```
 
 ## Workspace
 
