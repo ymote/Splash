@@ -2,7 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use splash_core::{
-    check_syntax_named, format_source_named, fuzzing, ExecutionLimits, RuntimeError,
+    check_syntax_named, format_source_named, fuzzing, top_level_declarations_named,
+    ExecutionLimits, RuntimeError, TopLevelDeclaration, TopLevelDeclarationKind,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -33,6 +34,10 @@ fuzz_target!(|data: &[u8]| {
             full.diagnostics
         );
 
+        let declarations = top_level_declarations_named("fuzz.splash", source, limits)
+            .expect("the fuzz limits are always valid for bounded outlining");
+        assert_outline_invariants(source, &declarations);
+
         match format_source_named("fuzz.splash", source, limits) {
             Ok(formatted) => {
                 let formatted_limits = ExecutionLimits {
@@ -59,3 +64,47 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 });
+
+fn assert_outline_invariants(source: &str, declarations: &[TopLevelDeclaration]) {
+    let mut previous_end_byte = 0_usize;
+
+    for declaration in declarations {
+        assert!(
+            previous_end_byte <= declaration.declaration_start_byte,
+            "top-level declaration spans overlap: {declarations:?}"
+        );
+        assert!(
+            declaration.declaration_start_byte <= declaration.selection_start_byte
+                && declaration.selection_start_byte <= declaration.selection_end_byte
+                && declaration.selection_end_byte <= declaration.declaration_end_byte
+                && declaration.declaration_end_byte <= source.len(),
+            "outline contains an unordered or out-of-bounds span: {declaration:?}"
+        );
+        for offset in [
+            declaration.declaration_start_byte,
+            declaration.selection_start_byte,
+            declaration.selection_end_byte,
+            declaration.declaration_end_byte,
+        ] {
+            assert!(
+                source.is_char_boundary(offset),
+                "outline span is not a UTF-8 boundary: {declaration:?}"
+            );
+        }
+        assert_eq!(
+            &source[declaration.selection_start_byte..declaration.selection_end_byte],
+            declaration.name,
+            "outline selection does not match its declared name"
+        );
+        let expected_keyword = match declaration.kind {
+            TopLevelDeclarationKind::Function => "fn",
+            TopLevelDeclarationKind::Let => "let",
+        };
+        assert!(
+            source[declaration.declaration_start_byte..declaration.declaration_end_byte]
+                .starts_with(expected_keyword),
+            "outline span does not begin with its declaration keyword: {declaration:?}"
+        );
+        previous_end_byte = declaration.declaration_end_byte;
+    }
+}

@@ -41,10 +41,13 @@ The standalone `fuzz` package has two bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser with a 16 KiB source
 cap and a 2,048-token cap. It asserts that every source accepted by the
 canonical preflight is also accepted by the VM parser, and that successful
-canonical formatting stays accepted and idempotent. `execution` starts a fresh,
-capability-free runtime for each syntactically accepted input with an 8 KiB
-source cap, 1,024-token cap, 4,096 instruction cap, one-instruction deadline
-sampling, and a 32 ms terminal execution deadline. Script-level errors from
+canonical formatting stays accepted and idempotent. It also checks that every
+accepted source's top-level declaration outline has ordered, non-overlapping,
+UTF-8-boundary-safe spans that contain the exact declared identifier.
+`execution` starts a fresh, capability-free runtime for each syntactically
+accepted input with an 8 KiB source cap, 1,024-token cap, 4,096 instruction
+cap, one-instruction deadline sampling, and a 32 ms terminal execution
+deadline. Script-level errors from
 unavailable modules are expected. It creates `Runtime<(), ()>`, so no
 capability or Rust adapter can run; a panic or hang is a fuzz failure.
 `execution` explicitly collects its fresh VM after evaluation so retained heap
