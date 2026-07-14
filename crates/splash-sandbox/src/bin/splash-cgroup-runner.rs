@@ -27,7 +27,7 @@ mod linux {
     use std::fs;
     use std::io;
     use std::os::unix::process::CommandExt;
-    use std::path::{Component, Path, PathBuf};
+    use std::path::{Component, PathBuf};
     use std::process::Command;
 
     const EXIT_USAGE: i32 = 64;
@@ -237,7 +237,7 @@ mod linux {
 
             assert_eq!(
                 configuration.cgroup_procs,
-                Path::new("/sys/fs/cgroup/splash-1/cgroup.procs")
+                std::path::Path::new("/sys/fs/cgroup/splash-1/cgroup.procs")
             );
             assert_eq!(configuration.preserve_fd, Some(9));
             assert_eq!(configuration.command, OsString::from("/usr/bin/bwrap"));
