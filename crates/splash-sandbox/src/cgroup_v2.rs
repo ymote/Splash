@@ -277,7 +277,8 @@ impl CgroupV2Policy {
         // actually writable without affecting a worker. Merely checking for a
         // control-file name would defer a delegated-permission failure until a
         // live session needs containment teardown.
-        if let Err(source) = fs::write(session.path.join("cgroup.kill"), "1\n") {
+        let kill_path = session.path.join("cgroup.kill");
+        if let Err(source) = fs::metadata(&kill_path).and_then(|_| fs::write(&kill_path, "1\n")) {
             let path = session.path.clone();
             let _ = session.cleanup();
             return Err(CgroupV2PrepareError::MissingKillInterface { path, source });
@@ -637,11 +638,14 @@ fn write_control(
     file: &'static str,
     value: impl AsRef<[u8]>,
 ) -> Result<(), CgroupV2PrepareError> {
-    fs::write(path.join(file), value).map_err(|source| CgroupV2PrepareError::Configure {
-        path: path.to_path_buf(),
-        file,
-        source,
-    })
+    let control_path = path.join(file);
+    fs::metadata(&control_path)
+        .and_then(|_| fs::write(&control_path, value))
+        .map_err(|source| CgroupV2PrepareError::Configure {
+            path: path.to_path_buf(),
+            file,
+            source,
+        })
 }
 
 #[cfg(target_os = "linux")]
