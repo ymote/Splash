@@ -23,6 +23,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - Schema-required Serde bridges for reviewed Rust input and output types.
 - Bounded, host-pumped deferred tool promises for cooperative mobile and
   embedded event loops.
+- A sealed static-catalog mobile and embedded profile for reviewed local Rust
+  adapters, with executable JSON contracts for structured script-visible data.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
@@ -182,7 +184,8 @@ evaluates source, creates a capability host, or loads a Rust adapter.
 
 - `splash-core`: bounded VM wrapper and diagnostics.
 - `splash-capabilities`: explicit tool policy, audit log, deferred promises,
-  LLM-facing host catalog, JSON contracts, and safe host bridge.
+  LLM-facing host catalog, JSON contracts, safe host bridge, and a sealed
+  static-catalog mobile/embedded profile.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite

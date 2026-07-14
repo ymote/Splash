@@ -307,6 +307,15 @@ impl<H: Any, S: Any> Runtime<H, S> {
         })
     }
 
+    /// Reclaims unreachable VM values at a host-selected scheduling point.
+    ///
+    /// This may take time proportional to the live VM heap, so callers should
+    /// schedule it outside latency-sensitive work. Paused script threads remain
+    /// GC roots and are safe to collect around.
+    pub fn collect_garbage(&mut self) {
+        self.with_vm(|vm| vm.gc());
+    }
+
     fn with_vm<R>(&mut self, operation: impl FnOnce(&mut vm::ScriptVm) -> R) -> R {
         let previous_vm = std::mem::replace(&mut self.vm, Box::new(vm::ScriptVmBase::new()));
         let mut vm = vm::ScriptVm {
@@ -654,6 +663,22 @@ mod tests {
 
         assert!(report.succeeded(), "{:?}", report.diagnostics);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn collection_preserves_an_evaluation_value() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval("let reply = {message: \"hello\"}\nreply")
+            .unwrap();
+
+        runtime.collect_garbage();
+
+        let value = runtime.with_vm(|vm| {
+            let serialized = vm.bx.heap.to_json(report.value);
+            vm.string_with(serialized, |_, text| text.to_owned())
+        });
+        assert_eq!(value.as_deref(), Some("{\"message\":\"hello\"}"));
     }
 
     #[test]

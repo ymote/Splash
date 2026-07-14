@@ -9,6 +9,8 @@
   published v0.1 grammar.
 - Deny-by-default, audited string-tool bridge.
 - Bounded, host-pumped deferred tool promises.
+- Sealed static-catalog mobile and embedded profile for app-provided local
+  adapters, with no post-build registration or external-dispatch API.
 - Host-owned plan, approval, and sequential workflow execution.
 - Portable worker protocol with capability attenuation and bounded wire
   messages.
@@ -90,7 +92,6 @@
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable
   policy; they must remain denied until each can be enforced.
-- Mobile profile with app-provided tools only.
 
 ## Before a stable language release
 

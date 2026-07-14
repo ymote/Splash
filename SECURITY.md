@@ -104,6 +104,19 @@ trusted mobile or embedded adapter catalog. It confers no OS, memory, process,
 or resource containment; the adapter retains all authority of the embedding
 application. Do not use it to run untrusted local-tool workloads.
 
+`mobile::MobileRuntimeBuilder` is a narrower direct-adapter profile for mobile
+and embedded hosts. It accepts only app-provided local adapters during setup;
+consuming `build()` yields a runtime with no registration, external claim,
+external completion, or worker-transport API. JSON adapters must carry an
+executable input/output `JsonToolContract`, so structured script data remains
+validated at the Rust boundary. This seals the catalog exposed through that
+profile, not the embedding application's Rust authority: a host can still
+choose a lower-level runtime, and every registered adapter retains the app's
+ambient authority. It must not expose an arbitrary executable, filesystem,
+network-origin, plugin, or crate selector. `collect_garbage()` is host-scheduled
+and may cost time proportional to the live VM heap; it is not a per-pump
+resource limit or containment mechanism.
+
 The optional JSON-line worker channel carries one bounded authenticated frame
 at a time over host-provided I/O. It limits a line to 1 MiB before decoding and
 poisons the channel after any write, flush, read, decode, size, or framing
@@ -286,7 +299,11 @@ trusted host calls `CapabilityRuntime::pump`; one default pump tick processes
 at most one tool. Hosts may choose a bounded batch with `pump_up_to`. They
 are cooperative scheduling, not a threading or isolation mechanism. A paused
 script with no runnable capability work must be resumed by a host that
-understands the relevant suspension source.
+understands the relevant suspension source. A settled promise record remains
+until it is unreachable and the trusted host calls
+`CapabilityRuntime::collect_garbage()` at a suitable idle point. Collection is
+not implicit in `pump()` because a full VM sweep can take time proportional to
+the live heap.
 
 External-only tools add a host-managed completion path. They have no
 in-process handler and are denied to synchronous calls. A trusted host claims

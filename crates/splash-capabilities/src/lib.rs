@@ -38,6 +38,13 @@ pub use splash_schema::{JsonSchema, SchemaError};
 /// supply their own lifecycle supervisor.
 pub mod bounded_worker;
 
+/// Sealed static-catalog runtime profile for mobile and embedded hosts.
+///
+/// It accepts only app-provided local adapters during setup, then exposes
+/// canonical Splash evaluation and bounded host pumping without an API for
+/// registering tools or dispatching external work.
+pub mod mobile;
+
 /// Connects the generic bounded worker transport to the Linux Bubblewrap
 /// watchdog lifecycle.
 #[cfg(feature = "bubblewrap-watchdog")]
@@ -2336,6 +2343,12 @@ impl CapabilityRuntime {
 
     pub fn pending_tools(&self) -> usize {
         self.runtime.host().pending_len()
+    }
+
+    /// Reclaims settled promise records after the VM no longer references
+    /// them. Hosts should schedule collection at an appropriate idle point.
+    pub fn collect_garbage(&mut self) {
+        self.runtime.collect_garbage();
     }
 
     /// Claims one external-only deferred invocation for host dispatch.

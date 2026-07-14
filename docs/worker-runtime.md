@@ -282,12 +282,58 @@ base path can sit behind an app-owned message loop or an embedded transport as
 long as the host enforces frame-size limits, adapter I/O timeouts, storage
 semantics, and containment appropriate to the target.
 
-On mobile, the recommended profile is app-provided adapters only: do not
-expose arbitrary executable, filesystem, or network selectors to the worker.
-On these in-process targets, the adapter set is part of the trusted computing
-base: an unreviewed or compromised Rust adapter has the embedding app's
-authority despite protocol grants. Grants constrain protocol dispatch; they do
-not provide runtime confinement for ordinary Rust code.
+For direct mobile and embedded scripting, use
+`splash_capabilities::mobile::MobileRuntimeBuilder`. It accepts reviewed local
+adapters during setup, and `build()` consumes it to yield a `MobileRuntime`
+with canonical evaluation, bounded host pumping, catalog inspection, audit
+inspection, and explicit garbage collection only. The resulting profile has no
+API to register more tools, claim or complete external work, or attach a worker
+transport. Structured adapters require an executable `JsonToolContract`.
+
+```rust
+use splash_capabilities::{
+    json, JsonToolContract, ToolMetadata, ToolPolicy,
+    mobile::MobileRuntimeBuilder,
+};
+
+let contract = JsonToolContract::new(
+    json!({"type": "object", "properties": {"name": {"type": "string"}},
+           "required": ["name"], "additionalProperties": false}),
+    json!({"type": "object", "properties": {"message": {"type": "string"}},
+           "required": ["message"], "additionalProperties": false}),
+)?;
+let mut builder = MobileRuntimeBuilder::new()?;
+builder.register_json_tool(
+    ToolPolicy::json("device.greet"),
+    ToolMetadata::new("Formats a device-local greeting."),
+    contract,
+    |request| {
+        let name = request.input["name"].as_str().unwrap_or_default();
+        Ok(json!({"message": format!("hello {name}")}))
+    },
+)?;
+let mut runtime = builder.build();
+
+let report = runtime.eval(
+    "use mod.tool\nlet reply = tool.call_json(\"device.greet\", {name: \"Ada\"})\nreply",
+)?;
+assert!(report.completed());
+runtime.collect_garbage(); // Schedule this at an app-selected idle point.
+```
+
+`MobileRuntimeBuilder` is catalog governance, not process or OS containment.
+Do not expose arbitrary executable, filesystem, network-origin, plugin, or
+crate selectors through an adapter. The adapter set remains part of the trusted
+computing base: an unreviewed or compromised Rust adapter has the embedding
+app's authority despite the sealed catalog. Rust code can choose a lower-level
+runtime instead, so only expose the mobile profile to code that must honor this
+contract. `collect_garbage()` is intentionally explicit because a full VM
+sweep can take time proportional to the live heap; use it at an application
+idle point to reclaim settled promise records.
+
+The authenticated in-process worker transport remains available for a fixed
+worker protocol catalog. It is appropriate when the application needs worker
+framing, but it has the same non-containment limitation.
 On embedded systems, select a small static adapter catalog and provide a
 platform durable store only when the hardware offers an authenticated
 anti-rollback primitive and atomic monotonic compare-and-swap. Otherwise use
