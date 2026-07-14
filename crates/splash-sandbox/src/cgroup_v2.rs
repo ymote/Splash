@@ -336,6 +336,10 @@ pub enum CgroupV2PrepareError {
         path: PathBuf,
         source: io::Error,
     },
+    ParentNotCgroupV2 {
+        path: PathBuf,
+        filesystem_type: u64,
+    },
     RunnerIo {
         path: PathBuf,
         source: io::Error,
@@ -382,6 +386,14 @@ impl Display for CgroupV2PrepareError {
             Self::ParentNotCgroup { path, source } => write!(
                 formatter,
                 "cgroup parent {} does not expose cgroup-v2 core files: {source}",
+                path.display()
+            ),
+            Self::ParentNotCgroupV2 {
+                path,
+                filesystem_type,
+            } => write!(
+                formatter,
+                "cgroup parent {} is not mounted from cgroup-v2 (filesystem type {filesystem_type:#x})",
                 path.display()
             ),
             Self::RunnerIo { path, source } => {
@@ -433,6 +445,7 @@ impl std::error::Error for CgroupV2PrepareError {
             | Self::MissingKillInterface { source, .. } => Some(source),
             Self::UnsupportedPlatform
             | Self::ParentNotDirectory { .. }
+            | Self::ParentNotCgroupV2 { .. }
             | Self::RunnerNotRegularExecutable { .. }
             | Self::NameExhausted { .. } => None,
         }
@@ -587,6 +600,16 @@ fn validate_path(field: &'static str, path: &Path) -> Result<(), CgroupV2PolicyE
 
 #[cfg(target_os = "linux")]
 fn ensure_cgroup_parent(path: &Path) -> Result<(), CgroupV2PrepareError> {
+    let filesystem = rustix::fs::statfs(path).map_err(|source| CgroupV2PrepareError::ParentIo {
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    if filesystem.f_type as u64 != u64::from(linux_raw_sys::general::CGROUP2_SUPER_MAGIC) {
+        return Err(CgroupV2PrepareError::ParentNotCgroupV2 {
+            path: path.to_path_buf(),
+            filesystem_type: filesystem.f_type as u64,
+        });
+    }
     for file in [
         "cgroup.controllers",
         "cgroup.procs",
@@ -779,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_fails_closed_when_controller_files_are_not_delegated() {
+    fn preparation_rejects_a_non_cgroup_parent() {
         let root = TestDirectory::new();
         let parent = fake_parent(&root);
         let runner = root.path().join("runner");
@@ -792,10 +815,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            CgroupV2PrepareError::Configure {
-                file: "cpu.max",
-                ..
-            }
+            CgroupV2PrepareError::ParentNotCgroupV2 { .. }
         ));
     }
 
@@ -806,10 +826,8 @@ mod tests {
         let runner = root.path().join("runner");
         File::create(&runner).unwrap();
 
-        let error = CgroupV2Policy::new(parent, runner, limits())
-            .unwrap()
-            .prepare()
-            .unwrap_err();
+        let _policy = CgroupV2Policy::new(parent, &runner, limits()).unwrap();
+        let error = resolve_runner_program(&runner).unwrap_err();
 
         assert!(matches!(
             error,

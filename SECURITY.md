@@ -142,7 +142,8 @@ that has not yet joined the cgroup. The cgroup path is never a Splash value,
 worker protocol field, or Bubblewrap argument.
 
 The host must enable and delegate the required controllers under a dedicated
-parent before launch. Splash deliberately does not modify
+parent before launch. Splash verifies the parent is mounted from cgroup v2 and
+deliberately does not modify
 `cgroup.subtree_control`, because changing a shared parent can affect unrelated
 workloads. The policy fails before launch when a selected controller or
 `cgroup.kill` is unavailable. The runner is trusted host code, must remain

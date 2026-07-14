@@ -115,9 +115,10 @@ Build the bundled host-side runner on the target Linux platform with:
 cargo build --locked -p splash-sandbox --bin splash-cgroup-runner --release
 ```
 
-`CgroupV2Policy` requires an existing cgroup-v2 parent owned by the host. The
-host must delegate and enable every selected controller for its children before
-launch. Splash intentionally does not write the parent's
+`CgroupV2Policy` verifies that its parent is mounted from cgroup v2 and exposes
+the required core controls. It requires an existing cgroup-v2 parent owned by
+the host. The host must delegate and enable every selected controller for its
+children before launch. Splash intentionally does not write the parent's
 `cgroup.subtree_control`, because changing that parent could alter resource
 policy for unrelated workloads. Preparation creates a fresh child, writes the
 selected controller values, and fails before launch if a control file or
