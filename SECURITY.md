@@ -19,13 +19,14 @@ coverage, but the two parsers are not formally proven equivalent. Parser/VM
 differential fuzzing is required before a stable language release.
 
 `splash-lsp` is a host-only helper for a trusted local editor client. It never
-reads a document URI, evaluates source, creates a capability host, or loads an
-adapter. It retains at most 128 document states and no source text larger than
-the canonical 256 KiB limit, but the underlying LSP framing layer decodes an
-inbound message before that retention limit applies. Do not expose its stdio
-transport to a hostile peer or describe it as an IPC resource sandbox; place a
-separate bounded transport or operating-system boundary in front of such a
-peer.
+reads a document URI, evaluates source, creates a capability host, resolves an
+import, or loads an adapter. Its top-level `fn`/`let` outline is derived only
+from valid client-provided canonical source and grants no tool authority. It
+retains at most 128 document states and no source text larger than the canonical
+256 KiB limit, but the underlying LSP framing layer decodes an inbound message
+before that retention limit applies. Do not expose its stdio transport to a
+hostile peer or describe it as an IPC resource sandbox; place a separate
+bounded transport or operating-system boundary in front of such a peer.
 
 `splash-protocol` defines the portable, attenuated handoff from a policy host
 to a contained worker. It validates manifests, request uniqueness, formats,

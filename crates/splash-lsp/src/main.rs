@@ -2,8 +2,8 @@
 
 //! Stdio language server for the canonical Splash v0.1 source profile.
 //!
-//! The server only receives client-provided text and calls the effect-free
-//! syntax checker and formatter. It never reads document URIs, evaluates
+//! The server only receives client-provided text and calls effect-free syntax,
+//! formatting, and outline helpers. It never reads document URIs, evaluates
 //! Splash code, creates a capability host, or loads an adapter.
 
 use std::{collections::HashMap, error::Error, io, process::ExitCode};
@@ -14,11 +14,12 @@ use lsp_types::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit,
         Notification as LspNotification, PublishDiagnostics,
     },
-    request::{Formatting, Request as LspRequest},
+    request::{DocumentSymbolRequest, Formatting, Request as LspRequest},
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, OneOf, Position, PositionEncodingKind,
-    PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentItem,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams, Range,
+    ServerCapabilities, SymbolKind, TextDocumentItem, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri,
 };
 use splash_core::{
     check_syntax_named, format_source_named, ExecutionLimits, SyntaxDiagnostic,
@@ -91,6 +92,24 @@ impl SplashLanguageServer {
             Range::new(Position::new(0, 0), document_end_position(source)),
             formatted,
         )])
+    }
+
+    fn document_symbols(&self, uri: &Uri) -> Result<Vec<DocumentSymbol>, String> {
+        let state = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| "the document is not open in this Splash session".to_owned())?;
+        let source = state.source.as_deref().ok_or_else(|| {
+            format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
+        })?;
+        let report = check_syntax_named(uri.as_str(), source, ExecutionLimits::default())
+            .map_err(|error| format!("cannot outline canonical Splash source: {error}"))?;
+
+        if !report.valid {
+            return Ok(Vec::new());
+        }
+
+        Ok(outline_document_symbols(source))
     }
 
     fn replace_document(
@@ -190,6 +209,7 @@ fn server_capabilities() -> ServerCapabilities {
         position_encoding: Some(PositionEncodingKind::UTF16),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
     }
 }
@@ -210,6 +230,19 @@ fn handle_request(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("invalid textDocument/formatting parameters: {error}"),
+            ),
+        }
+    } else if request.method == DocumentSymbolRequest::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<DocumentSymbolParams>(request.params) {
+            Ok(params) => match server.document_symbols(&params.text_document.uri) {
+                Ok(symbols) => Response::new_ok(id, DocumentSymbolResponse::Nested(symbols)),
+                Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+            },
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/documentSymbol parameters: {error}"),
             ),
         }
     } else {
@@ -347,15 +380,246 @@ fn diagnostic_position(source: &str, line: usize, column: usize) -> Position {
 }
 
 fn document_end_position(source: &str) -> Position {
+    position_at_byte(source, source.len())
+}
+
+#[derive(Clone, Copy)]
+enum OutlineTokenKind {
+    Identifier,
+    OpenCurly,
+    CloseCurly,
+}
+
+#[derive(Clone, Copy)]
+struct OutlineToken {
+    kind: OutlineTokenKind,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl OutlineToken {
+    fn identifier_is(self, source: &str, expected: &str) -> bool {
+        matches!(self.kind, OutlineTokenKind::Identifier)
+            && source[self.start_byte..self.end_byte] == *expected
+    }
+}
+
+fn outline_document_symbols(source: &str) -> Vec<DocumentSymbol> {
+    let tokens = outline_tokens(source);
+    let mut symbols = Vec::new();
+    let mut brace_depth = 0_usize;
+
+    for (index, token) in tokens.iter().copied().enumerate() {
+        match token.kind {
+            OutlineTokenKind::OpenCurly => brace_depth = brace_depth.saturating_add(1),
+            OutlineTokenKind::CloseCurly => brace_depth = brace_depth.saturating_sub(1),
+            OutlineTokenKind::Identifier
+                if brace_depth == 0 && token.identifier_is(source, "fn") =>
+            {
+                let Some(name) = tokens
+                    .get(index + 1)
+                    .copied()
+                    .filter(|name| matches!(name.kind, OutlineTokenKind::Identifier))
+                else {
+                    continue;
+                };
+                let end_byte = function_end_byte(&tokens, index + 2).unwrap_or(name.end_byte);
+                symbols.push(outline_symbol(
+                    source,
+                    token.start_byte,
+                    end_byte,
+                    name,
+                    SymbolKind::FUNCTION,
+                ));
+            }
+            OutlineTokenKind::Identifier
+                if brace_depth == 0 && token.identifier_is(source, "let") =>
+            {
+                let Some(name) = tokens
+                    .get(index + 1)
+                    .copied()
+                    .filter(|name| matches!(name.kind, OutlineTokenKind::Identifier))
+                else {
+                    continue;
+                };
+                symbols.push(outline_symbol(
+                    source,
+                    token.start_byte,
+                    name.end_byte,
+                    name,
+                    SymbolKind::VARIABLE,
+                ));
+            }
+            OutlineTokenKind::Identifier => {}
+        }
+    }
+
+    symbols
+}
+
+fn function_end_byte(tokens: &[OutlineToken], after_name: usize) -> Option<usize> {
+    let opening = tokens
+        .iter()
+        .skip(after_name)
+        .position(|token| matches!(token.kind, OutlineTokenKind::OpenCurly))?
+        + after_name;
+    let mut depth = 0_usize;
+
+    for token in &tokens[opening..] {
+        match token.kind {
+            OutlineTokenKind::OpenCurly => depth = depth.saturating_add(1),
+            OutlineTokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(token.end_byte);
+                }
+            }
+            OutlineTokenKind::Identifier => {}
+        }
+    }
+
+    None
+}
+
+#[allow(deprecated)]
+fn outline_symbol(
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    name: OutlineToken,
+    kind: SymbolKind,
+) -> DocumentSymbol {
+    let selection_range = Range::new(
+        position_at_byte(source, name.start_byte),
+        position_at_byte(source, name.end_byte),
+    );
+    DocumentSymbol {
+        name: source[name.start_byte..name.end_byte].to_owned(),
+        detail: None,
+        kind,
+        tags: None,
+        deprecated: None,
+        range: Range::new(
+            position_at_byte(source, start_byte),
+            position_at_byte(source, end_byte),
+        ),
+        selection_range,
+        children: None,
+    }
+}
+
+fn outline_tokens(source: &str) -> Vec<OutlineToken> {
+    let mut tokens = Vec::new();
+    let mut offset = 0_usize;
+
+    while offset < source.len() {
+        let rest = &source[offset..];
+        if rest.starts_with("//") {
+            offset += 2;
+            while offset < source.len() && !matches!(source.as_bytes()[offset], b'\n' | b'\r') {
+                offset += 1;
+            }
+            continue;
+        }
+        if rest.starts_with("/*") {
+            offset = rest.find("*/").map_or(source.len(), |end| offset + end + 2);
+            continue;
+        }
+
+        let byte = source.as_bytes()[offset];
+        if byte == b'"' {
+            offset = skip_string_literal(source, offset);
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start_byte = offset;
+            offset += 1;
+            while offset < source.len()
+                && (source.as_bytes()[offset].is_ascii_alphanumeric()
+                    || source.as_bytes()[offset] == b'_')
+            {
+                offset += 1;
+            }
+            tokens.push(OutlineToken {
+                kind: OutlineTokenKind::Identifier,
+                start_byte,
+                end_byte: offset,
+            });
+            continue;
+        }
+
+        let kind = match byte {
+            b'{' => Some(OutlineTokenKind::OpenCurly),
+            b'}' => Some(OutlineTokenKind::CloseCurly),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            tokens.push(OutlineToken {
+                kind,
+                start_byte: offset,
+                end_byte: offset + 1,
+            });
+            offset += 1;
+            continue;
+        }
+
+        let character = rest
+            .chars()
+            .next()
+            .expect("source slice at a valid byte offset is nonempty");
+        offset += character.len_utf8();
+    }
+
+    tokens
+}
+
+fn skip_string_literal(source: &str, mut offset: usize) -> usize {
+    offset += 1;
+    while offset < source.len() {
+        let character = source[offset..]
+            .chars()
+            .next()
+            .expect("source slice at a valid byte offset is nonempty");
+        offset += character.len_utf8();
+        if character == '\\' {
+            if offset < source.len() {
+                let escaped = source[offset..]
+                    .chars()
+                    .next()
+                    .expect("source slice at a valid byte offset is nonempty");
+                offset += escaped.len_utf8();
+            }
+        } else if character == '"' {
+            break;
+        }
+    }
+    offset
+}
+
+fn position_at_byte(source: &str, byte_offset: usize) -> Position {
     let mut line = 0_u32;
     let mut character = 0_u32;
+    let mut previous_was_carriage_return = false;
 
-    for value in source.chars() {
-        if value == '\n' {
-            line = line.saturating_add(1);
-            character = 0;
-        } else {
-            character = character.saturating_add(value.len_utf16() as u32);
+    for value in source[..byte_offset].chars() {
+        match value {
+            '\r' => {
+                line = line.saturating_add(1);
+                character = 0;
+                previous_was_carriage_return = true;
+            }
+            '\n' if previous_was_carriage_return => {
+                previous_was_carriage_return = false;
+            }
+            '\n' => {
+                line = line.saturating_add(1);
+                character = 0;
+                previous_was_carriage_return = false;
+            }
+            _ => {
+                character = character.saturating_add(value.len_utf16() as u32);
+                previous_was_carriage_return = false;
+            }
         }
     }
 
@@ -399,6 +663,69 @@ mod tests {
         assert_eq!(
             diagnostics.diagnostics[0].severity,
             Some(DiagnosticSeverity::ERROR)
+        );
+    }
+
+    #[test]
+    fn outlines_top_level_declarations_without_reading_or_executing_source() {
+        let source = "let config = {label: \"fn hidden() {}\", nested: {count: 1}}\n\
+                      fn greet(name) {\n\
+                          let local = name\n\
+                          local\n\
+                      }\n\
+                      let emoji = \"\u{1f642}\"\n\
+                      // let ignored = 0\n";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let symbols = server
+            .document_symbols(&test_uri())
+            .expect("document is open and valid");
+
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["config", "greet", "emoji"]
+        );
+        assert_eq!(symbols[0].kind, SymbolKind::VARIABLE);
+        assert_eq!(symbols[1].kind, SymbolKind::FUNCTION);
+        assert_eq!(symbols[1].selection_range.start, Position::new(1, 3));
+        assert_eq!(symbols[1].selection_range.end, Position::new(1, 8));
+        assert_eq!(symbols[1].range.start, Position::new(1, 0));
+        assert_eq!(symbols[1].range.end, Position::new(4, 1));
+        assert_eq!(
+            symbols[2].selection_range,
+            Range::new(Position::new(5, 4), Position::new(5, 9))
+        );
+    }
+
+    #[test]
+    fn suppresses_symbols_for_invalid_source_and_normalizes_crlf_positions() {
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, "fn broken("));
+        assert!(server
+            .document_symbols(&test_uri())
+            .expect("invalid source still has an outline response")
+            .is_empty());
+
+        server.open_document(document(2, "fn crlf() {\r\n}\r\n"));
+        let symbols = server
+            .document_symbols(&test_uri())
+            .expect("valid CRLF source has an outline response");
+        assert_eq!(
+            symbols[0].selection_range,
+            Range::new(Position::new(0, 3), Position::new(0, 7))
+        );
+        assert_eq!(
+            symbols[0].range,
+            Range::new(Position::new(0, 0), Position::new(1, 1))
+        );
+
+        assert_eq!(
+            document_end_position("let value = 1\r\n"),
+            Position::new(1, 0)
         );
     }
 
@@ -472,6 +799,7 @@ mod tests {
         let diagnostics = server.open_document(document(1, &oversized));
         assert_eq!(diagnostics.diagnostics.len(), 1);
         assert!(server.format_document(&test_uri()).is_err());
+        assert!(server.document_symbols(&test_uri()).is_err());
 
         let update = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier::new(test_uri(), 2),
@@ -489,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn announces_utf16_full_sync_and_formats_over_stdio_protocol() {
+    fn announces_utf16_full_sync_formatting_and_symbols_over_stdio_protocol() {
         let (server_connection, client_connection) = Connection::memory();
         let server_thread = std::thread::spawn(move || run_connection(&server_connection));
 
@@ -520,6 +848,7 @@ mod tests {
         assert_eq!(capabilities["positionEncoding"], "utf-16");
         assert_eq!(capabilities["textDocumentSync"], 1);
         assert_eq!(capabilities["documentFormattingProvider"], true);
+        assert_eq!(capabilities["documentSymbolProvider"], true);
 
         client_connection
             .sender
@@ -574,7 +903,34 @@ mod tests {
 
         client_connection
             .sender
-            .send(Request::new(3.into(), "shutdown".to_owned(), ()).into())
+            .send(
+                Request::new(
+                    3.into(),
+                    DocumentSymbolRequest::METHOD.to_owned(),
+                    serde_json::json!({"textDocument": {"uri": test_uri()}}),
+                )
+                .into(),
+            )
+            .expect("document symbol request send succeeds");
+        let symbol_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("document symbol response arrives");
+        let Message::Response(response) = symbol_response else {
+            panic!("expected document symbol response");
+        };
+        let symbols = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("document symbol request failed: {}", error.message)
+            }
+        };
+        assert_eq!(symbols[0]["name"], "value");
+        assert_eq!(symbols[0]["kind"], 13);
+
+        client_connection
+            .sender
+            .send(Request::new(4.into(), "shutdown".to_owned(), ()).into())
             .expect("shutdown send succeeds");
         let shutdown_response = client_connection
             .receiver

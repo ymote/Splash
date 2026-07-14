@@ -212,6 +212,9 @@ and never evaluate code.
 `splash-lsp` exposes the same effect-free validation and formatting operations
 over stdio LSP. It uses UTF-16 positions, requests full-document sync, and
 supports `textDocument/didOpen`, `textDocument/didChange`,
-`textDocument/didClose`, and `textDocument/formatting`. It does not open the
-URI supplied by the client or run source; all diagnostics and edits derive from
-the client-provided document text.
+`textDocument/didClose`, `textDocument/formatting`, and
+`textDocument/documentSymbol`. Symbols list only top-level `fn` and `let`
+declarations after canonical syntax succeeds; they do not resolve imports,
+types, references, or tool grants. The server does not open the URI supplied by
+the client or run source; all diagnostics, edits, and symbols derive from the
+client-provided document text.

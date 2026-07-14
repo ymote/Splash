@@ -11,8 +11,9 @@ and keeps UI support optional rather than making UI the language boundary.
   diagnostics for generated source and editor tooling.
 - An effect-free canonical formatter that preserves comments and literal
   spellings while normalizing valid Splash source for LLM and editor workflows.
-- A host-only stdio language server that publishes canonical syntax diagnostics
-  and full-document formatting edits without reading files or evaluating code.
+- A host-only stdio language server that publishes canonical syntax diagnostics,
+  full-document formatting edits, and top-level declaration symbols without
+  reading files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -176,9 +177,9 @@ cargo run -p splash-lsp
 
 It accepts only client-provided open-document text, retains at most 128
 document states and no document text above the standard 256 KiB source cap,
-and provides full-sync
-diagnostics plus whole-document formatting. It never reads a document URI,
-evaluates source, creates a capability host, or loads a Rust adapter.
+and provides full-sync diagnostics, whole-document formatting, and top-level
+declaration symbols. It never reads a document URI, evaluates source, resolves
+an import, creates a capability host, or loads a Rust adapter.
 
 ## Workspace
 
@@ -200,8 +201,8 @@ evaluates source, creates a capability host, or loads a Rust adapter.
 - `splash-workflow`: host-owned planning, approval, checkpointing, durable
   operation records, and sequential execution.
 - `splash-cli`: local development CLI.
-- `splash-lsp`: host-only stdio diagnostics and canonical formatting for
-  open editor documents.
+- `splash-lsp`: host-only stdio diagnostics, canonical formatting, and
+  top-level declaration symbols for open editor documents.
 - `vendor/makepad`: provenance-preserving compatibility import.
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)

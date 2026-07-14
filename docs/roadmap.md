@@ -7,6 +7,7 @@
 - Canonical source formatting that preserves comments and literal spellings.
 - Host-only LSP diagnostics and full-document canonical formatting for the
   published v0.1 grammar.
+- Effect-free top-level LSP document symbols derived from valid client source.
 - Deny-by-default, audited string-tool bridge.
 - Bounded, host-pumped deferred tool promises.
 - Sealed static-catalog mobile and embedded profile for app-provided local
@@ -95,7 +96,7 @@
 
 ## Before a stable language release
 
-- Semantic editor features beyond syntax diagnostics and canonical formatting.
+- Richer semantic editor features beyond top-level document symbols.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Durable event storage, replay, and compensation actions.
