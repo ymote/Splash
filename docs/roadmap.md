@@ -8,6 +8,7 @@
 - Host-only LSP diagnostics and full-document canonical formatting for the
   published v0.1 grammar.
 - Effect-free top-level LSP document symbols derived from valid client source.
+- Effect-free CLI top-level declaration outline for LLM and editor tooling.
 - Deny-by-default, audited string-tool bridge.
 - Bounded, host-pumped deferred tool promises.
 - Sealed static-catalog mobile and embedded profile for app-provided local

@@ -194,6 +194,12 @@ canonical and VM-compatibility checks, then return only top-level `fn` and
 Invalid source returns an empty outline; call `check_syntax` for diagnostics.
 The API never evaluates source, resolves imports, or creates a capability host.
 
+The development CLI exposes the same operation as `splash outline <file>`. It
+prints JSON with `valid`, bounded diagnostics, and a `declarations` array. A
+declaration has `kind` (`function` or `let`), `name`, and `declaration` and
+`selection` UTF-8 byte spans. Invalid source prints its diagnostics with an
+empty declaration list and exits nonzero, just as `splash check` does.
+
 ## Formatting
 
 Format canonical source through the same profile and VM-compatibility checks:

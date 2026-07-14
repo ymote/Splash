@@ -155,6 +155,17 @@ The command emits JSON diagnostics and exits nonzero for invalid source,
 including Makepad compatibility syntax outside the portable contract. The
 portable source contract is [Splash Grammar v0.1](docs/grammar.md).
 
+Inspect valid top-level declarations without evaluating source or constructing
+a capability host:
+
+```sh
+cargo run -p splash-cli -- outline examples/json_tool_workflow.splash
+```
+
+The command emits JSON with `function` and `let` declarations plus UTF-8 byte
+spans for each declaration and identifier. Invalid source still emits the
+structured syntax diagnostics and exits nonzero with an empty declaration list.
+
 Format valid canonical source without creating a capability host or rewriting
 the input file:
 

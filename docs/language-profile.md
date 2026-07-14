@@ -34,6 +34,9 @@ API applies the same bounded profile and VM compatibility checks as syntax
 preflight, then returns byte spans for valid top-level `fn` and `let`
 declarations only. It produces no recovery outline for invalid source and does
 not resolve imports, construct a capability host, or execute source.
+`splash outline <file>` exposes that result as structured JSON for local LLM
+and editor-tool workflows; it emits diagnostics and exits nonzero when the
+source is invalid.
 
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
 execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape
