@@ -19,3 +19,9 @@ name = "syntax"
 path = "fuzz_targets/syntax.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "execution"
+path = "fuzz_targets/execution.rs"
+test = false
+doc = false

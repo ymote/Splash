@@ -38,9 +38,13 @@ syntax report and completed-prefix count.
 The canonical checker and the vendored VM parser are separate implementations.
 Every canonical source first passes the profile, then is parsed by the VM before
 evaluation; the shipped core and capability-host fixtures exercise that path
-with real execution and tool bindings. This is regression coverage, not a
-claim that the two parsers are formally equivalent. Parser/VM differential
-fuzzing remains a release requirement before the language profile is stable.
+with real execution and tool bindings. The `syntax` fuzz target differentially
+checks canonical preflight, VM parsing, and formatting. The separate
+capability-free `execution` target runs accepted programs under strict source,
+token, instruction, and wall-clock bounds. This is regression coverage, not a
+claim that the two parsers are formally equivalent. Sustained parser/VM
+differential fuzzing and corpus triage remain release requirements before the
+language profile is stable.
 
 The current profile supports:
 

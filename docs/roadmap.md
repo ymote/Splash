@@ -96,6 +96,7 @@
 ## Before a stable language release
 
 - Semantic editor features beyond syntax diagnostics and canonical formatting.
-- Parser/VM differential fuzzing and resource-exhaustion coverage.
+- Sustained parser/VM differential fuzzing, expanded resource-exhaustion
+  coverage, and corpus triage.
 - Durable event storage, replay, and compensation actions.
 - Independent security review of effectful adapters.

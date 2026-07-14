@@ -36,14 +36,25 @@ retain document text above the normal 256 KiB Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package differentially exercises the canonical profile
-and the vendored VM parser. It uses a 16 KiB source cap and a 2,048-token cap,
-then asserts that every source accepted by the canonical preflight is also
-accepted by the VM parser. It also checks that a successful canonical format is
-accepted again and idempotent; deliberately bounded formatter-output rejection
-is the only accepted formatting failure for a canonical input. Its tracked
-`.splash` seeds cover canonical dataflow, deferred tools, loops, and lambdas;
-generated corpus entries and crash artifacts stay local.
+The standalone `fuzz` package has two bounded targets. `syntax` differentially
+exercises the canonical profile and the vendored VM parser with a 16 KiB source
+cap and a 2,048-token cap. It asserts that every source accepted by the
+canonical preflight is also accepted by the VM parser, and that successful
+canonical formatting stays accepted and idempotent. `execution` starts a fresh,
+capability-free runtime for each syntactically accepted input with an 8 KiB
+source cap, 1,024-token cap, 4,096 instruction cap, one-instruction deadline
+sampling, and a 32 ms terminal execution deadline. Script-level errors from
+unavailable modules are expected. It creates `Runtime<(), ()>`, so no
+capability or Rust adapter can run; a panic or hang is a fuzz failure.
+`execution` explicitly collects its fresh VM after evaluation so retained heap
+state cannot mask resource behavior. Their tracked `.splash` seeds cover
+canonical dataflow, deferred tools, loops, lambdas, and an intentional
+instruction-limit case; generated corpus entries and crash artifacts stay
+local.
+
+CI compiles both targets and performs a short 128-run coverage-only smoke pass
+with `--sanitizer none`. Run the longer local commands below with the default
+sanitizer whenever the platform supports it.
 
 Install `cargo-fuzz` once, then run the target with nightly Rust:
 
@@ -51,18 +62,22 @@ Install `cargo-fuzz` once, then run the target with nightly Rust:
 cargo install cargo-fuzz
 cd fuzz
 cargo +nightly fuzz run syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 ```
 
 If AddressSanitizer's libFuzzer runtime does not initialize on a target, use
 `--sanitizer none` as a coverage-only fallback. It keeps the differential
-assertion but does not provide memory-safety instrumentation:
+and resource-boundary assertions but does not provide memory-safety
+instrumentation:
 
 ```sh
 cargo +nightly fuzz run --sanitizer none syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run --sanitizer none execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 ```
 
 Reproduce a saved failure from the same directory with:
 
 ```sh
 cargo +nightly fuzz run syntax artifacts/syntax/<artifact>
+cargo +nightly fuzz run execution artifacts/execution/<artifact>
 ```

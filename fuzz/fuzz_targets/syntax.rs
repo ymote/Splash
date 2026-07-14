@@ -39,12 +39,9 @@ fuzz_target!(|data: &[u8]| {
                     max_source_bytes: formatted.len().max(1),
                     ..limits
                 };
-                let formatted_report = check_syntax_named(
-                    "formatted-fuzz.splash",
-                    &formatted,
-                    formatted_limits,
-                )
-                .expect("formatted source uses valid fuzz limits");
+                let formatted_report =
+                    check_syntax_named("formatted-fuzz.splash", &formatted, formatted_limits)
+                        .expect("formatted source uses valid fuzz limits");
                 assert!(
                     formatted_report.valid,
                     "formatter emitted source rejected by the profile or VM: {formatted:?}\n{:?}",

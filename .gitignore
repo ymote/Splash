@@ -5,6 +5,9 @@ vendor/makepad/target/
 !/fuzz/corpus/syntax/
 /fuzz/corpus/syntax/*
 !/fuzz/corpus/syntax/*.splash
+!/fuzz/corpus/execution/
+/fuzz/corpus/execution/*
+!/fuzz/corpus/execution/*.splash
 /fuzz/target/
 *.swp
 .DS_Store
