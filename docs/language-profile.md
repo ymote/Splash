@@ -28,6 +28,13 @@ requesting execution, then use `splash check` when a structured diagnostic
 report is needed. Formatted output is capped at four times the configured
 source budget.
 
+For effect-free editor or generator structure, Rust hosts can call
+`splash_core::top_level_declarations` or its named, limit-aware variant. The
+API applies the same bounded profile and VM compatibility checks as syntax
+preflight, then returns byte spans for valid top-level `fn` and `let`
+declarations only. It produces no recovery outline for invalid source and does
+not resolve imports, construct a capability host, or execute source.
+
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
 execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape
 hatch for Makepad migration code; do not expose it to generated source or a

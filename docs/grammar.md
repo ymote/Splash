@@ -186,6 +186,14 @@ and syntax-token limits but not instruction or deadline execution limits
 because they do not execute source. Embedded hosts can lower either bound with
 `ExecutionLimits`.
 
+Editor and generator tooling that needs an outline can call
+`splash_core::top_level_declarations` or
+`splash_core::top_level_declarations_named`. They apply the same bounded
+canonical and VM-compatibility checks, then return only top-level `fn` and
+`let` declarations with UTF-8 byte spans for the declaration and identifier.
+Invalid source returns an empty outline; call `check_syntax` for diagnostics.
+The API never evaluates source, resolves imports, or creates a capability host.
+
 ## Formatting
 
 Format canonical source through the same profile and VM-compatibility checks:
@@ -214,7 +222,8 @@ over stdio LSP. It uses UTF-16 positions, requests full-document sync, and
 supports `textDocument/didOpen`, `textDocument/didChange`,
 `textDocument/didClose`, `textDocument/formatting`, and
 `textDocument/documentSymbol`. Symbols list only top-level `fn` and `let`
-declarations after canonical syntax succeeds; they do not resolve imports,
-types, references, or tool grants. The server does not open the URI supplied by
-the client or run source; all diagnostics, edits, and symbols derive from the
-client-provided document text.
+declarations after canonical syntax succeeds, using the same canonical lexer as
+the core outline API; they do not resolve imports, types, references, or tool
+grants. The server does not open the URI supplied by the client or run source;
+all diagnostics, edits, and symbols derive from the client-provided document
+text.

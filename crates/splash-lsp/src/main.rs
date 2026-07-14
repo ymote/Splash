@@ -22,8 +22,9 @@ use lsp_types::{
     TextDocumentSyncKind, TextEdit, Uri,
 };
 use splash_core::{
-    check_syntax_named, format_source_named, ExecutionLimits, SyntaxDiagnostic,
-    DEFAULT_MAX_SOURCE_BYTES, MAX_SYNTAX_DIAGNOSTICS,
+    check_syntax_named, format_source_named, top_level_declarations_named, ExecutionLimits,
+    SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
+    MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -102,14 +103,14 @@ impl SplashLanguageServer {
         let source = state.source.as_deref().ok_or_else(|| {
             format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
         })?;
-        let report = check_syntax_named(uri.as_str(), source, ExecutionLimits::default())
-            .map_err(|error| format!("cannot outline canonical Splash source: {error}"))?;
+        let declarations =
+            top_level_declarations_named(uri.as_str(), source, ExecutionLimits::default())
+                .map_err(|error| format!("cannot outline canonical Splash source: {error}"))?;
 
-        if !report.valid {
-            return Ok(Vec::new());
-        }
-
-        Ok(outline_document_symbols(source))
+        Ok(declarations
+            .iter()
+            .map(|declaration| outline_symbol(source, declaration))
+            .collect())
     }
 
     fn replace_document(
@@ -383,217 +384,28 @@ fn document_end_position(source: &str) -> Position {
     position_at_byte(source, source.len())
 }
 
-#[derive(Clone, Copy)]
-enum OutlineTokenKind {
-    Identifier,
-    OpenCurly,
-    CloseCurly,
-}
-
-#[derive(Clone, Copy)]
-struct OutlineToken {
-    kind: OutlineTokenKind,
-    start_byte: usize,
-    end_byte: usize,
-}
-
-impl OutlineToken {
-    fn identifier_is(self, source: &str, expected: &str) -> bool {
-        matches!(self.kind, OutlineTokenKind::Identifier)
-            && source[self.start_byte..self.end_byte] == *expected
-    }
-}
-
-fn outline_document_symbols(source: &str) -> Vec<DocumentSymbol> {
-    let tokens = outline_tokens(source);
-    let mut symbols = Vec::new();
-    let mut brace_depth = 0_usize;
-
-    for (index, token) in tokens.iter().copied().enumerate() {
-        match token.kind {
-            OutlineTokenKind::OpenCurly => brace_depth = brace_depth.saturating_add(1),
-            OutlineTokenKind::CloseCurly => brace_depth = brace_depth.saturating_sub(1),
-            OutlineTokenKind::Identifier
-                if brace_depth == 0 && token.identifier_is(source, "fn") =>
-            {
-                let Some(name) = tokens
-                    .get(index + 1)
-                    .copied()
-                    .filter(|name| matches!(name.kind, OutlineTokenKind::Identifier))
-                else {
-                    continue;
-                };
-                let end_byte = function_end_byte(&tokens, index + 2).unwrap_or(name.end_byte);
-                symbols.push(outline_symbol(
-                    source,
-                    token.start_byte,
-                    end_byte,
-                    name,
-                    SymbolKind::FUNCTION,
-                ));
-            }
-            OutlineTokenKind::Identifier
-                if brace_depth == 0 && token.identifier_is(source, "let") =>
-            {
-                let Some(name) = tokens
-                    .get(index + 1)
-                    .copied()
-                    .filter(|name| matches!(name.kind, OutlineTokenKind::Identifier))
-                else {
-                    continue;
-                };
-                symbols.push(outline_symbol(
-                    source,
-                    token.start_byte,
-                    name.end_byte,
-                    name,
-                    SymbolKind::VARIABLE,
-                ));
-            }
-            OutlineTokenKind::Identifier => {}
-        }
-    }
-
-    symbols
-}
-
-fn function_end_byte(tokens: &[OutlineToken], after_name: usize) -> Option<usize> {
-    let opening = tokens
-        .iter()
-        .skip(after_name)
-        .position(|token| matches!(token.kind, OutlineTokenKind::OpenCurly))?
-        + after_name;
-    let mut depth = 0_usize;
-
-    for token in &tokens[opening..] {
-        match token.kind {
-            OutlineTokenKind::OpenCurly => depth = depth.saturating_add(1),
-            OutlineTokenKind::CloseCurly => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(token.end_byte);
-                }
-            }
-            OutlineTokenKind::Identifier => {}
-        }
-    }
-
-    None
-}
-
 #[allow(deprecated)]
-fn outline_symbol(
-    source: &str,
-    start_byte: usize,
-    end_byte: usize,
-    name: OutlineToken,
-    kind: SymbolKind,
-) -> DocumentSymbol {
+fn outline_symbol(source: &str, declaration: &TopLevelDeclaration) -> DocumentSymbol {
     let selection_range = Range::new(
-        position_at_byte(source, name.start_byte),
-        position_at_byte(source, name.end_byte),
+        position_at_byte(source, declaration.selection_start_byte),
+        position_at_byte(source, declaration.selection_end_byte),
     );
     DocumentSymbol {
-        name: source[name.start_byte..name.end_byte].to_owned(),
+        name: declaration.name.clone(),
         detail: None,
-        kind,
+        kind: match declaration.kind {
+            TopLevelDeclarationKind::Function => SymbolKind::FUNCTION,
+            TopLevelDeclarationKind::Let => SymbolKind::VARIABLE,
+        },
         tags: None,
         deprecated: None,
         range: Range::new(
-            position_at_byte(source, start_byte),
-            position_at_byte(source, end_byte),
+            position_at_byte(source, declaration.declaration_start_byte),
+            position_at_byte(source, declaration.declaration_end_byte),
         ),
         selection_range,
         children: None,
     }
-}
-
-fn outline_tokens(source: &str) -> Vec<OutlineToken> {
-    let mut tokens = Vec::new();
-    let mut offset = 0_usize;
-
-    while offset < source.len() {
-        let rest = &source[offset..];
-        if rest.starts_with("//") {
-            offset += 2;
-            while offset < source.len() && !matches!(source.as_bytes()[offset], b'\n' | b'\r') {
-                offset += 1;
-            }
-            continue;
-        }
-        if rest.starts_with("/*") {
-            offset = rest.find("*/").map_or(source.len(), |end| offset + end + 2);
-            continue;
-        }
-
-        let byte = source.as_bytes()[offset];
-        if byte == b'"' {
-            offset = skip_string_literal(source, offset);
-            continue;
-        }
-        if byte.is_ascii_alphabetic() || byte == b'_' {
-            let start_byte = offset;
-            offset += 1;
-            while offset < source.len()
-                && (source.as_bytes()[offset].is_ascii_alphanumeric()
-                    || source.as_bytes()[offset] == b'_')
-            {
-                offset += 1;
-            }
-            tokens.push(OutlineToken {
-                kind: OutlineTokenKind::Identifier,
-                start_byte,
-                end_byte: offset,
-            });
-            continue;
-        }
-
-        let kind = match byte {
-            b'{' => Some(OutlineTokenKind::OpenCurly),
-            b'}' => Some(OutlineTokenKind::CloseCurly),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            tokens.push(OutlineToken {
-                kind,
-                start_byte: offset,
-                end_byte: offset + 1,
-            });
-            offset += 1;
-            continue;
-        }
-
-        let character = rest
-            .chars()
-            .next()
-            .expect("source slice at a valid byte offset is nonempty");
-        offset += character.len_utf8();
-    }
-
-    tokens
-}
-
-fn skip_string_literal(source: &str, mut offset: usize) -> usize {
-    offset += 1;
-    while offset < source.len() {
-        let character = source[offset..]
-            .chars()
-            .next()
-            .expect("source slice at a valid byte offset is nonempty");
-        offset += character.len_utf8();
-        if character == '\\' {
-            if offset < source.len() {
-                let escaped = source[offset..]
-                    .chars()
-                    .next()
-                    .expect("source slice at a valid byte offset is nonempty");
-                offset += escaped.len_utf8();
-            }
-        } else if character == '"' {
-            break;
-        }
-    }
-    offset
 }
 
 fn position_at_byte(source: &str, byte_offset: usize) -> Position {
@@ -698,6 +510,10 @@ mod tests {
         assert_eq!(
             symbols[2].selection_range,
             Range::new(Position::new(5, 4), Position::new(5, 9))
+        );
+        assert_eq!(
+            symbols[2].range,
+            Range::new(Position::new(5, 0), Position::new(5, 16))
         );
     }
 

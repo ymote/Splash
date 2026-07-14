@@ -4,7 +4,9 @@
 //! language. This module accepts only the portable grammar documented by
 //! Splash, without producing bytecode or evaluating source.
 
-use super::{SyntaxDiagnostic, MAX_SYNTAX_DIAGNOSTICS};
+use super::{
+    SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, MAX_SYNTAX_DIAGNOSTICS,
+};
 
 const MAX_CANONICAL_PROFILE_NESTING: usize = 128;
 
@@ -29,6 +31,18 @@ pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> Profil
     }
 
     CanonicalParser::new(tokens).parse()
+}
+
+/// Extracts declarations after the public caller has confirmed that the source
+/// is canonical and compatible with the vendored parser. Reusing the profile
+/// lexer keeps tooling structure aligned with canonical token rules.
+pub(super) fn collect_top_level_declarations(
+    source: &str,
+    max_tokens: usize,
+) -> Vec<TopLevelDeclaration> {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    top_level_declarations_from_tokens(&tokens)
 }
 
 /// Formats source after validating the canonical grammar without evaluating it.
@@ -87,6 +101,112 @@ struct Token {
     column: usize,
     start_byte: usize,
     end_byte: usize,
+}
+
+fn top_level_declarations_from_tokens(tokens: &[Token]) -> Vec<TopLevelDeclaration> {
+    let mut declarations = Vec::new();
+    let mut brace_depth = 0_usize;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match &token.kind {
+            TokenKind::OpenCurly => brace_depth = brace_depth.saturating_add(1),
+            TokenKind::CloseCurly => brace_depth = brace_depth.saturating_sub(1),
+            TokenKind::Identifier(keyword) if brace_depth == 0 && keyword == "fn" => {
+                let Some(name) = tokens.get(index + 1).and_then(identifier_token) else {
+                    continue;
+                };
+                let declaration_end_byte =
+                    function_declaration_end_byte(tokens, index + 2).unwrap_or(name.end_byte);
+                declarations.push(TopLevelDeclaration {
+                    kind: TopLevelDeclarationKind::Function,
+                    name: name.identifier.clone(),
+                    declaration_start_byte: token.start_byte,
+                    declaration_end_byte,
+                    selection_start_byte: name.start_byte,
+                    selection_end_byte: name.end_byte,
+                });
+            }
+            TokenKind::Identifier(keyword) if brace_depth == 0 && keyword == "let" => {
+                let Some(name) = tokens.get(index + 1).and_then(identifier_token) else {
+                    continue;
+                };
+                declarations.push(TopLevelDeclaration {
+                    kind: TopLevelDeclarationKind::Let,
+                    name: name.identifier.clone(),
+                    declaration_start_byte: token.start_byte,
+                    declaration_end_byte: declaration_end_byte(tokens, index + 2, name.end_byte),
+                    selection_start_byte: name.start_byte,
+                    selection_end_byte: name.end_byte,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    declarations
+}
+
+struct IdentifierToken<'token> {
+    identifier: &'token String,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+fn identifier_token(token: &Token) -> Option<IdentifierToken<'_>> {
+    let TokenKind::Identifier(identifier) = &token.kind else {
+        return None;
+    };
+    Some(IdentifierToken {
+        identifier,
+        start_byte: token.start_byte,
+        end_byte: token.end_byte,
+    })
+}
+
+fn function_declaration_end_byte(tokens: &[Token], after_name: usize) -> Option<usize> {
+    let opening = tokens
+        .iter()
+        .skip(after_name)
+        .position(|token| matches!(&token.kind, TokenKind::OpenCurly))?
+        + after_name;
+    let mut depth = 0_usize;
+
+    for token in &tokens[opening..] {
+        match &token.kind {
+            TokenKind::OpenCurly => depth = depth.saturating_add(1),
+            TokenKind::CloseCurly => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(token.end_byte);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn declaration_end_byte(tokens: &[Token], after_name: usize, initial_end_byte: usize) -> usize {
+    let mut end_byte = initial_end_byte;
+    let mut nesting = 0_usize;
+
+    for token in tokens.iter().skip(after_name) {
+        match &token.kind {
+            TokenKind::Newline | TokenKind::Semicolon if nesting == 0 => return end_byte,
+            TokenKind::End => return end_byte,
+            TokenKind::OpenCurly | TokenKind::OpenRound | TokenKind::OpenSquare => {
+                nesting = nesting.saturating_add(1);
+            }
+            TokenKind::CloseCurly | TokenKind::CloseRound | TokenKind::CloseSquare => {
+                nesting = nesting.saturating_sub(1);
+            }
+            _ => {}
+        }
+        end_byte = token.end_byte;
+    }
+
+    end_byte
 }
 
 struct ProfileLexer<'source> {

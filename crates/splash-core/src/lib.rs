@@ -13,7 +13,10 @@ use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 pub use makepad_script as vm;
-use profile::{check_canonical_profile, format_canonical_source, ProfileFormatError};
+use profile::{
+    check_canonical_profile, collect_top_level_declarations, format_canonical_source,
+    ProfileFormatError,
+};
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
@@ -165,6 +168,32 @@ pub struct SyntaxReport {
     pub valid: bool,
     pub diagnostics: Vec<SyntaxDiagnostic>,
     pub diagnostics_truncated: bool,
+}
+
+/// The syntactic kind of one top-level canonical declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopLevelDeclarationKind {
+    /// A `fn` declaration.
+    Function,
+    /// A `let` declaration.
+    Let,
+}
+
+/// A bounded, effect-free outline item for valid canonical Splash source.
+///
+/// Byte offsets are valid UTF-8 boundaries in the supplied source. The
+/// declaration span begins at `fn` or `let`; the selection span covers only
+/// the declared identifier. Invalid or VM-incompatible source produces no
+/// declarations through [`top_level_declarations`] or
+/// [`top_level_declarations_named`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopLevelDeclaration {
+    pub kind: TopLevelDeclarationKind,
+    pub name: String,
+    pub declaration_start_byte: usize,
+    pub declaration_end_byte: usize,
+    pub selection_start_byte: usize,
+    pub selection_end_byte: usize,
 }
 
 impl Evaluation {
@@ -335,6 +364,15 @@ pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
     check_syntax_named("inline.splash", source, ExecutionLimits::default())
 }
 
+/// Lists top-level declarations in valid canonical source without evaluating
+/// it, resolving imports, or creating a capability host.
+///
+/// Invalid or VM-incompatible source produces an empty outline. Call
+/// [`check_syntax`] to obtain the corresponding diagnostics.
+pub fn top_level_declarations(source: &str) -> Result<Vec<TopLevelDeclaration>, RuntimeError> {
+    top_level_declarations_named("inline.splash", source, ExecutionLimits::default())
+}
+
 /// Formats canonical Splash source with default bounds without evaluating it.
 ///
 /// This preserves strings and comments while normalizing token spacing,
@@ -409,6 +447,29 @@ pub fn check_syntax_named(
         diagnostics,
         diagnostics_truncated,
     })
+}
+
+/// Lists top-level declarations in named canonical source without evaluating
+/// it, resolving imports, or creating a capability host.
+///
+/// This applies the same source, token, canonical-profile, and vendored
+/// parser-compatibility checks as [`check_syntax_named`]. `file` appears only
+/// in VM-parser diagnostics. Invalid source produces an empty outline; callers
+/// that need diagnostics should call [`check_syntax_named`] separately.
+pub fn top_level_declarations_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<Vec<TopLevelDeclaration>, RuntimeError> {
+    let report = check_syntax_named(file, source, limits)?;
+    if !report.valid {
+        return Ok(Vec::new());
+    }
+
+    Ok(collect_top_level_declarations(
+        source,
+        limits.max_syntax_tokens,
+    ))
 }
 
 /// Formats named canonical Splash source without evaluating it.
@@ -737,6 +798,59 @@ mod tests {
         let report = check_syntax("use mod.tool\ntool.call(\"text.echo\", \"hello\")").unwrap();
 
         assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn outlines_valid_top_level_declarations_with_byte_spans() {
+        let source = "let config = {\n\
+                      label: \"fn hidden() {}\"\n\
+                      }\n\
+                      fn greet(name) {\n\
+                          let local = name\n\
+                          local\n\
+                      }\n\
+                      let emoji = \"\u{1f642}\"\n\
+                      // let ignored = 0\n";
+
+        let declarations = top_level_declarations(source).expect("source is within default limits");
+
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|declaration| (declaration.name.as_str(), declaration.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("config", TopLevelDeclarationKind::Let),
+                ("greet", TopLevelDeclarationKind::Function),
+                ("emoji", TopLevelDeclarationKind::Let),
+            ]
+        );
+        assert_eq!(declarations[0].declaration_start_byte, 0);
+        assert_eq!(
+            declarations[0].declaration_end_byte,
+            source
+                .find("}\nfn greet")
+                .expect("record closes before function")
+                + 1
+        );
+        assert_eq!(
+            declarations[1].declaration_end_byte,
+            source
+                .find("}\nlet emoji")
+                .expect("function closes before declaration")
+                + 1
+        );
+        assert_eq!(
+            &source[declarations[2].selection_start_byte..declarations[2].selection_end_byte],
+            "emoji"
+        );
+        assert_eq!(
+            &source[declarations[2].declaration_start_byte..declarations[2].declaration_end_byte],
+            "let emoji = \"\u{1f642}\""
+        );
+        assert!(top_level_declarations("fn broken(")
+            .expect("invalid source is still bounded")
+            .is_empty());
     }
 
     #[test]
