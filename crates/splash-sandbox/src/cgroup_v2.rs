@@ -33,8 +33,18 @@ pub enum CgroupV2Limit {
     CpuQuotaMicros,
     /// cgroup memory usage in bytes (`memory.max`).
     MemoryMaxBytes,
+    /// cgroup swap usage in bytes (`memory.swap.max`).
+    MemorySwapMaxBytes,
     /// Tasks in the cgroup subtree (`pids.max`), including threads.
     PidsMax,
+    /// Per-device read bandwidth (`io.max` `rbps`).
+    IoReadBytesPerSecond,
+    /// Per-device write bandwidth (`io.max` `wbps`).
+    IoWriteBytesPerSecond,
+    /// Per-device read operations (`io.max` `riops`).
+    IoReadOperationsPerSecond,
+    /// Per-device write operations (`io.max` `wiops`).
+    IoWriteOperationsPerSecond,
 }
 
 impl Display for CgroupV2Limit {
@@ -42,7 +52,12 @@ impl Display for CgroupV2Limit {
         match self {
             Self::CpuQuotaMicros => formatter.write_str("cpu quota"),
             Self::MemoryMaxBytes => formatter.write_str("memory maximum"),
+            Self::MemorySwapMaxBytes => formatter.write_str("memory swap maximum"),
             Self::PidsMax => formatter.write_str("PID maximum"),
+            Self::IoReadBytesPerSecond => formatter.write_str("I/O read bandwidth"),
+            Self::IoWriteBytesPerSecond => formatter.write_str("I/O write bandwidth"),
+            Self::IoReadOperationsPerSecond => formatter.write_str("I/O read operation rate"),
+            Self::IoWriteOperationsPerSecond => formatter.write_str("I/O write operation rate"),
         }
     }
 }
@@ -57,27 +72,223 @@ pub enum CgroupV2LimitError {
 impl Display for CgroupV2LimitError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidMaximum { limit, maximum } => write!(
-                formatter,
-                "{limit} must be within 1..={MAX_FINITE_LIMIT}; got {maximum}"
-            ),
+            Self::InvalidMaximum { limit, maximum } => {
+                let minimum = if limit_allows_zero(*limit) { 0 } else { 1 };
+                write!(
+                    formatter,
+                    "{limit} must be within {minimum}..={MAX_FINITE_LIMIT}; got {maximum}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for CgroupV2LimitError {}
 
+/// A host-selected Linux block device addressed as `major:minor` for
+/// cgroup-v2 `io.max` control.
+///
+/// The caller must obtain this pair from trusted host configuration. It is not
+/// a script-visible path or a device-discovery API.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CgroupV2IoDevice {
+    major: u32,
+    minor: u32,
+}
+
+impl CgroupV2IoDevice {
+    /// Creates one Linux block-device identifier.
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+
+    /// Returns the Linux device major number.
+    pub const fn major(self) -> u32 {
+        self.major
+    }
+
+    /// Returns the Linux device minor number.
+    pub const fn minor(self) -> u32 {
+        self.minor
+    }
+}
+
+impl Display for CgroupV2IoDevice {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.major, self.minor)
+    }
+}
+
+/// Finite `io.max` limits for one host-selected block device.
+///
+/// Omitted fields remain unlimited in this child, subject to any ancestor
+/// policy. A value of zero is accepted for these I/O controls and prohibits
+/// that direction or operation class. The kernel may permit short bursts even
+/// when an I/O ceiling is configured.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CgroupV2IoMax {
+    device: CgroupV2IoDevice,
+    read_bytes_per_second: Option<u64>,
+    write_bytes_per_second: Option<u64>,
+    read_operations_per_second: Option<u64>,
+    write_operations_per_second: Option<u64>,
+}
+
+impl CgroupV2IoMax {
+    /// Creates an empty I/O policy for `device`.
+    ///
+    /// Set at least one ceiling before adding it to [`CgroupV2Limits`].
+    pub const fn new(device: CgroupV2IoDevice) -> Self {
+        Self {
+            device,
+            read_bytes_per_second: None,
+            write_bytes_per_second: None,
+            read_operations_per_second: None,
+            write_operations_per_second: None,
+        }
+    }
+
+    /// Returns the host-selected block device.
+    pub const fn device(&self) -> CgroupV2IoDevice {
+        self.device
+    }
+
+    /// Sets the `io.max` `rbps` ceiling.
+    pub fn set_read_bytes_per_second(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, CgroupV2LimitError> {
+        self.read_bytes_per_second = Some(validate_zero_allowed_limit(
+            CgroupV2Limit::IoReadBytesPerSecond,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets the `io.max` `wbps` ceiling.
+    pub fn set_write_bytes_per_second(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, CgroupV2LimitError> {
+        self.write_bytes_per_second = Some(validate_zero_allowed_limit(
+            CgroupV2Limit::IoWriteBytesPerSecond,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets the `io.max` `riops` ceiling.
+    pub fn set_read_operations_per_second(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, CgroupV2LimitError> {
+        self.read_operations_per_second = Some(validate_zero_allowed_limit(
+            CgroupV2Limit::IoReadOperationsPerSecond,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Sets the `io.max` `wiops` ceiling.
+    pub fn set_write_operations_per_second(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, CgroupV2LimitError> {
+        self.write_operations_per_second = Some(validate_zero_allowed_limit(
+            CgroupV2Limit::IoWriteOperationsPerSecond,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
+    /// Returns the configured `rbps` ceiling.
+    pub const fn read_bytes_per_second(&self) -> Option<u64> {
+        self.read_bytes_per_second
+    }
+
+    /// Returns the configured `wbps` ceiling.
+    pub const fn write_bytes_per_second(&self) -> Option<u64> {
+        self.write_bytes_per_second
+    }
+
+    /// Returns the configured `riops` ceiling.
+    pub const fn read_operations_per_second(&self) -> Option<u64> {
+        self.read_operations_per_second
+    }
+
+    /// Returns the configured `wiops` ceiling.
+    pub const fn write_operations_per_second(&self) -> Option<u64> {
+        self.write_operations_per_second
+    }
+
+    fn is_empty(&self) -> bool {
+        self.read_bytes_per_second.is_none()
+            && self.write_bytes_per_second.is_none()
+            && self.read_operations_per_second.is_none()
+            && self.write_operations_per_second.is_none()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn control_value(&self) -> String {
+        let mut value = self.device.to_string();
+        if let Some(maximum) = self.read_bytes_per_second {
+            value.push_str(&format!(" rbps={maximum}"));
+        }
+        if let Some(maximum) = self.write_bytes_per_second {
+            value.push_str(&format!(" wbps={maximum}"));
+        }
+        if let Some(maximum) = self.read_operations_per_second {
+            value.push_str(&format!(" riops={maximum}"));
+        }
+        if let Some(maximum) = self.write_operations_per_second {
+            value.push_str(&format!(" wiops={maximum}"));
+        }
+        value.push('\n');
+        value
+    }
+}
+
+/// Rejection while adding an I/O controller policy to [`CgroupV2Limits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CgroupV2IoMaxError {
+    Empty { device: CgroupV2IoDevice },
+    DuplicateDevice { device: CgroupV2IoDevice },
+}
+
+impl Display for CgroupV2IoMaxError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty { device } => {
+                write!(
+                    formatter,
+                    "I/O policy for device {device} requires at least one limit"
+                )
+            }
+            Self::DuplicateDevice { device } => {
+                write!(formatter, "I/O policy already exists for device {device}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CgroupV2IoMaxError {}
+
 /// Trusted controller limits for one worker cgroup.
 ///
 /// `cpu.max` uses a fixed 100 ms period, so a quota of 100,000 permits one
 /// fair-scheduler CPU worth of bandwidth. A larger quota can permit multiple
 /// CPUs. `memory.max` is a memory-cgroup hard limit rather than an RSS-only
-/// limit. `pids.max` limits kernel task IDs, which includes threads.
+/// limit. `memory.swap.max` can independently prohibit or bound swapping.
+/// `pids.max` limits kernel task IDs, which includes threads. `io.max` limits
+/// are always scoped to one explicit host-selected block device.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CgroupV2Limits {
     cpu_quota_micros: Option<NonZeroU64>,
     memory_max_bytes: Option<NonZeroU64>,
+    memory_swap_max_bytes: Option<u64>,
     pids_max: Option<NonZeroU64>,
+    io_max: Vec<CgroupV2IoMax>,
 }
 
 impl CgroupV2Limits {
@@ -96,9 +307,49 @@ impl CgroupV2Limits {
         Ok(self)
     }
 
+    /// Sets the `memory.swap.max` ceiling in bytes.
+    ///
+    /// A value of zero is valid and prohibits swapping for the worker cgroup.
+    /// This is independent from `memory.max`; selecting it requires a kernel
+    /// and delegated memory controller that expose `memory.swap.max`.
+    pub fn set_memory_swap_max_bytes(
+        &mut self,
+        maximum: u64,
+    ) -> Result<&mut Self, CgroupV2LimitError> {
+        self.memory_swap_max_bytes = Some(validate_zero_allowed_limit(
+            CgroupV2Limit::MemorySwapMaxBytes,
+            maximum,
+        )?);
+        Ok(self)
+    }
+
     /// Sets the `pids.max` ceiling for the worker subtree.
     pub fn set_pids_max(&mut self, maximum: u64) -> Result<&mut Self, CgroupV2LimitError> {
         self.pids_max = Some(validate_limit(CgroupV2Limit::PidsMax, maximum)?);
+        Ok(self)
+    }
+
+    /// Adds one finite per-device `io.max` policy.
+    ///
+    /// At least one BPS or IOPS field must be configured. A device can occur
+    /// only once so the host cannot accidentally rely on kernel-specific merge
+    /// behavior for repeated `io.max` writes.
+    pub fn add_io_max(&mut self, maximum: CgroupV2IoMax) -> Result<&mut Self, CgroupV2IoMaxError> {
+        if maximum.is_empty() {
+            return Err(CgroupV2IoMaxError::Empty {
+                device: maximum.device(),
+            });
+        }
+        if self
+            .io_max
+            .iter()
+            .any(|configured| configured.device() == maximum.device())
+        {
+            return Err(CgroupV2IoMaxError::DuplicateDevice {
+                device: maximum.device(),
+            });
+        }
+        self.io_max.push(maximum);
         Ok(self)
     }
 
@@ -112,15 +363,27 @@ impl CgroupV2Limits {
         self.memory_max_bytes
     }
 
+    /// Returns the swap ceiling in bytes, where zero prohibits swapping.
+    pub const fn memory_swap_max_bytes(&self) -> Option<u64> {
+        self.memory_swap_max_bytes
+    }
+
     /// Returns the task ceiling for the worker subtree.
     pub const fn pids_max(&self) -> Option<NonZeroU64> {
         self.pids_max
     }
 
+    /// Returns the configured per-device I/O ceilings in host insertion order.
+    pub fn io_max(&self) -> &[CgroupV2IoMax] {
+        &self.io_max
+    }
+
     fn is_empty(&self) -> bool {
         self.cpu_quota_micros.is_none()
             && self.memory_max_bytes.is_none()
+            && self.memory_swap_max_bytes.is_none()
             && self.pids_max.is_none()
+            && self.io_max.is_empty()
     }
 
     #[cfg(target_os = "linux")]
@@ -136,8 +399,14 @@ impl CgroupV2Limits {
             write_control(path, "memory.max", format!("{}\n", maximum.get()))?;
             write_control(path, "memory.oom.group", "1\n")?;
         }
+        if let Some(maximum) = self.memory_swap_max_bytes {
+            write_control(path, "memory.swap.max", format!("{maximum}\n"))?;
+        }
         if let Some(maximum) = self.pids_max {
             write_control(path, "pids.max", format!("{}\n", maximum.get()))?;
+        }
+        for maximum in &self.io_max {
+            write_control(path, "io.max", maximum.control_value())?;
         }
         Ok(())
     }
@@ -154,6 +423,27 @@ fn validate_limit(limit: CgroupV2Limit, maximum: u64) -> Result<NonZeroU64, Cgro
         });
     }
     Ok(maximum)
+}
+
+fn validate_zero_allowed_limit(
+    limit: CgroupV2Limit,
+    maximum: u64,
+) -> Result<u64, CgroupV2LimitError> {
+    if maximum > MAX_FINITE_LIMIT {
+        return Err(CgroupV2LimitError::InvalidMaximum { limit, maximum });
+    }
+    Ok(maximum)
+}
+
+const fn limit_allows_zero(limit: CgroupV2Limit) -> bool {
+    matches!(
+        limit,
+        CgroupV2Limit::MemorySwapMaxBytes
+            | CgroupV2Limit::IoReadBytesPerSecond
+            | CgroupV2Limit::IoWriteBytesPerSecond
+            | CgroupV2Limit::IoReadOperationsPerSecond
+            | CgroupV2Limit::IoWriteOperationsPerSecond
+    )
 }
 
 /// Trusted host configuration for one delegated cgroup-v2 worker subtree.
@@ -796,6 +1086,53 @@ mod tests {
             limits.set_pids_max(0),
             Err(CgroupV2LimitError::InvalidMaximum {
                 limit: CgroupV2Limit::PidsMax,
+                ..
+            })
+        ));
+        assert!(matches!(
+            limits.set_memory_swap_max_bytes(u64::MAX),
+            Err(CgroupV2LimitError::InvalidMaximum {
+                limit: CgroupV2Limit::MemorySwapMaxBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn configures_finite_swap_and_per_device_io_limits() {
+        let device = CgroupV2IoDevice::new(8, 16);
+        let mut io = CgroupV2IoMax::new(device);
+        io.set_read_bytes_per_second(2 * 1024 * 1024).unwrap();
+        io.set_write_operations_per_second(120).unwrap();
+
+        let mut limits = CgroupV2Limits::default();
+        limits.set_memory_swap_max_bytes(0).unwrap();
+        limits.add_io_max(io.clone()).unwrap();
+
+        assert_eq!(limits.memory_swap_max_bytes(), Some(0));
+        assert_eq!(limits.io_max(), &[io]);
+        assert_eq!(
+            limits.io_max()[0].control_value(),
+            "8:16 rbps=2097152 wiops=120\n"
+        );
+
+        let duplicate = CgroupV2IoMax::new(device);
+        assert!(matches!(
+            limits.add_io_max(duplicate),
+            Err(CgroupV2IoMaxError::Empty { device: actual }) if actual == device
+        ));
+
+        let mut duplicate = CgroupV2IoMax::new(device);
+        duplicate.set_read_operations_per_second(0).unwrap();
+        assert!(matches!(
+            limits.add_io_max(duplicate),
+            Err(CgroupV2IoMaxError::DuplicateDevice { device: actual }) if actual == device
+        ));
+
+        assert!(matches!(
+            CgroupV2IoMax::new(CgroupV2IoDevice::new(8, 0)).set_write_bytes_per_second(u64::MAX),
+            Err(CgroupV2LimitError::InvalidMaximum {
+                limit: CgroupV2Limit::IoWriteBytesPerSecond,
                 ..
             })
         ));

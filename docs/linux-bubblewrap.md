@@ -93,12 +93,19 @@ parent and the runner are host paths: neither is a worker-visible runtime mount
 or a Splash value.
 
 ```rust
-use splash_sandbox::cgroup_v2::{CgroupV2Limits, CgroupV2Policy};
+use splash_sandbox::cgroup_v2::{
+    CgroupV2IoDevice, CgroupV2IoMax, CgroupV2Limits, CgroupV2Policy,
+};
 
 let mut cgroup_limits = CgroupV2Limits::default();
 cgroup_limits.set_cpu_quota_micros(50_000)?; // 50 ms per 100 ms period.
 cgroup_limits.set_memory_max_bytes(512 * 1024 * 1024)?;
+cgroup_limits.set_memory_swap_max_bytes(0)?; // Do not swap worker memory.
 cgroup_limits.set_pids_max(64)?;
+let mut io = CgroupV2IoMax::new(CgroupV2IoDevice::new(8, 16));
+io.set_read_bytes_per_second(2 * 1024 * 1024)?;
+io.set_write_operations_per_second(120)?;
+cgroup_limits.add_io_max(io)?;
 
 let cgroup_policy = CgroupV2Policy::new(
     "/sys/fs/cgroup/splash-workers",
@@ -149,7 +156,17 @@ The current controller profile provides:
 - `memory.max`, a memory-cgroup limit rather than an RSS-only metric. When this
   limit is selected Splash also writes `memory.oom.group=1`, so a cgroup OOM is
   handled as one worker-tree failure rather than leaving a partial tree.
+- `memory.swap.max`, an independent swap hard limit. A value of zero prevents
+  worker anonymous memory from being swapped out. Selecting it fails before
+  launch on kernels or delegated memory controllers that do not expose the
+  control.
 - `pids.max`, a task limit for the subtree that includes threads.
+- `io.max`, finite BPS and IOPS ceilings for an explicit trusted `major:minor`
+  block device. The host can configure `rbps`, `wbps`, `riops`, and `wiops` in
+  one policy; a zero value prohibits that class of I/O. The kernel may allow
+  short bursts. Buffered-write attribution requires cgroup writeback support in
+  the underlying filesystem; without it, writeback I/O is attributed to the
+  root cgroup.
 
 Managed `BubblewrapWorkerLifecycle::terminate` and the watchdog call
 `cgroup.kill` before reaping the direct Bubblewrap child, closing the descendant
@@ -160,9 +177,9 @@ managed lifecycle; `SpawnedBubblewrapWorker::into_parts` and
 `BubblewrapWorkerLifecycle::into_child` deliberately relinquish that
 process-tree teardown and cleanup handle.
 
-This is not a disk, I/O, memory-swap, device, network, or session-wide
-wall-clock policy. It also does not prove an adapter effect was cancelled or
-rolled back. See the Linux [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+This is not an aggregate-disk, device, network, or session-wide wall-clock
+policy. Per-device `io.max` is not a filesystem quota, and neither controller
+proves an adapter effect was cancelled or rolled back. See the Linux [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 for the kernel controller semantics.
 
 ## Host Wall-Clock Watchdog
@@ -405,10 +422,11 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- aggregate-disk, cgroup I/O, memory-swap, device, or session-wide wall-clock
-  quotas. An optional cgroup-v2 policy adds only the CPU bandwidth, memory, and
-  task controls described above; an optional runner adds the narrower rlimits,
-  and a configured private `/tmp` size limits only that Bubblewrap `tmpfs`;
+- aggregate-disk, device, or session-wide wall-clock quotas. An optional
+  cgroup-v2 policy adds CPU bandwidth, memory, swap, task, and per-device I/O
+  controls; it is not a filesystem quota. An optional runner adds the narrower
+  rlimits, and a configured private `/tmp` size limits only that Bubblewrap
+  `tmpfs`;
 - a worker-specific syscall allowlist, D-Bus mediation, device-specific policy,
   or a network proxy. `DenyKnownEscapeSurface` is a narrow default-allow
   hardening filter, not a replacement for any of these;

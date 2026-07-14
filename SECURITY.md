@@ -133,13 +133,14 @@ attestation, or key storage.
 
 For Linux deployments with a host-owned delegated cgroup-v2 parent,
 `CgroupV2Policy` can be used with `BubblewrapCommand::spawn_in_cgroup` or
-`spawn_with_bootstrap_in_cgroup`. The policy creates a fresh child, applies only
-the selected `cpu.max`, `memory.max`, and `pids.max` controls, and starts a
-fixed host-side runner. The runner moves itself into that child before it
-executes Bubblewrap. Splash observes the direct child in `cgroup.procs` before
-it returns a managed worker handle, so lifecycle teardown cannot race a runner
-that has not yet joined the cgroup. The cgroup path is never a Splash value,
-worker protocol field, or Bubblewrap argument.
+`spawn_with_bootstrap_in_cgroup`. The policy creates a fresh child, applies
+selected `cpu.max`, `memory.max`, `memory.swap.max`, `pids.max`, and per-device
+`io.max` controls, and starts a fixed host-side runner. The runner moves itself
+into that child before it executes Bubblewrap. Splash observes the direct child
+in `cgroup.procs` before it returns a managed worker handle, so lifecycle
+teardown cannot race a runner that has not yet joined the cgroup. The cgroup
+path and I/O device identifiers are never Splash values, worker protocol
+fields, or Bubblewrap arguments.
 
 The host must enable and delegate the required controllers under a dedicated
 parent before launch. Splash verifies the parent is mounted from cgroup v2 and
@@ -155,9 +156,12 @@ process. This covers the worker cgroup subtree, including descendant forks,
 where `Child::kill` alone would not. A cgroup cleanup or kill failure is a
 containment failure, not a successful cancellation result. `memory.max` is a
 memory-cgroup boundary rather than an RSS-only metric; Splash additionally sets
-`memory.oom.group=1` when it selects that control. `pids.max` counts tasks,
-including threads, and `cpu.max` is CPU bandwidth rather than a wall-clock
-deadline. The [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+`memory.oom.group=1` when it selects that control. `memory.swap.max=0` prevents
+anonymous memory in the worker cgroup from being swapped out. `io.max` bounds
+selected BPS and IOPS classes for one trusted block-device `major:minor`
+identity, but it is not a filesystem quota. `pids.max` counts tasks, including
+threads, and `cpu.max` is CPU
+bandwidth rather than a wall-clock deadline. The [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 defines the kernel semantics.
 
 Hosts may additionally select the typed
@@ -225,13 +229,15 @@ reconcile a durable effect rather than infer that process termination cancelled
 or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no worker-specific syscall allowlist, aggregate-disk, cgroup
-I/O, memory-swap, device, or session-wide wall-clock quota, per-origin network
-proxy, D-Bus mediation, secret broker, authenticated cancellation delivery, or
-post-exit recovery. Its optional watchdog supplies only the narrow host
-wall-clock force-stop described above, its optional runner provides only the
-narrow rlimits described above, and its cgroup profile supplies only the CPU,
-memory, and task controls described above.
+This backend has no worker-specific syscall allowlist, aggregate-disk, device,
+or session-wide wall-clock quota, per-origin network proxy, D-Bus mediation,
+secret broker, authenticated cancellation delivery, or post-exit recovery. Its
+optional watchdog supplies only the narrow host wall-clock force-stop described
+above, its optional runner provides only the narrow rlimits described above,
+and its cgroup profile supplies only the CPU, memory, swap, task, and selected
+per-device I/O controls described above. The per-device I/O control is neither
+a filesystem quota nor a guarantee that buffered writeback will be attributed
+to the worker on every filesystem.
 `DenyKnownEscapeSurface` provides only the fixed default-allow hardening
 described above. A private `/tmp` is opt-in and unbounded unless the host
 selects its explicit Bubblewrap size limit; that limit does not replace a

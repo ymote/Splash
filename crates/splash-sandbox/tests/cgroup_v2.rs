@@ -75,6 +75,7 @@ fn cgroup_limits() -> CgroupV2Limits {
     let mut limits = CgroupV2Limits::default();
     limits.set_cpu_quota_micros(20_000).unwrap();
     limits.set_memory_max_bytes(64 * 1024 * 1024).unwrap();
+    limits.set_memory_swap_max_bytes(0).unwrap();
     limits.set_pids_max(32).unwrap();
     limits
 }
@@ -106,6 +107,12 @@ fn applies_limits_before_exec_and_kills_the_runner_subtree() {
             .unwrap()
             .trim(),
         "67108864"
+    );
+    assert_eq!(
+        fs::read_to_string(session.path().join("memory.swap.max"))
+            .unwrap()
+            .trim(),
+        "0"
     );
     assert_eq!(
         fs::read_to_string(session.path().join("pids.max"))

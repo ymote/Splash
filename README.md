@@ -61,8 +61,9 @@ and keeps UI support optional rather than making UI the language boundary.
   force-terminates and reaps a Bubblewrap worker without treating termination
   as an adapter-effect result.
 - Optional Linux cgroup-v2 worker sessions with host-delegated CPU bandwidth,
-  memory, and task limits; a fixed runner joins the cgroup before Bubblewrap
-  starts, and managed lifecycle teardown kills the whole worker process tree.
+  memory, swap, task, and per-device I/O limits; a fixed runner joins the
+  cgroup before Bubblewrap starts, and managed lifecycle teardown kills the
+  whole worker process tree.
 - Optional Bubblewrap watchdog and generic bounded worker transport that apply
   a host-selected wall-clock deadline to one synchronous invocation; deadline
   or host termination poisons the session and remains indeterminate.
