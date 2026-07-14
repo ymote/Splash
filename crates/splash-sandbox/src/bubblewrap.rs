@@ -18,17 +18,21 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::cgroup_v2::{
+    CgroupV2Policy, CgroupV2PrepareError, CgroupV2Session, CgroupV2SessionError,
+};
+
 #[cfg(target_os = "linux")]
 use std::io::Write;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::process::{ChildStderr, Command, Stdio};
 
 #[cfg(target_os = "linux")]
-use rustix::io::{fcntl_setfd, FdFlags};
+use rustix::io::{fcntl_dupfd_cloexec, fcntl_setfd, FdFlags};
 use splash_protocol::{
     CapabilityManifest, PrivatePipeWorkerBootstrap, PrivatePipeWorkerBootstrapError, ProtocolError,
     ResourceKind, ResourceSelector,
@@ -799,8 +803,39 @@ impl BubblewrapCommand {
 
         #[cfg(target_os = "linux")]
         {
-            self.spawn_with_stderr(Stdio::null())
+            self.spawn_with_stderr(Stdio::null(), None, None)
                 .map(|(worker, _)| worker)
+        }
+    }
+
+    /// Starts a worker through a fresh, limited cgroup-v2 child.
+    ///
+    /// The policy is trusted host configuration. Its fixed runner joins the
+    /// prepared cgroup before it executes Bubblewrap, so Bubblewrap and every
+    /// descendant inherit the configured controller limits. Keep the returned
+    /// worker's lifecycle handle until termination and cleanup complete; raw
+    /// child extraction cannot provide cgroup process-tree teardown.
+    pub fn spawn_in_cgroup(
+        &self,
+        policy: &CgroupV2Policy,
+    ) -> Result<SpawnedBubblewrapWorker, BubblewrapCgroupSpawnError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, policy);
+            Err(BubblewrapCgroupSpawnError::Prepare(
+                CgroupV2PrepareError::UnsupportedPlatform,
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let join_timeout = policy.join_timeout();
+            let session = policy
+                .prepare()
+                .map_err(BubblewrapCgroupSpawnError::Prepare)?;
+            self.spawn_with_stderr(Stdio::null(), Some(session), Some(join_timeout))
+                .map(|(worker, _)| worker)
+                .map_err(BubblewrapCgroupSpawnError::Spawn)
         }
     }
 
@@ -808,13 +843,29 @@ impl BubblewrapCommand {
     fn spawn_with_stderr(
         &self,
         stderr: Stdio,
+        cgroup: Option<CgroupV2Session>,
+        cgroup_join_timeout: Option<Duration>,
     ) -> Result<(SpawnedBubblewrapWorker, Option<ChildStderr>), BubblewrapSpawnError> {
         let seccomp_descriptor = self
             .seccomp_program
             .as_ref()
             .map(SeccompProgram::open_for_bubblewrap)
             .transpose()?;
-        let mut command = Command::new(&self.bwrap_program);
+        let mut command = if let Some(session) = &cgroup {
+            let mut command = Command::new(session.runner_program());
+            command
+                .arg("--cgroup-procs")
+                .arg(session.cgroup_procs_path());
+            if let Some(descriptor) = &seccomp_descriptor {
+                command
+                    .arg("--preserve-fd")
+                    .arg(descriptor.as_raw_fd().to_string());
+            }
+            command.arg("--").arg(&self.bwrap_program);
+            command
+        } else {
+            Command::new(&self.bwrap_program)
+        };
         if let Some(descriptor) = &seccomp_descriptor {
             command
                 .arg("--seccomp")
@@ -831,12 +882,22 @@ impl BubblewrapCommand {
         // reads the program. Close our deliberately inherited copy before
         // any later host process launch can observe it.
         drop(seccomp_descriptor);
+        if let Some(session) = &cgroup {
+            let join_timeout = cgroup_join_timeout
+                .expect("cgroup-backed Bubblewrap spawn must carry its host-selected join timeout");
+            if let Err(error) = wait_for_cgroup_join(&mut child, session, join_timeout) {
+                discard_worker(&mut child, Some(session));
+                return Err(error);
+            }
+        } else {
+            debug_assert!(cgroup_join_timeout.is_none());
+        }
         let Some(stdin) = child.stdin.take() else {
-            discard_child(&mut child);
+            discard_worker(&mut child, cgroup.as_ref());
             return Err(BubblewrapSpawnError::MissingStdin);
         };
         let Some(stdout) = child.stdout.take() else {
-            discard_child(&mut child);
+            discard_worker(&mut child, cgroup.as_ref());
             return Err(BubblewrapSpawnError::MissingStdout);
         };
         let stderr = child.stderr.take();
@@ -845,6 +906,7 @@ impl BubblewrapCommand {
                 child,
                 stdin,
                 stdout,
+                cgroup,
             },
             stderr,
         ))
@@ -854,7 +916,7 @@ impl BubblewrapCommand {
     fn spawn_capturing_stderr(
         &self,
     ) -> Result<(SpawnedBubblewrapWorker, ChildStderr), BubblewrapSpawnError> {
-        let (worker, stderr) = self.spawn_with_stderr(Stdio::piped())?;
+        let (worker, stderr) = self.spawn_with_stderr(Stdio::piped(), None, None)?;
         let Some(stderr) = stderr else {
             unreachable!("a piped Bubblewrap standard-error stream must be available")
         };
@@ -884,8 +946,36 @@ impl BubblewrapCommand {
 
         let mut worker = self.spawn().map_err(BubblewrapBootstrapError::Spawn)?;
         if let Err(error) = bootstrap.write_to(&mut worker.stdin) {
-            discard_child(&mut worker.child);
+            let _ = worker.terminate();
             return Err(BubblewrapBootstrapError::Bootstrap(error));
+        }
+        Ok(worker)
+    }
+
+    /// Starts a cgroup-v2-limited worker and writes its authenticated bootstrap
+    /// before any JSON worker frame can be sent.
+    ///
+    /// This has the same key-delivery and recovery requirements as
+    /// [`Self::spawn_with_bootstrap`]. A bootstrap write failure terminates the
+    /// whole cgroup before this method returns the error.
+    pub fn spawn_with_bootstrap_in_cgroup(
+        &self,
+        policy: &CgroupV2Policy,
+        bootstrap: &PrivatePipeWorkerBootstrap,
+    ) -> Result<SpawnedBubblewrapWorker, BubblewrapCgroupBootstrapError> {
+        if bootstrap.session_id() != self.session_id {
+            return Err(BubblewrapCgroupBootstrapError::SessionMismatch {
+                expected: self.session_id.clone(),
+                actual: bootstrap.session_id().to_owned(),
+            });
+        }
+
+        let mut worker = self
+            .spawn_in_cgroup(policy)
+            .map_err(BubblewrapCgroupBootstrapError::Spawn)?;
+        if let Err(error) = bootstrap.write_to(&mut worker.stdin) {
+            let _ = worker.terminate();
+            return Err(BubblewrapCgroupBootstrapError::Bootstrap(error));
         }
         Ok(worker)
     }
@@ -899,7 +989,7 @@ struct SeccompProgram {
 
 impl SeccompProgram {
     #[cfg(target_os = "linux")]
-    fn open_for_bubblewrap(&self) -> Result<UnixStream, BubblewrapSpawnError> {
+    fn open_for_bubblewrap(&self) -> Result<OwnedFd, BubblewrapSpawnError> {
         let (descriptor, mut producer) =
             UnixStream::pair().map_err(BubblewrapSpawnError::SeccompTransport)?;
         producer
@@ -907,6 +997,12 @@ impl SeccompProgram {
             .map_err(BubblewrapSpawnError::SeccompTransport)?;
         drop(producer);
 
+        // `Command` configures the child standard streams after this socket is
+        // created. Duplicate it above descriptor 2 so a host with a closed
+        // standard descriptor cannot have that setup replace the seccomp
+        // transport before Bubblewrap reads it.
+        let descriptor = fcntl_dupfd_cloexec(&descriptor, 3)
+            .map_err(|source| BubblewrapSpawnError::SeccompTransport(source.into()))?;
         // Bubblewrap receives this descriptor through exec, reads the complete
         // cBPF program, and closes it before it enters the sandbox. The worker
         // never receives a descriptor selected by a caller.
@@ -941,6 +1037,7 @@ pub struct SpawnedBubblewrapWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+    cgroup: Option<CgroupV2Session>,
 }
 
 impl SpawnedBubblewrapWorker {
@@ -959,7 +1056,7 @@ impl SpawnedBubblewrapWorker {
     /// session and reconcile any durable effect through the authenticated
     /// worker protocol.
     pub fn terminate(&mut self) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
-        terminate_and_reap(&mut self.child)
+        terminate_and_reap(&mut self.child, &mut self.cgroup)
     }
 
     /// Consumes the startup handle while retaining managed worker lifecycle
@@ -970,7 +1067,10 @@ impl SpawnedBubblewrapWorker {
     /// after a deadline, transport failure, or host cancellation.
     pub fn into_lifecycle_parts(self) -> (BubblewrapWorkerLifecycle, ChildStdin, ChildStdout) {
         (
-            BubblewrapWorkerLifecycle { child: self.child },
+            BubblewrapWorkerLifecycle {
+                child: self.child,
+                cgroup: self.cgroup,
+            },
             self.stdin,
             self.stdout,
         )
@@ -978,6 +1078,12 @@ impl SpawnedBubblewrapWorker {
 
     /// Consumes the handle and returns the child plus its private input/output
     /// pipes. The caller can wrap these in `JsonLineWorkerChannel`.
+    ///
+    /// For a worker started with [`BubblewrapCommand::spawn_in_cgroup`], this
+    /// relinquishes the cgroup lifecycle handle. The cgroup limits remain in
+    /// effect, but the host can no longer use this API to kill descendant
+    /// processes or remove the cgroup. Use [`Self::into_lifecycle_parts`] for
+    /// cgroup-backed workers.
     pub fn into_parts(self) -> (Child, ChildStdin, ChildStdout) {
         (self.child, self.stdin, self.stdout)
     }
@@ -988,6 +1094,7 @@ impl SpawnedBubblewrapWorker {
 #[derive(Debug)]
 pub struct BubblewrapWorkerLifecycle {
     child: Child,
+    cgroup: Option<CgroupV2Session>,
 }
 
 impl BubblewrapWorkerLifecycle {
@@ -1002,7 +1109,7 @@ impl BubblewrapWorkerLifecycle {
     /// This has the same effect and recovery requirements as
     /// [`SpawnedBubblewrapWorker::terminate`].
     pub fn terminate(&mut self) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
-        terminate_and_reap(&mut self.child)
+        terminate_and_reap(&mut self.child, &mut self.cgroup)
     }
 
     /// Transfers this worker lifecycle to a host-owned watchdog thread.
@@ -1022,6 +1129,10 @@ impl BubblewrapWorkerLifecycle {
     }
 
     /// Consumes this lifecycle handle and returns the raw child process.
+    ///
+    /// For cgroup-backed workers, this relinquishes cgroup process-tree
+    /// teardown and cleanup. Prefer [`Self::into_watchdog`] or
+    /// [`Self::terminate`] for those workers.
     pub fn into_child(self) -> Child {
         self.child
     }
@@ -1499,13 +1610,19 @@ fn arm_watchdog_call(
     }
     match state {
         WatchdogState::Idle => {
-            if let Some(status) = lifecycle
+            if lifecycle
                 .child_mut()
                 .try_wait()
                 .map_err(BubblewrapTerminationError::Inspect)
                 .map_err(BubblewrapWorkerWatchdogError::Termination)?
+                .is_some()
             {
-                let outcome = BubblewrapTermination::AlreadyExited(status);
+                // A direct Bubblewrap exit does not prove that a cgroup
+                // descendant has exited. Reuse managed termination so a
+                // cgroup-backed lifecycle kills and cleans its full subtree.
+                let outcome = lifecycle
+                    .terminate()
+                    .map_err(BubblewrapWorkerWatchdogError::Termination)?;
                 *state = WatchdogState::Terminated {
                     reason: WatchdogTerminationReason::ProcessExited,
                     outcome: outcome.clone(),
@@ -1813,6 +1930,41 @@ pub enum BubblewrapSpawnError {
     Spawn(io::Error),
     MissingStdin,
     MissingStdout,
+    CgroupMembership(CgroupV2SessionError),
+    CgroupJoinTimeout(Duration),
+    CgroupRunnerExited(ExitStatus),
+}
+
+/// Failure while starting a Bubblewrap worker through a cgroup-v2 runner.
+#[derive(Debug)]
+pub enum BubblewrapCgroupSpawnError {
+    /// The host cgroup policy could not create a fresh limited child.
+    Prepare(CgroupV2PrepareError),
+    /// Bubblewrap or the fixed cgroup runner could not be spawned.
+    Spawn(BubblewrapSpawnError),
+}
+
+impl Display for BubblewrapCgroupSpawnError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Prepare(error) => {
+                write!(
+                    formatter,
+                    "could not prepare cgroup-v2 worker session: {error}"
+                )
+            }
+            Self::Spawn(error) => write!(formatter, "could not start cgroup-v2 worker: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BubblewrapCgroupSpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Prepare(error) => Some(error),
+            Self::Spawn(error) => Some(error),
+        }
+    }
 }
 
 /// Failure while launching a worker with a private-pipe session bootstrap.
@@ -1847,12 +1999,48 @@ impl std::error::Error for BubblewrapBootstrapError {
     }
 }
 
+/// Failure while bootstrapping a cgroup-v2-limited Bubblewrap worker.
+#[derive(Debug)]
+pub enum BubblewrapCgroupBootstrapError {
+    Spawn(BubblewrapCgroupSpawnError),
+    SessionMismatch { expected: String, actual: String },
+    Bootstrap(PrivatePipeWorkerBootstrapError),
+}
+
+impl Display for BubblewrapCgroupBootstrapError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(formatter, "could not start cgroup-v2 worker: {error}"),
+            Self::SessionMismatch { .. } => {
+                formatter.write_str("private worker bootstrap does not match the compiled session")
+            }
+            Self::Bootstrap(error) => {
+                write!(
+                    formatter,
+                    "could not provision cgroup-v2 worker bootstrap: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BubblewrapCgroupBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) => Some(error),
+            Self::Bootstrap(error) => Some(error),
+            Self::SessionMismatch { .. } => None,
+        }
+    }
+}
+
 /// Failure while force-terminating and reaping a Bubblewrap worker.
 #[derive(Debug)]
 pub enum BubblewrapTerminationError {
     Inspect(io::Error),
     Kill(io::Error),
     Wait(io::Error),
+    Cgroup(CgroupV2SessionError),
 }
 
 impl Display for BubblewrapTerminationError {
@@ -1868,6 +2056,12 @@ impl Display for BubblewrapTerminationError {
                 write!(formatter, "could not terminate Bubblewrap worker: {error}")
             }
             Self::Wait(error) => write!(formatter, "could not reap Bubblewrap worker: {error}"),
+            Self::Cgroup(error) => {
+                write!(
+                    formatter,
+                    "could not terminate or clean up worker cgroup: {error}"
+                )
+            }
         }
     }
 }
@@ -1876,6 +2070,7 @@ impl std::error::Error for BubblewrapTerminationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Inspect(error) | Self::Kill(error) | Self::Wait(error) => Some(error),
+            Self::Cgroup(error) => Some(error),
         }
     }
 }
@@ -1895,6 +2090,20 @@ impl Display for BubblewrapSpawnError {
             Self::Spawn(error) => write!(formatter, "failed to spawn Bubblewrap worker: {error}"),
             Self::MissingStdin => formatter.write_str("Bubblewrap worker did not expose stdin"),
             Self::MissingStdout => formatter.write_str("Bubblewrap worker did not expose stdout"),
+            Self::CgroupMembership(error) => {
+                write!(
+                    formatter,
+                    "could not verify cgroup worker membership: {error}"
+                )
+            }
+            Self::CgroupJoinTimeout(timeout) => write!(
+                formatter,
+                "cgroup runner did not join the worker cgroup within {timeout:?}"
+            ),
+            Self::CgroupRunnerExited(status) => write!(
+                formatter,
+                "cgroup runner exited before joining the worker cgroup: {status}"
+            ),
         }
     }
 }
@@ -1903,7 +2112,9 @@ impl std::error::Error for BubblewrapSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SeccompTransport(error) | Self::Spawn(error) => Some(error),
+            Self::CgroupMembership(error) => Some(error),
             Self::UnsupportedPlatform | Self::MissingStdin | Self::MissingStdout => None,
+            Self::CgroupJoinTimeout(_) | Self::CgroupRunnerExited(_) => None,
         }
     }
 }
@@ -2182,17 +2393,41 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
 
 fn terminate_and_reap(
     child: &mut Child,
+    cgroup: &mut Option<CgroupV2Session>,
 ) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
-    if let Some(status) = child
+    let initial_status = child
         .try_wait()
-        .map_err(BubblewrapTerminationError::Inspect)?
-    {
-        return Ok(BubblewrapTermination::AlreadyExited(status));
+        .map_err(BubblewrapTerminationError::Inspect)?;
+
+    // A cgroup-backed launch has to terminate the full tree even when the
+    // direct Bubblewrap process has already exited. `cgroup.kill` closes the
+    // fork race that a direct `Child::kill` cannot cover.
+    let cgroup_kill_error = cgroup.as_ref().and_then(|session| session.kill().err());
+
+    let termination = match initial_status {
+        Some(status) => Ok(BubblewrapTermination::AlreadyExited(status)),
+        None => terminate_running_child(child),
+    };
+
+    let cgroup_cleanup_error = cgroup
+        .as_ref()
+        .and_then(|session| cleanup_cgroup_after_termination(session).err());
+    if cgroup_cleanup_error.is_none() && cgroup.is_some() {
+        let _ = cgroup.take();
     }
 
+    if let Some(error) = cgroup_kill_error.or(cgroup_cleanup_error) {
+        return Err(BubblewrapTerminationError::Cgroup(error));
+    }
+    termination
+}
+
+fn terminate_running_child(
+    child: &mut Child,
+) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
     if let Err(error) = child.kill() {
         if let Ok(Some(status)) = child.try_wait() {
-            return Ok(BubblewrapTermination::AlreadyExited(status));
+            return Ok(BubblewrapTermination::Killed(status));
         }
         return Err(BubblewrapTerminationError::Kill(error));
     }
@@ -2203,9 +2438,85 @@ fn terminate_and_reap(
         .map_err(BubblewrapTerminationError::Wait)
 }
 
+#[cfg(target_os = "linux")]
 fn discard_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(target_os = "linux")]
+fn discard_worker(child: &mut Child, cgroup: Option<&CgroupV2Session>) {
+    if let Some(session) = cgroup {
+        let _ = session.kill();
+    }
+    discard_child(child);
+    if let Some(session) = cgroup {
+        // The runner could join between the first cgroup kill and direct-child
+        // reap on an early launch failure. A second kill after the runner PID
+        // is gone covers any subtree it managed to create in that interval.
+        let _ = session.kill();
+        let _ = cleanup_cgroup_after_termination(session);
+    }
+}
+
+fn cleanup_cgroup_after_termination(session: &CgroupV2Session) -> Result<(), CgroupV2SessionError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        session.cleanup()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        const MAX_RETRIES: usize = 50;
+        const RETRY_DELAY: Duration = Duration::from_millis(10);
+
+        for attempt in 0..=MAX_RETRIES {
+            match session.cleanup() {
+                Ok(()) => return Ok(()),
+                Err(error) if should_retry_cgroup_cleanup(&error) && attempt < MAX_RETRIES => {
+                    thread::sleep(RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the cgroup cleanup retry loop always returns")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn should_retry_cgroup_cleanup(error: &CgroupV2SessionError) -> bool {
+    matches!(
+        error,
+        CgroupV2SessionError::Cleanup { source, .. }
+            if matches!(
+                source.kind(),
+                io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::ResourceBusy
+            )
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_cgroup_join(
+    child: &mut Child,
+    cgroup: &CgroupV2Session,
+    maximum: Duration,
+) -> Result<(), BubblewrapSpawnError> {
+    let started = Instant::now();
+    loop {
+        if cgroup
+            .contains_process(child.id())
+            .map_err(BubblewrapSpawnError::CgroupMembership)?
+        {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(BubblewrapSpawnError::Spawn)? {
+            return Err(BubblewrapSpawnError::CgroupRunnerExited(status));
+        }
+        if started.elapsed() >= maximum {
+            return Err(BubblewrapSpawnError::CgroupJoinTimeout(maximum));
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2552,6 +2863,8 @@ mod linux_seccomp {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
     #[cfg(unix)]
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2812,6 +3125,24 @@ mod tests {
             ),
             ptrace::SECCOMP_RET_KILL_PROCESS
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seccomp_launch_descriptor_is_never_a_standard_descriptor() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
+        let plan = policy.compile(&manifest([])).unwrap();
+
+        let descriptor = plan
+            .seccomp_program
+            .as_ref()
+            .unwrap()
+            .open_for_bubblewrap()
+            .unwrap();
+
+        assert!(descriptor.as_raw_fd() >= 3);
     }
 
     #[cfg(target_os = "linux")]
@@ -3271,6 +3602,25 @@ print("seccomp-active")
 
     #[cfg(not(target_os = "linux"))]
     #[test]
+    fn refuses_cgroup_spawn_off_linux() {
+        let root = TestDirectory::new();
+        let plan = base_policy(&root).compile(&manifest([])).unwrap();
+        let mut limits = crate::cgroup_v2::CgroupV2Limits::default();
+        limits.set_pids_max(8).unwrap();
+        let policy =
+            crate::cgroup_v2::CgroupV2Policy::new(root.path(), root.path().join("runner"), limits)
+                .unwrap();
+
+        assert!(matches!(
+            plan.spawn_in_cgroup(&policy),
+            Err(BubblewrapCgroupSpawnError::Prepare(
+                CgroupV2PrepareError::UnsupportedPlatform
+            ))
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
     fn refuses_to_bootstrap_an_uncontained_worker_off_linux() {
         let root = TestDirectory::new();
         let plan = base_policy(&root).compile(&manifest([])).unwrap();
@@ -3429,6 +3779,7 @@ print("seccomp-active")
             child,
             stdin,
             stdout,
+            cgroup: None,
         }
     }
 }

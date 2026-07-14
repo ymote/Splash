@@ -131,6 +131,34 @@ reaps the child. This avoids exposing the key in argv or environment variables,
 but it is transfer only: it does not provide key exchange, encryption,
 attestation, or key storage.
 
+For Linux deployments with a host-owned delegated cgroup-v2 parent,
+`CgroupV2Policy` can be used with `BubblewrapCommand::spawn_in_cgroup` or
+`spawn_with_bootstrap_in_cgroup`. The policy creates a fresh child, applies only
+the selected `cpu.max`, `memory.max`, and `pids.max` controls, and starts a
+fixed host-side runner. The runner moves itself into that child before it
+executes Bubblewrap. Splash observes the direct child in `cgroup.procs` before
+it returns a managed worker handle, so lifecycle teardown cannot race a runner
+that has not yet joined the cgroup. The cgroup path is never a Splash value,
+worker protocol field, or Bubblewrap argument.
+
+The host must enable and delegate the required controllers under a dedicated
+parent before launch. Splash deliberately does not modify
+`cgroup.subtree_control`, because changing a shared parent can affect unrelated
+workloads. The policy fails before launch when a selected controller or
+`cgroup.kill` is unavailable. The runner is trusted host code, must remain
+immutable to untrusted actors, and is not mounted into the worker runtime.
+
+For a managed cgroup-backed worker, explicit termination, watchdog expiry, and
+bootstrap failure call `cgroup.kill` before reaping the direct Bubblewrap
+process. This covers the worker cgroup subtree, including descendant forks,
+where `Child::kill` alone would not. A cgroup cleanup or kill failure is a
+containment failure, not a successful cancellation result. `memory.max` is a
+memory-cgroup boundary rather than an RSS-only metric; Splash additionally sets
+`memory.oom.group=1` when it selects that control. `pids.max` counts tasks,
+including threads, and `cpu.max` is CPU bandwidth rather than a wall-clock
+deadline. The [Linux cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+defines the kernel semantics.
+
 Hosts may additionally select the typed
 `WorkerSeccompProfile::DenyKnownEscapeSurface`. Splash generates a fixed cBPF
 program and transfers it over an anonymous launch-only descriptor to
@@ -164,16 +192,17 @@ nonstandard host descriptor inherited through Bubblewrap from becoming worker
 authority. It does not make the standard streams secret: the worker protocol
 and host logging policy must still treat their contents as sensitive.
 
-These are narrow per-process rlimits, not cgroup quotas: CPU is cumulative
-time, address space is virtual memory, open files are file descriptors, and
-file size is per created file. `RLIMIT_NPROC` is per-real-UID thread accounting,
-can include unrelated processes, and is not enforced for real UID 0 or a
-process with `CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`. Hard limits prevent an
-unprivileged worker from raising them, but a process with `CAP_SYS_RESOURCE` in
-the initial user namespace can do so. Do not describe this as a worker-tree
-process limit, RSS ceiling, aggregate disk quota, wall-clock deadline, seccomp
-policy, cancellation mechanism, or complete sandbox. Use cgroups and a
-dedicated non-root sandbox identity where those properties are required.
+The optional rlimits remain narrow per-process controls, not a replacement for
+the cgroup profile: CPU is cumulative time, address space is virtual memory,
+open files are file descriptors, and file size is per created file.
+`RLIMIT_NPROC` is per-real-UID thread accounting, can include unrelated
+processes, and is not enforced for real UID 0 or a process with
+`CAP_SYS_ADMIN` or `CAP_SYS_RESOURCE`. Hard limits prevent an unprivileged
+worker from raising them, but a process with `CAP_SYS_RESOURCE` in the initial
+user namespace can do so. Do not describe rlimits as a worker-tree process
+limit, RSS ceiling, aggregate disk quota, wall-clock deadline, seccomp policy,
+cancellation mechanism, or complete sandbox. Use a cgroup policy and dedicated
+non-root sandbox identity where the available cgroup properties are required.
 
 `RLIMIT_CPU` does not bound a sleeping or blocked worker. A host using the
 optional `BubblewrapWorkerWatchdog` through `BoundedWorkerTransport` can arm a
@@ -195,11 +224,13 @@ reconcile a durable effect rather than infer that process termination cancelled
 or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no worker-specific syscall allowlist, cgroup quotas,
-per-origin network proxy, D-Bus mediation, secret broker, authenticated
-cancellation delivery, or post-exit recovery. Its optional watchdog supplies
-only the narrow host wall-clock force-stop described above, and its optional
-runner provides only the narrow rlimits described above.
+This backend has no worker-specific syscall allowlist, aggregate-disk, cgroup
+I/O, memory-swap, device, or session-wide wall-clock quota, per-origin network
+proxy, D-Bus mediation, secret broker, authenticated cancellation delivery, or
+post-exit recovery. Its optional watchdog supplies only the narrow host
+wall-clock force-stop described above, its optional runner provides only the
+narrow rlimits described above, and its cgroup profile supplies only the CPU,
+memory, and task controls described above.
 `DenyKnownEscapeSurface` provides only the fixed default-allow hardening
 described above. A private `/tmp` is opt-in and unbounded unless the host
 selects its explicit Bubblewrap size limit; that limit does not replace a

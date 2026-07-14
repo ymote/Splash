@@ -85,6 +85,85 @@ pipes in the bounded JSON-line transport and sends that frame with
 generated and trusts; it is not key exchange, encrypted transport, worker
 attestation, or key storage.
 
+## Cgroup-v2 Resource Boundary
+
+For a Linux deployment that has a host-owned delegated cgroup-v2 parent, the
+host can add controller limits to the complete Bubblewrap worker tree. The
+parent and the runner are host paths: neither is a worker-visible runtime mount
+or a Splash value.
+
+```rust
+use splash_sandbox::cgroup_v2::{CgroupV2Limits, CgroupV2Policy};
+
+let mut cgroup_limits = CgroupV2Limits::default();
+cgroup_limits.set_cpu_quota_micros(50_000)?; // 50 ms per 100 ms period.
+cgroup_limits.set_memory_max_bytes(512 * 1024 * 1024)?;
+cgroup_limits.set_pids_max(64)?;
+
+let cgroup_policy = CgroupV2Policy::new(
+    "/sys/fs/cgroup/splash-workers",
+    "/opt/splash/host-bin/splash-cgroup-runner",
+    cgroup_limits,
+)?;
+let worker = command.spawn_with_bootstrap_in_cgroup(&cgroup_policy, &bootstrap)?;
+let (lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
+```
+
+Build the bundled host-side runner on the target Linux platform with:
+
+```sh
+cargo build --locked -p splash-sandbox --bin splash-cgroup-runner --release
+```
+
+`CgroupV2Policy` requires an existing cgroup-v2 parent owned by the host. The
+host must delegate and enable every selected controller for its children before
+launch. Splash intentionally does not write the parent's
+`cgroup.subtree_control`, because changing that parent could alter resource
+policy for unrelated workloads. Preparation creates a fresh child, writes the
+selected controller values, and fails before launch if a control file or
+`cgroup.kill` is unavailable. The runner must be an immutable, host-trusted
+regular executable; it is not mounted into the worker.
+
+The fixed runner writes its own PID to the fresh child's `cgroup.procs` before
+it `exec`s Bubblewrap. Bubblewrap and every later descendant therefore inherit
+the cgroup without a post-spawn migration race. Before it executes Bubblewrap,
+the runner marks every inherited descriptor from 3 onward close-on-exec,
+preserving only the optional launch-only seccomp descriptor. The cgroup path is
+not present in the Bubblewrap command line, environment, Splash source, or
+worker protocol.
+
+Before `spawn_in_cgroup` or `spawn_with_bootstrap_in_cgroup` returns a worker
+handle, Splash observes the direct child PID in the fresh `cgroup.procs`. The
+default bounded wait is five seconds and can be changed with
+`CgroupV2Policy::set_join_timeout`; a runner that exits or does not join in time
+is killed along with the prepared cgroup and the launch fails. This confirmation
+prevents a host lifecycle operation from racing a runner that has not entered
+the cgroup yet.
+
+The current controller profile provides:
+
+- `cpu.max` bandwidth with a fixed 100 ms period. A 50,000 microsecond quota
+  permits up to half of one fair-scheduler CPU worth of bandwidth in each
+  period; it is not a wall-clock deadline.
+- `memory.max`, a memory-cgroup limit rather than an RSS-only metric. When this
+  limit is selected Splash also writes `memory.oom.group=1`, so a cgroup OOM is
+  handled as one worker-tree failure rather than leaving a partial tree.
+- `pids.max`, a task limit for the subtree that includes threads.
+
+Managed `BubblewrapWorkerLifecycle::terminate` and the watchdog call
+`cgroup.kill` before reaping the direct Bubblewrap child, closing the descendant
+fork race that `Child::kill` alone cannot cover. They then remove the empty
+cgroup. A cgroup kill or cleanup failure is returned as a lifecycle error and
+must be treated as a containment failure. Keep cgroup-backed workers in their
+managed lifecycle; `SpawnedBubblewrapWorker::into_parts` and
+`BubblewrapWorkerLifecycle::into_child` deliberately relinquish that
+process-tree teardown and cleanup handle.
+
+This is not a disk, I/O, memory-swap, device, network, or session-wide
+wall-clock policy. It also does not prove an adapter effect was cancelled or
+rolled back. See the Linux [cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+for the kernel controller semantics.
+
 ## Host Wall-Clock Watchdog
 
 For a synchronous JSON-line worker, enable both
@@ -325,9 +404,10 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- cgroup CPU, memory/RSS, process-tree, aggregate-disk, or wall-clock quotas.
-  An optional runner adds the narrower rlimits described above, and a configured
-  private `/tmp` size limits only that Bubblewrap `tmpfs`;
+- aggregate-disk, cgroup I/O, memory-swap, device, or session-wide wall-clock
+  quotas. An optional cgroup-v2 policy adds only the CPU bandwidth, memory, and
+  task controls described above; an optional runner adds the narrower rlimits,
+  and a configured private `/tmp` size limits only that Bubblewrap `tmpfs`;
 - a worker-specific syscall allowlist, D-Bus mediation, device-specific policy,
   or a network proxy. `DenyKnownEscapeSurface` is a narrow default-allow
   hardening filter, not a replacement for any of these;

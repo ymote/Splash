@@ -9,3 +9,4 @@
 //! executable path, mount path, network policy, or session key.
 
 pub mod bubblewrap;
+pub mod cgroup_v2;
