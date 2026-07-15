@@ -596,7 +596,24 @@ impl<'a> ScriptVm<'a> {
     #[inline(never)]
     #[cold]
     fn handle_errors(&mut self) {
-        if self.bx.threads.cur().call_has_try() {
+        if self.bx.threads.cur_ref().call_stack_has_try() {
+            // Discard younger calls until the active frame owns a try frame.
+            while !self.bx.threads.cur_ref().call_has_try() {
+                let Some(call) = self.bx.threads.cur().calls.pop() else {
+                    self.bail("calls empty while unwinding to a try frame");
+                    return;
+                };
+                let return_ip = call.return_ip;
+                self.bx
+                    .threads
+                    .cur()
+                    .truncate_bases(call.bases, &mut self.bx.heap);
+                let Some(return_ip) = return_ip else {
+                    self.bail("root call reached while unwinding to a try frame");
+                    return;
+                };
+                self.bx.threads.cur().trap.ip = return_ip;
+            }
             // pop all errors
             self.bx.threads.cur().trap.err.borrow_mut().clear();
             let try_frame = self.bx.threads.cur().tries.pop().unwrap();
@@ -721,6 +738,10 @@ impl<'a> ScriptVm<'a> {
                             self.bx.threads.cur().trap.pass(),
                             "script time budget exceeded"
                         );
+                        // A hard budget hit is an uncatchable VM bail. Move its
+                        // diagnostic out of the thread queue before unwinding so
+                        // a later run cannot observe it as a script error.
+                        self.drain_errors();
                         self.bx
                             .threads
                             .cur()
@@ -1442,5 +1463,107 @@ mod tests {
                 idx
             );
         }
+    }
+
+    #[test]
+    fn streaming_try_catch_restores_the_contextual_separator_state() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        let script_mod = || ScriptMod {
+            file: "streaming-try-catch.splash".to_owned(),
+            ..Default::default()
+        };
+        let prefix = "use mod.std.assert\n\
+                      let catch = 41\n\
+                      try {\n\
+                          assert(false)\n\
+                      } catch";
+
+        let _ = vm.eval_with_append_source(script_mod(), prefix, ScriptObject::ZERO);
+        let result = vm.eval_with_append_source(
+            script_mod(),
+            &format!("{prefix} catch + 1\n;"),
+            ScriptObject::ZERO,
+        );
+
+        assert_eq!(result.as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn streaming_legacy_try_ok_repatches_the_success_jump() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        let script_mod = || ScriptMod {
+            file: "streaming-try-ok.splash".to_owned(),
+            ..Default::default()
+        };
+        let prefix = "let marker = 0\ntry { 7 } { marker = 1 }";
+
+        let _ = vm.eval_with_append_source(script_mod(), prefix, ScriptObject::ZERO);
+        let result = vm.eval_with_append_source(
+            script_mod(),
+            &format!("{prefix} ok {{ marker = 2 }}\nreturn marker\n;"),
+            ScriptObject::ZERO,
+        );
+
+        assert_eq!(result.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn hard_time_budget_drains_its_uncatchable_error() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        vm.bx.captured_errors = Some(Vec::new());
+        vm.bx.run_budget = Some(ScriptRunBudget::from_durations(
+            Duration::ZERO,
+            Duration::ZERO,
+            1,
+        ));
+
+        let result = vm.eval(ScriptMod {
+            file: "hard-time-budget.splash".to_owned(),
+            code: "loop {}\n;".to_owned(),
+            ..Default::default()
+        });
+
+        assert!(result.is_err());
+        assert!(vm.bx.threads.cur_ref().trap.err.borrow().is_empty());
+        assert!(vm
+            .take_errors()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("script time budget exceeded")));
+    }
+
+    #[test]
+    fn malformed_ok_end_bails_instead_of_ignoring_the_missing_try_frame() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+
+        vm.handle_ok_end();
+
+        assert!(matches!(
+            vm.bx.threads.cur_ref().trap.on.get(),
+            Some(ScriptTrapOn::Bail(_))
+        ));
     }
 }

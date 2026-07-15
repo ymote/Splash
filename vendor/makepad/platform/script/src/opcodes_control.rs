@@ -317,7 +317,10 @@ impl<'a> ScriptVm<'a> {
     }
 
     pub(crate) fn handle_ok_end(&mut self) {
-        self.bx.threads.cur().tries.pop();
+        if self.bx.threads.cur().tries.pop().is_none() {
+            self.bail("tries empty in handle_ok_end");
+            return;
+        }
         self.bx.threads.cur().trap.goto_next();
     }
 
@@ -338,7 +341,8 @@ impl<'a> ScriptVm<'a> {
             self.bail("tries empty in handle_try_err");
             return;
         }
-        self.bx.threads.cur().trap.goto_rel(opargs.to_u32() + 1);
+        // The parser includes the optional legacy OK guard in this distance.
+        self.bx.threads.cur().trap.goto_rel(opargs.to_u32());
     }
 
     pub(crate) fn handle_try_ok(&mut self, opargs: OpcodeArgs) {

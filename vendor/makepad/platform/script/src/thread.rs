@@ -7,7 +7,7 @@ use crate::trap::*;
 use crate::value::*;
 use crate::*;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct StackBases {
     pub loops: usize,
     pub tries: usize,
@@ -152,6 +152,13 @@ impl ScriptThread {
         self.mes.truncate(bases.mes);
     }
 
+    pub fn truncate_loop_iteration_bases(&mut self, bases: StackBases, heap: &mut ScriptHeap) {
+        self.tries.truncate(bases.tries);
+        self.stack.truncate(bases.stack);
+        self.free_unreffed_scopes(&bases, heap);
+        self.mes.truncate(bases.mes);
+    }
+
     pub fn free_unreffed_scopes(&mut self, bases: &StackBases, heap: &mut ScriptHeap) {
         while self.scopes.len() > bases.scope {
             let scope = self.scopes.pop().unwrap();
@@ -243,6 +250,13 @@ impl ScriptThread {
             .last()
             .map(|call| self.tries.len() > call.bases.tries)
             .unwrap_or(false)
+    }
+
+    pub(crate) fn call_stack_has_try(&self) -> bool {
+        self.calls
+            .iter()
+            .rev()
+            .any(|call| self.tries.len() > call.bases.tries)
     }
 
     // lets resolve an id to a ScriptValue

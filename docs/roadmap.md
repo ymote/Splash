@@ -6,7 +6,9 @@
 - Bounded evaluation and canonical grammar diagnostics.
 - Canonical source formatting that preserves comments and literal spellings.
 - Host-only LSP diagnostics and full-document canonical formatting for the
-  published v0.1 grammar.
+  published v0.2 grammar.
+- Canonical cross-function `try/catch` recovery with contextual syntax, no
+  script-visible error details, and uncatchable hard resource termination.
 - Effect-free top-level LSP document symbols derived from valid client source.
 - Effect-free CLI top-level declaration outline for LLM and editor tooling.
 - Bounded effect-free direct tool-call outline for LLM and operator

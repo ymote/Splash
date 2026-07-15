@@ -18,6 +18,13 @@ fn grammar_v0_1_fixture_is_accepted_without_capabilities_or_execution() {
 }
 
 #[test]
+fn grammar_v0_2_fixture_is_accepted_without_capabilities_or_execution() {
+    let report = check_syntax(include_str!("fixtures/grammar_v0_2.splash")).unwrap();
+
+    assert!(report.valid, "{:?}", report.diagnostics);
+}
+
+#[test]
 fn canonical_construct_fixture_is_accepted_without_execution() {
     let report = check_syntax(include_str!("fixtures/canonical_constructs.splash")).unwrap();
 

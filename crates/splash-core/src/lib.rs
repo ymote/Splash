@@ -470,7 +470,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
     /// host binding.
     ///
     /// This is suitable for LLM preflight and editor validation. It checks the
-    /// portable Splash v0.1 grammar, then confirms VM compatibility. Imports,
+    /// portable Splash v0.2 grammar, then confirms VM compatibility. Imports,
     /// capability grants, schemas, and tool names remain host-policy decisions
     /// that are validated at execution time.
     pub fn check_syntax(&self, source: &str) -> Result<SyntaxReport, RuntimeError> {
@@ -506,7 +506,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
         tool_call_hint_report_named("inline.splash", source, self.limits)
     }
 
-    /// Evaluates source only after it passes the canonical Splash v0.1 profile.
+    /// Evaluates source only after it passes the canonical Splash v0.2 profile.
     ///
     /// This is the normal execution entry point for generated and user-authored
     /// source. Use [`Self::eval_vm_compatibility`] only for a trusted host that
@@ -656,7 +656,7 @@ pub mod fuzzing {
 /// Validates named canonical Splash source without executing it.
 ///
 /// This function rejects Makepad compatibility syntax outside the documented
-/// Splash v0.1 grammar. Only source accepted by that profile reaches the
+/// Splash v0.2 grammar. Only source accepted by that profile reaches the
 /// vendored VM parser for a compatibility check. `file` appears only in
 /// VM-parser diagnostics. It never loads a module, resolves an import, runs
 /// bytecode, or invokes a host tool.
@@ -1389,6 +1389,519 @@ mod tests {
     }
 
     #[test]
+    fn vm_compatibility_try_recovers_from_a_script_error() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval_vm_compatibility(
+                "use mod.std.assert\n\
+                 try {\n\
+                     assert(false)\n\
+                 } {\n\
+                     42\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+
+        let succeeded = runtime
+            .eval_vm_compatibility(
+                "use mod.std.assert\n\
+                 let value = try { 7 } { assert(false) }\n\
+                 value",
+            )
+            .unwrap();
+        assert!(succeeded.completed(), "{:?}", succeeded.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    succeeded.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(7)
+        );
+
+        let ok_after_success = runtime
+            .eval_vm_compatibility(
+                "let marker = 0\n\
+                 try { 7 } { marker = 1 } ok { marker = 2 }\n\
+                 marker",
+            )
+            .unwrap();
+        assert!(
+            ok_after_success.completed(),
+            "{:?}",
+            ok_after_success.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    ok_after_success.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(2)
+        );
+
+        let fallback_after_error = runtime
+            .eval_vm_compatibility(
+                "use mod.std.assert\n\
+                 let marker = 0\n\
+                 try { assert(false) } { marker = 1 } ok { marker = 2 }\n\
+                 marker",
+            )
+            .unwrap();
+        assert!(
+            fallback_after_error.completed(),
+            "{:?}",
+            fallback_after_error.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    fallback_after_error.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn canonical_try_catch_returns_the_protected_or_fallback_value() {
+        let mut runtime = Runtime::default();
+        let recovered = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 try {\n\
+                     assert(false)\n\
+                 } catch {\n\
+                     42\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert!(recovered.diagnostics.is_empty());
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+
+        let succeeded = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 let value = try {\n\
+                     7\n\
+                 } catch {\n\
+                     assert(false)\n\
+                 }\n\
+                 value",
+            )
+            .unwrap();
+        assert!(succeeded.completed(), "{:?}", succeeded.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    succeeded.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(7)
+        );
+
+        let expression = runtime
+            .eval("use mod.std.assert\ntry assert(false) catch 9")
+            .unwrap();
+        assert!(expression.completed(), "{:?}", expression.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    expression.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(9)
+        );
+
+        let record = runtime
+            .eval(
+                "let value = try ({answer: 42}) catch ({answer: 0})\n\
+                 value.answer",
+            )
+            .unwrap();
+        assert!(record.completed(), "{:?}", record.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    record.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+    }
+
+    #[test]
+    fn canonical_try_catch_does_not_swallow_a_fallback_error() {
+        let mut runtime = Runtime::default();
+        let evaluation = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 try {\n\
+                     assert(false)\n\
+                 } catch {\n\
+                     assert(false)\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(!evaluation.succeeded());
+        assert!(evaluation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("assertion failed")));
+    }
+
+    #[test]
+    fn canonical_try_catch_unwinds_across_script_function_calls() {
+        let mut runtime = Runtime::default();
+        let outer = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 fn fail() {\n\
+                     assert(false)\n\
+                 }\n\
+                 fn middle() {\n\
+                     return fail()\n\
+                 }\n\
+                 let recovered = try {\n\
+                     middle()\n\
+                     0\n\
+                 } catch {\n\
+                     42\n\
+                 }\n\
+                 recovered",
+            )
+            .unwrap();
+        assert!(outer.completed(), "{:?}", outer.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    outer.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+
+        let inner = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 fn fail() {\n\
+                     assert(false)\n\
+                 }\n\
+                 fn recover() {\n\
+                     return try {\n\
+                         fail()\n\
+                     } catch {\n\
+                         7\n\
+                     }\n\
+                 }\n\
+                 recover()",
+            )
+            .unwrap();
+        assert!(inner.completed(), "{:?}", inner.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    inner.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(7)
+        );
+    }
+
+    #[test]
+    fn canonical_nested_try_catch_can_recover_from_an_inner_fallback_error() {
+        let mut runtime = Runtime::default();
+        let evaluation = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 try {\n\
+                     try {\n\
+                         assert(false)\n\
+                     } catch {\n\
+                         assert(false)\n\
+                     }\n\
+                 } catch {\n\
+                     42\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(evaluation.completed(), "{:?}", evaluation.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    evaluation.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+    }
+
+    #[test]
+    fn canonical_catch_marker_is_consumed_only_once() {
+        let mut runtime = Runtime::default();
+        let evaluation = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 let catch = 2\n\
+                 try {\n\
+                     assert(false)\n\
+                 } catch catch + 1",
+            )
+            .unwrap();
+
+        assert!(evaluation.completed(), "{:?}", evaluation.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    evaluation.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(3)
+        );
+
+        let protected_identifier = runtime
+            .eval(
+                "let catch = 2\n\
+                 try (catch) catch catch + 1",
+            )
+            .unwrap();
+        assert!(
+            protected_identifier.completed(),
+            "{:?}",
+            protected_identifier.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    protected_identifier.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
+    fn canonical_try_catch_cannot_recover_from_instruction_exhaustion() {
+        let limits = ExecutionLimits {
+            instruction_limit: 128,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+        let evaluation = runtime
+            .eval("try {\nloop {}\nnil\n} catch {\n42\n}")
+            .unwrap();
+
+        assert!(!evaluation.succeeded());
+        assert!(evaluation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("instruction limit exceeded")));
+    }
+
+    #[test]
+    fn canonical_try_catch_cannot_recover_from_a_hard_time_budget() {
+        let limits = ExecutionLimits {
+            instruction_limit: 100_000,
+            soft_timeout: Duration::from_nanos(1),
+            hard_timeout: Duration::from_nanos(1),
+            budget_sample_interval: 64,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+        let evaluation = runtime
+            .eval("try {\nloop {}\nnil\n} catch {\n42\n}")
+            .unwrap();
+
+        assert!(!evaluation.succeeded());
+        assert!(evaluation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("script time budget exceeded")));
+    }
+
+    #[test]
+    fn canonical_try_requires_an_explicit_catch_branch() {
+        let report = check_syntax("try {\n42\n}\n").unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("expected `catch` after the protected expression or block")
+        }));
+    }
+
+    #[test]
+    fn canonical_try_blocks_require_an_explicit_result_expression() {
+        for (source, expected) in [
+            (
+                "try {\nlet value = 42\n} catch {\n0\n}",
+                "try protected block must end with a value-producing expression",
+            ),
+            (
+                "try {\n42\n} catch {\nlet value = 0\n}",
+                "try fallback block must end with a value-producing expression",
+            ),
+            (
+                "try {\n42\n} catch {\n}",
+                "try fallback block must end with a value-producing expression",
+            ),
+            (
+                "try {\nloop {\nbreak\n}\n} catch {\n0\n}",
+                "try protected block must end with a value-producing expression",
+            ),
+        ] {
+            let report = check_syntax(source).unwrap();
+
+            assert!(!report.valid, "unexpectedly accepted: {source}");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(expected)),
+                "missing `{expected}` for {source}: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn loop_control_flow_discards_iteration_local_try_frames() {
+        for (name, source) in [
+            (
+                "plain loop continue",
+                "use mod.std.assert\n\
+                 let state = {caught: 0}\n\
+                 let first = true\n\
+                 loop {\n\
+                     if first {\n\
+                         first = false\n\
+                         try {\n\
+                             continue\n\
+                             nil\n\
+                         } catch {\n\
+                             state.caught += 1\n\
+                         }\n\
+                     }\n\
+                     assert(false)\n\
+                     break\n\
+                 }\n\
+                 state.caught",
+            ),
+            (
+                "while continue",
+                "use mod.std.assert\n\
+                 let state = {caught: 0}\n\
+                 let index = 0\n\
+                 while index < 2 {\n\
+                     index += 1\n\
+                     if index == 1 {\n\
+                         try {\n\
+                             continue\n\
+                             nil\n\
+                         } catch {\n\
+                             state.caught += 1\n\
+                         }\n\
+                     }\n\
+                     assert(false)\n\
+                     break\n\
+                 }\n\
+                 state.caught",
+            ),
+            (
+                "loop break",
+                "use mod.std.assert\n\
+                 let state = {caught: 0}\n\
+                 loop {\n\
+                     try {\n\
+                         break\n\
+                         nil\n\
+                     } catch {\n\
+                         state.caught += 1\n\
+                     }\n\
+                 }\n\
+                 assert(false)\n\
+                 state.caught",
+            ),
+        ] {
+            let mut runtime = Runtime::default();
+            let evaluation = runtime.eval(source).unwrap();
+
+            assert!(
+                evaluation.completed(),
+                "{name} did not complete: {:?}",
+                evaluation.diagnostics
+            );
+            assert!(
+                evaluation
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains("assertion failed")),
+                "{name}: {:?}",
+                evaluation.diagnostics
+            );
+            assert_eq!(
+                runtime
+                    .script_value_as_json(
+                        evaluation.value,
+                        DEFAULT_MAX_JSON_DATA_BYTES,
+                        DEFAULT_MAX_JSON_DATA_DEPTH,
+                    )
+                    .unwrap(),
+                serde_json::json!(0),
+                "{name} re-entered an abandoned fallback"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_sources_above_the_configured_limit() {
         let limits = ExecutionLimits {
             max_source_bytes: 4,
@@ -1469,6 +1982,22 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
 
         let runtime = Runtime::default();
         assert_eq!(runtime.tool_call_hints(source).unwrap(), hints);
+    }
+
+    #[test]
+    fn try_catch_tool_calls_remain_visible_in_review_hints() {
+        let source = "use mod.tool\n\
+                      try {\n\
+                          tool.call(\"text.primary\", \"input\")\n\
+                      } catch {\n\
+                          tool.call(\"text.fallback\", \"input\")\n\
+                      }";
+
+        let hints = tool_call_hints(source).unwrap();
+
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].literal_name.as_deref(), Some("text.primary"));
+        assert_eq!(hints[1].literal_name.as_deref(), Some("text.fallback"));
     }
 
     #[test]
@@ -1596,6 +2125,16 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
             format_source(source).unwrap(),
             "let values = [1, 2]\nlet transform = |value| value * 2\nlet first = values[0]\n"
         );
+    }
+
+    #[test]
+    fn formatter_normalizes_canonical_try_catch() {
+        let source = "try{\n42\n}catch{\n0\n}";
+        let formatted = format_source(source).unwrap();
+
+        assert_eq!(formatted, "try {\n    42\n} catch {\n    0\n}\n");
+        assert!(check_syntax(&formatted).unwrap().valid);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
 
     #[test]

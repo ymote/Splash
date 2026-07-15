@@ -10,6 +10,21 @@ use crate::vm::ScriptVm;
 use crate::*;
 
 impl<'a> ScriptVm<'a> {
+    fn reset_loop_iteration(&mut self, bases: StackBases) -> Option<ScriptObject> {
+        self.bx
+            .threads
+            .cur()
+            .truncate_loop_iteration_bases(bases, &mut self.bx.heap);
+        let Some(&parent) = self.bx.threads.cur_ref().scopes.last() else {
+            self.bail("scopes empty while resetting a loop iteration");
+            return None;
+        };
+        let scope = self.bx.heap.new_with_proto(parent.into());
+        self.bx.heap.clear_object_deep(scope);
+        self.bx.threads.cur().scopes.push(scope);
+        Some(scope)
+    }
+
     pub fn begin_for_loop_inner(
         &mut self,
         jump: u32,
@@ -176,25 +191,16 @@ impl<'a> ScriptVm<'a> {
                     return;
                 }
                 let start_ip = lf.start_ip;
-                let bases_scope = lf.bases.scope;
+                let bases = lf.bases;
                 let value_id = values.value_id;
                 let index = values.index;
-                self.bx.threads.cur().trap.goto(start_ip);
-                while self.bx.threads.cur_ref().scopes.len() > bases_scope {
-                    if let Some(scope) = self.bx.threads.cur().scopes.pop() {
-                        self.bx.heap.free_object_if_unreffed(scope);
-                    }
-                }
-                let Some(&parent) = self.bx.threads.cur_ref().scopes.last() else {
-                    self.bail("scopes empty after pop in end_for_loop/number");
+                let Some(scope) = self.reset_loop_iteration(bases) else {
                     return;
                 };
-                let scope = self.bx.heap.new_with_proto(parent.into());
-                self.bx.heap.clear_object_deep(scope);
-                self.bx.threads.cur().scopes.push(scope);
                 self.bx
                     .heap
                     .set_value_def(scope, value_id.into(), index.into());
+                self.bx.threads.cur().trap.goto(start_ip);
                 return;
             } else if let Some(obj) = values.source.as_object() {
                 if self
@@ -229,22 +235,13 @@ impl<'a> ScriptVm<'a> {
                         return;
                     }
                     let start_ip = lf.start_ip;
-                    let bases_scope = lf.bases.scope;
+                    let bases = lf.bases;
                     let value_id = values.value_id;
                     let key_id = values.key_id;
                     let index = values.index;
-                    while self.bx.threads.cur_ref().scopes.len() > bases_scope {
-                        if let Some(scope) = self.bx.threads.cur().scopes.pop() {
-                            self.bx.heap.free_object_if_unreffed(scope);
-                        }
-                    }
-                    let Some(&parent) = self.bx.threads.cur_ref().scopes.last() else {
-                        self.bail("scopes empty after pop in end_for_loop/range");
+                    let Some(scope) = self.reset_loop_iteration(bases) else {
                         return;
                     };
-                    let scope = self.bx.heap.new_with_proto(parent.into());
-                    self.bx.heap.clear_object_deep(scope);
-                    self.bx.threads.cur().scopes.push(scope);
                     self.bx
                         .heap
                         .set_value_def(scope, value_id.into(), index.into());
@@ -291,24 +288,15 @@ impl<'a> ScriptVm<'a> {
                         return;
                     };
                     let start_ip = lf.start_ip;
-                    let bases_scope = lf.bases.scope;
+                    let bases = lf.bases;
                     let value_id = values.value_id;
                     let index_id = values.index_id;
                     let key_id = values.key_id;
                     let index = values.index;
 
-                    while self.bx.threads.cur_ref().scopes.len() > bases_scope {
-                        if let Some(scope) = self.bx.threads.cur().scopes.pop() {
-                            self.bx.heap.free_object_if_unreffed(scope);
-                        }
-                    }
-                    let Some(&parent) = self.bx.threads.cur_ref().scopes.last() else {
-                        self.bail("scopes empty after pop in end_for_loop/object");
+                    let Some(scope) = self.reset_loop_iteration(bases) else {
                         return;
                     };
-                    let scope = self.bx.heap.new_with_proto(parent.into());
-                    self.bx.heap.clear_object_deep(scope);
-                    self.bx.threads.cur().scopes.push(scope);
                     self.bx
                         .heap
                         .set_value_def(scope, value_id.into(), kv.value.into());
@@ -346,24 +334,15 @@ impl<'a> ScriptVm<'a> {
                     return;
                 };
                 let start_ip = lf.start_ip;
-                let bases_scope = lf.bases.scope;
+                let bases = lf.bases;
                 let value_id = values.value_id;
                 let index_id = values.index_id;
                 let key_id = values.key_id;
                 let index = values.index;
 
-                while self.bx.threads.cur_ref().scopes.len() > bases_scope {
-                    if let Some(scope) = self.bx.threads.cur().scopes.pop() {
-                        self.bx.heap.free_object_if_unreffed(scope);
-                    }
-                }
-                let Some(&parent) = self.bx.threads.cur_ref().scopes.last() else {
-                    self.bail("scopes empty after pop in end_for_loop/array");
+                let Some(scope) = self.reset_loop_iteration(bases) else {
                     return;
                 };
-                let scope = self.bx.heap.new_with_proto(parent.into());
-                self.bx.heap.clear_object_deep(scope);
-                self.bx.threads.cur().scopes.push(scope);
 
                 self.bx
                     .heap
@@ -389,6 +368,14 @@ impl<'a> ScriptVm<'a> {
                 return;
             };
             let start_ip = lf.start_ip;
+            let mut bases = lf.bases;
+            // Plain `loop` keeps its iteration scope across back-edges. Only
+            // nested scopes and iteration-local interpreter state are reset.
+            bases.scope += 1;
+            self.bx
+                .threads
+                .cur()
+                .truncate_loop_iteration_bases(bases, &mut self.bx.heap);
             self.bx.threads.cur().trap.goto(start_ip);
             return;
         }

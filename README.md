@@ -27,6 +27,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
+- Recoverable `try ... catch ...` control flow across Splash function calls,
+  with hard resource stops kept uncatchable and no implicit effect rollback.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
 - A bounded LLM-facing tool catalog with aggregate descriptor-count and
@@ -160,6 +162,20 @@ let summary = tool.start("text.echo", "plan the release").await()
 summary
 ```
 
+For a recovery-safe fallback, use canonical `try/catch`. Recovery does not
+refund the call or imply that an adapter effect was rolled back.
+
+```splash
+use mod.tool
+
+let summary = try {
+    tool.start("text.echo", "plan the release").await()
+} catch {
+    "summary unavailable"
+}
+summary
+```
+
 Rust applications integrate their existing crate ecosystem by registering a
 narrow, policy-bound adapter for each effect. Splash does not import crates or
 ambient OS APIs directly.
@@ -200,7 +216,7 @@ Inspect the exact demo-tool catalog supplied to an LLM host with:
 cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 ```
 
-Validate generated source against the canonical Splash v0.1 profile without
+Validate generated source against the canonical Splash v0.2 profile without
 creating a capability host or running any bytecode:
 
 ```sh
@@ -209,7 +225,7 @@ cargo run -p splash-cli -- check examples/deferred_tool_workflow.splash
 
 The command emits JSON diagnostics and exits nonzero for invalid source,
 including Makepad compatibility syntax outside the portable contract. The
-portable source contract is [Splash Grammar v0.1](docs/grammar.md).
+portable source contract is [Splash Grammar v0.2](docs/grammar.md).
 
 Inspect valid top-level declarations without evaluating source or constructing
 a capability host:

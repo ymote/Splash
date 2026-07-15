@@ -66,9 +66,10 @@ unavailable modules are expected. It creates `Runtime<(), ()>`, so no
 capability or Rust adapter can run; a panic or hang is a fuzz failure.
 `execution` explicitly collects its fresh VM after evaluation so retained heap
 state cannot mask resource behavior. Their tracked `.splash` seeds cover
-canonical dataflow, deferred tools, loops, lambdas, and an intentional
-instruction-limit case. `workflow_draft` feeds bounded UTF-8 JSON into the
-data-only `WorkflowDraft` decoder, then checks that every accepted draft
+canonical dataflow, deferred tools, loops, lambdas, recoverable error control
+flow, and an intentional instruction-limit case. `workflow_draft` feeds
+bounded UTF-8 JSON into the data-only `WorkflowDraft` decoder, then checks that
+every accepted draft
 round-trips through the current wire format and produces exactly one review
 entry per retained step. The same input also probes bounded `WorkflowData` as
 fresh JSON input and as persisted `{input, outputs}` context; every accepted

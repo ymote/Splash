@@ -9344,7 +9344,7 @@ mod tests {
     }
 
     #[test]
-    fn dataflow_contract_rejects_output_before_later_authorized_tool_runs() {
+    fn dataflow_contract_rejects_recovered_fallback_before_later_tool_runs() {
         let later_calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let observed_later_calls = later_calls.clone();
         let mut runtime = CapabilityRuntime::default();
@@ -9359,7 +9359,13 @@ mod tests {
             .plan(vec![
                 WorkflowStep::new(
                     "transform",
-                    "let result = {unexpected: workflow.input.value}\nresult",
+                    "use mod.std.assert\n\
+                     try {\n\
+                         assert(false)\n\
+                         {total: workflow.input.value}\n\
+                     } catch {\n\
+                         {unexpected: workflow.input.value}\n\
+                     }",
                 ),
                 WorkflowStep::new(
                     "dispatch",

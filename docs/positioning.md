@@ -22,10 +22,11 @@ separate portable language contract and host model:
 
 | Area | Makepad-oriented substrate | Splash runtime profile |
 | --- | --- | --- |
-| Source contract | Broad compatibility parser | Published canonical v0.1 grammar, preflighted before execution |
+| Source contract | Broad compatibility parser | Published canonical v0.2 grammar, preflighted before execution |
 | Primary use | UI/runtime embedding | Dynamic workflows, dataflow, and reviewed tool calls |
 | Effects | Determined by the embedding host | Deny-by-default registered capabilities only |
 | Async behavior | VM-host integration detail | Bounded host-pumped promises and explicit external lifecycle |
+| Error recovery | Inherited frame-local `try` form | Canonical cross-function `try/catch` with uncatchable hard limits and no rollback |
 | Rust integration | Native bindings chosen by app | Schema-checked, policy-bound Rust adapters and typed Serde bridges |
 | Workflow control | Application-specific | Host-owned plans, approvals, bounded JSON dataflow, per-step leases, checkpoints, and ledgers |
 | Generated source | Trusted-host decision | Syntax review, bounded source, direct-call hints, and runtime enforcement |
@@ -62,7 +63,7 @@ Do not position Splash as a universal Python or JavaScript replacement. It
 does not currently provide a package manager, direct crate imports, browser or
 Node compatibility, a standard filesystem/network/process API, a mature async
 runtime, a broad numerical ecosystem, or a stable language specification beyond
-the documented v0.1 profile. The VM and host APIs also use `std`; bare-metal
+the documented v0.2 profile. The VM and host APIs also use `std`; bare-metal
 `no_std` firmware is not a supported target.
 
 Rust ecosystem access is deliberately indirect. The embedding application

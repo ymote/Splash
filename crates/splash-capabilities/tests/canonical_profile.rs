@@ -29,6 +29,10 @@ fn executes_shipped_canonical_fixtures_through_real_capability_bindings() {
             "grammar_v0_1.splash",
             include_str!("../../splash-core/tests/fixtures/grammar_v0_1.splash"),
         ),
+        (
+            "grammar_v0_2.splash",
+            include_str!("../../splash-core/tests/fixtures/grammar_v0_2.splash"),
+        ),
     ] {
         let evaluation = runtime.eval(source).unwrap();
         assert!(

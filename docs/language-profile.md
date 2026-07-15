@@ -1,19 +1,19 @@
-# Splash Language Profile v0.1
+# Splash Language Profile v0.2
 
 This profile defines the portable, LLM-oriented subset exercised by the
-standalone runtime. [Splash Grammar v0.1](grammar.md) is the normative source
-producer contract. The fixture at
-`crates/splash-core/tests/fixtures/workflow_language.splash` is the normative
-runtime-compatibility regression for this first release; parser features
-outside the grammar and fixture remain compatibility features inherited from
-the upstream VM until separately specified.
+standalone runtime. [Splash Grammar v0.2](grammar.md) is the normative source
+producer contract. The `grammar_v0_2.splash` fixture is the normative
+grammar-version regression, while `workflow_language.splash` exercises the
+broader runtime profile. The v0.1 fixture remains a backward-compatibility
+regression. Parser features outside the grammar and fixtures remain inherited
+compatibility features until separately specified.
 
 ## Source contract
 
 Provide normal Splash source. The runtime adds its own internal terminal
 marker, so generated code must not depend on Makepad widget-host framing.
 Run `splash check <file>` before execution when an LLM or editor produced the
-source. The check enforces the canonical v0.1 grammar rather than merely
+source. The check enforces the canonical v0.2 grammar rather than merely
 accepting the larger Makepad compatibility parser. Syntax preflight never
 resolves imports, creates a host, or grants a tool capability. A source that
 the canonical profile rejects never enters the inherited tokenizer or parser.
@@ -97,6 +97,8 @@ The current profile supports:
 - Functions with `fn`, arguments, `return`, and lexical closures.
 - Numbers, strings, booleans, arrays, and record literals.
 - Field access, array operations, conditionals, loops, and assertions.
+- Recoverable `try protected catch fallback` expressions without an error
+  binding or transactional rollback.
 - Module imports through `use mod.<name>`.
 - Host-defined tools through `use mod.tool`, `tool.call(name, input)`, and
   `tool.start(name, input).await()`.
@@ -184,7 +186,9 @@ that is already executing.
 For external tools, retry policy is also owned by the host. Splash source has
 no retry primitive: a host may make a bounded retry of an already claimed
 operation, preserving its idempotency key, but that does not create another
-script-visible call or grant new authority.
+script-visible call or grant new authority. `try/catch` may select a fallback
+after the terminal promise fails, but it cannot request a worker retry or prove
+that an uncertain external effect did not occur.
 
 An external tool may also emit bounded progress chunks to the host after it is
 claimed. Those chunks are optionally redacted by trusted Rust code and never
@@ -223,12 +227,21 @@ or mutate its keys, input digest, worker observation, or restart policy.
   fences when targeting the CLI/runtime.
 - Follow the [canonical grammar](grammar.md), run `splash format`, then use
   `splash check` before requesting execution.
-- Do not use Makepad compatibility syntax such as `var`, `match`, `try`, typed
-  or destructuring declarations, single-quoted strings, range operators, or
-  whitespace-separated record members; `splash check` rejects it.
+- Do not use Makepad compatibility syntax such as `var`, `match`, the legacy
+  catch-less `try`/`ok` form, typed or destructuring declarations,
+  single-quoted strings, range operators, or whitespace-separated record
+  members; `splash check` rejects it.
 - Import `mod.tool` before calling a tool.
-- Treat a denied tool call as a runtime error. Do not retry by attempting
-  filesystem, process, or network imports.
+- Use canonical `try protected catch fallback` for bounded local recovery. The
+  fallback cannot inspect the error, and hard instruction/deadline termination
+  remains uncatchable. End each block branch with a value-producing expression;
+  use `nil` when the branch has no other result. Parenthesize a record literal
+  used as the whole protected or fallback branch.
+- Treat a denied tool call as a catchable runtime error that is still audited.
+  Do not retry by attempting filesystem, process, or network imports.
+- Do not assume a caught tool failure rolled back an effect or refunded its
+  call budget. Invoke another effectful fallback only when trusted host policy
+  defines that recovery as safe.
 - Do not generate retry loops for external tools; the host applies its bounded
   retry policy and reports the final result through the existing promise.
 - Do not assume external progress output is readable from Splash source; use

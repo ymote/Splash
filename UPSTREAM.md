@@ -20,6 +20,8 @@ explicitly with `cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad
 Upstream changes are reviewed and imported as explicit commits. New host
 capabilities belong in `crates/splash-capabilities`, never in the vendored VM.
 
-Local behavioral-neutral vendor patches are documented in
-`vendor/makepad/PATCHES.md` and must be reapplied or retired during each
-upstream update.
+Every local vendor patch is documented in `vendor/makepad/PATCHES.md` and must
+be reapplied or retired during each upstream update. Behavioral changes are
+allowed only when they implement a published Splash language contract, carry
+focused compatibility and streaming regressions, and do not add ambient host
+authority to the VM.

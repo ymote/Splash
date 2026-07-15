@@ -18,6 +18,15 @@ before evaluation. The runtime carries executable canonical-fixture regression
 coverage, but the two parsers are not formally proven equivalent. Parser/VM
 differential fuzzing is required before a stable language release.
 
+Canonical `try/catch` handles ordinary script and native-binding errors and
+unwinds Splash function calls, but it is not a sandbox or transaction. It
+cannot catch instruction-limit or hard-deadline termination, inspect an error
+object, widen a capability lease, refund a call, erase an audit outcome, or
+bypass a workflow data contract. A caught error is discarded before the
+fallback runs and does not appear in the evaluation diagnostics. An uncaught
+native error is host-facing and may contain adapter-provided text, so adapters
+must return disclosure-safe messages and keep private detail in trusted logs.
+
 `splash-lsp` is a host-only helper for a trusted local editor client. It never
 reads a document URI, evaluates source, creates a capability host, resolves an
 import, or loads an adapter. Its top-level `fn`/`let` outline is derived only
@@ -408,6 +417,12 @@ so the audit view preserves only a fixed-length, session-scoped BLAKE3 label
 for invalid or oversized unrecognized names. It does not retain that raw
 script value. The label is a correlation aid, not a credential or a secrecy
 guarantee against a host that already knows the candidate value.
+
+A denied or failed tool call can transfer control to a script `catch` branch,
+but reservation, budget, and audit decisions remain final. A fallback tool call
+is separately authorized and charged. Handler failure is not evidence that an
+effect was rolled back; ambiguous or durable effects still require host-owned
+idempotency, reconciliation, and compensation policy.
 
 JSON capabilities are an explicit policy type. They accept only JSON object or
 array envelopes: envelope validation happens before the Rust handler is called,

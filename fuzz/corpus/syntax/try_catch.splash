@@ -1,0 +1,11 @@
+use mod.std.assert
+
+let catch = 41
+let recovered = try {
+    assert(false)
+    0
+} catch {
+    catch + 1
+}
+
+assert(recovered == 42)

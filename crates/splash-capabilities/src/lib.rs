@@ -4099,6 +4099,188 @@ mod tests {
     }
 
     #[test]
+    fn try_catch_recovers_from_a_denied_tool_without_erasing_the_audit() {
+        let mut runtime = CapabilityRuntime::default();
+        let report = runtime
+            .eval(
+                "use mod.tool\n\
+                 try {\n\
+                     tool.call(\"shell.exec\", \"whoami\")\n\
+                 } catch {\n\
+                     \"denied\"\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(
+            runtime.script_value_as_json(report.value, 64, 4).unwrap(),
+            serde_json::json!("denied")
+        );
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "shell.exec");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn loop_continue_cannot_reenter_an_abandoned_tool_fallback() {
+        let handler_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_handler_calls = handler_calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), move |request| {
+                handler_calls.set(handler_calls.get() + 1);
+                Ok(request.input.clone())
+            })
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 use mod.tool\n\
+                 for index in 2 {\n\
+                     if index == 0 {\n\
+                         try {\n\
+                             continue\n\
+                             nil\n\
+                         } catch {\n\
+                             tool.call(\"text.echo\", \"must not run\")\n\
+                         }\n\
+                     }\n\
+                     assert(false)\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("assertion failed")));
+        assert_eq!(observed_handler_calls.get(), 0);
+        assert!(runtime.audit().is_empty());
+    }
+
+    #[test]
+    fn try_catch_cannot_widen_a_lease_and_can_use_its_granted_fallback() {
+        let shell_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_shell_calls = shell_calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("shell.exec"), move |_| {
+                shell_calls.set(shell_calls.get() + 1);
+                Ok("must not run".to_owned())
+            })
+            .unwrap();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("text.echo", 1)])
+            .unwrap();
+
+        let report = runtime
+            .eval_with_capability_lease(
+                "use mod.tool\n\
+                 try {\n\
+                     tool.call(\"shell.exec\", \"whoami\")\n\
+                 } catch {\n\
+                     tool.call(\"text.echo\", \"fallback\")\n\
+                 }",
+                &lease,
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(observed_shell_calls.get(), 0);
+        assert_eq!(
+            runtime.script_value_as_json(report.value, 64, 4).unwrap(),
+            serde_json::json!("fallback")
+        );
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn try_catch_does_not_refund_a_failed_tool_call_budget() {
+        let handler_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_handler_calls = handler_calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.flaky"), move |_| {
+                handler_calls.set(handler_calls.get() + 1);
+                Err(ToolError::Failed("private adapter detail".to_owned()))
+            })
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.tool\n\
+                 let recovered = try {\n\
+                     tool.call(\"text.flaky\", \"first\")\n\
+                 } catch {\n\
+                     \"fallback\"\n\
+                 }\n\
+                 tool.call(\"text.flaky\", recovered)",
+            )
+            .unwrap();
+
+        assert!(!report.succeeded());
+        assert_eq!(observed_handler_calls.get(), 1);
+        assert!(report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.contains("private adapter detail")));
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Failed);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn try_catch_recovers_from_an_external_failure_after_await() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let initial = runtime
+            .eval(
+                "use mod.tool\n\
+                 fn fetch() {\n\
+                     return tool.start(\"text.remote\", \"release\").await()\n\
+                 }\n\
+                 try {\n\
+                     fetch()\n\
+                 } catch {\n\
+                     \"offline\"\n\
+                 }",
+            )
+            .unwrap();
+
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        let resumed = runtime
+            .complete_external_tool(
+                invocation.id,
+                Err(ToolError::Failed("private worker detail".to_owned())),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert!(resumed.diagnostics.is_empty());
+        assert_eq!(
+            runtime.script_value_as_json(resumed.value, 64, 4).unwrap(),
+            serde_json::json!("offline")
+        );
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Failed);
+    }
+
+    #[test]
     fn calls_json_tools_with_splash_records() {
         let mut runtime = CapabilityRuntime::default();
         runtime

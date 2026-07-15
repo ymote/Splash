@@ -112,8 +112,14 @@ enum State {
     TryTestExpr {
         try_start: u32,
     },
-    TryErrBlockOrExpr,
+    TryErrBlockOrExpr {
+        allow_catch: bool,
+        canonical_catch: bool,
+        protected_was_block: bool,
+        try_start: u32,
+    },
     TryErrBlock {
+        canonical_catch: bool,
         err_start: u32,
         last_was_sep: bool,
     },
@@ -121,6 +127,7 @@ enum State {
         err_start: u32,
     },
     TryOk {
+        err_start: u32,
         was_block: bool,
     },
     TryOkBlockOrExpr,
@@ -2920,33 +2927,76 @@ impl ScriptParser {
                     try_start,
                     OpcodeArgs::from_u32(self.code_len() as u32 - try_start),
                 );
-                self.state.push(State::TryErrBlockOrExpr);
+                self.state.push(State::TryErrBlockOrExpr {
+                    allow_catch: true,
+                    canonical_catch: false,
+                    protected_was_block: false,
+                    try_start,
+                });
                 return 0;
             }
             State::TryTestBlock {
                 try_start,
                 last_was_sep,
             } => {
-                self.set_opcode_args(
-                    try_start,
-                    OpcodeArgs::from_u32(self.code_len() as u32 - try_start),
-                );
                 if tok.is_close_curly() {
                     if !last_was_sep && self.has_pop_to_me() {
                         self.clear_pop_to_me();
                     }
-                    self.state.push(State::TryErrBlockOrExpr);
+                    self.set_opcode_args(
+                        try_start,
+                        OpcodeArgs::from_u32(self.code_len() as u32 - try_start),
+                    );
+                    self.state.push(State::TryErrBlockOrExpr {
+                        allow_catch: true,
+                        canonical_catch: false,
+                        protected_was_block: true,
+                        try_start,
+                    });
                     return 1;
                 } else {
-                    self.state.push(State::TryErrBlockOrExpr);
+                    self.set_opcode_args(
+                        try_start,
+                        OpcodeArgs::from_u32(self.code_len() as u32 - try_start),
+                    );
+                    self.state.push(State::TryErrBlockOrExpr {
+                        allow_catch: true,
+                        canonical_catch: false,
+                        protected_was_block: true,
+                        try_start,
+                    });
                     return 0;
                 }
             }
-            State::TryErrBlockOrExpr => {
+            State::TryErrBlockOrExpr {
+                allow_catch,
+                canonical_catch,
+                protected_was_block,
+                try_start,
+            } => {
+                if allow_catch && id == id!(catch) {
+                    // Canonical blocks end in a separator. Retain their tail
+                    // value, then repatch the jump after removing pop-to-me.
+                    if protected_was_block && self.has_pop_to_me() {
+                        self.clear_pop_to_me();
+                    }
+                    self.set_opcode_args(
+                        try_start,
+                        OpcodeArgs::from_u32(self.code_len() as u32 - try_start),
+                    );
+                    self.state.push(State::TryErrBlockOrExpr {
+                        allow_catch: false,
+                        canonical_catch: true,
+                        protected_was_block,
+                        try_start,
+                    });
+                    return 1;
+                }
                 let err_start = self.code_len() as _;
                 self.push_code(Opcode::TRY_ERR.into(), self.index);
                 if tok.is_open_curly() {
                     self.state.push(State::TryErrBlock {
+                        canonical_catch,
                         err_start,
                         last_was_sep: false,
                     });
@@ -2964,30 +3014,53 @@ impl ScriptParser {
                     err_start,
                     OpcodeArgs::from_u32(self.code_len() as u32 - err_start),
                 );
-                self.state.push(State::TryOk { was_block: false });
+                self.state.push(State::TryOk {
+                    err_start,
+                    was_block: false,
+                });
             }
             State::TryErrBlock {
+                canonical_catch,
                 err_start,
                 last_was_sep,
             } => {
-                self.set_opcode_args(
-                    err_start,
-                    OpcodeArgs::from_u32(self.code_len() as u32 - err_start),
-                );
                 if tok.is_close_curly() {
-                    if !last_was_sep && self.has_pop_to_me() {
+                    if (canonical_catch || !last_was_sep) && self.has_pop_to_me() {
                         self.clear_pop_to_me();
                     }
-                    self.state.push(State::TryOk { was_block: true });
+                    self.set_opcode_args(
+                        err_start,
+                        OpcodeArgs::from_u32(self.code_len() as u32 - err_start),
+                    );
+                    self.state.push(State::TryOk {
+                        err_start,
+                        was_block: true,
+                    });
                     return 1;
                 } else {
+                    self.set_opcode_args(
+                        err_start,
+                        OpcodeArgs::from_u32(self.code_len() as u32 - err_start),
+                    );
                     error!(self, tokenizer, "Expected }} not found");
-                    self.state.push(State::TryOk { was_block: false });
+                    self.state.push(State::TryOk {
+                        err_start,
+                        was_block: false,
+                    });
                     return 0;
                 }
             }
-            State::TryOk { was_block } => {
+            State::TryOk {
+                err_start,
+                was_block,
+            } => {
                 if id == id!(ok) {
+                    // A successful legacy try skips TRY_OK itself so it enters
+                    // the ok branch; without ok, TRY_ERR lands on its parent.
+                    self.set_opcode_args(
+                        err_start,
+                        OpcodeArgs::from_u32(self.code_len() as u32 - err_start + 1),
+                    );
                     self.state.push(State::TryOkBlockOrExpr);
                     return 1;
                 }

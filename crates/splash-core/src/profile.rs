@@ -1,4 +1,4 @@
-//! Canonical Splash v0.1 source-profile validation.
+//! Canonical Splash v0.2 source-profile validation.
 //!
 //! The vendored Makepad parser intentionally accepts a larger compatibility
 //! language. This module accepts only the portable grammar documented by
@@ -1280,6 +1280,8 @@ impl CanonicalParser {
         }
         if self.at_identifier("if") {
             self.parse_if_expression();
+        } else if self.at_identifier("try") {
+            self.parse_try_expression();
         } else if self.at_identifier("for") {
             self.parse_for_expression();
         } else if self.at_identifier("loop") {
@@ -1293,6 +1295,65 @@ impl CanonicalParser {
             self.parse_assignment();
         }
         self.leave_nesting();
+    }
+
+    fn parse_try_expression(&mut self) {
+        self.advance();
+        if self.at_identifier("catch") || self.at_expression_boundary() {
+            self.report_current("expected an expression or block after `try`");
+        } else {
+            self.parse_try_branch("protected");
+        }
+
+        if !self.take_identifier_named("catch") {
+            self.report_current("expected `catch` after the protected expression or block");
+            return;
+        }
+        if self.at_expression_boundary() {
+            self.report_current("expected an expression or block after `catch`");
+        } else {
+            self.parse_try_branch("fallback");
+        }
+    }
+
+    fn parse_try_branch(&mut self, branch: &'static str) {
+        if !self.at_kind(&TokenKind::OpenCurly) {
+            self.parse_expression();
+            return;
+        }
+        if !self.enter_nesting() {
+            return;
+        }
+        self.advance();
+        self.consume_statement_ends();
+        let mut ends_with_value = false;
+        while !self.at_end() && !self.at_kind(&TokenKind::CloseCurly) {
+            let start = self.index;
+            ends_with_value = !self.starts_non_value_try_tail();
+            self.parse_statement();
+            self.require_statement_end();
+            if self.index == start {
+                self.advance();
+            }
+        }
+        if self.take_kind(&TokenKind::CloseCurly) {
+            if !ends_with_value {
+                self.report_previous(format!(
+                    "try {branch} block must end with a value-producing expression; use `nil` for no value"
+                ));
+            }
+        } else {
+            self.report_current("expected `}` to close a try branch");
+        }
+        self.leave_nesting();
+    }
+
+    fn starts_non_value_try_tail(&self) -> bool {
+        [
+            "use", "let", "fn", "return", "break", "continue", "for", "loop", "while",
+        ]
+        .iter()
+        .any(|keyword| self.at_identifier(keyword))
     }
 
     fn parse_if_expression(&mut self) {

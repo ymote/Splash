@@ -1,4 +1,4 @@
-# Splash Grammar v0.1
+# Splash Grammar v0.2
 
 This document specifies the portable source subset for Splash producers,
 formatters, editors, and LLMs. It is intentionally narrower than the
@@ -10,6 +10,10 @@ compatibility.
 The parser accepts a few legacy separator and declaration forms for Makepad
 compatibility. Generated workflow source must use the canonical forms below.
 Use [`splash check`](#syntax-preflight) before executing generated code.
+
+Version 0.2 adds the canonical `try ... catch ...` expression. Every v0.1
+program remains valid v0.2 source; the new form does not enable an error value,
+ambient effect, or new host API.
 
 ## Lexical Rules
 
@@ -33,11 +37,14 @@ block-comment    = "/*", { any-character }, "*/" ;
 ```
 
 Identifiers are case-sensitive. Unicode escapes use either exactly four
-hexadecimal digits or one through six digits between braces. `if`, `elif`, `else`, `for`, `in`, `loop`,
-`while`, `fn`, `let`, `return`, `break`, `continue`, `use`, `true`, `false`,
-and `nil` are reserved in canonical source. A Unicode escape must encode a
-valid Unicode scalar value: surrogate code points and values above `U+10FFFF`
-are rejected. Strings use double quotes.
+hexadecimal digits or one through six digits between braces. `if`, `elif`,
+`else`, `try`, `for`, `in`, `loop`, `while`, `fn`, `let`, `return`, `break`,
+`continue`, `use`, `true`, `false`, and `nil` are canonical keywords. `var`,
+`match`, `ok`, and `do` are reserved compatibility words and are rejected in
+canonical source. `catch` is a contextual separator after a `try` branch and
+remains an ordinary identifier elsewhere. A Unicode escape must encode a valid
+Unicode scalar value: surrogate code points and values above `U+10FFFF` are
+rejected. Strings use double quotes.
 
 ## Program and Statements
 
@@ -75,10 +82,16 @@ not a trailing comma.
 
 ```ebnf
 expression         = control-expression | assignment ;
-control-expression = "if", expression, expression-or-block,
-                     { "elif", expression, expression-or-block },
-                     [ "else", expression-or-block ]
+control-expression = conditional-expression
+                   | try-expression
                    | loop-expression ;
+conditional-expression = "if", expression, expression-or-block,
+                         { "elif", expression, expression-or-block },
+                         [ "else", expression-or-block ] ;
+try-expression     = "try", try-branch, "catch", try-branch ;
+try-branch         = expression | value-block ;
+value-block        = "{", { statement, statement-end },
+                     expression, statement-end, "}" ;
 expression-or-block = block | expression ;
 
 loop-expression    = "for", for-bindings, "in", expression, block
@@ -120,18 +133,50 @@ lambda-body        = block | expression ;
 assignment-operator = "=" | "+=" | "-=" | "*=" | "/=" | "%=" ;
 ```
 
+The `{` immediately after `try` or `catch` always starts a value block. To use
+a record literal as the whole branch, parenthesize it, for example
+`try ({value: 1}) catch ({value: 0})`. A value block's final statement must be
+a value-producing expression. `for`, `loop`, and `while` do not produce a
+value; place an explicit `nil` or another result expression after them.
+
 The grammar makes the portable operator precedence explicit rather than making
 every inherited VM operator part of the language contract. Use parentheses
 when a generated expression mixes control expressions and operators. A tool
 promise is explicitly awaited with `tool.start(...).await()`; `await` is not a
 standalone keyword or scheduler.
 
+## Recoverable Errors
+
+`try protected catch fallback` evaluates to the protected branch's value when
+that branch succeeds. An ordinary script or native-binding error unwinds
+Splash function calls to the nearest active `try`, discards the error, and
+evaluates the fallback branch. A fallback error can be caught only by an
+enclosing `try` or otherwise reaches the host. Generated source should normally
+use blocks for both branches when either branch has more than one expression.
+Each branch block must end with a value-producing expression so the enclosing
+`try` always has a value; write `nil` explicitly when no other value is needed.
+Parenthesize a protected expression that is itself an identifier named `catch`
+to disambiguate it from the separator.
+
+The language deliberately exposes no error object, message, stack, or pattern
+binding to the fallback. Assertions, type and lookup errors, denied or failed
+tool calls, and a failed deferred tool after `await()` are catchable. An
+instruction-limit stop, hard evaluation deadline, or internal VM bail is not
+catchable.
+
+Recovery is control flow, not a transaction. It does not roll back a Rust
+adapter effect, refund a capability call, widen a lease, erase an audit event,
+or bypass a workflow input/output contract. A tool invoked by the fallback is
+a separate call that must pass the same host policy. Hosts must not treat a
+caught failure as proof that an external effect did not happen.
+
 ## Compatibility Boundary
 
 `splash check` rejects Makepad-only compatibility forms even when the vendored
-VM parser would accept them. This includes `var`, `match`, `try`/`ok`, typed or
-destructuring declarations, numeric suffixes, single-quoted strings, range and
-other noncanonical operators, and record members separated only by spaces.
+VM parser would accept them. This includes `var`, `match`, the legacy
+catch-less `try protected fallback [ok success]` form, standalone `ok`, typed
+or destructuring declarations, numeric suffixes, single-quoted strings, range
+and other noncanonical operators, and record members separated only by spaces.
 The checker also rejects trailing commas where this grammar does not admit
 them. This keeps LLM output deterministic: valid source has one documented
 producer grammar rather than an inherited parser superset.

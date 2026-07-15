@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Stdio language server for the canonical Splash v0.1 source profile.
+//! Stdio language server for the canonical Splash v0.2 source profile.
 //!
 //! The server only receives client-provided text and calls effect-free syntax,
 //! formatting, and outline helpers. It never reads document URIs, evaluates
