@@ -274,9 +274,18 @@ and never evaluate code.
 over stdio LSP. It uses UTF-16 positions, requests full-document sync, and
 supports `textDocument/didOpen`, `textDocument/didChange`,
 `textDocument/didClose`, `textDocument/formatting`, and
-`textDocument/documentSymbol`. Symbols list only top-level `fn` and `let`
-declarations after canonical syntax succeeds, using the same canonical lexer as
-the core outline API; they do not resolve imports, types, references, or tool
-grants. The server does not open the URI supplied by the client or run source;
-all diagnostics, edits, and symbols derive from the client-provided document
-text.
+`textDocument/documentSymbol`, `textDocument/definition`, and
+`textDocument/references`. Document symbols list only top-level `fn` and `let`
+declarations after canonical syntax succeeds. Definition and reference requests
+use a grammar-aware same-document lexical index for the final binding introduced
+by `use`, named functions, `let`, function and lambda parameters, and `for`
+bindings already introduced in a visible runtime scope. The index is bounded to
+4,096 retained definition/reference occurrences. A retained definition remains
+sound after truncation, but an exhaustive reference request fails when that
+bound is exceeded.
+
+The lexical service does not load or resolve imported modules, infer forward
+references or types, treat record keys or member fields as variables, or grant
+tool authority. The server does not open the URI supplied by the client or run
+source; all diagnostics, edits, symbols, definitions, and references derive
+from the client-provided document text.

@@ -38,6 +38,22 @@ not resolve imports, construct a capability host, or execute source.
 and editor-tool workflows; it emits diagnostics and exits nonzero when the
 source is invalid.
 
+For same-document navigation, Rust hosts can call
+`splash_core::lexical_symbol_report` or its named, limit-aware variant. The
+grammar-aware index records the final binding introduced by `use`, named
+functions, `let`, function and lambda parameters, and `for` bindings, then
+associates references resolved after each binding is introduced in the visible
+runtime scope. Symbols are sorted by definition byte position and every span is
+an exact UTF-8 identifier boundary. The combined definition/reference count is
+fixed at 4,096 and `truncated` makes an incomplete result explicit. Invalid or
+VM-incompatible source produces an empty report.
+
+This is a conservative lexical service, not a module or type checker. It does
+not load imported modules, infer forward references, resolve record keys or
+member fields, evaluate source, create a capability host, or authorize a tool.
+The LSP can serve a retained definition from a truncated report, but rejects a
+reference request instead of presenting an incomplete set as exhaustive.
+
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash
 tool-calls <file>` exposes the same result as structured JSON. The report

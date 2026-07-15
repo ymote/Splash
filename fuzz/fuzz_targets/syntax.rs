@@ -2,9 +2,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use splash_core::{
-    check_syntax_named, format_source_named, fuzzing, tool_call_hint_report_named,
-    top_level_declarations_named, ExecutionLimits, RuntimeError, ToolCallHint, TopLevelDeclaration,
-    TopLevelDeclarationKind, MAX_TOOL_CALL_HINTS,
+    check_syntax_named, format_source_named, fuzzing, lexical_symbol_report_named,
+    tool_call_hint_report_named, top_level_declarations_named, ExecutionLimits, LexicalSymbol,
+    RuntimeError, ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -46,6 +47,20 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(tool_call_report.hints.len(), MAX_TOOL_CALL_HINTS);
         }
         assert_tool_call_hint_invariants(source, &tool_call_report.hints);
+
+        let lexical_report = lexical_symbol_report_named("fuzz.splash", source, limits)
+            .expect("the fuzz limits are always valid for bounded lexical indexing");
+        let lexical_occurrences = lexical_report.symbols.len()
+            + lexical_report
+                .symbols
+                .iter()
+                .map(|symbol| symbol.references.len())
+                .sum::<usize>();
+        assert!(lexical_occurrences <= MAX_LEXICAL_SYMBOL_OCCURRENCES);
+        if lexical_report.truncated {
+            assert_eq!(lexical_occurrences, MAX_LEXICAL_SYMBOL_OCCURRENCES);
+        }
+        assert_lexical_symbol_invariants(source, &lexical_report.symbols);
 
         match format_source_named("fuzz.splash", source, limits) {
             Ok(formatted) => {
@@ -171,4 +186,53 @@ fn assert_tool_call_hint_invariants(source: &str, hints: &[ToolCallHint]) {
 
         previous_start_byte = hint.callee_start_byte;
     }
+}
+
+fn assert_lexical_symbol_invariants(source: &str, symbols: &[LexicalSymbol]) {
+    let mut previous_definition_start = 0_usize;
+    let mut all_spans = Vec::new();
+
+    for symbol in symbols {
+        assert!(
+            previous_definition_start <= symbol.definition.start_byte
+                && symbol.definition.start_byte < symbol.definition.end_byte
+                && symbol.definition.end_byte <= source.len(),
+            "lexical definition span is unordered or out of bounds: {symbol:?}"
+        );
+        assert_symbol_span(source, symbol, symbol.definition);
+        all_spans.push(symbol.definition);
+        let mut previous_reference_start = symbol.definition.end_byte;
+        for reference in &symbol.references {
+            assert!(
+                previous_reference_start <= reference.start_byte
+                    && reference.start_byte < reference.end_byte
+                    && reference.end_byte <= source.len(),
+                "lexical reference span is unordered, empty, or out of bounds: {symbol:?}"
+            );
+            assert_symbol_span(source, symbol, *reference);
+            all_spans.push(*reference);
+            previous_reference_start = reference.start_byte;
+        }
+        previous_definition_start = symbol.definition.start_byte;
+    }
+
+    all_spans.sort_unstable_by_key(|span| span.start_byte);
+    for spans in all_spans.windows(2) {
+        assert!(
+            spans[0].end_byte <= spans[1].start_byte,
+            "lexical symbol occurrences overlap: {spans:?}"
+        );
+    }
+}
+
+fn assert_symbol_span(source: &str, symbol: &LexicalSymbol, span: splash_core::SourceSpan) {
+    assert!(
+        source.is_char_boundary(span.start_byte) && source.is_char_boundary(span.end_byte),
+        "lexical symbol span is not a UTF-8 boundary: {symbol:?}"
+    );
+    assert_eq!(
+        &source[span.start_byte..span.end_byte],
+        symbol.name,
+        "lexical symbol span does not match its name"
+    );
 }

@@ -15,8 +15,8 @@ use std::time::Duration;
 
 pub use makepad_script as vm;
 use profile::{
-    check_canonical_profile, collect_tool_call_hints, collect_top_level_declarations,
-    format_canonical_source, ProfileFormatError,
+    check_canonical_profile, collect_lexical_symbols, collect_tool_call_hints,
+    collect_top_level_declarations, format_canonical_source, ProfileFormatError,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -48,6 +48,12 @@ pub const MAX_SYNTAX_DIAGNOSTICS: usize = 32;
 /// source and token limits. Use [`ToolCallHintReport::truncated`] to detect
 /// when a source contains additional direct call sites.
 pub const MAX_TOOL_CALL_HINTS: usize = 1_024;
+/// Maximum retained lexical definition and reference occurrences per source.
+///
+/// The symbol index counts each definition and each resolved reference toward
+/// this fixed bound. [`LexicalSymbolReport::truncated`] is set when later
+/// occurrences are omitted.
+pub const MAX_LEXICAL_SYMBOL_OCCURRENCES: usize = 4_096;
 
 /// Bounds applied to one source evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +285,56 @@ pub struct TopLevelDeclaration {
     pub selection_end_byte: usize,
 }
 
+/// The grammar role that introduced one lexical Splash binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LexicalSymbolKind {
+    /// The final identifier in a `use mod.<path>` import.
+    Import,
+    /// A named `fn` declaration.
+    Function,
+    /// A `let` declaration.
+    Let,
+    /// A named function parameter.
+    Parameter,
+    /// A binding introduced by `for ... in ...`.
+    LoopBinding,
+    /// A named lambda parameter.
+    LambdaParameter,
+}
+
+/// One half-open UTF-8 byte span in canonical Splash source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// One lexical binding and the source references resolved to it.
+///
+/// The index is intentionally conservative and source ordered. It resolves
+/// imports, functions, `let` declarations, function parameters, loop bindings,
+/// and lambda parameters already introduced in the visible runtime scope. It
+/// does not infer types, fields, record keys, imports across documents, or
+/// forward references. Every span is a valid UTF-8 boundary in the supplied
+/// source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LexicalSymbol {
+    pub kind: LexicalSymbolKind,
+    pub name: String,
+    pub definition: SourceSpan,
+    pub references: Vec<SourceSpan>,
+}
+
+/// Bounded, effect-free lexical symbol output for one canonical source.
+///
+/// `symbols` is sorted by definition byte position. A truncated report is
+/// incomplete and must not be presented as an exhaustive reference result.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LexicalSymbolReport {
+    pub symbols: Vec<LexicalSymbol>,
+    pub truncated: bool,
+}
+
 /// The direct `mod.tool` method named by one source-level tool-call hint.
 ///
 /// This is a syntactic classification only. It does not resolve bindings,
@@ -506,6 +562,12 @@ impl<H: Any, S: Any> Runtime<H, S> {
         tool_call_hint_report_named("inline.splash", source, self.limits)
     }
 
+    /// Builds a bounded lexical symbol index without evaluating bytecode or
+    /// entering any host binding.
+    pub fn lexical_symbol_report(&self, source: &str) -> Result<LexicalSymbolReport, RuntimeError> {
+        lexical_symbol_report_named("inline.splash", source, self.limits)
+    }
+
     /// Evaluates source only after it passes the canonical Splash v0.2 profile.
     ///
     /// This is the normal execution entry point for generated and user-authored
@@ -601,6 +663,16 @@ pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
 /// [`check_syntax`] to obtain the corresponding diagnostics.
 pub fn top_level_declarations(source: &str) -> Result<Vec<TopLevelDeclaration>, RuntimeError> {
     top_level_declarations_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Builds a bounded lexical symbol index for valid canonical source without
+/// evaluating it, resolving imports, or creating a capability host.
+///
+/// Invalid or VM-incompatible source produces an empty report. The result is
+/// source ordered and conservative; see [`LexicalSymbol`] for the supported
+/// binding and reference semantics.
+pub fn lexical_symbol_report(source: &str) -> Result<LexicalSymbolReport, RuntimeError> {
+    lexical_symbol_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Lists direct source-level `mod.tool` call hints in valid canonical Splash
@@ -727,6 +799,26 @@ pub fn top_level_declarations_named(
         source,
         limits.max_syntax_tokens,
     ))
+}
+
+/// Builds a bounded lexical symbol index for named canonical source without
+/// evaluating it, resolving document URIs, or creating a capability host.
+///
+/// This applies the same source, token, canonical-profile, and vendored parser
+/// compatibility checks as [`check_syntax_named`]. Invalid source returns an
+/// empty report; callers that need diagnostics should call
+/// [`check_syntax_named`] separately.
+pub fn lexical_symbol_report_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<LexicalSymbolReport, RuntimeError> {
+    let report = check_syntax_named(file, source, limits)?;
+    if !report.valid {
+        return Ok(LexicalSymbolReport::default());
+    }
+
+    Ok(collect_lexical_symbols(source, limits.max_syntax_tokens))
 }
 
 /// Lists direct source-level `mod.tool` call hints in named canonical source
@@ -2089,6 +2181,174 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
         assert!(top_level_declarations("fn broken(")
             .expect("invalid source is still bounded")
             .is_empty());
+    }
+
+    #[test]
+    fn indexes_lexical_bindings_with_grammar_aware_scopes() {
+        let source = r#"use mod.std.assert
+let outer = 1
+fn compute(outer, input) {
+    let before = outer
+    let record = {input: input}
+    record.input
+    if true {
+        let branch = before
+        branch
+    } else 0
+    let transform = |outer| outer + input
+    for index, value in [outer] {
+        let nested = value
+        assert(nested + index)
+    }
+    branch + outer + before + input
+}
+compute(outer, 2)
+"#;
+
+        let report = lexical_symbol_report(source).expect("canonical source has a symbol index");
+
+        assert!(!report.truncated);
+        let summary = report
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind, symbol.references.len()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("assert", LexicalSymbolKind::Import, 1),
+                ("outer", LexicalSymbolKind::Let, 1),
+                ("compute", LexicalSymbolKind::Function, 1),
+                ("outer", LexicalSymbolKind::Parameter, 3),
+                ("input", LexicalSymbolKind::Parameter, 3),
+                ("before", LexicalSymbolKind::Let, 2),
+                ("record", LexicalSymbolKind::Let, 1),
+                ("branch", LexicalSymbolKind::Let, 2),
+                ("transform", LexicalSymbolKind::Let, 0),
+                ("outer", LexicalSymbolKind::LambdaParameter, 1),
+                ("index", LexicalSymbolKind::LoopBinding, 1),
+                ("value", LexicalSymbolKind::LoopBinding, 1),
+                ("nested", LexicalSymbolKind::Let, 1),
+            ]
+        );
+
+        for symbol in &report.symbols {
+            assert_eq!(
+                &source[symbol.definition.start_byte..symbol.definition.end_byte],
+                symbol.name
+            );
+            for reference in &symbol.references {
+                assert_eq!(
+                    &source[reference.start_byte..reference.end_byte],
+                    symbol.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_index_is_source_ordered_and_ignores_keys_and_members() {
+        let source = "value\n\
+                      let value = 1\n\
+                      let record = {value: value}\n\
+                      record.value\n\
+                      let value = 2\n\
+                      value";
+
+        let report = lexical_symbol_report(source).unwrap();
+        let values = report
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "value")
+            .collect::<Vec<_>>();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].references.len(), 1);
+        assert_eq!(values[1].references.len(), 1);
+        assert_eq!(
+            &source[values[0].references[0].start_byte..values[0].references[0].end_byte],
+            "value"
+        );
+        assert_eq!(
+            report
+                .symbols
+                .iter()
+                .find(|symbol| symbol.name == "record")
+                .expect("record declaration is indexed")
+                .references
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn for_iterable_resolves_before_its_binding_shadows_the_outer_name() {
+        let source = "let item = [1]\n\
+                      for item in item {\n\
+                          item\n\
+                      }\n\
+                      item";
+
+        let report = lexical_symbol_report(source).unwrap();
+        let items = report
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "item")
+            .collect::<Vec<_>>();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, LexicalSymbolKind::Let);
+        assert_eq!(items[0].references.len(), 2);
+        assert_eq!(items[1].kind, LexicalSymbolKind::LoopBinding);
+        assert_eq!(items[1].references.len(), 1);
+        let occurrences = source
+            .match_indices("item")
+            .map(|(start_byte, _)| start_byte)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items[0]
+                .references
+                .iter()
+                .map(|span| span.start_byte)
+                .collect::<Vec<_>>(),
+            [occurrences[2], occurrences[4]]
+        );
+        assert_eq!(items[1].references[0].start_byte, occurrences[3]);
+    }
+
+    #[test]
+    fn lexical_index_spans_remain_utf8_boundaries_after_unicode() {
+        let source = "let marker = \"\u{1f642}\"\nlet value = marker\nvalue";
+        let report = lexical_symbol_report(source).unwrap();
+
+        for symbol in &report.symbols {
+            for span in std::iter::once(&symbol.definition).chain(&symbol.references) {
+                assert!(source.is_char_boundary(span.start_byte));
+                assert!(source.is_char_boundary(span.end_byte));
+                assert_eq!(&source[span.start_byte..span.end_byte], symbol.name);
+            }
+        }
+    }
+
+    #[test]
+    fn lexical_index_is_empty_for_invalid_source_and_bounded_for_large_source() {
+        assert_eq!(
+            lexical_symbol_report("fn broken(").unwrap(),
+            LexicalSymbolReport::default()
+        );
+
+        let mut source = String::new();
+        for index in 0..=MAX_LEXICAL_SYMBOL_OCCURRENCES {
+            source.push_str(&format!("let binding{index} = 0\n"));
+        }
+        let report = lexical_symbol_report(&source).unwrap();
+
+        assert_eq!(report.symbols.len(), MAX_LEXICAL_SYMBOL_OCCURRENCES);
+        assert!(report.truncated);
+        assert!(report
+            .symbols
+            .iter()
+            .all(|symbol| symbol.references.is_empty()));
     }
 
     #[test]

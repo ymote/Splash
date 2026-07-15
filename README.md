@@ -11,6 +11,8 @@ and keeps UI support optional rather than making UI the language boundary.
   diagnostics for generated source and editor tooling.
 - An effect-free canonical formatter that preserves comments and literal
   spellings while normalizing valid Splash source for LLM and editor workflows.
+- A bounded, grammar-aware lexical symbol index for imports, functions, local
+  bindings, parameters, and loop bindings without evaluating source.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -22,8 +24,9 @@ and keeps UI support optional rather than making UI the language boundary.
   completed step output before a later step's authority can become active, and
   bind their digest into contract-aware dataflow checkpoints.
 - A host-only stdio language server that publishes canonical syntax diagnostics,
-  full-document formatting edits, and top-level declaration symbols without
-  reading files or evaluating code.
+  full-document formatting edits, top-level declaration symbols, and
+  same-document lexical definitions and references without reading files or
+  evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -321,8 +324,13 @@ cargo run -p splash-lsp
 It accepts only client-provided open-document text, retains at most 128
 document states and no document text above the standard 256 KiB source cap,
 and provides full-sync diagnostics, whole-document formatting, and top-level
-declaration symbols. It never reads a document URI, evaluates source, resolves
-an import, creates a capability host, or loads a Rust adapter.
+declaration symbols plus bounded same-document lexical definition/reference
+requests. It never reads a document URI, evaluates source, resolves an imported
+module, creates a capability host, or loads a Rust adapter. The lexical index is
+conservative: it does not infer forward references, types, record keys, or
+member fields. A truncated 4,096-occurrence index can still serve a retained,
+sound definition, but exhaustive reference requests fail instead of returning a
+partial set.
 
 ## Workspace
 
@@ -351,8 +359,9 @@ an import, creates a capability host, or loads a Rust adapter.
   execution, and a sealed mobile/embedded workflow facade for static local
   adapters.
 - `splash-cli`: local development CLI.
-- `splash-lsp`: host-only stdio diagnostics, canonical formatting, and
-  top-level declaration symbols for open editor documents.
+- `splash-lsp`: host-only stdio diagnostics, canonical formatting, top-level
+  declaration symbols, and bounded same-document lexical navigation for open
+  editor documents.
 - `vendor/makepad`: provenance-preserving compatibility import.
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)

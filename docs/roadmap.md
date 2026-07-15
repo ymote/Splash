@@ -10,6 +10,9 @@
 - Canonical cross-function `try/catch` recovery with contextual syntax, no
   script-visible error details, and uncatchable hard resource termination.
 - Effect-free top-level LSP document symbols derived from valid client source.
+- Bounded grammar-aware same-document lexical definition/reference navigation
+  for imports and runtime-scope bindings, with explicit truncation and no URI
+  reads, evaluation, type inference, or authority.
 - Effect-free CLI top-level declaration outline for LLM and editor tooling.
 - Bounded effect-free direct tool-call outline for LLM and operator
   pre-approval review; it is explicitly non-authoritative and backed by
@@ -160,7 +163,9 @@
 
 ## Before a stable language release
 
-- Richer semantic editor features beyond top-level document symbols.
+- Additional semantic editor features beyond lexical navigation, including
+  completion, hover, rename, imported-module resolution, and type-aware field
+  semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Centralized event retention/aggregation and product-specific compensation

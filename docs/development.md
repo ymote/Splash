@@ -32,8 +32,9 @@ separate behavioral coverage for the imported VM.
 
 `splash-lsp` is a host-only stdio server for editor clients. It advertises
 UTF-16 positions, full document synchronization, syntax diagnostics,
-whole-document canonical formatting, and top-level `fn`/`let` document symbols
-for valid canonical source:
+whole-document canonical formatting, top-level `fn`/`let` document symbols,
+and same-document lexical definition/reference requests for valid canonical
+source:
 
 ```sh
 cargo run -p splash-lsp
@@ -41,8 +42,15 @@ cargo run -p splash-lsp
 
 It receives document text through LSP notifications only. It does not read the
 document URI, evaluate Splash code, construct a capability host, resolve
-imports, or load a Rust adapter. The server retains at most 128 open documents
-and refuses to retain document text above the normal 256 KiB Splash source cap.
+imported modules, or load a Rust adapter. The grammar-aware lexical index covers
+the final binding introduced by `use`, named functions, `let`, function and
+lambda parameters, and `for` bindings already introduced in a visible runtime
+scope. It does not infer forward references, types, record keys, or member
+fields. A definition retained before the fixed 4,096-occurrence budget is
+exhausted remains available, while reference requests fail instead of returning
+a partial set from a truncated index.
+The server retains at most 128 open documents and refuses to retain document
+text above the normal 256 KiB Splash source cap.
 
 ## Syntax fuzzing
 
@@ -58,6 +66,9 @@ must not exceed the fixed cap, its spans must be ordered UTF-8 boundaries
 within the source, and any decoded literal name must correspond to a direct
 string-literal span. The outline remains a source-review aid rather than an
 authorization mechanism.
+The target also validates the bounded lexical symbol index: definitions are
+ordered, every retained definition and resolved reference is an exact UTF-8
+identifier span, and the combined count never exceeds 4,096 occurrences.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 4,096 instruction
 cap, one-instruction deadline sampling, and a 32 ms terminal execution

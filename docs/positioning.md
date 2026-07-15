@@ -124,6 +124,6 @@ target:
 6. Obtain an independent security review for effectful adapters and the
    selected containment backend.
 
-The roadmap tracks platform containment, durable storage anchors, richer
-editor support, and sustained fuzzing separately. Those are release gates,
+The roadmap tracks platform containment, durable storage anchors, additional
+semantic editor support, and sustained fuzzing separately. Those are release gates,
 not capabilities implied by the presence of a VM sandbox.

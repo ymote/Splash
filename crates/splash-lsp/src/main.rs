@@ -3,8 +3,8 @@
 //! Stdio language server for the canonical Splash v0.2 source profile.
 //!
 //! The server only receives client-provided text and calls effect-free syntax,
-//! formatting, and outline helpers. It never reads document URIs, evaluates
-//! Splash code, creates a capability host, or loads an adapter.
+//! formatting, outline, and lexical symbol helpers. It never reads document
+//! URIs, evaluates Splash code, creates a capability host, or loads an adapter.
 
 use std::{collections::HashMap, error::Error, io, process::ExitCode};
 
@@ -14,17 +14,21 @@ use lsp_types::{
         DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit,
         Notification as LspNotification, PublishDiagnostics,
     },
-    request::{DocumentSymbolRequest, Formatting, Request as LspRequest},
+    request::{
+        DocumentSymbolRequest, Formatting, GotoDefinition, References, Request as LspRequest,
+    },
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams, Range,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Location, OneOf,
+    Position, PositionEncodingKind, PublishDiagnosticsParams, Range, ReferenceParams,
     ServerCapabilities, SymbolKind, TextDocumentItem, TextDocumentSyncCapability,
     TextDocumentSyncKind, TextEdit, Uri,
 };
 use splash_core::{
-    check_syntax_named, format_source_named, top_level_declarations_named, ExecutionLimits,
+    check_syntax_named, format_source_named, lexical_symbol_report_named,
+    top_level_declarations_named, ExecutionLimits, LexicalSymbol, LexicalSymbolReport, SourceSpan,
     SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
-    MAX_SYNTAX_DIAGNOSTICS,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -111,6 +115,65 @@ impl SplashLanguageServer {
             .iter()
             .map(|declaration| outline_symbol(source, declaration))
             .collect())
+    }
+
+    fn definition(&self, uri: &Uri, position: Position) -> Result<Option<Location>, String> {
+        let (source, report) = self.lexical_symbols(uri)?;
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(None);
+        };
+        let Some(symbol) = symbol_at_byte(&report, byte_offset) else {
+            return Ok(None);
+        };
+
+        Ok(Some(symbol_location(uri, source, symbol.definition)))
+    }
+
+    fn references(
+        &self,
+        uri: &Uri,
+        position: Position,
+        include_declaration: bool,
+    ) -> Result<Vec<Location>, String> {
+        let (source, report) = self.lexical_symbols(uri)?;
+        if report.truncated {
+            return Err(format!(
+                "the lexical index exceeds Splash's {MAX_LEXICAL_SYMBOL_OCCURRENCES}-occurrence limit"
+            ));
+        }
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(Vec::new());
+        };
+        let Some(symbol) = symbol_at_byte(&report, byte_offset) else {
+            return Ok(Vec::new());
+        };
+
+        let mut locations =
+            Vec::with_capacity(symbol.references.len() + usize::from(include_declaration));
+        if include_declaration {
+            locations.push(symbol_location(uri, source, symbol.definition));
+        }
+        locations.extend(
+            symbol
+                .references
+                .iter()
+                .copied()
+                .map(|span| symbol_location(uri, source, span)),
+        );
+        Ok(locations)
+    }
+
+    fn lexical_symbols(&self, uri: &Uri) -> Result<(&str, LexicalSymbolReport), String> {
+        let state = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| "the document is not open in this Splash session".to_owned())?;
+        let source = state.source.as_deref().ok_or_else(|| {
+            format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
+        })?;
+        let report = lexical_symbol_report_named(uri.as_str(), source, ExecutionLimits::default())
+            .map_err(|error| format!("cannot index canonical Splash source: {error}"))?;
+        Ok((source, report))
     }
 
     fn replace_document(
@@ -211,6 +274,8 @@ fn server_capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
     }
 }
@@ -244,6 +309,44 @@ fn handle_request(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("invalid textDocument/documentSymbol parameters: {error}"),
+            ),
+        }
+    } else if request.method == GotoDefinition::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<GotoDefinitionParams>(request.params) {
+            Ok(params) => {
+                let text_document_position = params.text_document_position_params;
+                match server.definition(
+                    &text_document_position.text_document.uri,
+                    text_document_position.position,
+                ) {
+                    Ok(location) => {
+                        Response::new_ok(id, location.map(GotoDefinitionResponse::Scalar))
+                    }
+                    Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+                }
+            }
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/definition parameters: {error}"),
+            ),
+        }
+    } else if request.method == References::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<ReferenceParams>(request.params) {
+            Ok(params) => match server.references(
+                &params.text_document_position.text_document.uri,
+                params.text_document_position.position,
+                params.context.include_declaration,
+            ) {
+                Ok(locations) => Response::new_ok(id, Some(locations)),
+                Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+            },
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/references parameters: {error}"),
             ),
         }
     } else {
@@ -408,6 +511,80 @@ fn outline_symbol(source: &str, declaration: &TopLevelDeclaration) -> DocumentSy
     }
 }
 
+fn symbol_at_byte(report: &LexicalSymbolReport, byte_offset: usize) -> Option<&LexicalSymbol> {
+    report.symbols.iter().find(|symbol| {
+        span_contains(symbol.definition, byte_offset)
+            || symbol
+                .references
+                .iter()
+                .any(|span| span_contains(*span, byte_offset))
+    })
+}
+
+fn span_contains(span: SourceSpan, byte_offset: usize) -> bool {
+    span.start_byte <= byte_offset && byte_offset < span.end_byte
+}
+
+fn symbol_location(uri: &Uri, source: &str, span: SourceSpan) -> Location {
+    Location::new(
+        uri.clone(),
+        Range::new(
+            position_at_byte(source, span.start_byte),
+            position_at_byte(source, span.end_byte),
+        ),
+    )
+}
+
+fn byte_at_position(source: &str, position: Position) -> Option<usize> {
+    let mut line = 0_u32;
+    let mut line_start = 0_usize;
+    let mut offset = 0_usize;
+    let bytes = source.as_bytes();
+
+    while offset < bytes.len() {
+        let line_end = match bytes[offset] {
+            b'\r' | b'\n' => Some(offset),
+            _ => None,
+        };
+        if let Some(line_end) = line_end {
+            if line == position.line {
+                return byte_at_utf16_column(&source[line_start..line_end], position.character)
+                    .map(|column| line_start + column);
+            }
+
+            if bytes[offset] == b'\r' && bytes.get(offset + 1) == Some(&b'\n') {
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            line = line.saturating_add(1);
+            line_start = offset;
+            continue;
+        }
+
+        offset += source[offset..].chars().next()?.len_utf8();
+    }
+
+    (line == position.line)
+        .then(|| byte_at_utf16_column(&source[line_start..], position.character))
+        .flatten()
+        .map(|column| line_start + column)
+}
+
+fn byte_at_utf16_column(line: &str, character: u32) -> Option<usize> {
+    let mut utf16_column = 0_u32;
+    for (byte_offset, value) in line.char_indices() {
+        if utf16_column == character {
+            return Some(byte_offset);
+        }
+        utf16_column = utf16_column.checked_add(value.len_utf16() as u32)?;
+        if utf16_column > character {
+            return None;
+        }
+    }
+    (utf16_column == character).then_some(line.len())
+}
+
 fn position_at_byte(source: &str, byte_offset: usize) -> Position {
     let mut line = 0_u32;
     let mut character = 0_u32;
@@ -546,6 +723,155 @@ mod tests {
     }
 
     #[test]
+    fn resolves_same_document_definitions_and_references() {
+        let source = "let marker = \"\u{1f642}\"\r\n\
+                      fn echo(value) {\r\n\
+                          let local = value\r\n\
+                          local + value\r\n\
+                      }\r\n\
+                      echo(marker)";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let local_reference = source.rfind("local").expect("local reference exists");
+        let definition = server
+            .definition(&test_uri(), position_at_byte(source, local_reference))
+            .expect("symbol index succeeds")
+            .expect("local reference resolves");
+        let local_definition = source.find("local").expect("local definition exists");
+        assert_eq!(
+            definition.range,
+            Range::new(
+                position_at_byte(source, local_definition),
+                position_at_byte(source, local_definition + "local".len()),
+            )
+        );
+        assert_eq!(
+            server
+                .definition(&test_uri(), position_at_byte(source, local_definition))
+                .expect("symbol index succeeds")
+                .expect("a definition resolves to itself"),
+            definition
+        );
+
+        let value_reference = source.rfind("value").expect("value reference exists");
+        let without_declaration = server
+            .references(
+                &test_uri(),
+                position_at_byte(source, value_reference),
+                false,
+            )
+            .expect("reference index succeeds");
+        assert_eq!(without_declaration.len(), 2);
+        let with_declaration = server
+            .references(&test_uri(), position_at_byte(source, value_reference), true)
+            .expect("reference index succeeds");
+        assert_eq!(with_declaration.len(), 3);
+        assert_eq!(
+            with_declaration[0].range,
+            Range::new(Position::new(1, 8), Position::new(1, 13))
+        );
+    }
+
+    #[test]
+    fn resolves_imports_and_loop_bindings_without_cross_document_leakage() {
+        let source = "use mod.std.assert\n\
+                      for index in [1] {\n\
+                          assert(index)\n\
+                      }";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        for name in ["assert", "index"] {
+            let definition_start = source.find(name).expect("definition exists");
+            let reference_start = source.rfind(name).expect("reference exists");
+            let location = server
+                .definition(&test_uri(), position_at_byte(source, reference_start))
+                .expect("symbol index succeeds")
+                .expect("reference resolves");
+            assert_eq!(location.uri, test_uri());
+            assert_eq!(
+                location.range,
+                Range::new(
+                    position_at_byte(source, definition_start),
+                    position_at_byte(source, definition_start + name.len()),
+                )
+            );
+        }
+
+        let other_uri = Uri::from_str("file:///workspace/other.splash").expect("valid file URI");
+        let other_source = "let index = 9\nindex";
+        server.open_document(TextDocumentItem::new(
+            other_uri.clone(),
+            "splash".to_owned(),
+            1,
+            other_source.to_owned(),
+        ));
+        let other_location = server
+            .definition(&other_uri, Position::new(1, 1))
+            .expect("other document index succeeds")
+            .expect("other document reference resolves");
+        assert_eq!(other_location.uri, other_uri);
+        assert_eq!(
+            other_location.range,
+            Range::new(Position::new(0, 4), Position::new(0, 9))
+        );
+    }
+
+    #[test]
+    fn lexical_requests_return_no_result_for_invalid_source_or_position() {
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, "fn broken("));
+
+        assert_eq!(
+            server
+                .definition(&test_uri(), Position::new(0, 3))
+                .expect("invalid source produces an empty index"),
+            None
+        );
+        assert!(server
+            .references(&test_uri(), Position::new(0, 3), true)
+            .expect("invalid source produces an empty index")
+            .is_empty());
+
+        server.open_document(document(2, "let value = 1"));
+        assert_eq!(
+            server
+                .definition(&test_uri(), Position::new(4, 0))
+                .expect("an out-of-range position has no symbol"),
+            None
+        );
+    }
+
+    #[test]
+    fn serves_retained_definitions_but_rejects_truncated_reference_indexes() {
+        let mut source = String::new();
+        for index in 0..=MAX_LEXICAL_SYMBOL_OCCURRENCES {
+            source.push_str(&format!("let binding{index} = 0\n"));
+        }
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        assert!(server
+            .definition(&test_uri(), Position::new(0, 4))
+            .expect("retained definitions remain sound")
+            .is_some());
+        assert_eq!(
+            server
+                .definition(
+                    &test_uri(),
+                    Position::new(to_u32(MAX_LEXICAL_SYMBOL_OCCURRENCES), 4),
+                )
+                .expect("an omitted definition produces no location"),
+            None
+        );
+        let error = server
+            .references(&test_uri(), Position::new(0, 4), true)
+            .expect_err("truncated reference sets are not returned as complete results");
+        assert!(error.contains("occurrence limit"));
+    }
+
+    #[test]
     fn converts_core_positions_to_zero_based_utf16() {
         assert_eq!(
             diagnostic_position("\u{1f642}x", 1, 3),
@@ -555,6 +881,22 @@ mod tests {
         assert_eq!(
             diagnostic_position("first\nlast", 9, 9),
             Position::new(1, 4)
+        );
+        assert_eq!(
+            byte_at_position("\u{1f642}x\r\ny", Position::new(0, 2)),
+            Some(4)
+        );
+        assert_eq!(
+            byte_at_position("\u{1f642}x\r\ny", Position::new(0, 1)),
+            None
+        );
+        assert_eq!(
+            byte_at_position("\u{1f642}x\r\ny", Position::new(1, 0)),
+            Some(7)
+        );
+        assert_eq!(
+            byte_at_position("\u{1f642}x\r\ny", Position::new(1, 1)),
+            Some(8)
         );
     }
 
@@ -633,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn announces_utf16_full_sync_formatting_and_symbols_over_stdio_protocol() {
+    fn announces_and_serves_bounded_editor_features_over_stdio_protocol() {
         let (server_connection, client_connection) = Connection::memory();
         let server_thread = std::thread::spawn(move || run_connection(&server_connection));
 
@@ -665,6 +1007,8 @@ mod tests {
         assert_eq!(capabilities["textDocumentSync"], 1);
         assert_eq!(capabilities["documentFormattingProvider"], true);
         assert_eq!(capabilities["documentSymbolProvider"], true);
+        assert_eq!(capabilities["definitionProvider"], true);
+        assert_eq!(capabilities["referencesProvider"], true);
 
         client_connection
             .sender
@@ -676,7 +1020,7 @@ mod tests {
                 Notification::new(
                     DidOpenTextDocument::METHOD.to_owned(),
                     DidOpenTextDocumentParams {
-                        text_document: document(1, "let value=1"),
+                        text_document: document(1, "let value=1\nvalue"),
                     },
                 )
                 .into(),
@@ -715,7 +1059,7 @@ mod tests {
                 panic!("format failed: {}", error.message)
             }
         };
-        assert_eq!(edits[0]["newText"], "let value = 1\n");
+        assert_eq!(edits[0]["newText"], "let value = 1\nvalue\n");
 
         client_connection
             .sender
@@ -746,7 +1090,73 @@ mod tests {
 
         client_connection
             .sender
-            .send(Request::new(4.into(), "shutdown".to_owned(), ()).into())
+            .send(
+                Request::new(
+                    4.into(),
+                    GotoDefinition::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 1}
+                    }),
+                )
+                .into(),
+            )
+            .expect("definition request send succeeds");
+        let definition_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("definition response arrives");
+        let Message::Response(response) = definition_response else {
+            panic!("expected definition response");
+        };
+        let definition = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("definition request failed: {}", error.message)
+            }
+        };
+        assert_eq!(
+            definition["range"]["start"],
+            serde_json::json!({"line": 0, "character": 4})
+        );
+        assert_eq!(
+            definition["range"]["end"],
+            serde_json::json!({"line": 0, "character": 9})
+        );
+
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    5.into(),
+                    References::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 1},
+                        "context": {"includeDeclaration": true}
+                    }),
+                )
+                .into(),
+            )
+            .expect("references request send succeeds");
+        let references_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("references response arrives");
+        let Message::Response(response) = references_response else {
+            panic!("expected references response");
+        };
+        let references = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("references request failed: {}", error.message)
+            }
+        };
+        assert_eq!(references.as_array().map(Vec::len), Some(2));
+
+        client_connection
+            .sender
+            .send(Request::new(6.into(), "shutdown".to_owned(), ()).into())
             .expect("shutdown send succeeds");
         let shutdown_response = client_connection
             .receiver

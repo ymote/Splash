@@ -4,9 +4,12 @@
 //! language. This module accepts only the portable grammar documented by
 //! Splash, without producing bytecode or evaluating source.
 
+use std::collections::HashMap;
+
 use super::{
-    SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration,
-    TopLevelDeclarationKind, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, SourceSpan, SyntaxDiagnostic,
+    ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration, TopLevelDeclarationKind,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_CANONICAL_PROFILE_NESTING: usize = 128;
@@ -44,6 +47,15 @@ pub(super) fn collect_top_level_declarations(
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
     top_level_declarations_from_tokens(&tokens)
+}
+
+/// Builds a lexical index after the public caller has confirmed canonical,
+/// VM-compatible source. Parsing the already bounded token stream gives the
+/// collector exact binding contexts without evaluating source or imports.
+pub(super) fn collect_lexical_symbols(source: &str, max_tokens: usize) -> LexicalSymbolReport {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    CanonicalParser::new(tokens).collect_symbols()
 }
 
 /// Extracts direct `mod.tool` call syntax after the public caller has already
@@ -112,6 +124,91 @@ struct Token {
     column: usize,
     start_byte: usize,
     end_byte: usize,
+}
+
+struct SymbolCollector {
+    symbols: Vec<LexicalSymbol>,
+    scopes: Vec<HashMap<String, usize>>,
+    occurrences: usize,
+    truncated: bool,
+}
+
+impl SymbolCollector {
+    fn new() -> Self {
+        Self {
+            symbols: Vec::new(),
+            scopes: vec![HashMap::new()],
+            occurrences: 0,
+            truncated: false,
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    fn define(&mut self, name: String, definition: SourceSpan, kind: LexicalSymbolKind) {
+        if !self.reserve_occurrence() {
+            return;
+        }
+
+        let symbol_index = self.symbols.len();
+        self.symbols.push(LexicalSymbol {
+            kind,
+            name: name.clone(),
+            definition,
+            references: Vec::new(),
+        });
+        self.scopes
+            .last_mut()
+            .expect("the lexical collector always has a root scope")
+            .insert(name, symbol_index);
+    }
+
+    fn reference(&mut self, name: &str, reference: SourceSpan) {
+        if self.truncated {
+            return;
+        }
+        let Some(symbol_index) = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+        else {
+            return;
+        };
+        if !self.reserve_occurrence() {
+            return;
+        }
+        self.symbols[symbol_index].references.push(reference);
+    }
+
+    fn reserve_occurrence(&mut self) -> bool {
+        if self.truncated {
+            return false;
+        }
+        if self.occurrences == MAX_LEXICAL_SYMBOL_OCCURRENCES {
+            self.truncated = true;
+            return false;
+        }
+        self.occurrences += 1;
+        true
+    }
+
+    fn finish(mut self) -> LexicalSymbolReport {
+        self.symbols
+            .sort_by_key(|symbol| symbol.definition.start_byte);
+        LexicalSymbolReport {
+            symbols: self.symbols,
+            truncated: self.truncated,
+        }
+    }
 }
 
 fn top_level_declarations_from_tokens(tokens: &[Token]) -> Vec<TopLevelDeclaration> {
@@ -1132,6 +1229,7 @@ struct CanonicalParser {
     nesting: usize,
     diagnostics: Vec<SyntaxDiagnostic>,
     diagnostics_truncated: bool,
+    symbols: Option<SymbolCollector>,
 }
 
 impl CanonicalParser {
@@ -1142,6 +1240,7 @@ impl CanonicalParser {
             nesting: 0,
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
+            symbols: None,
         }
     }
 
@@ -1151,6 +1250,15 @@ impl CanonicalParser {
             diagnostics: self.diagnostics,
             diagnostics_truncated: self.diagnostics_truncated,
         }
+    }
+
+    fn collect_symbols(mut self) -> LexicalSymbolReport {
+        self.symbols = Some(SymbolCollector::new());
+        self.parse_program();
+        self.symbols
+            .take()
+            .expect("symbol collection was enabled")
+            .finish()
     }
 
     fn parse_program(&mut self) {
@@ -1225,25 +1333,37 @@ impl CanonicalParser {
             self.report_current("expected `.` after `use mod`");
             return;
         }
-        self.expect_plain_identifier("expected a module identifier after `use mod.`");
+        let mut binding =
+            self.take_plain_identifier("expected a module identifier after `use mod.`");
         while self.take_operator(".") {
-            self.expect_plain_identifier("expected a module identifier after `.`");
+            binding = self.take_plain_identifier("expected a module identifier after `.`");
+        }
+        if let Some(binding) = binding {
+            self.define_symbol(binding, LexicalSymbolKind::Import);
         }
     }
 
     fn parse_declaration(&mut self) {
-        self.expect_plain_identifier("expected an identifier after `let`");
+        let binding = self.take_plain_identifier("expected an identifier after `let`");
         if self.take_operator("=") {
             self.parse_expression();
         } else if !self.at_statement_boundary() {
             self.report_current("expected `=` or a statement end after a `let` declaration");
         }
+        if let Some(binding) = binding {
+            self.define_symbol(binding, LexicalSymbolKind::Let);
+        }
     }
 
     fn parse_function_declaration(&mut self) {
-        self.expect_plain_identifier("expected a function identifier after `fn`");
+        let binding = self.take_plain_identifier("expected a function identifier after `fn`");
+        if let Some(binding) = binding {
+            self.define_symbol(binding, LexicalSymbolKind::Function);
+        }
+        self.push_symbol_scope();
         self.parse_parameter_list();
         self.parse_block();
+        self.pop_symbol_scope();
     }
 
     fn parse_parameter_list(&mut self) {
@@ -1256,7 +1376,9 @@ impl CanonicalParser {
         }
 
         loop {
-            self.expect_plain_identifier("expected a parameter identifier");
+            if let Some(parameter) = self.take_plain_identifier("expected a parameter identifier") {
+                self.define_symbol(parameter, LexicalSymbolKind::Parameter);
+            }
             if self.take_kind(&TokenKind::Comma) {
                 if self.at_kind(&TokenKind::CloseRound) {
                     self.report_current(
@@ -1286,11 +1408,15 @@ impl CanonicalParser {
             self.parse_for_expression();
         } else if self.at_identifier("loop") {
             self.advance();
+            self.push_symbol_scope();
             self.parse_block();
+            self.pop_symbol_scope();
         } else if self.at_identifier("while") {
             self.advance();
+            self.push_symbol_scope();
             self.parse_expression();
             self.parse_block();
+            self.pop_symbol_scope();
         } else {
             self.parse_assignment();
         }
@@ -1384,11 +1510,16 @@ impl CanonicalParser {
     fn parse_for_expression(&mut self) {
         self.advance();
         let mut bindings = 0_usize;
+        let mut binding_tokens = Vec::new();
         loop {
             if self.at_identifier("in") {
                 break;
             }
-            self.expect_plain_identifier("expected a binding identifier after `for`");
+            if let Some(binding) =
+                self.take_plain_identifier("expected a binding identifier after `for`")
+            {
+                binding_tokens.push(binding);
+            }
             bindings += 1;
             if bindings > 3 {
                 self.report_previous("a `for` expression supports at most three bindings");
@@ -1414,7 +1545,12 @@ impl CanonicalParser {
         } else {
             self.parse_expression();
         }
+        self.push_symbol_scope();
+        for binding in binding_tokens {
+            self.define_symbol(binding, LexicalSymbolKind::LoopBinding);
+        }
         self.parse_block();
+        self.pop_symbol_scope();
     }
 
     fn parse_expression_or_block(&mut self) {
@@ -1539,7 +1675,9 @@ impl CanonicalParser {
                 self.advance();
             }
             TokenKind::Identifier(identifier) if !is_reserved_identifier(identifier) => {
+                let reference = self.index;
                 self.advance();
+                self.reference_symbol(reference);
             }
             TokenKind::OpenSquare => self.parse_array(),
             TokenKind::OpenCurly => self.parse_record(),
@@ -1632,21 +1770,33 @@ impl CanonicalParser {
     }
 
     fn parse_lambda(&mut self) {
+        self.push_symbol_scope();
         if self.take_operator("||") {
             self.parse_expression_or_block();
+            self.pop_symbol_scope();
             return;
         }
 
         self.take_operator("|");
-        self.expect_plain_identifier("expected a lambda parameter identifier");
+        if let Some(parameter) =
+            self.take_plain_identifier("expected a lambda parameter identifier")
+        {
+            self.define_symbol(parameter, LexicalSymbolKind::LambdaParameter);
+        }
         while self.take_kind(&TokenKind::Comma) {
-            self.expect_plain_identifier("expected a lambda parameter identifier after `,`");
+            if let Some(parameter) =
+                self.take_plain_identifier("expected a lambda parameter identifier after `,`")
+            {
+                self.define_symbol(parameter, LexicalSymbolKind::LambdaParameter);
+            }
         }
         if !self.take_operator("|") {
             self.report_current("expected `|` after lambda parameters");
+            self.pop_symbol_scope();
             return;
         }
         self.parse_expression_or_block();
+        self.pop_symbol_scope();
     }
 
     fn require_statement_end(&mut self) {
@@ -1709,12 +1859,65 @@ impl CanonicalParser {
     }
 
     fn expect_plain_identifier(&mut self, message: &'static str) {
+        self.take_plain_identifier(message);
+    }
+
+    fn take_plain_identifier(&mut self, message: &'static str) -> Option<usize> {
         match &self.current().kind {
             TokenKind::Identifier(identifier) if !is_reserved_identifier(identifier) => {
+                let index = self.index;
                 self.advance();
+                Some(index)
             }
-            _ => self.report_current(message),
+            _ => {
+                self.report_current(message);
+                None
+            }
         }
+    }
+
+    fn push_symbol_scope(&mut self) {
+        if let Some(symbols) = &mut self.symbols {
+            symbols.push_scope();
+        }
+    }
+
+    fn pop_symbol_scope(&mut self) {
+        if let Some(symbols) = &mut self.symbols {
+            symbols.pop_scope();
+        }
+    }
+
+    fn define_symbol(&mut self, token_index: usize, kind: LexicalSymbolKind) {
+        let Some((name, span)) = self.symbol_token(token_index) else {
+            return;
+        };
+        if let Some(symbols) = &mut self.symbols {
+            symbols.define(name, span, kind);
+        }
+    }
+
+    fn reference_symbol(&mut self, token_index: usize) {
+        let Some((name, span)) = self.symbol_token(token_index) else {
+            return;
+        };
+        if let Some(symbols) = &mut self.symbols {
+            symbols.reference(&name, span);
+        }
+    }
+
+    fn symbol_token(&self, token_index: usize) -> Option<(String, SourceSpan)> {
+        let token = self.tokens.get(token_index)?;
+        let TokenKind::Identifier(name) = &token.kind else {
+            return None;
+        };
+        Some((
+            name.clone(),
+            SourceSpan {
+                start_byte: token.start_byte,
+                end_byte: token.end_byte,
+            },
+        ))
     }
 
     fn at_kind(&self, expected: &TokenKind) -> bool {
