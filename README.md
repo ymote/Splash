@@ -92,12 +92,17 @@ and keeps UI support optional rather than making UI the language boundary.
 - Feature-gated one-shot authenticated durable-operation transport for a fresh
   contained-worker session; it validates one dispatch, reconciliation, or
   compensation result but does not automate recovery policy.
+- Feature-gated Bubblewrap post-stop recovery coordinator that requires a
+  session-bound reaping proof, starts a differently keyed least-privilege
+  contained worker, performs one watchdog-bounded reconciliation, and commits
+  the observation through fenced authenticated compare-and-swap storage.
 - Linux Bubblewrap worker-policy compiler and launcher for a fixed,
   host-selected worker and manifest-selected file roots; it rejects network,
   executable, and secret selectors rather than claiming unsupported policy.
 - A one-shot, versioned private-pipe session bootstrap for Linux Bubblewrap
-  workers that is bound to the compiled manifest and precedes JSON worker
-  frames without exposing the key through argv or environment variables.
+  workers that is bound to the exact manifest retained by the compiled command
+  and precedes JSON worker frames without exposing the key through argv or
+  environment variables.
 - Optional bounded private `/tmp` capacity and a host lifecycle handle that
   force-terminates and reaps a Bubblewrap worker without treating termination
   as an adapter-effect result.
@@ -309,8 +314,9 @@ an import, creates a capability host, or loads a Rust adapter.
   Bubblewrap backend is Linux-only and deliberately narrow.
 - `splash-workflow`: host-owned planning, lease-bound approval, bounded JSON
   dataflow, bounded in-memory and authenticated durable event replay,
-  checkpointing, durable operation records, sequential execution, and a sealed
-  mobile/embedded workflow facade for static local adapters.
+  checkpointing, durable operation records, optional fenced Bubblewrap
+  post-stop reconciliation, sequential execution, and a sealed mobile/embedded
+  workflow facade for static local adapters.
 - `splash-cli`: local development CLI.
 - `splash-lsp`: host-only stdio diagnostics, canonical formatting, and
   top-level declaration symbols for open editor documents.
@@ -358,3 +364,6 @@ adapter boundary and the integration requirements for a contained backend.
 
 [Linux Bubblewrap workers](docs/linux-bubblewrap.md) define the first contained
 worker launcher, its capability mapping, and its explicit non-guarantees.
+
+[Bubblewrap post-stop recovery](docs/bubblewrap-recovery.md) defines the
+reaping, fresh-session reconciliation, and fenced host-ledger commit sequence.

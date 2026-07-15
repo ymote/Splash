@@ -16,6 +16,14 @@ pub mod mobile;
 /// capability lease, suspended promise, or external operation.
 pub mod durable_events;
 
+/// Fenced, reconciliation-only recovery for a reaped Linux Bubblewrap worker.
+///
+/// This integration is host-only and feature gated because it owns process
+/// lifecycle, authenticated JSON-line transport, and rollback-protected
+/// workflow-ledger persistence.
+#[cfg(feature = "bubblewrap-recovery")]
+pub mod bubblewrap_recovery;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroUsize;

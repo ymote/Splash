@@ -263,6 +263,14 @@ or workflow resumption. The host must choose how to handle `running`, an
 indeterminate transport failure, or a policy/input mismatch before it creates a
 fresh runtime or invokes compensation.
 
+On Linux, the optional `splash-workflow/bubblewrap-recovery` feature provides a
+reconciliation-only host composition around this transport. It requires an old
+worker reaping proof, a differently keyed exact-tool Bubblewrap manifest, a
+watchdog deadline, and `FencedRollbackProtectedStore`, then persists the
+observation only after the fresh worker is also reaped. See
+[Bubblewrap post-stop recovery](bubblewrap-recovery.md). It retains the same
+rule that a terminal observation cannot resume a workflow by itself.
+
 ## Explicit Compensation
 
 Compensation is an optional, separate effect. A host can record it only after

@@ -321,6 +321,15 @@ transport failure remains a host recovery decision. The transport does not
 restart a VM, resolve a promise, select compensation, or make a terminal
 observation sufficient to run a workflow suffix.
 
+On Linux, `splash-workflow/bubblewrap-recovery` provides the higher-level,
+reconciliation-only composition for this sequence. It requires a reaping proof
+from the stopped worker, reserves a fenced authenticated host-ledger writer,
+starts a differently keyed Bubblewrap session under an optional preserved
+cgroup-v2 policy, performs one watchdog-bounded exchange, reaps that worker,
+and compare-and-swap persists the observation. See
+[Bubblewrap post-stop recovery](bubblewrap-recovery.md). The worker must still
+load its own fenced durable journal and satisfy fresh-session admission.
+
 The channel performs synchronous I/O, so it cannot deliver an in-band `cancel`
 frame while a call is blocked waiting for its result. On Linux, the optional
 `bubblewrap-watchdog` feature connects a

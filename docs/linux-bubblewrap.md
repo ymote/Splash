@@ -237,6 +237,22 @@ device use or an adapter's downstream I/O. Keep cgroup-backed workers in their
 managed lifecycle when process-tree teardown is required. Both deadlines are
 trusted host configuration and are never Splash values.
 
+## Durable Post-Stop Reconciliation
+
+The optional `splash-workflow/bubblewrap-recovery` feature composes the
+launcher, private bootstrap, watchdog, one-shot durable transport, workflow
+ledger, and fenced authenticated store for one recovery attempt. It requires a
+`BubblewrapWorkerReaped` proof from the old lifecycle, refuses the old session
+ID and broad recovery manifests, launches a fresh contained worker, sends only
+one reconciliation request, reaps that worker, and commits the observation by
+fenced compare-and-swap.
+
+Use `FreshBubblewrapRecoverySession::generate_in_cgroup` when the deployment
+requires cgroup-v2 limits; the coordinator never silently replaces that choice
+with an uncgrouped launch. See
+[Bubblewrap post-stop recovery](bubblewrap-recovery.md) for the complete API,
+ordering, retry behavior, and non-guarantees.
+
 `enable_private_tmpfs_with_maximum_bytes` emits `--size BYTES` immediately
 before `--tmpfs /tmp`. Bubblewrap enforces that maximum only for allocations in
 this private `/tmp`; it is not a general process-memory, CPU, process-count, or
@@ -481,10 +497,9 @@ It does not yet provide:
 - authenticated in-band cancellation delivery or worker cancellation
   acknowledgements. The optional watchdog supplies a host wall-clock force-stop
   for one synchronous transport invocation, not proof that an adapter effect
-  was cancelled. Bubblewrap also does not automate post-exit recovery or supply
-  durable operation storage: a host may pair a fresh contained worker session
-  with the one-shot durable-operation transport and separately authenticated
-  journal/ledger storage, but it must select and execute that recovery policy;
+  was cancelled. The optional workflow coordinator automates a narrow
+  reconciliation-only post-stop sequence but does not supply durable worker
+  journal storage, retry effects, select compensation, or resume a workflow;
   and
 - protection from a trusted host changing a policy source path between plan
   compilation and worker exit. Policy sources and their contents, including

@@ -869,7 +869,7 @@ impl BubblewrapWorkerPolicy {
         Ok(BubblewrapCommand {
             bwrap_program,
             arguments,
-            session_id: manifest.session_id.clone(),
+            manifest: manifest.clone(),
             seccomp_program,
         })
     }
@@ -886,7 +886,7 @@ impl BubblewrapWorkerPolicy {
 pub struct BubblewrapCommand {
     bwrap_program: PathBuf,
     arguments: Vec<OsString>,
-    session_id: String,
+    manifest: CapabilityManifest,
     seccomp_program: Option<SeccompProgram>,
 }
 
@@ -911,7 +911,16 @@ impl BubblewrapCommand {
     /// a host accidentally pairing the worker policy with another session.
     /// It is never added to the Bubblewrap command line.
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        &self.manifest.session_id
+    }
+
+    /// Returns the exact capability manifest used to compile this command.
+    ///
+    /// Recovery hosts use this binding to prevent a fresh authenticated
+    /// session from being paired with a containment plan compiled for broader
+    /// or otherwise different authority under the same session ID.
+    pub fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
     }
 
     /// Returns the selected host-owned seccomp hardening profile.
@@ -1048,6 +1057,7 @@ impl BubblewrapCommand {
                 stdout,
                 cgroup,
                 started_at,
+                session_id: self.manifest.session_id.clone(),
             },
             stderr,
         ))
@@ -1078,9 +1088,9 @@ impl BubblewrapCommand {
         &self,
         bootstrap: &PrivatePipeWorkerBootstrap,
     ) -> Result<SpawnedBubblewrapWorker, BubblewrapBootstrapError> {
-        if bootstrap.session_id() != self.session_id {
+        if bootstrap.session_id() != self.manifest.session_id {
             return Err(BubblewrapBootstrapError::SessionMismatch {
-                expected: self.session_id.clone(),
+                expected: self.manifest.session_id.clone(),
                 actual: bootstrap.session_id().to_owned(),
             });
         }
@@ -1104,9 +1114,9 @@ impl BubblewrapCommand {
         policy: &CgroupV2Policy,
         bootstrap: &PrivatePipeWorkerBootstrap,
     ) -> Result<SpawnedBubblewrapWorker, BubblewrapCgroupBootstrapError> {
-        if bootstrap.session_id() != self.session_id {
+        if bootstrap.session_id() != self.manifest.session_id {
             return Err(BubblewrapCgroupBootstrapError::SessionMismatch {
-                expected: self.session_id.clone(),
+                expected: self.manifest.session_id.clone(),
                 actual: bootstrap.session_id().to_owned(),
             });
         }
@@ -1188,9 +1198,16 @@ pub struct SpawnedBubblewrapWorker {
     stdout: ChildStdout,
     cgroup: Option<CgroupV2Session>,
     started_at: Instant,
+    session_id: String,
 }
 
 impl SpawnedBubblewrapWorker {
+    /// Returns the authenticated session ID compiled into this worker's
+    /// containment plan.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Returns the child process for host-controlled lifecycle management.
     pub fn child_mut(&mut self) -> &mut Child {
         &mut self.child
@@ -1209,6 +1226,27 @@ impl SpawnedBubblewrapWorker {
         terminate_and_reap(&mut self.child, &mut self.cgroup)
     }
 
+    /// Consumes this worker after force-termination and reap, yielding a proof
+    /// that can authorize post-stop recovery.
+    ///
+    /// The proof does not claim that an adapter effect was cancelled. It only
+    /// establishes that this exact contained session can no longer race a
+    /// fresh reconciliation session.
+    pub fn into_reaped(
+        mut self,
+    ) -> Result<BubblewrapWorkerReaped, BubblewrapWorkerReapError<Self>> {
+        match terminate_and_reap(&mut self.child, &mut self.cgroup) {
+            Ok(termination) => Ok(BubblewrapWorkerReaped {
+                session_id: self.session_id,
+                termination,
+            }),
+            Err(source) => Err(BubblewrapWorkerReapError {
+                source,
+                worker: Box::new(self),
+            }),
+        }
+    }
+
     /// Consumes the startup handle while retaining managed worker lifecycle
     /// control separately from the private JSON-line pipes.
     ///
@@ -1221,6 +1259,7 @@ impl SpawnedBubblewrapWorker {
                 child: self.child,
                 cgroup: self.cgroup,
                 started_at: self.started_at,
+                session_id: self.session_id,
             },
             self.stdin,
             self.stdout,
@@ -1248,11 +1287,13 @@ impl SpawnedBubblewrapWorker {
             stdout,
             cgroup,
             started_at,
+            session_id,
         } = self;
         let lifecycle = BubblewrapWorkerLifecycle {
             child,
             cgroup,
             started_at,
+            session_id,
         };
         let watchdog = lifecycle.into_watchdog_with_session_deadline(deadline)?;
         Ok((watchdog, stdin, stdout))
@@ -1278,9 +1319,16 @@ pub struct BubblewrapWorkerLifecycle {
     child: Child,
     cgroup: Option<CgroupV2Session>,
     started_at: Instant,
+    session_id: String,
 }
 
 impl BubblewrapWorkerLifecycle {
+    /// Returns the authenticated session ID compiled into this worker's
+    /// containment plan.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Returns the worker process for host-controlled lifecycle integration.
     pub fn child_mut(&mut self) -> &mut Child {
         &mut self.child
@@ -1293,6 +1341,23 @@ impl BubblewrapWorkerLifecycle {
     /// [`SpawnedBubblewrapWorker::terminate`].
     pub fn terminate(&mut self) -> Result<BubblewrapTermination, BubblewrapTerminationError> {
         terminate_and_reap(&mut self.child, &mut self.cgroup)
+    }
+
+    /// Consumes this lifecycle after force-termination and reap, yielding a
+    /// session-bound post-stop recovery proof.
+    pub fn into_reaped(
+        mut self,
+    ) -> Result<BubblewrapWorkerReaped, BubblewrapWorkerReapError<Self>> {
+        match terminate_and_reap(&mut self.child, &mut self.cgroup) {
+            Ok(termination) => Ok(BubblewrapWorkerReaped {
+                session_id: self.session_id,
+                termination,
+            }),
+            Err(source) => Err(BubblewrapWorkerReapError {
+                source,
+                worker: Box::new(self),
+            }),
+        }
     }
 
     /// Transfers this worker lifecycle to a host-owned watchdog thread.
@@ -1404,6 +1469,79 @@ pub enum BubblewrapTermination {
     Killed(ExitStatus),
 }
 
+/// Unforgeable proof that one exact Bubblewrap worker session was reaped.
+///
+/// Only consuming lifecycle APIs construct this value. Recovery code can
+/// therefore require process teardown before it loads durable state or starts
+/// a fresh worker. The proof is cloneable because reaping is a permanent fact
+/// and a failed fresh launch must remain retryable. It says nothing about
+/// whether an adapter effect ran.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BubblewrapWorkerReaped {
+    session_id: String,
+    termination: BubblewrapTermination,
+}
+
+impl BubblewrapWorkerReaped {
+    /// Returns the authenticated session ID of the reaped worker.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Returns the process-level termination observation.
+    pub fn termination(&self) -> &BubblewrapTermination {
+        &self.termination
+    }
+
+    /// Consumes the proof into non-authorizing audit data.
+    pub fn into_parts(self) -> (String, BubblewrapTermination) {
+        (self.session_id, self.termination)
+    }
+}
+
+/// Failed consuming transition from a worker lifecycle to a reaping proof.
+///
+/// The owned worker is returned so trusted host code can retry termination or
+/// apply a platform-specific escalation without losing process control.
+#[derive(Debug)]
+pub struct BubblewrapWorkerReapError<T> {
+    source: BubblewrapTerminationError,
+    worker: Box<T>,
+}
+
+impl<T> BubblewrapWorkerReapError<T> {
+    /// Returns the teardown failure that prevented a reaping proof.
+    pub fn source_error(&self) -> &BubblewrapTerminationError {
+        &self.source
+    }
+
+    /// Returns the still-owned worker or lifecycle handle.
+    pub fn worker(&self) -> &T {
+        &self.worker
+    }
+
+    /// Recovers ownership for another cleanup attempt.
+    pub fn into_worker(self) -> T {
+        *self.worker
+    }
+}
+
+impl<T> Display for BubblewrapWorkerReapError<T> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not produce a worker reaping proof: {}",
+            self.source
+        )
+    }
+}
+
+impl<T: fmt::Debug> std::error::Error for BubblewrapWorkerReapError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl BubblewrapTermination {
     /// Returns the reaped child process exit status.
     pub fn exit_status(&self) -> &ExitStatus {
@@ -1433,6 +1571,7 @@ impl BubblewrapTermination {
 pub struct BubblewrapWorkerWatchdog {
     sender: mpsc::Sender<WatchdogCommand>,
     join: Option<JoinHandle<()>>,
+    session_id: String,
 }
 
 impl BubblewrapWorkerWatchdog {
@@ -1440,6 +1579,7 @@ impl BubblewrapWorkerWatchdog {
         lifecycle: BubblewrapWorkerLifecycle,
         session_deadline: Option<Instant>,
     ) -> Result<Self, BubblewrapWorkerWatchdogStartError> {
+        let session_id = lifecycle.session_id.clone();
         let (sender, receiver) = mpsc::channel();
         // Retain the lifecycle outside the closure until the OS confirms that
         // the watchdog thread exists. A failed thread spawn must not orphan a
@@ -1463,6 +1603,7 @@ impl BubblewrapWorkerWatchdog {
         Ok(Self {
             sender,
             join: Some(join),
+            session_id,
         })
     }
 
@@ -1519,6 +1660,16 @@ impl BubblewrapWorkerWatchdog {
     /// trusted host needs the reaped status for its own audit record.
     pub fn close(mut self) -> Result<BubblewrapTermination, BubblewrapWorkerWatchdogError> {
         self.shutdown()
+    }
+
+    /// Force-stops, reaps, and joins the watchdog thread, then returns a
+    /// session-bound post-stop recovery proof for this exact session.
+    pub fn close_reaped(mut self) -> Result<BubblewrapWorkerReaped, BubblewrapWorkerWatchdogError> {
+        let termination = self.shutdown()?;
+        Ok(BubblewrapWorkerReaped {
+            session_id: self.session_id.clone(),
+            termination,
+        })
     }
 
     fn request<R>(
@@ -4218,6 +4369,24 @@ print("seccomp-active")
         ));
     }
 
+    #[test]
+    fn compiled_command_retains_the_exact_manifest_binding() {
+        let root = TestDirectory::new();
+        let expected = manifest([selector(ResourceKind::FileRoot, "workspace")]);
+        let mut policy = base_policy(&root);
+        policy
+            .add_file_root(
+                "workspace",
+                binding(&root, "workspace", "/workspace", FileRootAccess::ReadOnly),
+            )
+            .unwrap();
+
+        let command = policy.compile(&expected).unwrap();
+
+        assert_eq!(command.manifest(), &expected);
+        assert_eq!(command.session_id(), expected.session_id);
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn refuses_to_spawn_off_linux() {
@@ -4287,6 +4456,16 @@ print("seccomp-active")
 
     #[cfg(unix)]
     #[test]
+    fn consuming_worker_lifecycle_yields_a_retryable_reaping_proof() {
+        let proof = test_worker("exec sleep 60").into_reaped().unwrap();
+
+        assert_eq!(proof.session_id(), "test-session");
+        assert!(proof.termination().was_killed());
+        assert_eq!(proof.clone(), proof);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn watchdog_disarms_a_completed_call_and_reaps_on_close() {
         let (lifecycle, stdin, stdout) = test_worker("exec sleep 60").into_lifecycle_parts();
         drop(stdin);
@@ -4300,6 +4479,20 @@ print("seccomp-active")
         );
 
         assert!(watchdog.close().unwrap().was_killed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_close_can_yield_a_session_bound_reaping_proof() {
+        let (lifecycle, stdin, stdout) = test_worker("exec sleep 60").into_lifecycle_parts();
+        drop(stdin);
+        drop(stdout);
+        let watchdog = lifecycle.into_watchdog().unwrap();
+
+        let proof = watchdog.close_reaped().unwrap();
+
+        assert_eq!(proof.session_id(), "test-session");
+        assert!(proof.termination().was_killed());
     }
 
     #[cfg(unix)]
@@ -4496,6 +4689,7 @@ print("seccomp-active")
             stdout,
             cgroup: None,
             started_at: Instant::now(),
+            session_id: "test-session".to_owned(),
         }
     }
 }

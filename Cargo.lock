@@ -679,11 +679,13 @@ name = "splash-workflow"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "getrandom",
  "serde",
  "serde_json",
  "splash-capabilities",
  "splash-core",
  "splash-protocol",
+ "splash-sandbox",
  "splash-schema",
  "splash-storage",
 ]

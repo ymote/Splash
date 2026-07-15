@@ -115,6 +115,12 @@
   deadlines. A timeout or trusted force-stop poisons the session and is
   indeterminate, never a cancellation acknowledgement or durable recovery
   result.
+- Feature-gated Bubblewrap post-stop recovery coordinator with exact compiled
+  manifest binding, a session-bound reaping proof, fresh OS-generated session
+  key, optional preserved cgroup-v2 policy, one watchdog-bounded authenticated
+  reconciliation, and fenced authenticated host-ledger compare-and-swap. It
+  never redispatches an ambiguous effect, selects compensation, or resumes a
+  workflow.
 
 ## Next: durable external operations
 
@@ -124,8 +130,8 @@
 
 ## Next: contained local effects
 
-- Aggregate-disk quotas; authenticated in-band cancellation; and automatic
-  durable post-stop recovery policy around the Linux Bubblewrap launcher.
+- Aggregate-disk quotas and authenticated in-band cancellation around the
+  Linux Bubblewrap launcher.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

@@ -291,9 +291,15 @@ or rolled it back.
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no aggregate-disk or device quota, per-origin network proxy,
 D-Bus mediation, executable-path policy, secret broker, authenticated
-cancellation delivery, or post-exit recovery. Its optional strict allowlist is
-a target-specific syscall boundary, not a replacement for those missing
-controls. Its optional watchdog supplies only trusted wall-clock process stops
+cancellation delivery. Its optional strict allowlist is a target-specific
+syscall boundary, not a replacement for those missing controls. The optional
+`splash-workflow/bubblewrap-recovery` coordinator adds a narrow post-exit path:
+it requires a session-bound reaping proof, reloads a fenced authenticated host
+ledger, uses a differently keyed least-privilege contained session for one
+bounded reconciliation, reaps that session, and compare-and-swap persists the
+observation. It does not report cancellation, redispatch an effect, choose
+compensation, implement the worker journal, or resume a workflow. The optional
+watchdog supplies only trusted wall-clock process stops
 described above, its optional runner provides only the narrow rlimits described
 above, and its cgroup profile supplies only the CPU, memory, swap, task, and
 selected per-device I/O controls described above. The per-device I/O control is
@@ -414,6 +420,17 @@ effect's outcome, acknowledge cancellation, approve output, or resume a
 workflow. The host must restore and authenticate both its ledger and the
 worker journal, choose recovery policy, persist the verified observation, and
 issue fresh approval before it can run any later workflow work.
+
+The optional `splash-workflow/bubblewrap-recovery` integration owns the narrow
+Linux composition of those steps for reconciliation only. It accepts a proof
+that the old Bubblewrap session was reaped, generates a new session key without
+fallback, requires one exact-tool manifest, reserves a durable writer fence,
+starts and later reaps a watchdog-bounded fresh worker, and persists the bound
+observation through authenticated fenced compare-and-swap. It returns the
+authenticated result only to trusted host code and redacts it from `Debug`; the
+ledger stores only lifecycle state. A terminal result is still not approval to
+resume, and any transport, deadline, cleanup, fence, or compare-and-swap race
+discards the observation.
 
 An external tool may opt into bounded host-visible output chunks. The runtime
 accepts chunks only for a claimed operation, applies source-byte, aggregate,
