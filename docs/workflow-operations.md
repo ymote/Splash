@@ -80,6 +80,94 @@ input, and operation identity into the durable worker-deduplication key. Hosts
 with an existing durable worker key may use `record_operation`, but then they
 must ensure the key is unique across workflow plans and input revisions.
 
+## Bridge A Live External Await
+
+For a workflow step that is already suspended on an external `await`, prefer
+the two-stage bridge below instead of manually combining
+`claim_next_external_tool` and `record_derived_operation`.
+
+1. Call `prepare_next_external_operation`. It inspects the next queued
+   external invocation without claiming it, converts its exact text or JSON
+   envelope to canonical worker input, and records or verifies the plan-bound
+   durable key in the ledger.
+2. Persist the changed ledger through authenticated compare-and-swap storage.
+   This must finish before the host claims or dispatches the operation.
+3. Call `claim_prepared_external_operation` with that same ledger. It claims
+   only the prepared opaque runtime ID; a stale preparation fails rather than
+   consuming a different queued tool invocation.
+4. Use `prepare_authenticated_claimed_external_operation_dispatch` to create
+   the worker frame from the bound key and exact payload. Send the frame only
+   after the ledger persistence in step 2.
+5. When the worker responds, call
+   `apply_authenticated_operation_dispatch_result`. It authenticates the
+   frame and updates only the ledger state while returning the verified result.
+   Persist that updated ledger before resolving the Splash promise with
+   `complete_external_tool` or recording the authenticated terminal
+   `cancelled` observation with `cancel_external_tool`. A host-originated
+   cooperative stop instead uses the separate request/confirm cancellation
+   pair and must not treat process termination as acknowledgement.
+
+~~~rust
+let mut ledger = engine.operation_ledger(&plan)?;
+let prepared = engine
+    .prepare_next_external_operation(
+        &plan,
+        &mut ledger,
+        b"workflow-run-42:publish:operation-0",
+    )?
+    .expect("queued external operation");
+
+persist_ledger_compare_and_swap(ledger.to_json()?)?; // before claim or dispatch
+
+let claimed = engine.claim_prepared_external_operation(&plan, &ledger, prepared)?;
+let outbound = engine.prepare_authenticated_claimed_external_operation_dispatch(
+    &plan,
+    &ledger,
+    &claimed,
+    "publish-dispatch-1",
+    &mut host_authenticator,
+)?;
+send_to_worker(outbound.frame)?;
+
+let (state, result) = engine.apply_authenticated_operation_dispatch_result(
+    &plan,
+    &mut ledger,
+    &outbound.request,
+    &mut host_authenticator,
+    worker_frame,
+)?;
+persist_ledger_compare_and_swap(ledger.to_json()?)?; // before promise completion
+
+match result.status {
+    OperationStatus::Succeeded {
+        payload: ToolPayload::Text(output),
+    } => engine.complete_external_tool(claimed.invocation().id, Ok(output))?,
+    OperationStatus::Succeeded {
+        payload: ToolPayload::Json(output),
+    } => engine.complete_external_tool(
+        claimed.invocation().id,
+        Ok(serde_json::to_string(&output)?),
+    )?,
+    OperationStatus::Failed { message } => engine.complete_external_tool(
+        claimed.invocation().id,
+        Err(ToolError::Failed(message)),
+    )?,
+    OperationStatus::Cancelled => engine.cancel_external_tool(claimed.invocation().id)?,
+    OperationStatus::Running => {}
+}
+~~~
+
+The nonce is host-owned and durable. Use a persisted workflow-run identifier
+and a host-defined operation ordinal; do not derive it from Splash source,
+the runtime-local `call_index`, or the external runtime's idempotency key.
+Those values can change when a process or resumed suffix is recreated.
+
+The bridge does not serialize a VM continuation, `ExternalToolId`, payload,
+approval, or worker session. After a process restart, rebuild the trusted plan
+and capability policy, restore and validate the ledger, reconcile the durable
+operation, then choose an explicit policy for a new workflow execution. A
+terminal ledger state alone is not permission to skip or resume a Splash step.
+
 ## Reconcile After Restart
 
 After a restart, rebuild the trusted plan and active capability policy, load
@@ -134,6 +222,46 @@ terminal payload against the current tool contract, decide whether the effect
 is sufficient to advance the plan, and issue fresh workflow approval before it
 runs a suffix. The ledger intentionally retains no worker output with which to
 make that decision automatically.
+
+### Fresh-session pipe transport
+
+For a contained worker using the optional `json-line-worker` feature,
+`OneShotAuthenticatedOperationWorkerTransport` can carry one verified durable
+operation exchange over a freshly opened host-owned channel. It is intended for
+the recovery sequence after the old worker has been discarded: restore the
+ledger and worker journal, create a fresh contained worker session, then ask
+that worker to reconcile the existing key. It must not be used to replay an
+ambiguous dispatch.
+
+The one-shot transport seals and opens frames itself. Build the plain request
+with `operation_reconcile_request`, not
+`prepare_authenticated_operation_reconciliation`, and apply the returned
+verified result before persisting the new ledger revision:
+
+~~~rust
+let request = engine.operation_reconcile_request(
+    &recreated_plan,
+    &restored_ledger,
+    &operation_key,
+    &current_input,
+    host_authenticator.session_id(),
+    "reconcile-after-stop-1",
+)?;
+let result = recovery_transport.reconcile_operation(request.clone())?;
+let observed = engine.apply_verified_operation_reconciliation(
+    &recreated_plan,
+    &mut restored_ledger,
+    &request,
+    &result,
+)?;
+persist_ledger_compare_and_swap(restored_ledger.to_json()?)?;
+~~~
+
+The transport is consumed after this one call and poisons itself on any error.
+It does not provide automatic process restart, cancellation, output approval,
+or workflow resumption. The host must choose how to handle `running`, an
+indeterminate transport failure, or a policy/input mismatch before it creates a
+fresh runtime or invokes compensation.
 
 ## Explicit Compensation
 

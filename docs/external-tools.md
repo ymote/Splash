@@ -17,8 +17,10 @@ must create a promise with tool.start or tool.start_json and await it.
    idempotency key, terminal-output byte limit, optional stream policy, and
    any remaining deadline in milliseconds.
 3. The host dispatches that invocation to its own worker or platform adapter.
-4. The host calls complete_external_tool with the result, or
-   cancel_external_tool when it decides the work must stop.
+4. The host calls complete_external_tool with a terminal result. To stop work
+   cooperatively, it calls request_external_tool_cancellation, passes the
+   returned identity to the owning adapter, and calls
+   confirm_external_tool_cancellation only after that adapter acknowledges it.
 
 Pump never invokes claimed or unclaimed external tools. A successful external
 completion uses the same output byte limit, JSON envelope validation, optional
@@ -63,6 +65,14 @@ workers, prefer the authenticated reconciliation bridge below instead of
 manually trusting a returned request ID. When present,
 remaining_deadline_millis should also be applied by the worker adapter.
 
+When an external invocation belongs to a suspended `splash-workflow` step and
+must be durable, do not call `claim_next_external_tool` first and add a ledger
+record later. Use `WorkflowEngine::prepare_next_external_operation`, persist
+the ledger, then call `claim_prepared_external_operation`. That flow converts
+the invocation to the exact canonical `ToolPayload`, records its plan-bound
+operation key before dispatch, and refuses to replace a stale prepared ID with
+another queued invocation. See [durable operation ledgers](workflow-operations.md#bridge-a-live-external-await).
+
 ## Host-owned retries
 
 `ToolPolicy::max_attempts` bounds external dispatch attempts for one deferred
@@ -91,13 +101,15 @@ deadline returns `DeadlineElapsed`; the event loop should resolve it through
 `expire_timed_out_tools`.
 
 `idempotency_key` is safe to pass to an authenticated worker as a downstream
-deduplication key. It is stable for all attempts of one operation and unique
-within this runtime process, but it is not an authorization credential and is
-not durable across host restarts. Retain the opaque `ExternalToolId` locally.
-Durable workflows should use a persisted workflow or operation identity in
-addition to this per-runtime key. Do not retry a non-idempotent worker unless
-the worker deduplicates requests using that key or another durable operation
-identity. `splash-workflow` provides a plan-bound
+deduplication key. It is stable for all attempts of one operation and includes
+a runtime session nonce sourced from operating-system entropy when available,
+with a process-local time/PID fallback otherwise. This avoids reuse by normal
+new host processes. It is not an authorization credential or durable operation
+identity. Retain the opaque `ExternalToolId` locally. Durable workflows should
+use a persisted workflow or operation identity in addition to this per-runtime
+key. Do not retry a non-idempotent worker unless the worker deduplicates
+requests using that key or another durable operation identity.
+`splash-workflow` provides a plan-bound
 [durable operation ledger](workflow-operations.md) for that host-owned
 identity and restart policy. A contained worker can accept that identity in an
 authenticated [durable operation dispatch](worker-operations.md), then persist
@@ -256,14 +268,33 @@ cooperative cancellation acknowledgement.
 
 ## Cancellation and containment
 
-Cancellation is host-directed. It consumes the reserved call budget and records
-the audit outcome as cancelled; a later completion for the same ID is rejected.
-It does not kill an OS process or network request on its own. The host must
-translate cancellation into its worker transport and platform containment
-mechanism. The current single-flight JSON-line worker transport cannot deliver
-`WorkerMessage::Cancel` while an invocation is blocked; a Linux Bubblewrap host
-can force-stop it through the watchdog, then discard the session and reconcile
-any durable effect instead of claiming the effect was cancelled.
+Cooperative cancellation is a two-phase host operation. Calling
+`request_external_tool_cancellation` moves a claimed operation into a distinct
+cancellation-requested state and records `AuditOutcome::CancellationRequested`.
+The returned `ExternalToolCancellationRequest` repeats the opaque host ID, tool,
+call index, attempt, and idempotency key, but not the input. It is correlation
+metadata, not adapter authority or proof that work stopped. Repeating the
+request is idempotent.
+
+While cancellation is requested, the runtime keeps the Splash promise pending
+and rejects retries, pre-dispatch validation, and further stream chunks. A
+terminal success or failure can still win the race and resolve normally. Only
+after the owning adapter acknowledges cancellation should the host call
+`confirm_external_tool_cancellation`; confirmation without a prior request is
+rejected. Confirmation records the terminal `cancelled` audit outcome and a
+later result for the same ID is rejected.
+
+`cancel_external_tool` remains a direct trusted-host terminal assertion for
+compatibility and for an already-authenticated terminal worker observation. It
+does not send or stage a cancellation request. Do not use it merely because the
+host wants work to stop.
+
+None of these runtime calls kill an OS process or network request. The host must
+translate the request into its adapter's own cooperative contract. The current
+single-flight JSON-line worker transport cannot deliver `WorkerMessage::Cancel`
+while an invocation is blocked. A Linux Bubblewrap host can force-stop it
+through the watchdog, but must then discard the session and reconcile any
+durable effect instead of confirming cancellation.
 
 External dispatch is a capability boundary, not an OS sandbox. A production
 adapter still needs an authenticated transport and a separately contained

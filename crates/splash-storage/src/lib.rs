@@ -19,6 +19,13 @@ use zeroize::Zeroize;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+/// Read-only platform credential-store loading for host-provisioned keys.
+///
+/// This feature supports macOS, iOS, and Windows credential stores. It does
+/// not provide a rollback anchor or write keys into a platform store.
+#[cfg(feature = "keyring")]
+pub mod platform_keyring;
+
 /// Byte length of a BLAKE3 storage authentication key.
 pub const STORAGE_KEY_BYTES: usize = blake3::KEY_LEN;
 /// Maximum byte length of a persisted key identifier.

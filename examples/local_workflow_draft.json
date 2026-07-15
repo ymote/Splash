@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "steps": [
+    {
+      "id": "prepare",
+      "source": "use mod.tool\nlet notes = tool.start(\"text.echo\", \"draft release notes\").await()\nnotes"
+    },
+    {
+      "id": "calculate",
+      "source": "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet result = raw.parse_json()\nassert(result.total == 42)"
+    }
+  ]
+}

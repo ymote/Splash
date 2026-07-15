@@ -7,11 +7,13 @@
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, BufRead, Write};
 
-use splash_protocol::MAX_WIRE_FRAME_BYTES;
+pub use splash_protocol::MAX_WIRE_FRAME_BYTES;
 
 use crate::{
-    AuthenticatedWorkerMessage, ProtocolError, SessionAuthenticator, SessionRole, WorkerInvocation,
-    WorkerMessage, WorkerResult, WorkerTransport,
+    AuthenticatedWorkerMessage, CapabilityManifest, OperationCompensationRequest,
+    OperationCompensationResult, OperationDispatchRequest, OperationReconcileRequest,
+    OperationReconcileResult, ProtocolError, SessionAuthenticator, SessionAuthorizer, SessionRole,
+    WorkerInvocation, WorkerMessage, WorkerResult, WorkerTransport,
 };
 
 /// Trusted byte channel for one ordered sequence of authenticated worker
@@ -302,6 +304,293 @@ impl<E> std::error::Error for AuthenticatedFrameWorkerTransportError<E> where
 {
 }
 
+/// One authenticated durable-operation exchange over a host-owned worker
+/// frame channel.
+///
+/// A durable operation may be ambiguous when a contained worker stops. This
+/// type deliberately performs only one dispatch, reconciliation, or
+/// compensation exchange, then becomes consumed. Recovery must therefore use
+/// a newly authenticated worker session loaded from the durable worker journal
+/// instead of reusing an interrupted transport or replaying an effect.
+///
+/// Construct it only after the host has sent the matching `open_session` frame
+/// and the worker has opened its session. The supplied manifest is used for
+/// host-side capability, output, request-identity, and compensation validation
+/// before a verified result is returned to the caller.
+pub struct OneShotAuthenticatedOperationWorkerTransport<C> {
+    host_authenticator: SessionAuthenticator,
+    authorizer: SessionAuthorizer,
+    channel: C,
+    state: OneShotOperationTransportState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OneShotOperationTransportState {
+    Ready,
+    Completed,
+    Poisoned,
+}
+
+impl<C> OneShotAuthenticatedOperationWorkerTransport<C> {
+    /// Creates a one-shot durable-operation transport for one already-opened
+    /// host-worker session.
+    pub fn new(
+        manifest: CapabilityManifest,
+        host_authenticator: SessionAuthenticator,
+        channel: C,
+    ) -> Result<Self, OneShotAuthenticatedOperationWorkerTransportInitError> {
+        if host_authenticator.role() != SessionRole::Host {
+            return Err(
+                OneShotAuthenticatedOperationWorkerTransportInitError::RequiresHostAuthenticator,
+            );
+        }
+        if host_authenticator.session_id() != manifest.session_id {
+            return Err(
+                OneShotAuthenticatedOperationWorkerTransportInitError::SessionMismatch {
+                    host: host_authenticator.session_id().to_owned(),
+                    manifest: manifest.session_id,
+                },
+            );
+        }
+        let authorizer = SessionAuthorizer::new(manifest)
+            .map_err(OneShotAuthenticatedOperationWorkerTransportInitError::Protocol)?;
+        Ok(Self {
+            host_authenticator,
+            authorizer,
+            channel,
+            state: OneShotOperationTransportState::Ready,
+        })
+    }
+
+    /// Returns whether a failed exchange made this transport unsafe to reuse.
+    pub const fn is_poisoned(&self) -> bool {
+        matches!(self.state, OneShotOperationTransportState::Poisoned)
+    }
+
+    /// Returns whether this transport has already completed or failed its one
+    /// permitted exchange.
+    pub const fn is_consumed(&self) -> bool {
+        !matches!(self.state, OneShotOperationTransportState::Ready)
+    }
+
+    /// Marks this transport unusable without sending another frame.
+    pub fn discard(&mut self) {
+        self.state = OneShotOperationTransportState::Poisoned;
+    }
+}
+
+impl<C> OneShotAuthenticatedOperationWorkerTransport<C>
+where
+    C: WorkerFrameChannel,
+{
+    /// Dispatches one host-approved durable operation and verifies the matching
+    /// worker observation.
+    pub fn dispatch_operation(
+        &mut self,
+        request: OperationDispatchRequest,
+    ) -> Result<OperationReconcileResult, OneShotAuthenticatedOperationWorkerTransportError<C::Error>>
+    {
+        self.ensure_ready()?;
+        let result = (|| {
+            let authorized = self
+                .authorizer
+                .authorize_operation(request)
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            let request = self
+                .host_authenticator
+                .seal(WorkerMessage::DispatchOperation {
+                    request: authorized.request().clone(),
+                })
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            let WorkerMessage::OperationResult { result } = self.exchange(request)? else {
+                return Err(OneShotAuthenticatedOperationWorkerTransportError::UnexpectedResponse);
+            };
+            self.authorizer
+                .validate_operation_result(&authorized, &result)
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            Ok(result)
+        })();
+        self.finish(result)
+    }
+
+    /// Reconciles one existing durable operation and verifies the matching
+    /// worker observation.
+    pub fn reconcile_operation(
+        &mut self,
+        request: OperationReconcileRequest,
+    ) -> Result<OperationReconcileResult, OneShotAuthenticatedOperationWorkerTransportError<C::Error>>
+    {
+        self.ensure_ready()?;
+        let result = (|| {
+            let authorized = self
+                .authorizer
+                .authorize_reconciliation(request)
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            let request = self
+                .host_authenticator
+                .seal(WorkerMessage::ReconcileOperation {
+                    request: authorized.request().clone(),
+                })
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            let WorkerMessage::ReconciledOperation { result } = self.exchange(request)? else {
+                return Err(OneShotAuthenticatedOperationWorkerTransportError::UnexpectedResponse);
+            };
+            self.authorizer
+                .validate_reconciliation_result(&authorized, &result)
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            Ok(result)
+        })();
+        self.finish(result)
+    }
+
+    /// Dispatches one explicitly approved durable compensation and verifies the
+    /// matching worker observation.
+    pub fn compensate_operation(
+        &mut self,
+        request: OperationCompensationRequest,
+    ) -> Result<
+        OperationCompensationResult,
+        OneShotAuthenticatedOperationWorkerTransportError<C::Error>,
+    > {
+        self.ensure_ready()?;
+        let result = (|| {
+            let authorized = self
+                .authorizer
+                .authorize_compensation(request)
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            let request = self
+                .host_authenticator
+                .seal(WorkerMessage::CompensateOperation {
+                    request: authorized.request().clone(),
+                })
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            let WorkerMessage::CompensationResult { result } = self.exchange(request)? else {
+                return Err(OneShotAuthenticatedOperationWorkerTransportError::UnexpectedResponse);
+            };
+            self.authorizer
+                .validate_compensation_result(&authorized, &result)
+                .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)?;
+            Ok(result)
+        })();
+        self.finish(result)
+    }
+
+    fn ensure_ready(
+        &self,
+    ) -> Result<(), OneShotAuthenticatedOperationWorkerTransportError<C::Error>> {
+        match self.state {
+            OneShotOperationTransportState::Ready => Ok(()),
+            OneShotOperationTransportState::Completed => {
+                Err(OneShotAuthenticatedOperationWorkerTransportError::Consumed)
+            }
+            OneShotOperationTransportState::Poisoned => {
+                Err(OneShotAuthenticatedOperationWorkerTransportError::Poisoned)
+            }
+        }
+    }
+
+    fn exchange(
+        &mut self,
+        request: AuthenticatedWorkerMessage,
+    ) -> Result<WorkerMessage, OneShotAuthenticatedOperationWorkerTransportError<C::Error>> {
+        self.channel
+            .send_frame(request)
+            .map_err(OneShotAuthenticatedOperationWorkerTransportError::Channel)?;
+        let response = self
+            .channel
+            .receive_frame()
+            .map_err(OneShotAuthenticatedOperationWorkerTransportError::Channel)?;
+        self.host_authenticator
+            .open(response)
+            .map_err(OneShotAuthenticatedOperationWorkerTransportError::Protocol)
+    }
+
+    fn finish<T>(
+        &mut self,
+        result: Result<T, OneShotAuthenticatedOperationWorkerTransportError<C::Error>>,
+    ) -> Result<T, OneShotAuthenticatedOperationWorkerTransportError<C::Error>> {
+        self.state = if result.is_ok() {
+            OneShotOperationTransportState::Completed
+        } else {
+            OneShotOperationTransportState::Poisoned
+        };
+        result
+    }
+}
+
+/// Rejection while constructing a one-shot durable-operation transport.
+#[derive(Debug)]
+pub enum OneShotAuthenticatedOperationWorkerTransportInitError {
+    RequiresHostAuthenticator,
+    SessionMismatch { host: String, manifest: String },
+    Protocol(ProtocolError),
+}
+
+impl Display for OneShotAuthenticatedOperationWorkerTransportInitError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequiresHostAuthenticator => formatter.write_str(
+                "one-shot authenticated operation transport requires a host-role authenticator",
+            ),
+            Self::SessionMismatch { host, manifest } => write!(
+                formatter,
+                "one-shot authenticated operation transport session mismatch: host {host}, manifest {manifest}"
+            ),
+            Self::Protocol(error) => write!(
+                formatter,
+                "one-shot authenticated operation transport manifest is invalid: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OneShotAuthenticatedOperationWorkerTransportInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::RequiresHostAuthenticator | Self::SessionMismatch { .. } => None,
+        }
+    }
+}
+
+/// Failure during one authenticated durable-operation exchange.
+#[derive(Debug)]
+pub enum OneShotAuthenticatedOperationWorkerTransportError<E> {
+    Protocol(ProtocolError),
+    Channel(E),
+    UnexpectedResponse,
+    Consumed,
+    Poisoned,
+}
+
+impl<E: Display> Display for OneShotAuthenticatedOperationWorkerTransportError<E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => write!(
+                formatter,
+                "authenticated durable-operation protocol failure: {error}"
+            ),
+            Self::Channel(_) => {
+                formatter.write_str("authenticated durable-operation frame channel failed")
+            }
+            Self::UnexpectedResponse => {
+                formatter.write_str("worker returned an unexpected durable-operation response")
+            }
+            Self::Consumed => {
+                formatter.write_str("one-shot authenticated operation transport is consumed")
+            }
+            Self::Poisoned => {
+                formatter.write_str("one-shot authenticated operation transport is poisoned")
+            }
+        }
+    }
+}
+
+impl<E> std::error::Error for OneShotAuthenticatedOperationWorkerTransportError<E> where
+    E: std::error::Error + 'static
+{
+}
+
 fn read_json_line<R: BufRead>(reader: &mut R) -> Result<String, JsonLineWorkerChannelError> {
     let mut line = Vec::new();
     loop {
@@ -351,9 +640,14 @@ fn read_json_line<R: BufRead>(reader: &mut R) -> Result<String, JsonLineWorkerCh
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::Cursor;
+    use std::rc::Rc;
 
-    use splash_protocol::{CapabilityGrant, CapabilityManifest, SessionKey, ToolPayload};
+    use splash_protocol::{
+        CapabilityGrant, CapabilityManifest, OperationCompensationBinding, OperationStatus,
+        SessionKey, ToolPayload,
+    };
 
     use super::*;
 
@@ -369,6 +663,104 @@ mod tests {
             ToolPayload::Json(serde_json::json!({"left": 20, "right": 22})),
         )
         .unwrap()
+    }
+
+    fn durable_manifest() -> CapabilityManifest {
+        let mut grant = CapabilityGrant::json("release.publish");
+        grant.max_calls = 2;
+        grant.max_compensations = 1;
+        CapabilityManifest::new("worker-1", vec![grant]).unwrap()
+    }
+
+    fn opened_operation_session(
+        manifest: &CapabilityManifest,
+        key: SessionKey,
+    ) -> (
+        SessionAuthenticator,
+        SessionAuthenticator,
+        SessionAuthenticator,
+    ) {
+        let mut host =
+            SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap();
+        let mut expected_host =
+            SessionAuthenticator::new("worker-1", key.clone(), SessionRole::Host).unwrap();
+        let mut worker = SessionAuthenticator::new("worker-1", key, SessionRole::Worker).unwrap();
+        let opening_message = WorkerMessage::OpenSession {
+            manifest: manifest.clone(),
+        };
+        let opening = host.seal(opening_message.clone()).unwrap();
+        let expected_opening = expected_host.seal(opening_message.clone()).unwrap();
+        assert_eq!(opening, expected_opening);
+        assert_eq!(worker.open(expected_opening).unwrap(), opening_message);
+        (host, expected_host, worker)
+    }
+
+    struct OneResponseWorkerChannel {
+        response: Option<AuthenticatedWorkerMessage>,
+        sent: Rc<RefCell<Vec<AuthenticatedWorkerMessage>>>,
+    }
+
+    impl OneResponseWorkerChannel {
+        fn new(
+            response: AuthenticatedWorkerMessage,
+        ) -> (Self, Rc<RefCell<Vec<AuthenticatedWorkerMessage>>>) {
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    response: Some(response),
+                    sent: sent.clone(),
+                },
+                sent,
+            )
+        }
+    }
+
+    impl WorkerFrameChannel for OneResponseWorkerChannel {
+        type Error = String;
+
+        fn send_frame(&mut self, frame: AuthenticatedWorkerMessage) -> Result<(), Self::Error> {
+            self.sent.borrow_mut().push(frame);
+            Ok(())
+        }
+
+        fn receive_frame(&mut self) -> Result<AuthenticatedWorkerMessage, Self::Error> {
+            self.response
+                .take()
+                .ok_or_else(|| "worker sent no response".to_owned())
+        }
+    }
+
+    #[test]
+    fn one_shot_durable_transport_requires_a_matching_host_session() {
+        let manifest = durable_manifest();
+        let worker_authenticator = SessionAuthenticator::new(
+            "worker-1",
+            SessionKey::from_bytes([13; splash_protocol::AUTH_TAG_BYTES]).unwrap(),
+            SessionRole::Worker,
+        )
+        .unwrap();
+        assert!(matches!(
+            OneShotAuthenticatedOperationWorkerTransport::new(
+                manifest.clone(),
+                worker_authenticator,
+                (),
+            ),
+            Err(OneShotAuthenticatedOperationWorkerTransportInitError::RequiresHostAuthenticator)
+        ));
+
+        let host_authenticator = SessionAuthenticator::new(
+            "other-worker",
+            SessionKey::from_bytes([14; splash_protocol::AUTH_TAG_BYTES]).unwrap(),
+            SessionRole::Host,
+        )
+        .unwrap();
+        assert!(matches!(
+            OneShotAuthenticatedOperationWorkerTransport::new(manifest, host_authenticator, ()),
+            Err(OneShotAuthenticatedOperationWorkerTransportInitError::SessionMismatch {
+                host,
+                manifest,
+            }) if host == "other-worker" && manifest == "worker-1"
+        ));
     }
 
     #[test]
@@ -508,6 +900,250 @@ mod tests {
             AuthenticatedWorkerMessage::from_json_line(written.trim_end()).unwrap(),
             expected_request
         );
+    }
+
+    #[test]
+    fn dispatches_one_authenticated_durable_operation() {
+        let manifest = durable_manifest();
+        let key = SessionKey::from_bytes([8; splash_protocol::AUTH_TAG_BYTES]).unwrap();
+        let (host, mut expected_host, mut worker) = opened_operation_session(&manifest, key);
+        let request = OperationDispatchRequest::new(
+            "worker-1",
+            "dispatch-1",
+            "release.publish",
+            "operation-1",
+            ToolPayload::Json(serde_json::json!({"version": "1.2.3"})),
+        )
+        .unwrap();
+        let expected_request = expected_host
+            .seal(WorkerMessage::DispatchOperation {
+                request: request.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            worker.open(expected_request.clone()).unwrap(),
+            WorkerMessage::DispatchOperation {
+                request: request.clone(),
+            }
+        );
+        let result = OperationReconcileResult::new(
+            "worker-1",
+            "dispatch-1",
+            "release.publish",
+            "operation-1",
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(serde_json::json!({"published": true})),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::OperationResult {
+                result: result.clone(),
+            })
+            .unwrap();
+        let (channel, sent) = OneResponseWorkerChannel::new(response);
+        let mut transport =
+            OneShotAuthenticatedOperationWorkerTransport::new(manifest, host, channel).unwrap();
+
+        assert_eq!(
+            transport.dispatch_operation(request.clone()).unwrap(),
+            result
+        );
+        assert!(transport.is_consumed());
+        assert!(!transport.is_poisoned());
+        assert!(matches!(
+            transport.dispatch_operation(request),
+            Err(OneShotAuthenticatedOperationWorkerTransportError::Consumed)
+        ));
+        assert_eq!(sent.borrow().as_slice(), &[expected_request]);
+    }
+
+    #[test]
+    fn reconciles_one_authenticated_durable_operation() {
+        let manifest = durable_manifest();
+        let key = SessionKey::from_bytes([9; splash_protocol::AUTH_TAG_BYTES]).unwrap();
+        let (host, mut expected_host, mut worker) = opened_operation_session(&manifest, key);
+        let request = OperationReconcileRequest::new(
+            "worker-1",
+            "reconcile-1",
+            "release.publish",
+            "operation-1",
+        )
+        .unwrap();
+        let expected_request = expected_host
+            .seal(WorkerMessage::ReconcileOperation {
+                request: request.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            worker.open(expected_request.clone()).unwrap(),
+            WorkerMessage::ReconcileOperation {
+                request: request.clone(),
+            }
+        );
+        let result = OperationReconcileResult::new(
+            "worker-1",
+            "reconcile-1",
+            "release.publish",
+            "operation-1",
+            OperationStatus::Running,
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation {
+                result: result.clone(),
+            })
+            .unwrap();
+        let (channel, sent) = OneResponseWorkerChannel::new(response);
+        let mut transport =
+            OneShotAuthenticatedOperationWorkerTransport::new(manifest, host, channel).unwrap();
+
+        assert_eq!(transport.reconcile_operation(request).unwrap(), result);
+        assert!(transport.is_consumed());
+        assert!(!transport.is_poisoned());
+        assert_eq!(sent.borrow().as_slice(), &[expected_request]);
+    }
+
+    #[test]
+    fn dispatches_one_authenticated_compensation() {
+        let manifest = durable_manifest();
+        let grant = manifest.grants.first().unwrap();
+        let binding = OperationCompensationBinding::new(
+            "release.publish",
+            "operation-1",
+            "cmp-operation-1",
+            "tenant-release",
+            grant.compensation_fingerprint().unwrap(),
+        )
+        .unwrap();
+        let key = SessionKey::from_bytes([10; splash_protocol::AUTH_TAG_BYTES]).unwrap();
+        let (host, mut expected_host, mut worker) = opened_operation_session(&manifest, key);
+        let request = OperationCompensationRequest::new(
+            "worker-1",
+            "compensate-1",
+            binding.clone(),
+            ToolPayload::Json(serde_json::json!({"version": "1.2.3"})),
+        )
+        .unwrap();
+        let expected_request = expected_host
+            .seal(WorkerMessage::CompensateOperation {
+                request: request.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            worker.open(expected_request.clone()).unwrap(),
+            WorkerMessage::CompensateOperation {
+                request: request.clone(),
+            }
+        );
+        let result = OperationCompensationResult::new(
+            "worker-1",
+            "compensate-1",
+            binding,
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(serde_json::json!({"unpublished": true})),
+            },
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::CompensationResult {
+                result: result.clone(),
+            })
+            .unwrap();
+        let (channel, sent) = OneResponseWorkerChannel::new(response);
+        let mut transport =
+            OneShotAuthenticatedOperationWorkerTransport::new(manifest, host, channel).unwrap();
+
+        assert_eq!(transport.compensate_operation(request).unwrap(), result);
+        assert!(transport.is_consumed());
+        assert!(!transport.is_poisoned());
+        assert_eq!(sent.borrow().as_slice(), &[expected_request]);
+    }
+
+    #[test]
+    fn poisons_a_durable_operation_transport_after_an_authenticated_wrong_response() {
+        let manifest = durable_manifest();
+        let key = SessionKey::from_bytes([11; splash_protocol::AUTH_TAG_BYTES]).unwrap();
+        let (host, _expected_host, mut worker) = opened_operation_session(&manifest, key);
+        let response = worker
+            .seal(WorkerMessage::CloseSession {
+                protocol_version: splash_protocol::PROTOCOL_VERSION,
+                session_id: "worker-1".to_owned(),
+            })
+            .unwrap();
+        let (channel, _sent) = OneResponseWorkerChannel::new(response);
+        let mut transport =
+            OneShotAuthenticatedOperationWorkerTransport::new(manifest, host, channel).unwrap();
+        let request = OperationDispatchRequest::new(
+            "worker-1",
+            "dispatch-1",
+            "release.publish",
+            "operation-1",
+            ToolPayload::Json(serde_json::json!({"version": "1.2.3"})),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            transport.dispatch_operation(request),
+            Err(OneShotAuthenticatedOperationWorkerTransportError::UnexpectedResponse)
+        ));
+        assert!(transport.is_poisoned());
+        assert!(matches!(
+            transport.reconcile_operation(
+                OperationReconcileRequest::new(
+                    "worker-1",
+                    "reconcile-1",
+                    "release.publish",
+                    "operation-1",
+                )
+                .unwrap(),
+            ),
+            Err(OneShotAuthenticatedOperationWorkerTransportError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn poisons_a_durable_operation_transport_after_a_mismatched_result() {
+        let manifest = durable_manifest();
+        let key = SessionKey::from_bytes([12; splash_protocol::AUTH_TAG_BYTES]).unwrap();
+        let (host, mut expected_host, mut worker) = opened_operation_session(&manifest, key);
+        let request = OperationDispatchRequest::new(
+            "worker-1",
+            "dispatch-1",
+            "release.publish",
+            "operation-1",
+            ToolPayload::Json(serde_json::json!({"version": "1.2.3"})),
+        )
+        .unwrap();
+        let expected_request = expected_host
+            .seal(WorkerMessage::DispatchOperation {
+                request: request.clone(),
+            })
+            .unwrap();
+        worker.open(expected_request).unwrap();
+        let response = worker
+            .seal(WorkerMessage::OperationResult {
+                result: OperationReconcileResult::new(
+                    "worker-1",
+                    "different-request",
+                    "release.publish",
+                    "operation-1",
+                    OperationStatus::Running,
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        let (channel, _sent) = OneResponseWorkerChannel::new(response);
+        let mut transport =
+            OneShotAuthenticatedOperationWorkerTransport::new(manifest, host, channel).unwrap();
+
+        assert!(matches!(
+            transport.dispatch_operation(request),
+            Err(OneShotAuthenticatedOperationWorkerTransportError::Protocol(
+                ProtocolError::OperationResultMismatch
+            ))
+        ));
+        assert!(transport.is_poisoned());
     }
 
     #[test]

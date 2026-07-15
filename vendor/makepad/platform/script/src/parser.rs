@@ -799,15 +799,7 @@ impl ScriptParser {
             self.diagnostics_truncated = true;
         }
         if self.emit_errors {
-            log_with_level(
-                &self.file,
-                line,
-                column,
-                line,
-                column,
-                msg,
-                LogLevel::Error,
-            );
+            log_with_level(&self.file, line, column, line, column, msg, LogLevel::Error);
         }
     }
 

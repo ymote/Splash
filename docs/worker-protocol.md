@@ -325,14 +325,18 @@ sandbox. See [worker adapter runtime](worker-runtime.md#authenticated-in-process
 For a separately started worker, the optional
 `splash-capabilities/json-line-worker` feature provides
 `JsonLineWorkerChannel` over host-supplied buffered input/output handles and
-`AuthenticatedFrameWorkerTransport` over that channel. The host first sends
-the one-way authenticated `open_session` frame, then moves the same advanced
-host authenticator and channel into the call transport. It writes exactly one
+`AuthenticatedFrameWorkerTransport` for ordinary calls and
+`OneShotAuthenticatedOperationWorkerTransport` for one durable dispatch,
+reconciliation, or compensation exchange. The host first sends the one-way
+authenticated `open_session` frame, then moves the same advanced host
+authenticator and channel into the selected transport. It writes exactly one
 JSON frame plus `\n` per outbound message and reads exactly one bounded frame
 per response. The channel rejects a line longer than 1 MiB before decoding and
-poisons itself on any I/O, decoding, or framing failure; the authenticated
-transport also poisons itself on an invalid or unexpected response. Discard a
-poisoned channel/session rather than retrying on the same stream.
+poisons itself on any I/O, decoding, or framing failure; both authenticated
+transports poison themselves on an invalid or unexpected response. The durable
+transport is consumed after one exchange, so a host recovering a stopped worker
+must start a fresh session from the durable journal rather than replaying an
+effect on an interrupted stream.
 
 The JSON-line adapter is not a process launcher, sandbox, timeout mechanism,
 key-exchange protocol, or worker attestation scheme. A host using the Linux

@@ -6,11 +6,13 @@
 //! access by naming a tool: the host must register it with an explicit policy.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
+use std::num::NonZeroUsize;
+use std::ops::Index;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use makepad_script::{
     id, id_lut, script_args_def, script_err_not_allowed, script_err_unexpected, script_value,
@@ -59,8 +61,8 @@ pub mod in_process_worker;
 
 /// Bounded JSON-line worker transport for host-provided pipe or socket I/O.
 ///
-/// This optional module authenticates ordinary worker frames but does not
-/// create or contain a process.
+/// This optional module authenticates ordinary worker frames and one-shot
+/// durable-operation exchanges, but does not create or contain a process.
 #[cfg(feature = "json-line-worker")]
 pub mod json_line_worker;
 
@@ -69,6 +71,23 @@ pub mod json_line_worker;
 /// Hosts that need a lower bound for a constrained device can choose one with
 /// [`CapabilityRuntime::with_limits_and_pending`].
 pub const DEFAULT_MAX_PENDING_TOOLS: usize = 64;
+/// Default maximum number of host-visible capabilities in one runtime catalog.
+pub const DEFAULT_MAX_REGISTERED_TOOLS: usize = 128;
+/// Default maximum byte length of the serialized host-visible tool catalog.
+pub const DEFAULT_MAX_TOOL_CATALOG_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 byte length of a registered capability name.
+pub const MAX_TOOL_NAME_BYTES: usize = 128;
+/// Default number of recent capability audit events retained in memory.
+///
+/// Hosts that require complete audit retention must export events to their own
+/// authenticated storage or sink. This in-process view intentionally bounds
+/// memory instead of acting as a durable audit log.
+pub const DEFAULT_MAX_AUDIT_EVENTS: usize = 1_024;
+/// Absolute maximum capacity accepted for the in-memory capability audit view.
+///
+/// Use a smaller host-selected value on constrained targets and export entries
+/// to durable storage when retention beyond this in-process window is needed.
+pub const MAX_AUDIT_EVENTS: usize = 8_192;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 32 * 1024;
 pub const DEFAULT_MAX_STREAM_CHUNKS: usize = 64;
@@ -76,7 +95,41 @@ pub const DEFAULT_MAX_STREAM_CHUNK_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_STREAM_TOTAL_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_STREAM_EMITTED_BYTES: usize = 64 * 1024;
 
+const CAPABILITY_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"splash-capability-catalog-v1";
+const CAPABILITY_SESSION_NONCE_DOMAIN: &[u8] = b"splash-capability-session-nonce-v1";
+const CAPABILITY_AUDIT_LABEL_DOMAIN: &[u8] = b"splash-capability-audit-label-v1";
+const UNRECOGNIZED_AUDIT_TOOL_PREFIX: &str = "unrecognized:";
+
 static NEXT_CAPABILITY_SESSION: AtomicU64 = AtomicU64::new(1);
+
+fn capability_session_nonce(session_id: u64) -> String {
+    let mut entropy = [0_u8; 32];
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CAPABILITY_SESSION_NONCE_DOMAIN);
+    hasher.update(&session_id.to_be_bytes());
+    if getrandom::fill(&mut entropy).is_ok() {
+        hasher.update(&entropy);
+    } else {
+        // Keep distinct live runtimes separate when a constrained target has
+        // no OS entropy source. Durable hosts should still use their own
+        // workflow operation key across a process restart.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        hasher.update(&timestamp.to_be_bytes());
+        hasher.update(&std::process::id().to_be_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TOOL_NAME_BYTES
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
 
 /// Serialization contract for a capability's input and output envelopes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -243,12 +296,54 @@ impl ToolMetadata {
     }
 }
 
+/// Aggregate bounds for the host-visible capability catalog.
+///
+/// These limits complement the per-tool metadata and schema bounds. They keep
+/// a dynamic registration path from growing an LLM prompt or embedded host
+/// allocation without a deliberate host configuration change. They do not
+/// grant any capability and are not visible to Splash source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityCatalogLimits {
+    pub max_tools: usize,
+    pub max_serialized_bytes: usize,
+}
+
+impl CapabilityCatalogLimits {
+    fn validate(self) -> Result<Self, RuntimeError> {
+        if self.max_tools == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_catalog_tools must be greater than zero",
+            ));
+        }
+        if self.max_serialized_bytes == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_catalog_serialized_bytes must be greater than zero",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for CapabilityCatalogLimits {
+    fn default() -> Self {
+        Self {
+            max_tools: DEFAULT_MAX_REGISTERED_TOOLS,
+            max_serialized_bytes: DEFAULT_MAX_TOOL_CATALOG_BYTES,
+        }
+    }
+}
+
 /// Stable, serializable description of a currently granted capability.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ToolDescriptor {
     pub name: String,
     pub format: ToolDataFormat,
     pub dispatch: ToolDispatch,
+    /// Whether the published JSON schemas are executed at the tool boundary.
+    ///
+    /// `false` means any schemas are prompt metadata only. Text tools always
+    /// report `false` because they have no JSON envelope contract.
+    pub contract_enforced: bool,
     pub max_calls: usize,
     pub max_attempts: u32,
     pub max_input_bytes: usize,
@@ -259,6 +354,26 @@ pub struct ToolDescriptor {
     pub stream: Option<ToolStreamPolicy>,
     #[serde(flatten)]
     pub metadata: ToolMetadata,
+}
+
+/// Stable BLAKE3 identity of the complete host-visible capability catalog.
+///
+/// This is process-local policy identity, not a credential. It includes every
+/// published descriptor field, including executable-contract status, and is
+/// used to invalidate an approval when a runtime catalog changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityCatalogFingerprint(String);
+
+impl CapabilityCatalogFingerprint {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for CapabilityCatalogFingerprint {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// Executable input/output schemas for a JSON capability.
@@ -338,13 +453,7 @@ impl ToolPolicy {
     }
 
     fn validate(&self) -> Result<(), ToolRegistrationError> {
-        if self.name.is_empty()
-            || !self.name.bytes().all(|byte| {
-                byte.is_ascii_lowercase()
-                    || byte.is_ascii_digit()
-                    || matches!(byte, b'.' | b'_' | b'-')
-            })
-        {
+        if !is_valid_tool_name(&self.name) {
             return Err(ToolRegistrationError::InvalidName(self.name.clone()));
         }
         if self.max_calls == 0 {
@@ -382,6 +491,222 @@ pub struct JsonToolRequest {
     pub name: String,
     pub input: JsonValue,
     pub call_index: usize,
+}
+
+/// One named capability and the call budget granted to a process-local lease.
+///
+/// The runtime validates this request against the current registered tool
+/// policy when it creates the lease. A lease may only narrow a registered
+/// capability; it can never add a name or widen its call budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityLeaseGrant {
+    pub name: String,
+    pub max_calls: usize,
+}
+
+impl CapabilityLeaseGrant {
+    pub fn new(name: impl Into<String>, max_calls: usize) -> Self {
+        Self {
+            name: name.into(),
+            max_calls,
+        }
+    }
+}
+
+/// Trusted host hook evaluated immediately before a lease permits one tool
+/// invocation.
+///
+/// The hook can only deny a call that the immutable lease has already
+/// authorized. It is synchronous by design: hosts that need asynchronous user
+/// confirmation should use a deferred external tool and claim it through their
+/// own lifecycle rather than blocking the VM inside this callback.
+pub trait ToolCallAuthorizer {
+    fn authorize(
+        &mut self,
+        request: &ToolRequest,
+        descriptor: &ToolDescriptor,
+    ) -> Result<(), ToolError>;
+}
+
+impl<F> ToolCallAuthorizer for F
+where
+    F: FnMut(&ToolRequest, &ToolDescriptor) -> Result<(), ToolError>,
+{
+    fn authorize(
+        &mut self,
+        request: &ToolRequest,
+        descriptor: &ToolDescriptor,
+    ) -> Result<(), ToolError> {
+        self(request, descriptor)
+    }
+}
+
+/// Rejection while issuing, activating, or using a capability lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapabilityLeaseError {
+    UnknownTool(String),
+    DuplicateTool(String),
+    ZeroCallLimit(String),
+    CallLimitExceedsPolicy {
+        tool: String,
+        requested: usize,
+        maximum: usize,
+    },
+    RuntimeMismatch,
+    CatalogChanged,
+    LeaseAlreadyActive,
+    CatalogEncoding,
+}
+
+impl Display for CapabilityLeaseError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTool(tool) => write!(formatter, "unknown capability lease tool: {tool}"),
+            Self::DuplicateTool(tool) => {
+                write!(formatter, "duplicate capability lease tool: {tool}")
+            }
+            Self::ZeroCallLimit(tool) => {
+                write!(
+                    formatter,
+                    "capability lease call limit must be greater than zero: {tool}"
+                )
+            }
+            Self::CallLimitExceedsPolicy {
+                tool,
+                requested,
+                maximum,
+            } => write!(
+                formatter,
+                "capability lease for {tool} requests {requested} calls but policy allows {maximum}"
+            ),
+            Self::RuntimeMismatch => {
+                formatter.write_str("capability lease belongs to a different runtime")
+            }
+            Self::CatalogChanged => {
+                formatter.write_str("capability catalog changed after the lease was issued")
+            }
+            Self::LeaseAlreadyActive => formatter.write_str("a capability lease is already active"),
+            Self::CatalogEncoding => formatter.write_str("capability catalog could not be encoded"),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityLeaseError {}
+
+/// Execution failure returned when a lease cannot be activated or Splash
+/// evaluation itself fails.
+#[derive(Debug)]
+pub enum CapabilityLeaseEvaluationError {
+    Lease(CapabilityLeaseError),
+    Runtime(RuntimeError),
+}
+
+impl Display for CapabilityLeaseEvaluationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lease(error) => write!(formatter, "capability lease error: {error}"),
+            Self::Runtime(error) => write!(formatter, "Splash evaluation error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityLeaseEvaluationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Lease(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+        }
+    }
+}
+
+struct CapabilityLeaseState {
+    runtime_id: u64,
+    catalog_fingerprint: CapabilityCatalogFingerprint,
+    grants: BTreeMap<String, usize>,
+    calls: BTreeMap<String, usize>,
+    authorizer: Option<Box<dyn ToolCallAuthorizer>>,
+}
+
+impl CapabilityLeaseState {
+    fn validate_for(
+        &self,
+        runtime_id: u64,
+        catalog_fingerprint: &CapabilityCatalogFingerprint,
+    ) -> Result<(), CapabilityLeaseError> {
+        if self.runtime_id != runtime_id {
+            return Err(CapabilityLeaseError::RuntimeMismatch);
+        }
+        if self.catalog_fingerprint != *catalog_fingerprint {
+            return Err(CapabilityLeaseError::CatalogChanged);
+        }
+        Ok(())
+    }
+
+    fn authorize(
+        &mut self,
+        request: &ToolRequest,
+        descriptor: &ToolDescriptor,
+    ) -> Result<(), ToolError> {
+        let Some(maximum) = self.grants.get(&request.name).copied() else {
+            return Err(ToolError::Denied(format!(
+                "{} is not granted by the active capability lease",
+                request.name
+            )));
+        };
+        let calls = self.calls.get(&request.name).copied().unwrap_or_default();
+        if calls >= maximum {
+            return Err(ToolError::Denied(format!(
+                "{} exhausted its capability lease call budget of {maximum}",
+                request.name
+            )));
+        }
+        if let Some(authorizer) = self.authorizer.as_mut() {
+            authorizer.authorize(request, descriptor)?;
+        }
+        self.calls
+            .insert(request.name.clone(), calls.saturating_add(1));
+        Ok(())
+    }
+}
+
+/// A process-local, immutable capability policy with stateful call accounting.
+///
+/// A lease is issued by one `CapabilityRuntime`, bound to that runtime's exact
+/// catalog fingerprint, and normally moved into a workflow approval. The
+/// runtime holds its state across `await`/resume so a continuation cannot
+/// escape its approved tool set or reset its lease-local call budget.
+pub struct CapabilityLease {
+    state: Rc<RefCell<CapabilityLeaseState>>,
+}
+
+impl fmt::Debug for CapabilityLease {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        let state = self.state.borrow();
+        formatter
+            .debug_struct("CapabilityLease")
+            .field("catalog_fingerprint", &state.catalog_fingerprint)
+            .field("grants", &state.grants)
+            .field("calls", &state.calls)
+            .field("has_authorizer", &state.authorizer.is_some())
+            .finish()
+    }
+}
+
+impl CapabilityLease {
+    /// Returns the catalog fingerprint that this lease was issued against.
+    pub fn catalog_fingerprint(&self) -> CapabilityCatalogFingerprint {
+        self.state.borrow().catalog_fingerprint.clone()
+    }
+
+    /// Returns the attenuated call grants in stable name order.
+    pub fn grants(&self) -> Vec<CapabilityLeaseGrant> {
+        self.state
+            .borrow()
+            .grants
+            .iter()
+            .map(|(name, max_calls)| CapabilityLeaseGrant::new(name.clone(), *max_calls))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -426,6 +751,54 @@ pub struct ExternalToolInvocation {
     pub remaining_deadline_millis: Option<u64>,
 }
 
+impl ExternalToolInvocation {
+    /// Converts this host-visible invocation into the exact worker payload.
+    ///
+    /// JSON input is parsed back into its validated object-or-array envelope
+    /// rather than forwarded as an ad hoc display string. This lets a host
+    /// bind a durable worker operation to the same canonical bytes used by
+    /// [`canonical_operation_input_bytes`].
+    pub fn worker_payload(&self) -> Result<WorkerPayload, ExternalToolError> {
+        match self.format {
+            ToolDataFormat::Text => Ok(WorkerPayload::Text(self.input.clone())),
+            ToolDataFormat::Json => {
+                let payload = serde_json::from_str(&self.input)
+                    .map_err(|_| ExternalToolError::InvalidPayload(self.id))?;
+                let payload = WorkerPayload::Json(payload);
+                payload
+                    .validate_for(EnvelopeFormat::Json)
+                    .map_err(|_| ExternalToolError::InvalidPayload(self.id))?;
+                Ok(payload)
+            }
+        }
+    }
+
+    /// Returns the stable durable-operation input bytes for this invocation.
+    ///
+    /// The result is suitable for a host-owned operation ledger. It is not an
+    /// authorization credential and must not be logged when input may contain
+    /// sensitive application data.
+    pub fn canonical_input_bytes(&self) -> Result<Vec<u8>, ExternalToolError> {
+        canonical_operation_input_bytes(&self.worker_payload()?)
+            .map_err(ExternalToolError::Protocol)
+    }
+}
+
+/// Host-only request to cooperatively cancel one claimed external operation.
+///
+/// This value identifies the already-dispatched work without repeating its
+/// input. It is neither authority nor proof of cancellation. The host must
+/// pass it to the adapter that owns the operation and wait for that adapter's
+/// acknowledgement before confirming cancellation in the runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalToolCancellationRequest {
+    pub id: ExternalToolId,
+    pub name: String,
+    pub call_index: usize,
+    pub attempt: u32,
+    pub idempotency_key: String,
+}
+
 /// A redacted text chunk emitted by a claimed external tool operation.
 ///
 /// It is returned only to the trusted host that owns the runtime. Splash code
@@ -468,13 +841,17 @@ pub enum ExternalToolError {
     Unknown(ExternalToolId),
     NotExternal(ExternalToolId),
     NotClaimed(ExternalToolId),
+    AlreadyClaimed(ExternalToolId),
     AlreadyCompleted(ExternalToolId),
+    InvalidPayload(ExternalToolId),
     RetryLimitReached(ExternalToolId),
     DeadlineElapsed(ExternalToolId),
     StreamingDisabled(ExternalToolId),
     StreamLimitExceeded(ExternalToolId),
     ToolUnavailable(ExternalToolId),
     ReconciliationMismatch(ExternalToolId),
+    CancellationRequested(ExternalToolId),
+    CancellationNotRequested(ExternalToolId),
     ReconciliationRequiresHostAuthenticator,
     UnexpectedReconciliationMessage,
     Protocol(ProtocolError),
@@ -491,8 +868,14 @@ impl Display for ExternalToolError {
             Self::NotClaimed(_) => {
                 formatter.write_str("external tool operation has not been claimed")
             }
+            Self::AlreadyClaimed(_) => {
+                formatter.write_str("external tool operation is already claimed")
+            }
             Self::AlreadyCompleted(_) => {
                 formatter.write_str("external tool operation is already complete")
+            }
+            Self::InvalidPayload(_) => {
+                formatter.write_str("external tool operation has an invalid worker payload")
             }
             Self::RetryLimitReached(_) => {
                 formatter.write_str("external tool operation exhausted its retry limit")
@@ -511,6 +894,12 @@ impl Display for ExternalToolError {
             }
             Self::ReconciliationMismatch(_) => {
                 formatter.write_str("worker reconciliation does not match the claimed operation")
+            }
+            Self::CancellationRequested(_) => {
+                formatter.write_str("external tool cancellation has already been requested")
+            }
+            Self::CancellationNotRequested(_) => {
+                formatter.write_str("external tool cancellation has not been requested")
             }
             Self::ReconciliationRequiresHostAuthenticator => {
                 formatter.write_str("external reconciliation requires a host session authenticator")
@@ -723,7 +1112,10 @@ pub enum ToolRegistrationError {
     InvalidName(String),
     InvalidPolicy(&'static str),
     InvalidMetadata(&'static str),
+    CatalogToolLimitExceeded { maximum: usize },
+    CatalogByteLimitExceeded { actual: usize, maximum: usize },
     IncompatibleWorkerGrant(String),
+    ActiveCapabilityLease,
 }
 
 impl Display for ToolRegistrationError {
@@ -733,9 +1125,21 @@ impl Display for ToolRegistrationError {
             Self::InvalidName(name) => write!(formatter, "invalid tool name: {name}"),
             Self::InvalidPolicy(message) => formatter.write_str(message),
             Self::InvalidMetadata(message) => formatter.write_str(message),
+            Self::CatalogToolLimitExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "tool catalog exceeds its maximum of {maximum} tools"
+                )
+            }
+            Self::CatalogByteLimitExceeded { actual, maximum } => write!(
+                formatter,
+                "tool catalog is {actual} bytes but its maximum is {maximum} bytes"
+            ),
             Self::IncompatibleWorkerGrant(name) => {
                 write!(formatter, "worker manifest cannot safely back tool: {name}")
             }
+            Self::ActiveCapabilityLease => formatter
+                .write_str("cannot change the tool catalog while a capability lease is active"),
         }
     }
 }
@@ -750,6 +1154,7 @@ pub enum AuditOutcome {
     Failed,
     Cancelled,
     TimedOut,
+    CancellationRequested,
     RetryScheduled,
     Streamed,
     StreamDenied,
@@ -758,12 +1163,72 @@ pub enum AuditOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AuditEvent {
     pub sequence: u64,
+    /// Registered tool name, or a fixed-length digest label for an oversized
+    /// or invalid unrecognized request name.
     pub tool: String,
     pub input_bytes: usize,
     pub output_bytes: usize,
     pub outcome: AuditOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_class: Option<RetryClass>,
+}
+
+/// Ordered, read-only view of the recent in-memory capability audit events.
+///
+/// The view is backed by a bounded ring buffer. Entries are ordered from
+/// oldest to newest, but can wrap internally; use [`Self::as_slices`] when a
+/// host needs zero-copy access to both contiguous portions. This is not a
+/// durable audit record and does not itself grant or prove authority.
+#[derive(Clone, Copy, Debug)]
+pub struct AuditLog<'a> {
+    entries: &'a VecDeque<AuditEvent>,
+}
+
+impl<'a> AuditLog<'a> {
+    pub fn len(self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn get(self, index: usize) -> Option<&'a AuditEvent> {
+        self.entries.get(index)
+    }
+
+    pub fn first(self) -> Option<&'a AuditEvent> {
+        self.entries.front()
+    }
+
+    pub fn last(self) -> Option<&'a AuditEvent> {
+        self.entries.back()
+    }
+
+    pub fn iter(self) -> std::collections::vec_deque::Iter<'a, AuditEvent> {
+        self.entries.iter()
+    }
+
+    pub fn as_slices(self) -> (&'a [AuditEvent], &'a [AuditEvent]) {
+        self.entries.as_slices()
+    }
+}
+
+impl<'a> IntoIterator for AuditLog<'a> {
+    type Item = &'a AuditEvent;
+    type IntoIter = std::collections::vec_deque::Iter<'a, AuditEvent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl Index<usize> for AuditLog<'_> {
+    type Output = AuditEvent;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.entries[index]
+    }
 }
 
 pub type ToolHandler = Box<dyn FnMut(&ToolRequest) -> Result<String, ToolError> + 'static>;
@@ -779,11 +1244,30 @@ struct RegisteredTool {
     policy: ToolPolicy,
     metadata: ToolMetadata,
     dispatch: ToolDispatch,
+    contract_enforced: bool,
     calls: usize,
     input_validator: Option<ToolValidator>,
     output_validator: Option<ToolValidator>,
     stream_redactor: Option<StreamRedactor>,
     implementation: ToolImplementation,
+}
+
+impl RegisteredTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: self.policy.name.clone(),
+            format: self.policy.data_format,
+            dispatch: self.dispatch,
+            contract_enforced: self.contract_enforced,
+            max_calls: self.policy.max_calls,
+            max_attempts: self.policy.max_attempts,
+            max_input_bytes: self.policy.max_input_bytes,
+            max_output_bytes: self.policy.max_output_bytes,
+            max_deferred_millis: self.policy.max_deferred_duration.map(duration_millis),
+            stream: self.policy.stream.clone(),
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -843,6 +1327,7 @@ enum PendingDispatch {
     HostPump,
     ExternalQueued,
     ExternalClaimed,
+    ExternalCancellationRequested,
 }
 
 #[derive(Clone, Debug)]
@@ -897,7 +1382,8 @@ impl ScriptHandleGc for ToolPromiseGc {
         if matches!(
             &entry.state,
             PendingToolState::Pending {
-                dispatch: PendingDispatch::ExternalClaimed,
+                dispatch: PendingDispatch::ExternalClaimed
+                    | PendingDispatch::ExternalCancellationRequested,
                 ..
             }
         ) {
@@ -914,8 +1400,13 @@ impl ScriptHandleGc for ToolPromiseGc {
 
 pub struct CapabilityHost {
     session_id: u64,
+    session_nonce: String,
+    catalog_limits: CapabilityCatalogLimits,
     tools: BTreeMap<String, RegisteredTool>,
-    audit: Vec<AuditEvent>,
+    active_lease: Option<Rc<RefCell<CapabilityLeaseState>>>,
+    audit: VecDeque<AuditEvent>,
+    max_audit_events: NonZeroUsize,
+    dropped_audit_events: u64,
     next_sequence: u64,
     next_pending_id: u64,
     pending: PendingTools,
@@ -923,18 +1414,75 @@ pub struct CapabilityHost {
 
 impl Default for CapabilityHost {
     fn default() -> Self {
-        Self {
-            session_id: NEXT_CAPABILITY_SESSION.fetch_add(1, Ordering::Relaxed),
-            tools: BTreeMap::new(),
-            audit: Vec::new(),
-            next_sequence: 0,
-            next_pending_id: 0,
-            pending: Rc::new(RefCell::new(BTreeMap::new())),
-        }
+        Self::with_catalog_limits(CapabilityCatalogLimits::default())
+            .expect("default catalog limits are valid")
     }
 }
 
 impl CapabilityHost {
+    /// Creates a host with explicit aggregate bounds for its capability
+    /// catalog. Individual tool registration still validates each policy,
+    /// description, and schema independently.
+    pub fn with_catalog_limits(
+        catalog_limits: CapabilityCatalogLimits,
+    ) -> Result<Self, RuntimeError> {
+        let catalog_limits = catalog_limits.validate()?;
+        let session_id = NEXT_CAPABILITY_SESSION.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            session_id,
+            session_nonce: capability_session_nonce(session_id),
+            catalog_limits,
+            tools: BTreeMap::new(),
+            active_lease: None,
+            audit: VecDeque::new(),
+            max_audit_events: NonZeroUsize::new(DEFAULT_MAX_AUDIT_EVENTS)
+                .expect("default audit limit is nonzero"),
+            dropped_audit_events: 0,
+            next_sequence: 0,
+            next_pending_id: 0,
+            pending: Rc::new(RefCell::new(BTreeMap::new())),
+        })
+    }
+
+    /// Returns the immutable aggregate catalog limits selected at host setup.
+    pub const fn catalog_limits(&self) -> CapabilityCatalogLimits {
+        self.catalog_limits
+    }
+
+    /// Returns the current capacity of the bounded in-memory audit view.
+    pub const fn max_audit_events(&self) -> usize {
+        self.max_audit_events.get()
+    }
+
+    /// Returns how many oldest audit events were evicted since the last clear.
+    ///
+    /// This count saturates at `u64::MAX`. A nonzero result means this
+    /// in-process view is incomplete and must not be treated as a durable
+    /// audit record.
+    pub const fn dropped_audit_events(&self) -> u64 {
+        self.dropped_audit_events
+    }
+
+    /// Changes the capacity of the bounded in-memory audit view.
+    ///
+    /// Shrinking the capacity immediately evicts oldest entries and increments
+    /// [`Self::dropped_audit_events`]. This affects observability only; it
+    /// does not alter tool policy, leases, or pending operations. Values above
+    /// [`MAX_AUDIT_EVENTS`] are rejected.
+    pub fn set_max_audit_events(
+        &mut self,
+        max_audit_events: NonZeroUsize,
+    ) -> Result<(), RuntimeError> {
+        if max_audit_events.get() > MAX_AUDIT_EVENTS {
+            return Err(RuntimeError::InvalidLimits(
+                "max_audit_events exceeds the hard limit",
+            ));
+        }
+        self.max_audit_events = max_audit_events;
+        self.trim_audit_to_capacity();
+        Ok(())
+    }
+
     pub fn register<F>(
         &mut self,
         policy: ToolPolicy,
@@ -1025,6 +1573,9 @@ impl CapabilityHost {
         dispatch: ToolDispatch,
         implementation: ToolImplementation,
     ) -> Result<(), ToolRegistrationError> {
+        if self.active_lease.is_some() {
+            return Err(ToolRegistrationError::ActiveCapabilityLease);
+        }
         if dispatch != ToolDispatch::External && policy.stream.is_some() {
             return Err(ToolRegistrationError::InvalidPolicy(
                 "stream policy requires an external tool",
@@ -1035,19 +1586,21 @@ impl CapabilityHost {
         if self.tools.contains_key(&policy.name) {
             return Err(ToolRegistrationError::Duplicate(policy.name));
         }
-        self.tools.insert(
-            policy.name.clone(),
-            RegisteredTool {
-                policy,
-                metadata,
-                dispatch,
-                calls: 0,
-                input_validator,
-                output_validator,
-                stream_redactor: None,
-                implementation,
-            },
-        );
+        let contract_enforced = input_validator.is_some() && output_validator.is_some();
+        let name = policy.name.clone();
+        let registered = RegisteredTool {
+            policy,
+            metadata,
+            dispatch,
+            contract_enforced,
+            calls: 0,
+            input_validator,
+            output_validator,
+            stream_redactor: None,
+            implementation,
+        };
+        self.ensure_catalog_capacity(&registered)?;
+        self.tools.insert(name, registered);
         Ok(())
     }
 
@@ -1259,29 +1812,76 @@ impl CapabilityHost {
         )
     }
 
-    pub fn audit(&self) -> &[AuditEvent] {
-        &self.audit
+    pub fn audit(&self) -> AuditLog<'_> {
+        AuditLog {
+            entries: &self.audit,
+        }
     }
 
     pub fn clear_audit(&mut self) {
         self.audit.clear();
+        self.dropped_audit_events = 0;
+    }
+
+    fn record_audit(&mut self, event: AuditEvent) {
+        if self.audit.len() == self.max_audit_events.get() {
+            self.audit.pop_front();
+            self.dropped_audit_events = self.dropped_audit_events.saturating_add(1);
+        }
+        self.audit.push_back(event);
+    }
+
+    fn audit_tool_label(&self, name: &str) -> String {
+        if is_valid_tool_name(name) {
+            return name.to_owned();
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CAPABILITY_AUDIT_LABEL_DOMAIN);
+        hasher.update(self.session_nonce.as_bytes());
+        hasher.update(&(name.len() as u64).to_be_bytes());
+        hasher.update(name.as_bytes());
+        format!(
+            "{UNRECOGNIZED_AUDIT_TOOL_PREFIX}{}",
+            hasher.finalize().to_hex()
+        )
+    }
+
+    fn trim_audit_to_capacity(&mut self) {
+        while self.audit.len() > self.max_audit_events.get() {
+            self.audit.pop_front();
+            self.dropped_audit_events = self.dropped_audit_events.saturating_add(1);
+        }
+    }
+
+    fn ensure_catalog_capacity(
+        &self,
+        candidate: &RegisteredTool,
+    ) -> Result<(), ToolRegistrationError> {
+        if self.tools.len() >= self.catalog_limits.max_tools {
+            return Err(ToolRegistrationError::CatalogToolLimitExceeded {
+                maximum: self.catalog_limits.max_tools,
+            });
+        }
+
+        let mut descriptors = self.tool_catalog();
+        descriptors.push(candidate.descriptor());
+        let actual = serde_json::to_vec(&descriptors)
+            .map_err(|_| ToolRegistrationError::InvalidMetadata("tool catalog is invalid"))?
+            .len();
+        if actual > self.catalog_limits.max_serialized_bytes {
+            return Err(ToolRegistrationError::CatalogByteLimitExceeded {
+                actual,
+                maximum: self.catalog_limits.max_serialized_bytes,
+            });
+        }
+        Ok(())
     }
 
     pub fn tool_catalog(&self) -> Vec<ToolDescriptor> {
         self.tools
             .values()
-            .map(|registered| ToolDescriptor {
-                name: registered.policy.name.clone(),
-                format: registered.policy.data_format,
-                dispatch: registered.dispatch,
-                max_calls: registered.policy.max_calls,
-                max_attempts: registered.policy.max_attempts,
-                max_input_bytes: registered.policy.max_input_bytes,
-                max_output_bytes: registered.policy.max_output_bytes,
-                max_deferred_millis: registered.policy.max_deferred_duration.map(duration_millis),
-                stream: registered.policy.stream.clone(),
-                metadata: registered.metadata.clone(),
-            })
+            .map(RegisteredTool::descriptor)
             .collect()
     }
 
@@ -1289,6 +1889,103 @@ impl CapabilityHost {
         serde_json::to_string(&self.tool_catalog()).map_err(|error| {
             ToolError::Failed(format!("tool catalog serialization failed: {error}"))
         })
+    }
+
+    fn catalog_fingerprint(&self) -> Result<CapabilityCatalogFingerprint, CapabilityLeaseError> {
+        let catalog = serde_json::to_vec(&self.tool_catalog())
+            .map_err(|_| CapabilityLeaseError::CatalogEncoding)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CAPABILITY_CATALOG_FINGERPRINT_DOMAIN);
+        hasher.update(&(catalog.len() as u64).to_be_bytes());
+        hasher.update(&catalog);
+        Ok(CapabilityCatalogFingerprint(
+            hasher.finalize().to_hex().to_string(),
+        ))
+    }
+
+    fn issue_capability_lease<I>(
+        &self,
+        grants: I,
+        authorizer: Option<Box<dyn ToolCallAuthorizer>>,
+    ) -> Result<CapabilityLease, CapabilityLeaseError>
+    where
+        I: IntoIterator<Item = CapabilityLeaseGrant>,
+    {
+        if self.active_lease.is_some() {
+            return Err(CapabilityLeaseError::LeaseAlreadyActive);
+        }
+
+        let mut granted_calls = BTreeMap::new();
+        for grant in grants {
+            if grant.max_calls == 0 {
+                return Err(CapabilityLeaseError::ZeroCallLimit(grant.name));
+            }
+            let Some(registered) = self.tools.get(&grant.name) else {
+                return Err(CapabilityLeaseError::UnknownTool(grant.name));
+            };
+            if grant.max_calls > registered.policy.max_calls {
+                return Err(CapabilityLeaseError::CallLimitExceedsPolicy {
+                    tool: grant.name,
+                    requested: grant.max_calls,
+                    maximum: registered.policy.max_calls,
+                });
+            }
+            if granted_calls
+                .insert(grant.name.clone(), grant.max_calls)
+                .is_some()
+            {
+                return Err(CapabilityLeaseError::DuplicateTool(grant.name));
+            }
+        }
+
+        Ok(CapabilityLease {
+            state: Rc::new(RefCell::new(CapabilityLeaseState {
+                runtime_id: self.session_id,
+                catalog_fingerprint: self.catalog_fingerprint()?,
+                grants: granted_calls,
+                calls: BTreeMap::new(),
+                authorizer,
+            })),
+        })
+    }
+
+    fn issue_full_capability_lease(&self) -> Result<CapabilityLease, CapabilityLeaseError> {
+        self.issue_capability_lease(
+            self.tools.values().map(|registered| {
+                CapabilityLeaseGrant::new(
+                    registered.policy.name.clone(),
+                    registered.policy.max_calls,
+                )
+            }),
+            None,
+        )
+    }
+
+    fn validate_capability_lease(
+        &self,
+        lease: &CapabilityLease,
+    ) -> Result<(), CapabilityLeaseError> {
+        let fingerprint = self.catalog_fingerprint()?;
+        lease
+            .state
+            .borrow()
+            .validate_for(self.session_id, &fingerprint)
+    }
+
+    fn activate_capability_lease(
+        &mut self,
+        lease: &CapabilityLease,
+    ) -> Result<(), CapabilityLeaseError> {
+        if self.active_lease.is_some() {
+            return Err(CapabilityLeaseError::LeaseAlreadyActive);
+        }
+        self.validate_capability_lease(lease)?;
+        self.active_lease = Some(Rc::clone(&lease.state));
+        Ok(())
+    }
+
+    fn clear_active_capability_lease(&mut self) {
+        self.active_lease = None;
     }
 
     fn call(&mut self, name: &str, input: &str) -> Result<String, ToolError> {
@@ -1316,6 +2013,7 @@ impl CapabilityHost {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let input_bytes = input.len();
+        let active_lease = self.active_lease.clone();
 
         let result = match self.tools.get_mut(name) {
             None => Err(ToolError::Denied(format!("no capability grants {name}"))),
@@ -1349,6 +2047,7 @@ impl CapabilityHost {
                             input_bytes,
                             invocation_kind,
                             registered,
+                            active_lease.as_ref(),
                         )
                     })
                 }
@@ -1368,6 +2067,7 @@ impl CapabilityHost {
         input_bytes: usize,
         invocation_kind: ToolInvocationKind,
         registered: &mut RegisteredTool,
+        active_lease: Option<&Rc<RefCell<CapabilityLeaseState>>>,
     ) -> Result<ToolTicket, ToolError> {
         if let Some(validator) = registered.input_validator.as_ref() {
             validator(input)?;
@@ -1379,7 +2079,18 @@ impl CapabilityHost {
             )));
         }
 
-        registered.calls = registered.calls.saturating_add(1);
+        let call_index = registered.calls.saturating_add(1);
+        if let Some(lease) = active_lease {
+            let request = ToolRequest {
+                name: name.to_owned(),
+                input: input.to_owned(),
+                call_index,
+            };
+            let descriptor = registered.descriptor();
+            lease.borrow_mut().authorize(&request, &descriptor)?;
+        }
+
+        registered.calls = call_index;
         let deadline = if invocation_kind == ToolInvocationKind::Deferred {
             registered
                 .policy
@@ -1396,7 +2107,7 @@ impl CapabilityHost {
             name: name.to_owned(),
             input: input.to_owned(),
             input_bytes,
-            call_index: registered.calls,
+            call_index,
             max_output_bytes: registered.policy.max_output_bytes,
             max_attempts: registered.policy.max_attempts,
             stream: registered.policy.stream.clone(),
@@ -1476,9 +2187,9 @@ impl CapabilityHost {
             Err(ToolError::Cancelled(_)) => (0, AuditOutcome::Cancelled),
             Err(ToolError::TimedOut(_)) => (0, AuditOutcome::TimedOut),
         };
-        self.audit.push(AuditEvent {
+        self.record_audit(AuditEvent {
             sequence: ticket.sequence,
-            tool: ticket.name.clone(),
+            tool: self.audit_tool_label(&ticket.name),
             input_bytes: ticket.input_bytes,
             output_bytes,
             outcome,
@@ -1493,9 +2204,9 @@ impl CapabilityHost {
             ToolError::Cancelled(_) => AuditOutcome::Cancelled,
             ToolError::TimedOut(_) => AuditOutcome::TimedOut,
         };
-        self.audit.push(AuditEvent {
+        self.record_audit(AuditEvent {
             sequence,
-            tool: name.to_owned(),
+            tool: self.audit_tool_label(name),
             input_bytes,
             output_bytes: 0,
             outcome,
@@ -1504,13 +2215,24 @@ impl CapabilityHost {
     }
 
     fn record_retry(&mut self, ticket: &ToolTicket, retry_class: RetryClass) {
-        self.audit.push(AuditEvent {
+        self.record_audit(AuditEvent {
             sequence: ticket.sequence,
-            tool: ticket.name.clone(),
+            tool: self.audit_tool_label(&ticket.name),
             input_bytes: ticket.input_bytes,
             output_bytes: 0,
             outcome: AuditOutcome::RetryScheduled,
             retry_class: Some(retry_class),
+        });
+    }
+
+    fn record_cancellation_requested(&mut self, ticket: &ToolTicket) {
+        self.record_audit(AuditEvent {
+            sequence: ticket.sequence,
+            tool: self.audit_tool_label(&ticket.name),
+            input_bytes: ticket.input_bytes,
+            output_bytes: 0,
+            outcome: AuditOutcome::CancellationRequested,
+            retry_class: None,
         });
     }
 
@@ -1521,9 +2243,9 @@ impl CapabilityHost {
         emitted_bytes: usize,
         outcome: AuditOutcome,
     ) {
-        self.audit.push(AuditEvent {
+        self.record_audit(AuditEvent {
             sequence: ticket.sequence,
-            tool: ticket.name.clone(),
+            tool: self.audit_tool_label(&ticket.name),
             input_bytes: source_bytes,
             output_bytes: emitted_bytes,
             outcome,
@@ -1572,7 +2294,7 @@ impl CapabilityHost {
     }
 
     fn idempotency_key(&self, ticket: &ToolTicket) -> String {
-        format!("splash-{}-{}", self.session_id, ticket.sequence)
+        format!("splash-{}-{}", self.session_nonce, ticket.sequence)
     }
 
     fn allocate_pending_id(
@@ -1652,10 +2374,20 @@ impl CapabilityHost {
         }
     }
 
+    fn external_cancellation_request(entry: &PendingTool) -> ExternalToolCancellationRequest {
+        ExternalToolCancellationRequest {
+            id: entry.id,
+            name: entry.ticket.name.clone(),
+            call_index: entry.ticket.call_index,
+            attempt: entry.attempt,
+            idempotency_key: entry.idempotency_key.clone(),
+        }
+    }
+
     fn claimed_external_ticket(
         &self,
         id: ExternalToolId,
-    ) -> Result<(ToolTicket, String), ExternalToolError> {
+    ) -> Result<(ToolTicket, String, bool), ExternalToolError> {
         let pending = self.pending.borrow();
         let Some(entry) = pending.values().find(|entry| entry.id == id) else {
             return Err(ExternalToolError::Unknown(id));
@@ -1664,7 +2396,11 @@ impl CapabilityHost {
             PendingToolState::Pending {
                 dispatch: PendingDispatch::ExternalClaimed,
                 ..
-            } => Ok((entry.ticket.clone(), entry.idempotency_key.clone())),
+            } => Ok((entry.ticket.clone(), entry.idempotency_key.clone(), false)),
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::ExternalCancellationRequested,
+                ..
+            } => Ok((entry.ticket.clone(), entry.idempotency_key.clone(), true)),
             PendingToolState::Pending {
                 dispatch: PendingDispatch::ExternalQueued,
                 ..
@@ -1677,13 +2413,70 @@ impl CapabilityHost {
         }
     }
 
+    fn validate_claimed_external(&self, id: ExternalToolId) -> Result<(), ExternalToolError> {
+        let (ticket, _, cancellation_requested) = self.claimed_external_ticket(id)?;
+        if cancellation_requested {
+            return Err(ExternalToolError::CancellationRequested(id));
+        }
+        if ticket.expired_at(Instant::now()) {
+            return Err(ExternalToolError::DeadlineElapsed(id));
+        }
+        Ok(())
+    }
+
+    fn request_external_cancellation(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<ExternalToolCancellationRequest, ExternalToolError> {
+        let (request, ticket, newly_requested) = {
+            let mut pending = self.pending.borrow_mut();
+            let Some(entry) = pending.values_mut().find(|entry| entry.id == id) else {
+                return Err(ExternalToolError::Unknown(id));
+            };
+            let (waiting_thread, newly_requested) = match &entry.state {
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    waiting_thread,
+                } => (*waiting_thread, true),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalCancellationRequested,
+                    waiting_thread,
+                } => (*waiting_thread, false),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                } => return Err(ExternalToolError::NotClaimed(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::HostPump,
+                    ..
+                } => return Err(ExternalToolError::NotExternal(id)),
+                PendingToolState::Ready(_) => {
+                    return Err(ExternalToolError::AlreadyCompleted(id));
+                }
+            };
+            let request = Self::external_cancellation_request(entry);
+            let ticket = entry.ticket.clone();
+            if newly_requested {
+                entry.state = PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalCancellationRequested,
+                    waiting_thread,
+                };
+            }
+            (request, ticket, newly_requested)
+        };
+        if newly_requested {
+            self.record_cancellation_requested(&ticket);
+        }
+        Ok(request)
+    }
+
     fn external_reconcile_request(
         &self,
         id: ExternalToolId,
         session_id: String,
         request_id: String,
     ) -> Result<OperationReconcileRequest, ExternalToolError> {
-        let (ticket, operation_key) = self.claimed_external_ticket(id)?;
+        let (ticket, operation_key, _) = self.claimed_external_ticket(id)?;
         if ticket.expired_at(Instant::now()) {
             return Err(ExternalToolError::DeadlineElapsed(id));
         }
@@ -1700,7 +2493,7 @@ impl CapabilityHost {
         request.validate().map_err(ExternalToolError::Protocol)?;
         result.validate().map_err(ExternalToolError::Protocol)?;
 
-        let (ticket, operation_key) = self.claimed_external_ticket(id)?;
+        let (ticket, operation_key, _) = self.claimed_external_ticket(id)?;
         if request.tool != ticket.name || request.operation_key != operation_key {
             return Err(ExternalToolError::ReconciliationMismatch(id));
         }
@@ -1746,8 +2539,13 @@ impl CapabilityHost {
     }
 
     fn claim_next_external(&mut self) -> Option<ExternalToolInvocation> {
-        let mut pending = self.pending.borrow_mut();
-        let handle = pending.iter().find_map(|(handle, entry)| {
+        let id = self.peek_next_external()?.id;
+        self.claim_external(id).ok()
+    }
+
+    fn peek_next_external(&self) -> Option<ExternalToolInvocation> {
+        let pending = self.pending.borrow();
+        let entry = pending.values().find(|entry| {
             matches!(
                 &entry.state,
                 PendingToolState::Pending {
@@ -1755,22 +2553,40 @@ impl CapabilityHost {
                     ..
                 }
             )
-            .then_some(*handle)
         })?;
-        let entry = pending.get_mut(&handle)?;
+        Some(Self::external_invocation(entry, Instant::now()))
+    }
+
+    fn claim_external(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<ExternalToolInvocation, ExternalToolError> {
+        let mut pending = self.pending.borrow_mut();
+        let Some(entry) = pending.values_mut().find(|entry| entry.id == id) else {
+            return Err(ExternalToolError::Unknown(id));
+        };
         let waiting_thread = match &entry.state {
             PendingToolState::Pending {
                 dispatch: PendingDispatch::ExternalQueued,
                 waiting_thread,
             } => *waiting_thread,
-            _ => return None,
+            PendingToolState::Pending {
+                dispatch:
+                    PendingDispatch::ExternalClaimed | PendingDispatch::ExternalCancellationRequested,
+                ..
+            } => return Err(ExternalToolError::AlreadyClaimed(id)),
+            PendingToolState::Pending {
+                dispatch: PendingDispatch::HostPump,
+                ..
+            } => return Err(ExternalToolError::NotExternal(id)),
+            PendingToolState::Ready(_) => return Err(ExternalToolError::AlreadyCompleted(id)),
         };
         let invocation = Self::external_invocation(entry, Instant::now());
         entry.state = PendingToolState::Pending {
             dispatch: PendingDispatch::ExternalClaimed,
             waiting_thread,
         };
-        Some(invocation)
+        Ok(invocation)
     }
 
     fn retry_external(
@@ -1789,6 +2605,10 @@ impl CapabilityHost {
                     dispatch: PendingDispatch::ExternalClaimed,
                     ..
                 } => {}
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalCancellationRequested,
+                    ..
+                } => return Err(ExternalToolError::CancellationRequested(id)),
                 PendingToolState::Pending {
                     dispatch: PendingDispatch::ExternalQueued,
                     ..
@@ -1832,6 +2652,10 @@ impl CapabilityHost {
                     dispatch: PendingDispatch::ExternalClaimed,
                     ..
                 } => {}
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalCancellationRequested,
+                    ..
+                } => return Err(ExternalToolError::CancellationRequested(id)),
                 PendingToolState::Pending {
                     dispatch: PendingDispatch::ExternalQueued,
                     ..
@@ -1906,6 +2730,10 @@ impl CapabilityHost {
                     ..
                 } => {}
                 PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalCancellationRequested,
+                    ..
+                } => return Err(ExternalToolError::CancellationRequested(id)),
+                PendingToolState::Pending {
                     dispatch: PendingDispatch::ExternalQueued,
                     ..
                 } => return Err(ExternalToolError::NotClaimed(id)),
@@ -1958,7 +2786,9 @@ impl CapabilityHost {
             };
             match &entry.state {
                 PendingToolState::Pending {
-                    dispatch: PendingDispatch::ExternalClaimed,
+                    dispatch:
+                        PendingDispatch::ExternalClaimed
+                        | PendingDispatch::ExternalCancellationRequested,
                     waiting_thread,
                 } => (*handle, entry.ticket.clone(), *waiting_thread),
                 PendingToolState::Pending {
@@ -1993,9 +2823,43 @@ impl CapabilityHost {
         self.complete_external(
             id,
             Err(ToolError::Cancelled(
-                "cancelled by the trusted host".to_owned(),
+                "external operation was reported cancelled".to_owned(),
             )),
         )
+    }
+
+    fn confirm_external_cancellation(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<PendingCompletion, ExternalToolError> {
+        {
+            let pending = self.pending.borrow();
+            let Some(entry) = pending.values().find(|entry| entry.id == id) else {
+                return Err(ExternalToolError::Unknown(id));
+            };
+            match &entry.state {
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalCancellationRequested,
+                    ..
+                } => {}
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalClaimed,
+                    ..
+                } => return Err(ExternalToolError::CancellationNotRequested(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::ExternalQueued,
+                    ..
+                } => return Err(ExternalToolError::NotClaimed(id)),
+                PendingToolState::Pending {
+                    dispatch: PendingDispatch::HostPump,
+                    ..
+                } => return Err(ExternalToolError::NotExternal(id)),
+                PendingToolState::Ready(_) => {
+                    return Err(ExternalToolError::AlreadyCompleted(id));
+                }
+            }
+        }
+        self.cancel_external(id)
     }
 
     fn run_next_pending(&mut self) -> Option<PendingCompletion> {
@@ -2064,17 +2928,166 @@ impl CapabilityRuntime {
         limits: ExecutionLimits,
         max_pending_tools: usize,
     ) -> Result<Self, RuntimeError> {
+        Self::with_limits_pending_and_catalog(
+            limits,
+            max_pending_tools,
+            CapabilityCatalogLimits::default(),
+        )
+    }
+
+    /// Creates a runtime with explicit pending-promise and aggregate catalog
+    /// bounds. Use this when a host needs a tighter embedded profile or a
+    /// deliberate larger reviewed catalog.
+    pub fn with_limits_pending_and_catalog(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+    ) -> Result<Self, RuntimeError> {
         if max_pending_tools == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_pending_tools must be greater than zero",
             ));
         }
-        let mut runtime = Runtime::with_limits(CapabilityHost::default(), (), limits)?;
+        let host = CapabilityHost::with_catalog_limits(catalog_limits)?;
+        let mut runtime = Runtime::with_limits(host, (), limits)?;
         install_tool_module(&mut runtime, max_pending_tools);
         Ok(Self {
             runtime,
             max_pending_tools,
         })
+    }
+
+    /// Returns the immutable aggregate catalog limits selected at runtime
+    /// setup. Splash source cannot read or alter these host limits.
+    pub fn catalog_limits(&self) -> CapabilityCatalogLimits {
+        self.runtime.host().catalog_limits()
+    }
+
+    /// Returns a stable identity for the complete current capability catalog.
+    ///
+    /// The fingerprint is suitable for binding host approvals to one runtime's
+    /// exact names, limits, dispatch modes, metadata, and contract status. It
+    /// is not an authorization token.
+    pub fn capability_catalog_fingerprint(
+        &self,
+    ) -> Result<CapabilityCatalogFingerprint, CapabilityLeaseError> {
+        self.runtime.host().catalog_fingerprint()
+    }
+
+    /// Issues an attenuated, process-local capability lease for this runtime.
+    ///
+    /// Each requested name must already be registered, and its call budget may
+    /// only be equal to or smaller than the registered policy. An empty grant
+    /// list is valid for a pure workflow.
+    pub fn issue_capability_lease<I>(
+        &self,
+        grants: I,
+    ) -> Result<CapabilityLease, CapabilityLeaseError>
+    where
+        I: IntoIterator<Item = CapabilityLeaseGrant>,
+    {
+        self.runtime.host().issue_capability_lease(grants, None)
+    }
+
+    /// Issues an attenuated lease with a trusted per-invocation authorization
+    /// hook.
+    ///
+    /// The hook can only deny a call already present in `grants`; it cannot
+    /// grant an unlisted capability or widen a call budget.
+    pub fn issue_capability_lease_with_authorizer<I, A>(
+        &self,
+        grants: I,
+        authorizer: A,
+    ) -> Result<CapabilityLease, CapabilityLeaseError>
+    where
+        I: IntoIterator<Item = CapabilityLeaseGrant>,
+        A: ToolCallAuthorizer + 'static,
+    {
+        self.runtime
+            .host()
+            .issue_capability_lease(grants, Some(Box::new(authorizer)))
+    }
+
+    /// Issues a lease that covers every currently registered capability at its
+    /// current call limit. Prefer [`Self::issue_capability_lease`] for an
+    /// operator-reviewed subset.
+    pub fn issue_full_capability_lease(&self) -> Result<CapabilityLease, CapabilityLeaseError> {
+        self.runtime.host().issue_full_capability_lease()
+    }
+
+    /// Verifies that a lease belongs to this runtime and its catalog has not
+    /// changed since the lease was issued.
+    pub fn validate_capability_lease(
+        &self,
+        lease: &CapabilityLease,
+    ) -> Result<(), CapabilityLeaseError> {
+        self.runtime.host().validate_capability_lease(lease)
+    }
+
+    /// Evaluates source under an immutable capability lease.
+    ///
+    /// When `source` suspends on `await`, the lease remains active until the
+    /// resumed evaluation completes. Normal `pump`, external completion,
+    /// cancellation, and deadline APIs preserve that same lease while they
+    /// resume the single-flight VM.
+    pub fn eval_with_capability_lease(
+        &mut self,
+        source: &str,
+        lease: &CapabilityLease,
+    ) -> Result<Evaluation, CapabilityLeaseEvaluationError> {
+        self.runtime
+            .host_mut()
+            .activate_capability_lease(lease)
+            .map_err(CapabilityLeaseEvaluationError::Lease)?;
+        let evaluation = self.runtime.eval(source);
+        let clear_lease = evaluation.as_ref().map_or(true, |report| !report.suspended);
+        if clear_lease {
+            self.runtime.host_mut().clear_active_capability_lease();
+        }
+        evaluation.map_err(CapabilityLeaseEvaluationError::Runtime)
+    }
+
+    /// Injects bounded, host-owned JSON under one identifier for a later
+    /// Splash evaluation.
+    ///
+    /// This value is data only. It does not add a capability, alter the
+    /// active lease, or let source select Rust bindings. Hosts must retain
+    /// responsibility for clearing transient context once an evaluation has
+    /// completed. The underlying runtime rejects changes while an evaluation
+    /// is suspended so a resumed continuation observes its original context.
+    pub fn set_json_global(
+        &mut self,
+        name: &str,
+        value: &JsonValue,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<(), RuntimeError> {
+        self.runtime
+            .set_json_global(name, value, max_bytes, max_depth)
+    }
+
+    /// Clears a host-injected JSON global after a completed evaluation.
+    ///
+    /// The identifier remains present with a `nil` value so its prior data can
+    /// be reclaimed at the next host-selected garbage-collection point.
+    pub fn clear_json_global(&mut self, name: &str) -> Result<(), RuntimeError> {
+        self.runtime.clear_json_global(name)
+    }
+
+    /// Converts one completed Splash value into bounded JSON for trusted host
+    /// orchestration state.
+    ///
+    /// Script functions, handles, cycles, non-string object keys, non-finite
+    /// numbers, and values exceeding either bound are rejected rather than
+    /// being coerced into an ambiguous transport representation.
+    pub fn script_value_as_json(
+        &mut self,
+        value: ScriptValue,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<JsonValue, RuntimeError> {
+        self.runtime
+            .script_value_as_json(value, max_bytes, max_depth)
     }
 
     pub fn register_tool<F>(
@@ -2323,10 +3336,39 @@ impl CapabilityRuntime {
         self.runtime.eval(source)
     }
 
-    pub fn audit(&self) -> &[AuditEvent] {
+    /// Returns the bounded, ordered in-memory capability audit view.
+    ///
+    /// The view is not durable. Use [`Self::dropped_audit_events`] to detect
+    /// eviction and export events through a host-owned durable sink when full
+    /// retention is required.
+    pub fn audit(&self) -> AuditLog<'_> {
         self.runtime.host().audit()
     }
 
+    /// Returns the current in-memory audit capacity.
+    pub fn max_audit_events(&self) -> usize {
+        self.runtime.host().max_audit_events()
+    }
+
+    /// Returns the number of oldest audit events evicted since the last clear.
+    pub fn dropped_audit_events(&self) -> u64 {
+        self.runtime.host().dropped_audit_events()
+    }
+
+    /// Changes the capacity of the in-memory audit view.
+    ///
+    /// This host-only observability setting has no effect on capability policy
+    /// or on the current lease. Values above [`MAX_AUDIT_EVENTS`] are rejected.
+    pub fn set_max_audit_events(
+        &mut self,
+        max_audit_events: NonZeroUsize,
+    ) -> Result<(), RuntimeError> {
+        self.runtime
+            .host_mut()
+            .set_max_audit_events(max_audit_events)
+    }
+
+    /// Clears the retained audit view and its eviction counter.
     pub fn clear_audit(&mut self) {
         self.runtime.host_mut().clear_audit();
     }
@@ -2341,6 +3383,11 @@ impl CapabilityRuntime {
         self.runtime.host().tool_catalog_json()
     }
 
+    /// Returns the number of retained deferred-promise records.
+    ///
+    /// This includes settled records until their VM handles become
+    /// unreachable and [`Self::collect_garbage`] runs. It is therefore a
+    /// bounded retention count, not an executing-adapter count.
     pub fn pending_tools(&self) -> usize {
         self.runtime.host().pending_len()
     }
@@ -2351,12 +3398,48 @@ impl CapabilityRuntime {
         self.runtime.collect_garbage();
     }
 
+    /// Inspects the next queued external-only invocation without claiming it.
+    ///
+    /// This is useful when a host must first write a durable operation record.
+    /// The returned value grants no authority and remains queued until the host
+    /// calls a claim method. It can become stale after another mutable runtime
+    /// operation, so prefer [`Self::claim_external_tool`] when an exact ID was
+    /// prepared for durable dispatch.
+    pub fn peek_next_external_tool(&self) -> Option<ExternalToolInvocation> {
+        self.runtime.host().peek_next_external()
+    }
+
     /// Claims one external-only deferred invocation for host dispatch.
     ///
     /// Claimed work is never executed by a pump. The host must finish it with
     /// the external completion or cancellation API.
     pub fn claim_next_external_tool(&mut self) -> Option<ExternalToolInvocation> {
         self.runtime.host_mut().claim_next_external()
+    }
+
+    /// Claims one exact queued external-only invocation for host dispatch.
+    ///
+    /// A stale ID, a local promise, or an already claimed operation fails
+    /// without claiming another queued operation. This preserves the durable
+    /// binding a host established before dispatch.
+    pub fn claim_external_tool(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<ExternalToolInvocation, ExternalToolError> {
+        self.runtime.host_mut().claim_external(id)
+    }
+
+    /// Verifies that an exact external invocation remains claimed and within
+    /// its configured deadline, with no cancellation request pending, without
+    /// changing its lifecycle state.
+    ///
+    /// Hosts can use this before dispatching work after a durable persistence
+    /// boundary. It never claims, retries, completes, or cancels an operation.
+    pub fn validate_claimed_external_tool(
+        &self,
+        id: ExternalToolId,
+    ) -> Result<(), ExternalToolError> {
+        self.runtime.host().validate_claimed_external(id)
     }
 
     /// Creates the worker protocol request for one claimed external operation.
@@ -2450,11 +3533,26 @@ impl CapabilityRuntime {
         self.reconcile_external_tool(id, request, result)
     }
 
+    /// Marks a claimed operation as cancellation-requested and returns the
+    /// stable identity the host should pass to its external adapter.
+    ///
+    /// Repeating the request is idempotent. This does not resolve the Splash
+    /// promise, stop a process, or prove that the adapter stopped. While the
+    /// request is pending, the runtime rejects retries, pre-dispatch
+    /// validation, and further stream chunks. A terminal result may still win
+    /// the race and complete normally.
+    pub fn request_external_tool_cancellation(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<ExternalToolCancellationRequest, ExternalToolError> {
+        self.runtime.host_mut().request_external_cancellation(id)
+    }
+
     /// Schedules another host-owned attempt for a claimed external tool.
     ///
     /// The retry preserves the operation's idempotency key and does not create
     /// another script-visible call or consume additional call budget. Scripts
-    /// cannot invoke this API.
+    /// cannot invoke this API. A pending cancellation request blocks retries.
     pub fn retry_external_tool(
         &mut self,
         id: ExternalToolId,
@@ -2481,7 +3579,8 @@ impl CapabilityRuntime {
     /// Delivers a host-produced result for a previously claimed external tool.
     ///
     /// The same byte, JSON envelope, and optional schema checks used by local
-    /// handlers are applied before a suspended script is resumed.
+    /// handlers are applied before a suspended script is resumed. A terminal
+    /// result may complete while cooperative cancellation is still pending.
     pub fn complete_external_tool(
         &mut self,
         id: ExternalToolId,
@@ -2491,8 +3590,26 @@ impl CapabilityRuntime {
         self.resume_external_completion(completion)
     }
 
-    /// Cancels a claimed external tool and resumes its waiter with a
-    /// cancellation error when applicable.
+    /// Confirms that an adapter acknowledged a prior cancellation request.
+    ///
+    /// This is the terminal half of
+    /// [`Self::request_external_tool_cancellation`]. A process kill, transport
+    /// loss, or deadline is indeterminate and must not call this method unless
+    /// a separately trusted adapter contract proves that no effect can remain.
+    pub fn confirm_external_tool_cancellation(
+        &mut self,
+        id: ExternalToolId,
+    ) -> Result<Option<Evaluation>, ExternalToolError> {
+        let completion = self.runtime.host_mut().confirm_external_cancellation(id)?;
+        self.resume_external_completion(completion)
+    }
+
+    /// Records a trusted host's terminal assertion that a claimed external
+    /// tool is cancelled and resumes its waiter with a cancellation error.
+    ///
+    /// This compatibility API does not send or stage a cancellation request.
+    /// Prefer the request/confirm pair for cooperative adapters. Call this
+    /// directly only when the host already has trustworthy terminal evidence.
     pub fn cancel_external_tool(
         &mut self,
         id: ExternalToolId,
@@ -2522,7 +3639,8 @@ impl CapabilityRuntime {
         for completion in completions {
             report.expired = report.expired.saturating_add(1);
             if let Some(waiting_thread) = completion.waiting_thread {
-                report.resumed.push(self.runtime.resume(waiting_thread)?);
+                let resumed = self.resume_pending_evaluation(waiting_thread)?;
+                report.resumed.push(resumed);
             }
         }
         Ok(report)
@@ -2553,7 +3671,8 @@ impl CapabilityRuntime {
             };
             report.completed = report.completed.saturating_add(1);
             if let Some(waiting_thread) = completion.waiting_thread {
-                report.resumed.push(self.runtime.resume(waiting_thread)?);
+                let resumed = self.resume_pending_evaluation(waiting_thread)?;
+                report.resumed.push(resumed);
             }
         }
 
@@ -2564,14 +3683,36 @@ impl CapabilityRuntime {
         &mut self,
         completion: PendingCompletion,
     ) -> Result<Option<Evaluation>, ExternalToolError> {
-        completion
-            .waiting_thread
-            .map(|thread| {
-                self.runtime
-                    .resume(thread)
-                    .map_err(ExternalToolError::Runtime)
-            })
-            .transpose()
+        let Some(waiting_thread) = completion.waiting_thread else {
+            return Ok(None);
+        };
+        self.resume_pending_evaluation(waiting_thread)
+            .map(Some)
+            .map_err(ExternalToolError::Runtime)
+    }
+
+    fn resume_pending_evaluation(
+        &mut self,
+        waiting_thread: ScriptThreadId,
+    ) -> Result<Evaluation, RuntimeError> {
+        match self.runtime.resume(waiting_thread) {
+            Ok(resumed) => {
+                self.clear_capability_lease_after(&resumed);
+                Ok(resumed)
+            }
+            Err(error) => {
+                // Runtime::resume rejects an unknown thread before it can run
+                // a continuation. Do not leave its lease freezing this host.
+                self.runtime.host_mut().clear_active_capability_lease();
+                Err(error)
+            }
+        }
+    }
+
+    fn clear_capability_lease_after(&mut self, evaluation: &Evaluation) {
+        if !evaluation.suspended {
+            self.runtime.host_mut().clear_active_capability_lease();
+        }
     }
 }
 
@@ -3130,6 +4271,39 @@ mod tests {
     }
 
     #[test]
+    fn external_idempotency_keys_are_distinct_across_runtime_sessions() {
+        let mut first_runtime = CapabilityRuntime::default();
+        first_runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let first_initial = first_runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"first\").await()")
+            .unwrap();
+        assert!(first_initial.suspended);
+        let first_key = first_runtime
+            .claim_next_external_tool()
+            .unwrap()
+            .idempotency_key;
+
+        let mut second_runtime = CapabilityRuntime::default();
+        second_runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let second_initial = second_runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"second\").await()")
+            .unwrap();
+        assert!(second_initial.suspended);
+        let second_key = second_runtime
+            .claim_next_external_tool()
+            .unwrap()
+            .idempotency_key;
+
+        assert!(first_key.starts_with("splash-"));
+        assert!(second_key.starts_with("splash-"));
+        assert_ne!(first_key, second_key);
+    }
+
+    #[test]
     fn external_streams_are_redacted_bounded_and_audited() {
         let stream = ToolStreamPolicy::new(3, 8, 12, 12);
         let policy = ToolPolicy::new("text.remote").with_stream(stream.clone());
@@ -3422,6 +4596,80 @@ mod tests {
     }
 
     #[test]
+    fn external_invocations_can_be_prepared_before_an_exact_claim() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::json("math.remote"))
+            .unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nlet value = tool.start_json(\"math.remote\", {right: 22, left: 20}).await()\nvalue",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+
+        let prepared = runtime.peek_next_external_tool().unwrap();
+        let expected_payload = WorkerPayload::Json(serde_json::json!({"left": 20, "right": 22}));
+        assert_eq!(prepared.worker_payload().unwrap(), expected_payload);
+        assert_eq!(
+            prepared.canonical_input_bytes().unwrap(),
+            canonical_operation_input_bytes(&expected_payload).unwrap()
+        );
+        assert_eq!(runtime.peek_next_external_tool().unwrap(), prepared);
+
+        let claimed = runtime.claim_external_tool(prepared.id).unwrap();
+        assert_eq!(claimed, prepared);
+        assert!(runtime.peek_next_external_tool().is_none());
+        runtime.validate_claimed_external_tool(claimed.id).unwrap();
+        assert_eq!(
+            runtime.claim_external_tool(claimed.id).unwrap_err(),
+            ExternalToolError::AlreadyClaimed(claimed.id)
+        );
+
+        let resumed = runtime
+            .complete_external_tool(claimed.id, Ok("{\"total\":42}".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(
+            runtime
+                .validate_claimed_external_tool(claimed.id)
+                .unwrap_err(),
+            ExternalToolError::AlreadyCompleted(claimed.id)
+        );
+    }
+
+    #[test]
+    fn stale_exact_external_claim_does_not_consume_another_queued_operation() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_calls = 2;
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+        let initial = runtime
+            .eval(
+                "use mod.tool\n\
+                 let first = tool.start(\"text.remote\", \"first\")\n\
+                 let second = tool.start(\"text.remote\", \"second\")\n\
+                 second.await()",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+
+        let first = runtime.peek_next_external_tool().unwrap();
+        assert_eq!(first.input, "first");
+        runtime.claim_external_tool(first.id).unwrap();
+        let second = runtime.peek_next_external_tool().unwrap();
+        assert_eq!(second.input, "second");
+
+        assert_eq!(
+            runtime.claim_external_tool(first.id).unwrap_err(),
+            ExternalToolError::AlreadyClaimed(first.id)
+        );
+        assert_eq!(runtime.peek_next_external_tool(), Some(second));
+    }
+
+    #[test]
     fn cancellation_is_audited_and_cannot_be_completed_twice() {
         let mut runtime = CapabilityRuntime::default();
         runtime
@@ -3444,6 +4692,128 @@ mod tests {
         assert_eq!(
             runtime
                 .complete_external_tool(invocation.id, Ok("late".to_owned()))
+                .unwrap_err(),
+            ExternalToolError::AlreadyCompleted(invocation.id)
+        );
+    }
+
+    #[test]
+    fn cooperative_cancellation_waits_for_acknowledgement_and_is_idempotent() {
+        let mut policy = ToolPolicy::new("text.remote");
+        policy.max_attempts = 2;
+        let mut runtime = CapabilityRuntime::default();
+        runtime.register_external_tool(policy).unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"wait\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        let request = runtime
+            .request_external_tool_cancellation(invocation.id)
+            .unwrap();
+        assert_eq!(request.id, invocation.id);
+        assert_eq!(request.name, invocation.name);
+        assert_eq!(request.call_index, invocation.call_index);
+        assert_eq!(request.attempt, invocation.attempt);
+        assert_eq!(request.idempotency_key, invocation.idempotency_key);
+        assert_eq!(runtime.pending_tools(), 1);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(
+            runtime.audit()[0].outcome,
+            AuditOutcome::CancellationRequested
+        );
+        assert_eq!(
+            runtime
+                .validate_claimed_external_tool(invocation.id)
+                .unwrap_err(),
+            ExternalToolError::CancellationRequested(invocation.id)
+        );
+        assert_eq!(
+            runtime
+                .retry_external_tool(invocation.id, RetryClass::Transient)
+                .unwrap_err(),
+            ExternalToolError::CancellationRequested(invocation.id)
+        );
+
+        assert_eq!(
+            runtime
+                .request_external_tool_cancellation(invocation.id)
+                .unwrap(),
+            request
+        );
+        assert_eq!(runtime.audit().len(), 1);
+
+        let resumed = runtime
+            .confirm_external_tool_cancellation(invocation.id)
+            .unwrap()
+            .unwrap();
+        assert!(!resumed.succeeded());
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Cancelled);
+        assert_eq!(
+            runtime
+                .confirm_external_tool_cancellation(invocation.id)
+                .unwrap_err(),
+            ExternalToolError::AlreadyCompleted(invocation.id)
+        );
+    }
+
+    #[test]
+    fn cancellation_confirmation_requires_a_prior_request() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"wait\").await()")
+            .unwrap();
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        assert_eq!(
+            runtime
+                .confirm_external_tool_cancellation(invocation.id)
+                .unwrap_err(),
+            ExternalToolError::CancellationNotRequested(invocation.id)
+        );
+        assert_eq!(runtime.pending_tools(), 1);
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("done".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(resumed.succeeded());
+    }
+
+    #[test]
+    fn terminal_result_can_win_a_cooperative_cancellation_race() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"wait\").await()")
+            .unwrap();
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        runtime
+            .request_external_tool_cancellation(invocation.id)
+            .unwrap();
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("done".to_owned()))
+            .unwrap()
+            .unwrap();
+        assert!(resumed.succeeded());
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(
+            runtime.audit()[0].outcome,
+            AuditOutcome::CancellationRequested
+        );
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
+        assert_eq!(
+            runtime
+                .confirm_external_tool_cancellation(invocation.id)
                 .unwrap_err(),
             ExternalToolError::AlreadyCompleted(invocation.id)
         );
@@ -3816,6 +5186,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_reconciliation_can_confirm_requested_cancellation() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"release\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        runtime
+            .request_external_tool_cancellation(invocation.id)
+            .unwrap();
+        let (mut host, mut worker) = reconciliation_authenticators();
+
+        let outbound = runtime
+            .prepare_authenticated_external_reconciliation(invocation.id, "reconcile-1", &mut host)
+            .unwrap();
+        worker.open(outbound.frame).unwrap();
+        let cancelled = OperationReconcileResult::new(
+            outbound.request.session_id.clone(),
+            outbound.request.request_id.clone(),
+            outbound.request.tool.clone(),
+            outbound.request.operation_key.clone(),
+            OperationStatus::Cancelled,
+        )
+        .unwrap();
+        let response = worker
+            .seal(WorkerMessage::ReconciledOperation { result: cancelled })
+            .unwrap();
+
+        assert!(matches!(
+            runtime
+                .reconcile_authenticated_external_tool(
+                    invocation.id,
+                    &outbound.request,
+                    &mut host,
+                    response,
+                )
+                .unwrap(),
+            ExternalReconciliation::Resolved(Some(_))
+        ));
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(
+            runtime.audit()[0].outcome,
+            AuditOutcome::CancellationRequested
+        );
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Cancelled);
+    }
+
+    #[test]
     fn reconciliation_rejects_mismatched_bindings_and_payload_formats() {
         let mut runtime = CapabilityRuntime::default();
         runtime
@@ -4042,6 +5463,42 @@ mod tests {
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].metadata.input_schema, Some(input_schema));
         assert_eq!(catalog[0].metadata.output_schema, Some(output_schema));
+        assert!(catalog[0].contract_enforced);
+    }
+
+    #[test]
+    fn catalog_marks_advisory_json_schemas_as_not_enforced() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool_with_metadata(
+                ToolPolicy::json("math.advisory"),
+                ToolMetadata::new("Adds values with schemas supplied for prompting.")
+                    .with_input_schema(serde_json::json!({"type": "object"}))
+                    .with_output_schema(serde_json::json!({"type": "object"})),
+                |_| Ok(serde_json::json!({"total": 42})),
+            )
+            .unwrap();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.checked"),
+                ToolMetadata::new("Adds values under an executable contract."),
+                add_contract(),
+                |_| Ok(serde_json::json!({"total": 42})),
+            )
+            .unwrap();
+
+        let catalog = runtime.tool_catalog();
+        let advisory = catalog
+            .iter()
+            .find(|descriptor| descriptor.name == "math.advisory")
+            .unwrap();
+        let checked = catalog
+            .iter()
+            .find(|descriptor| descriptor.name == "math.checked")
+            .unwrap();
+
+        assert!(!advisory.contract_enforced);
+        assert!(checked.contract_enforced);
     }
 
     #[test]
@@ -4077,6 +5534,122 @@ mod tests {
         assert!(encoded.is_array());
         let catalog_json = runtime.tool_catalog_json().unwrap();
         assert!(catalog_json.contains("math.add"));
+    }
+
+    #[test]
+    fn capability_lease_denies_dynamic_ungranted_tool_names_before_handler_runs() {
+        let shell_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_shell_calls = shell_calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        runtime
+            .register_tool(ToolPolicy::new("shell.exec"), move |_| {
+                shell_calls.set(shell_calls.get() + 1);
+                Ok("must not run".to_owned())
+            })
+            .unwrap();
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("text.echo", 1)])
+            .unwrap();
+
+        let report = runtime
+            .eval_with_capability_lease(
+                "use mod.tool\nlet selected = \"shell.exec\"\ntool.call(selected, \"whoami\")",
+                &lease,
+            )
+            .unwrap();
+
+        assert!(!report.succeeded(), "{:?}", report.diagnostics);
+        assert_eq!(observed_shell_calls.get(), 0);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "shell.exec");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn capability_lease_authorizer_can_deny_without_consuming_its_call_budget() {
+        let handler_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_handler_calls = handler_calls.clone();
+        let allow = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_allow = allow.clone();
+        let authorizer_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_authorizer_calls = authorizer_calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), move |request| {
+                handler_calls.set(handler_calls.get() + 1);
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let lease = runtime
+            .issue_capability_lease_with_authorizer(
+                [CapabilityLeaseGrant::new("text.echo", 1)],
+                move |request: &ToolRequest, descriptor: &ToolDescriptor| {
+                    authorizer_calls.set(authorizer_calls.get() + 1);
+                    assert_eq!(request.name, "text.echo");
+                    assert_eq!(descriptor.name, "text.echo");
+                    if observed_allow.get() {
+                        Ok(())
+                    } else {
+                        Err(ToolError::Denied("operator denied this call".to_owned()))
+                    }
+                },
+            )
+            .unwrap();
+
+        let denied = runtime
+            .eval_with_capability_lease("use mod.tool\ntool.call(\"text.echo\", \"first\")", &lease)
+            .unwrap();
+        assert!(!denied.succeeded(), "{:?}", denied.diagnostics);
+        assert_eq!(observed_handler_calls.get(), 0);
+
+        allow.set(true);
+        let allowed = runtime
+            .eval_with_capability_lease(
+                "use mod.tool\ntool.call(\"text.echo\", \"second\")",
+                &lease,
+            )
+            .unwrap();
+        assert!(allowed.succeeded(), "{:?}", allowed.diagnostics);
+        assert_eq!(observed_authorizer_calls.get(), 2);
+        assert_eq!(observed_handler_calls.get(), 1);
+    }
+
+    #[test]
+    fn capability_lease_is_invalidated_when_the_catalog_changes() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let fingerprint = runtime.capability_catalog_fingerprint().unwrap();
+        let lease = runtime.issue_full_capability_lease().unwrap();
+
+        runtime
+            .register_tool(ToolPolicy::new("text.other"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+
+        assert_ne!(
+            fingerprint,
+            runtime.capability_catalog_fingerprint().unwrap()
+        );
+        assert_eq!(
+            runtime.validate_capability_lease(&lease),
+            Err(CapabilityLeaseError::CatalogChanged)
+        );
+        assert!(matches!(
+            runtime.eval_with_capability_lease("let result = 1", &lease),
+            Err(CapabilityLeaseEvaluationError::Lease(
+                CapabilityLeaseError::CatalogChanged
+            ))
+        ));
     }
 
     #[test]
@@ -4372,6 +5945,34 @@ mod tests {
             error,
             ToolRegistrationError::InvalidName("shell exec".to_owned())
         );
+
+        let too_long = "a".repeat(MAX_TOOL_NAME_BYTES + 1);
+        let error = runtime
+            .register_tool(ToolPolicy::new(too_long.clone()), |_| Ok(String::new()))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolRegistrationError::InvalidName(name) if name == too_long
+        ));
+    }
+
+    #[test]
+    fn audit_replaces_oversized_unrecognized_tool_names_with_a_digest_label() {
+        let unrecognized = "a".repeat(MAX_TOOL_NAME_BYTES + 1);
+        let source = format!("use mod.tool\ntool.call(\"{unrecognized}\", \"input\")");
+        let mut runtime = CapabilityRuntime::default();
+
+        let report = runtime.eval(&source).unwrap();
+
+        assert!(!report.succeeded());
+        let event = runtime.audit()[0].clone();
+        assert_eq!(event.outcome, AuditOutcome::Denied);
+        assert!(event.tool.starts_with(UNRECOGNIZED_AUDIT_TOOL_PREFIX));
+        assert!(!event.tool.contains(&unrecognized));
+        assert_eq!(
+            event.tool.len(),
+            UNRECOGNIZED_AUDIT_TOOL_PREFIX.len() + blake3::OUT_LEN * 2
+        );
     }
 
     #[test]
@@ -4424,6 +6025,100 @@ mod tests {
         assert_eq!(observed_calls.get(), 1);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn capability_lease_survives_await_and_freezes_registration_until_completion() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_calls = calls.clone();
+        let mut policy = ToolPolicy::new("text.echo");
+        policy.max_calls = 2;
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(policy, move |request| {
+                calls.set(calls.get() + 1);
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("text.echo", 1)])
+            .unwrap();
+
+        let initial = runtime
+            .eval_with_capability_lease(
+                "use mod.tool\nlet first = tool.start(\"text.echo\", \"first\")\nfirst.await()\ntool.call(\"text.echo\", \"second\")",
+                &lease,
+            )
+            .unwrap();
+
+        assert!(initial.succeeded(), "{:?}", initial.diagnostics);
+        assert!(initial.suspended);
+        assert_eq!(
+            runtime.eval("let unrelated = 1").unwrap_err(),
+            RuntimeError::EvaluationInProgress
+        );
+        assert_eq!(
+            runtime
+                .register_tool(ToolPolicy::new("text.other"), |request| {
+                    Ok(request.input.clone())
+                })
+                .unwrap_err(),
+            ToolRegistrationError::ActiveCapabilityLease
+        );
+
+        let pumped = runtime.pump().unwrap();
+
+        assert_eq!(pumped.completed, 1);
+        assert_eq!(pumped.resumed.len(), 1);
+        assert!(!pumped.resumed[0].succeeded());
+        assert_eq!(observed_calls.get(), 1);
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+        runtime
+            .register_tool(ToolPolicy::new("text.other"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn capability_lease_survives_external_completion_and_checks_the_continuation() {
+        let shell_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_shell_calls = shell_calls.clone();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+        runtime
+            .register_tool(ToolPolicy::new("shell.exec"), move |_| {
+                shell_calls.set(shell_calls.get() + 1);
+                Ok("must not run".to_owned())
+            })
+            .unwrap();
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("text.remote", 1)])
+            .unwrap();
+
+        let initial = runtime
+            .eval_with_capability_lease(
+                "use mod.tool\nlet output = tool.start(\"text.remote\", \"release\").await()\nlet selected = \"shell.exec\"\ntool.call(selected, output)",
+                &lease,
+            )
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("done".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        assert!(!resumed.succeeded(), "{:?}", resumed.diagnostics);
+        assert_eq!(observed_shell_calls.get(), 0);
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
     }
 
     #[test]
@@ -4481,6 +6176,142 @@ mod tests {
         assert_eq!(
             error,
             RuntimeError::InvalidLimits("max_pending_tools must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn bounded_audit_view_evicts_oldest_entries_and_reports_loss() {
+        let mut policy = ToolPolicy::new("text.echo");
+        policy.max_calls = 4;
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .set_max_audit_events(NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        runtime
+            .register_tool(policy, |request| Ok(request.input.clone()))
+            .unwrap();
+
+        for input in ["one", "two", "three"] {
+            let source = format!("use mod.tool\ntool.call(\"text.echo\", \"{input}\")");
+            assert!(runtime.eval(&source).unwrap().completed());
+        }
+
+        assert_eq!(runtime.max_audit_events(), 2);
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.dropped_audit_events(), 1);
+        assert_eq!(
+            runtime
+                .audit()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        runtime
+            .set_max_audit_events(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].sequence, 2);
+        assert_eq!(runtime.dropped_audit_events(), 2);
+
+        runtime.clear_audit();
+        assert!(runtime.audit().is_empty());
+        assert_eq!(runtime.dropped_audit_events(), 0);
+
+        assert_eq!(
+            runtime
+                .set_max_audit_events(NonZeroUsize::new(MAX_AUDIT_EVENTS + 1).unwrap())
+                .unwrap_err(),
+            RuntimeError::InvalidLimits("max_audit_events exceeds the hard limit")
+        );
+    }
+
+    #[test]
+    fn catalog_limits_reject_excess_tools_before_mutating_the_catalog() {
+        let catalog_limits = CapabilityCatalogLimits {
+            max_tools: 1,
+            max_serialized_bytes: 8 * 1024,
+        };
+        let mut runtime = CapabilityRuntime::with_limits_pending_and_catalog(
+            ExecutionLimits::default(),
+            1,
+            catalog_limits,
+        )
+        .unwrap();
+        assert_eq!(runtime.catalog_limits(), catalog_limits);
+
+        runtime
+            .register_tool(ToolPolicy::new("text.first"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+        let error = runtime
+            .register_tool(ToolPolicy::new("text.second"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ToolRegistrationError::CatalogToolLimitExceeded { maximum: 1 }
+        );
+        assert_eq!(
+            runtime
+                .tool_catalog()
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["text.first"]
+        );
+    }
+
+    #[test]
+    fn catalog_limits_reject_excess_serialized_metadata_before_mutating_the_catalog() {
+        let mut runtime = CapabilityRuntime::with_limits_pending_and_catalog(
+            ExecutionLimits::default(),
+            1,
+            CapabilityCatalogLimits {
+                max_tools: 2,
+                max_serialized_bytes: 1,
+            },
+        )
+        .unwrap();
+        let error = runtime
+            .register_tool_with_metadata(
+                ToolPolicy::new("text.echo"),
+                ToolMetadata::new("Returns text to the caller."),
+                |request| Ok(request.input.clone()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolRegistrationError::CatalogByteLimitExceeded {
+                actual,
+                maximum: 1,
+            } if actual > 1
+        ));
+        assert!(runtime.tool_catalog().is_empty());
+    }
+
+    #[test]
+    fn rejects_zero_catalog_limits() {
+        let error = match CapabilityRuntime::with_limits_pending_and_catalog(
+            ExecutionLimits::default(),
+            1,
+            CapabilityCatalogLimits {
+                max_tools: 0,
+                max_serialized_bytes: 1,
+            },
+        ) {
+            Ok(_) => panic!("zero catalog tool limit must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            RuntimeError::InvalidLimits("max_catalog_tools must be greater than zero")
         );
     }
 

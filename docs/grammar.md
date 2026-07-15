@@ -35,7 +35,9 @@ block-comment    = "/*", { any-character }, "*/" ;
 Identifiers are case-sensitive. Unicode escapes use either exactly four
 hexadecimal digits or one through six digits between braces. `if`, `elif`, `else`, `for`, `in`, `loop`,
 `while`, `fn`, `let`, `return`, `break`, `continue`, `use`, `true`, `false`,
-and `nil` are reserved in canonical source. Strings use double quotes.
+and `nil` are reserved in canonical source. A Unicode escape must encode a
+valid Unicode scalar value: surrogate code points and values above `U+10FFFF`
+are rejected. Strings use double quotes.
 
 ## Program and Statements
 

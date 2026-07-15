@@ -219,19 +219,22 @@ catalog with no arbitrary executable, filesystem, network-origin, plugin, or
 crate selectors. Untrusted local effects still require a separately contained
 worker and a real IPC transport.
 
-`WorkerTransport` currently carries only ordinary `invoke` messages. Durable
-operation dispatch, reconciliation, and compensation need their own
-host-controlled transport API and the authenticated rollback-resistant journal
-storage contract; this adapter does not weaken either requirement.
+`WorkerTransport` intentionally carries only ordinary `invoke` messages.
+Durable dispatch, reconciliation, and compensation use the separate,
+host-controlled one-shot transport described below, together with the
+authenticated rollback-resistant journal and ledger storage contracts. This
+adapter does not weaken either requirement.
 
 ## Bounded JSON-Line Transport
 
 The optional `splash-capabilities` feature `json-line-worker` provides a
 `JsonLineWorkerChannel<R, W>` for a host-owned buffered reader and writer,
 plus `AuthenticatedFrameWorkerTransport<C>` for ordinary `invoke`/`result`
-calls. It is the pipe boundary for a worker process that the host has already
-started and placed in an appropriate platform sandbox; it does not spawn,
-attest, or contain that process itself.
+calls and `OneShotAuthenticatedOperationWorkerTransport<C>` for exactly one
+durable dispatch, reconciliation, or compensation exchange. It is the pipe
+boundary for a worker process that the host has already started and placed in
+an appropriate platform sandbox; it does not spawn, attest, or contain that
+process itself.
 
 Session startup remains explicit because `open_session` is one-way. The host
 seals and sends it using the same `SessionAuthenticator` that it then moves
@@ -256,6 +259,67 @@ write, flush, read, malformed frame, oversized frame, invalid response, or
 authentication failure poisons the channel or transport. The host must discard
 it with the session and open a fresh session instead of retrying on the same
 stream.
+
+### One-shot durable recovery exchange
+
+`OneShotAuthenticatedOperationWorkerTransport` owns the advanced host
+authenticator, creates a fresh `SessionAuthorizer` from the supplied manifest,
+and performs exactly one `dispatch_operation`, `reconcile_operation`, or
+`compensate_operation` request. It seals the request, opens the response, and
+checks the grant, request identity, output contract, and compensation binding
+before it returns a verified result. A successful exchange consumes it; any
+failure poisons it. It is deliberately not a general recovery channel or an
+unbounded status oracle.
+
+For a post-stop effect, discard and reap the old worker first. Reload and
+validate the authenticated host ledger, start a fresh contained worker that
+loads its fenced durable journal, open a new authenticated session, then build
+a reconciliation request from the current input. The one-shot transport owns
+the frame sealing, so use `operation_reconcile_request` rather than
+`prepare_authenticated_operation_reconciliation` for this path:
+
+```rust
+use std::io::BufReader;
+
+use splash_capabilities::json_line_worker::{
+    JsonLineWorkerChannel, OneShotAuthenticatedOperationWorkerTransport, WorkerFrameChannel,
+};
+use splash_capabilities::WorkerMessage;
+
+let mut channel = JsonLineWorkerChannel::new(BufReader::new(child_stdout), child_stdin);
+let opening = host_authenticator.seal(WorkerMessage::OpenSession {
+    manifest: manifest.clone(),
+})?;
+channel.send_frame(opening)?;
+
+let request = engine.operation_reconcile_request(
+    &plan,
+    &ledger,
+    &operation_key,
+    &current_input,
+    host_authenticator.session_id(),
+    "reconcile-1",
+)?;
+let mut transport = OneShotAuthenticatedOperationWorkerTransport::new(
+    manifest,
+    host_authenticator,
+    channel,
+)?;
+let result = transport.reconcile_operation(request.clone())?;
+let state = engine.apply_verified_operation_reconciliation(
+    &plan,
+    &mut ledger,
+    &request,
+    &result,
+)?;
+persist_ledger_compare_and_swap(ledger.to_json()?)?;
+```
+
+Do not re-dispatch an ambiguous effect through this transport. A `running`
+result, changed input, invalid current policy, contradictory ledger state, or
+transport failure remains a host recovery decision. The transport does not
+restart a VM, resolve a promise, select compensation, or make a terminal
+observation sufficient to run a workflow suffix.
 
 The channel performs synchronous I/O, so it cannot deliver an in-band `cancel`
 frame while a call is blocked waiting for its result. On Linux, the optional
@@ -289,6 +353,12 @@ with canonical evaluation, bounded host pumping, catalog inspection, audit
 inspection, and explicit garbage collection only. The resulting profile has no
 API to register more tools, claim or complete external work, or attach a worker
 transport. Structured adapters require an executable `JsonToolContract`.
+`MobileRuntimeBuilder::with_limits_and_catalog` additionally lets the app set
+an immutable maximum descriptor count and serialized catalog size before any
+adapter is registered. `with_max_audit_events(NonZeroUsize)` sets the bounded
+in-memory audit capacity during setup, up to 8,192 entries. Its ordered audit
+view exposes an eviction counter; export entries to a host-owned durable sink
+when complete retention is required.
 
 ```rust
 use splash_capabilities::{
@@ -330,6 +400,49 @@ runtime instead, so only expose the mobile profile to code that must honor this
 contract. `collect_garbage()` is intentionally explicit because a full VM
 sweep can take time proportional to the live heap; use it at an application
 idle point to reclaim settled promise records.
+
+For an ordered mobile or embedded workflow, use
+`splash_workflow::mobile::MobileWorkflowBuilder` instead. It repeats the
+setup-only local adapter boundary, then returns a facade that can plan a
+bounded `WorkflowDraft`, issue only named `WorkflowStepCapabilityPolicy`
+grants, checkpoint, and execute. It has no mutable `CapabilityRuntime`,
+manual lease, full-catalog approval, external claim/completion, or worker
+transport API. Local host-pump adapters are driven by workflow execution; a
+streaming/external policy is rejected during static setup.
+
+```rust
+use splash_capabilities::{CapabilityLeaseGrant, ToolMetadata, ToolPolicy};
+use splash_workflow::{
+    mobile::MobileWorkflowBuilder, WorkflowDraft, WorkflowStep,
+    WorkflowStepCapabilityPolicy,
+};
+
+let mut builder = MobileWorkflowBuilder::new()?;
+builder.register_text_tool(
+    ToolPolicy::new("text.echo"),
+    ToolMetadata::new("Returns app-local text."),
+    |request| Ok(request.input.clone()),
+)?;
+let mut workflow = builder.build();
+
+let draft = WorkflowDraft::new(vec![WorkflowStep::new(
+    "prepare",
+    "use mod.tool\ntool.call(\"text.echo\", \"release\")",
+)])?;
+let plan = workflow.plan_draft(draft)?;
+let approval = workflow.approve_with_step_capability_policies(
+    &plan,
+    vec![WorkflowStepCapabilityPolicy::new(
+        "prepare",
+        [CapabilityLeaseGrant::new("text.echo", 1)],
+    )],
+)?;
+workflow.execute(&plan, approval)?;
+```
+
+This facade is catalog governance, not OS containment or a substitute for a
+platform storage anchor. It is appropriate only for reviewed app-local
+adapters whose effects are safe to run in the embedding application's process.
 
 The authenticated in-process worker transport remains available for a fixed
 worker protocol catalog. It is appropriate when the application needs worker

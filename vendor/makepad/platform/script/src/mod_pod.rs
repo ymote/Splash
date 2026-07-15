@@ -288,7 +288,8 @@ pub fn define_pod_module(heap: &mut ScriptHeap, native: &mut ScriptNative) -> Sc
                 let sself = vm.bx.heap.value(args, id!(self).into(), trap);
                 let ip = vm.bx.threads.cur_ref().trap.ip;
                 let nv = NumericValue::from_script_value_heap(&vm.bx.heap, sself, ip);
-                nv.normalize().to_script_value_heap(&mut vm.bx.heap, &vm.bx.code)
+                nv.normalize()
+                    .to_script_value_heap(&mut vm.bx.heap, &vm.bx.code)
             });
         }
         native.add_type_method(
@@ -318,7 +319,8 @@ pub fn define_pod_module(heap: &mut ScriptHeap, native: &mut ScriptNative) -> Sc
                 let ip = vm.bx.threads.cur_ref().trap.ip;
                 let a = NumericValue::from_script_value_heap(&vm.bx.heap, sself, ip);
                 let b = NumericValue::from_script_value_heap(&vm.bx.heap, other, ip);
-                a.cross(b).to_script_value_heap(&mut vm.bx.heap, &vm.bx.code)
+                a.cross(b)
+                    .to_script_value_heap(&mut vm.bx.heap, &vm.bx.code)
             },
         );
     }

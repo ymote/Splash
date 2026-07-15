@@ -87,6 +87,16 @@ must stop new admissions, reserve a fresh opaque recovery fence, then discard
 only unanchored candidates through the backend API. Never recover by deleting
 the SQLite file or by rebuilding anchor state from it.
 
+The optional `splash-storage` `keyring` feature retrieves a host-provisioned
+32-byte storage key from native credential stores on macOS, iOS, and Windows.
+It reads an existing binary credential only, rejects unsupported targets rather
+than using an in-process mock, and never creates, rotates, or deletes platform
+credentials. On supported targets it invokes the explicit native credential
+implementation rather than keyring-rs's process-configurable default builder.
+Credential storage protects key material; it does not provide the linearizable,
+rollback-resistant compare-and-swap required by `RollbackAnchor`. Do not use it
+as evidence that local payload storage is rollback protected.
+
 Worker adapters must explicitly declare read-only/idempotent safety before the
 non-durable `invoke` path is enabled, and a bounded reconciliation contract
 before durable dispatch or compensation is enabled. A declaration is a trusted
@@ -117,6 +127,16 @@ ambient authority. It must not expose an arbitrary executable, filesystem,
 network-origin, plugin, or crate selector. `collect_garbage()` is host-scheduled
 and may cost time proportional to the live VM heap; it is not a per-pump
 resource limit or containment mechanism.
+
+`splash_workflow::mobile::MobileWorkflowBuilder` applies the same static local
+adapter rule to host-owned workflow execution. Its sealed result can create
+plans from trusted steps or data-only drafts, approve only named per-step
+policies, checkpoint, and execute. It intentionally does not expose the
+underlying `CapabilityRuntime`, manual lease issuance, full-catalog approval,
+external-operation APIs, or mutable registration. This prevents the facade
+from widening its own catalog after setup; it does not constrain a host that
+deliberately chooses lower-level APIs or reduce the ambient authority of a
+registered Rust adapter.
 
 The optional JSON-line worker channel carries one bounded authenticated frame
 at a time over host-provided I/O. It limits a line to 1 MiB before decoding and
@@ -205,6 +225,20 @@ syscall sandbox. The profile can return `ENOSYS` for `clone3` to force a legacy
 a particular worker. See [`docs/linux-bubblewrap.md`](docs/linux-bubblewrap.md)
 for the exact supported architectures, denied operations, and limitations.
 
+For a fixed worker whose target ABI and runtime have been independently
+reviewed, a host can instead provide a bounded `WorkerSeccompAllowlist` through
+`set_seccomp_allowlist`. This selects `WorkerSeccompProfile::StrictAllowlist`:
+Splash keeps the ABI/x32 and fixed escape-surface guards, returns `ALLOW` only
+for listed syscall numbers, and kills every other syscall. An empty, duplicate,
+oversized, or missing list is rejected rather than falling back to default-allow
+filtering. The list is trusted host configuration, never Splash source, worker
+input, LLM output, or caller-provided cBPF. Policy compilation rejects a list
+without Bubblewrap's required final `execve`; the host must additionally cover
+any fixed pre-exec runner and the exact worker runtime. It is a syscall boundary
+only: because execution must normally remain available, it does not mediate an
+executable path, a network origin, device access, secrets, or capability
+grants.
+
 An optional host-configured `splash-limit-runner` can execute the fixed worker
 only after applying selected Linux rlimits and disabling core dumps. The runner,
 limits, worker target, and worker arguments are all compiled from trusted Rust
@@ -255,21 +289,23 @@ reconcile a durable effect rather than infer that process termination cancelled
 or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no worker-specific syscall allowlist, aggregate-disk or device
-quota, per-origin network proxy, D-Bus mediation, secret broker, authenticated
-cancellation delivery, or post-exit recovery. Its optional watchdog supplies
-only trusted wall-clock process stops described above, its optional runner
-provides only the narrow rlimits described above, and its cgroup profile
-supplies only the CPU, memory, swap, task, and selected per-device I/O controls
-described above. The per-device I/O control is neither a filesystem quota nor a
-guarantee that buffered writeback will be attributed to the worker on every
-filesystem.
+This backend has no aggregate-disk or device quota, per-origin network proxy,
+D-Bus mediation, executable-path policy, secret broker, authenticated
+cancellation delivery, or post-exit recovery. Its optional strict allowlist is
+a target-specific syscall boundary, not a replacement for those missing
+controls. Its optional watchdog supplies only trusted wall-clock process stops
+described above, its optional runner provides only the narrow rlimits described
+above, and its cgroup profile supplies only the CPU, memory, swap, task, and
+selected per-device I/O controls described above. The per-device I/O control is
+neither a filesystem quota nor a guarantee that buffered writeback will be
+attributed to the worker on every filesystem.
 `DenyKnownEscapeSurface` provides only the fixed default-allow hardening
-described above. A private `/tmp` is opt-in and unbounded unless the host
-selects its explicit Bubblewrap size limit; that limit does not replace a
-memory or disk policy. Its filesystem boundary is per worker session, not per
-individual invocation: an attenuated manifest should be narrowed before launch
-when per-call filesystem isolation is required.
+described above. `StrictAllowlist` kills unlisted syscalls but does not replace
+an executable-path or capability policy. A private `/tmp` is opt-in and
+unbounded unless the host selects its explicit Bubblewrap size limit; that
+limit does not replace a memory or disk policy. Its filesystem boundary is per
+worker session, not per individual invocation: an attenuated manifest should
+be narrowed before launch when per-call filesystem isolation is required.
 Policy source paths must be host-owned and immutable to untrusted actors from
 compilation through worker exit, including their executable and symlink
 targets; the current path-based launcher cannot eliminate that race. A fixed
@@ -284,6 +320,32 @@ Each registered tool declares a stable identifier and limits for calls, input
 bytes, and output bytes. Calls are recorded in an ordered audit log. Unknown,
 over-budget, over-depth, or malformed calls fail before a tool handler is
 invoked.
+
+The in-process audit view retains only its configured recent entries (1,024 by
+default, 8,192 maximum) and exposes an eviction counter. It is deliberately
+bounded so a long-lived untrusted-script host cannot grow memory through
+observability alone. Hosts that need complete audit retention must export
+entries to a separate authenticated durable sink; a retained view, its
+sequence numbers, and its loss counter are not an authorization decision or
+durable record.
+
+`splash_workflow::durable_events::WorkflowEventStore` provides one bounded
+authenticated workflow-telemetry journal for host-owned operator/audit replay.
+It accepts only contiguous engine-exported sequences, rejects source gaps and
+contradictory retained overlaps, records retention eviction explicitly, and
+uses the supplied rollback-protected store's compare-and-swap boundary. The
+journal includes no source, tool payload, approval, grant, worker key, or VM
+promise. It is not a workflow checkpoint, operation ledger, effect proof,
+cancellation acknowledgement, or permission to resume a workflow. A host must
+still use fresh approval, idempotency, and authenticated reconciliation for an
+external effect.
+
+Registered tool names are restricted to 128-byte lowercase ASCII capability
+identifiers. A denied call can still carry an arbitrary dynamic Splash string,
+so the audit view preserves only a fixed-length, session-scoped BLAKE3 label
+for invalid or oversized unrecognized names. It does not retain that raw
+script value. The label is a correlation aid, not a credential or a secrecy
+guarantee against a host that already knows the candidate value.
 
 JSON capabilities are an explicit policy type. They accept only JSON object or
 array envelopes: envelope validation happens before the Rust handler is called,
@@ -308,21 +370,28 @@ the live heap.
 
 External-only tools add a host-managed completion path. They have no
 in-process handler and are denied to synchronous calls. A trusted host claims
-each operation, then explicitly completes or cancels it; the runtime reuses
-the normal output validation and audit boundary. This does not terminate a
-worker or enforce an operating-system policy. The host must bind cancellation
-to its transport and enforce containment outside this process.
+each operation, then explicitly completes it or uses a two-phase
+cancellation-request/adapter-acknowledgement path; the runtime reuses the normal
+output validation and audit boundary. A request leaves the promise pending and
+blocks retries and stream forwarding. Confirmation is rejected until a request
+exists, but the trusted host remains responsible for deciding whether an
+adapter acknowledgement is credible. This does not terminate a worker or
+enforce an operating-system policy. A force-stop is indeterminate and must not
+be reported as cooperative cancellation without separate proof.
 
 External retries are also host-only. A script receives no retry API and cannot
 spend another capability call by requesting another attempt. For each claimed
 operation, the host may use its stable `idempotency_key` when forwarding an
-attempt to a worker. That key is a correlation and deduplication value, not a
-capability token or authorization credential; the opaque `ExternalToolId`
-must remain owned by the host. Hosts that need replay across restarts must
-persist their own workflow identity and authenticate every worker request with
-the keyed protocol frame or an equivalent transport mechanism. An adapter must
-not retry a non-idempotent effect unless its worker performs deduplication
-using that key or an equivalent durable identity.
+attempt to a worker. The key includes a runtime-session nonce sourced from
+operating-system entropy when available, with a process-local time/PID fallback
+otherwise, so normal new host processes do not reuse the old counter-only value.
+It is a correlation and deduplication value, not a capability token, authorization
+credential, or durable operation identity; the opaque `ExternalToolId` must
+remain owned by the host. Hosts that need replay across restarts must persist
+their own workflow identity and authenticate every worker request with the
+keyed protocol frame or an equivalent transport mechanism. An adapter must not
+retry a non-idempotent effect unless its worker performs deduplication using
+that key or an equivalent durable identity.
 
 Authenticated reconciliation can query a live claimed operation without
 serializing its `ExternalToolId`. `CapabilityRuntime` creates an authenticated
@@ -334,6 +403,17 @@ existing output limit and JSON-contract boundary. This does not make a
 promise, operation handle, or VM state restartable. A durable host workflow
 must persist and authenticate its own operation identity, then decide whether
 to reconcile, retry, compensate, or fail before it constructs a fresh runtime.
+
+The optional JSON-line `OneShotAuthenticatedOperationWorkerTransport` provides
+one separately authenticated durable dispatch, reconciliation, or compensation
+exchange after a host has opened a fresh contained-worker session. It validates
+the active manifest, request identity, and result before returning, then is
+consumed; a failure poisons it. This bounds the transport-level recovery
+attempt, but it does not restart a worker, provide durable storage, prove an
+effect's outcome, acknowledge cancellation, approve output, or resume a
+workflow. The host must restore and authenticate both its ledger and the
+worker journal, choose recovery policy, persist the verified observation, and
+issue fresh approval before it can run any later workflow work.
 
 An external tool may opt into bounded host-visible output chunks. The runtime
 accepts chunks only for a claimed operation, applies source-byte, aggregate,
@@ -361,7 +441,62 @@ Workflow plans are approved by the Rust host. An approval is bound to one plan
 and consumed by execution, so a script cannot manufacture approval for another
 workflow or resume a rejected plan by mutating its own state. Plans are also
 bound to their creating workflow engine; another engine cannot approve,
-checkpoint, or execute a foreign plan object.
+checkpoint, or execute a foreign plan object. Each plan or resume approval
+also carries process-local `CapabilityLease` authority tied to the originating
+runtime and its exact serialized tool-catalog fingerprint. A lease lists
+allowed tool names and non-widening call budgets; every `tool.call`,
+`tool.start`, JSON variant, and dynamically computed name is checked when the
+host reserves it. The lease remains active across `await` and continuation,
+and the host rejects tool registration while it is active. A catalog change
+after approval causes the lease to fail closed before execution or resume.
+
+For least-privilege LLM workflows, the host can instead approve an ordered
+lease queue with `approve_with_step_capability_leases`. It supplies exactly one
+lease per trusted step, and the engine activates only the current lease. An
+early step therefore cannot use authority assigned to a later step, including
+while it is waiting on an external operation; the current lease is retained
+until that step resolves. The checkpoint-resume variant accepts exactly the
+remaining suffix, so completed-prefix authority is not renewed after restart.
+This queue enforces host-reviewed ordering only: it does not infer correct
+grants from generated source, tool-call hints, or step names. The optional
+synchronous `ToolCallAuthorizer` can further deny an already leased invocation,
+but cannot add authority. This is script-level authority control, not adapter
+containment: a permitted Rust adapter still needs an appropriate
+contained-worker boundary before it can safely process untrusted local-tool
+work.
+
+`WorkflowStepCapabilityPolicy` is a host-only convenience for the common case
+without a custom authorizer. Its ordered step IDs and grant lists are checked
+against the trusted plan before `approve_with_step_capability_policies` or its
+resume counterpart issue any current-runtime lease. A policy intentionally has
+no serialized form and cannot invoke a tool; it is configuration, not
+authority. Hosts must build it from their own policy decision, never directly
+from generated source, a checkpoint, or review hints. A host that needs a
+`ToolCallAuthorizer` issues a manual lease instead.
+
+`WorkflowPlan::review` is an effect-free presentation aid for that host
+approval flow. It returns per-step canonical syntax reports and direct tool
+call hints, but creates no runtime, lease, or approval. An empty hint list is
+not authority and does not prove a step is pure: invalid source, aliases,
+control flow, and computed names deliberately remain outside its scope.
+Workflow plans are capped at 1,024 steps and 1 MiB of aggregate source before
+the engine retains them, limiting generated-plan review and lease-queue growth.
+
+`WorkflowDraft` is a separate bounded untrusted input format for an LLM's
+proposed step list. Its JSON envelope accepts only a format version plus step
+IDs and source, rejects unknown fields, caps wire data at 2 MiB, and bounds
+the decoded step collection before it can become a plan. Parsing and reviewing
+it do not create a capability runtime, grant, lease, approval, checkpoint, or
+operation handle. `plan_draft` records planning only; the host must still
+select grants from trusted policy and separately approve execution. Review
+hints remain non-authoritative, including for dynamic names.
+
+`WorkflowEngine` likewise retains only a configured recent in-memory event
+view (1,024 by default, 8,192 maximum) and exposes its eviction count. Those events are
+operational telemetry only; failure events retain diagnostic counts but never
+diagnostic text. They must not be used to replay a workflow. Checkpoints and
+operation ledgers remain the separate bounded data-only recovery records, each
+requiring fresh host approval and authenticated storage.
 
 Workflow checkpoints are bounded data-only records of a completed step prefix.
 They bind to the ordered trusted plan through a BLAKE3 fingerprint, but include
@@ -439,3 +574,19 @@ boundaries. Those features must not be inferred from the presence of the VM.
 Tool descriptions and schemas are available only through the host-side
 catalog. They are not script-visible authority. Schemas registered solely as
 `ToolMetadata` remain prompt metadata; only `JsonToolContract` is executable.
+The catalog publishes this distinction as `contract_enforced`, so a host or
+LLM prompt builder does not need to infer enforcement from the presence of a
+schema field.
+
+`splash_core::tool_call_hints` and the `splash tool-calls` CLI command are
+effect-free source-review aids, not static authorization. They recognize only
+direct `tool` method syntax and deliberately do not resolve aliases,
+shadowing, runtime string values, reachability, or imports. A host must never
+derive a capability grant from that output alone; every actual call remains
+subject to lease and reservation-time checks.
+
+`CapabilityCatalogLimits` bounds both the number of registered descriptors and
+the complete serialized host catalog before a new handler is retained. This
+limits catalog-driven prompt and allocation growth, but a trusted host must
+still select a suitable bound and review the metadata it registers. A catalog
+limit is not an authorization rule, input validator, or containment boundary.

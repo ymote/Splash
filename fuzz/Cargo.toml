@@ -9,7 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+serde_json = "1.0.150"
+splash-capabilities = { version = "0.1.0", path = "../crates/splash-capabilities", features = ["json-line-worker"] }
 splash-core = { path = "../crates/splash-core" }
+splash-workflow = { version = "0.1.0", path = "../crates/splash-workflow" }
 
 [workspace]
 members = ["."]
@@ -23,5 +26,35 @@ doc = false
 [[bin]]
 name = "execution"
 path = "fuzz_targets/execution.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "workflow_draft"
+path = "fuzz_targets/workflow_draft.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "capability_lease"
+path = "fuzz_targets/capability_lease.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "workflow_external_operation"
+path = "fuzz_targets/workflow_external_operation.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "workflow_event_journal"
+path = "fuzz_targets/workflow_event_journal.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "json_line_worker"
+path = "fuzz_targets/json_line_worker.rs"
 test = false
 doc = false

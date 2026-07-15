@@ -177,6 +177,51 @@ OS-provided CSPRNG and provision it only to the trusted host and its selected
 storage backend. This crate does not perform key exchange, key wrapping, or
 key attestation.
 
+## Native Keyring Loading
+
+The optional `keyring` feature can load **pre-provisioned** 32-byte storage
+keys from the native credential store on macOS, iOS, and Windows. It uses the
+platform Keychain or Credential Manager through `keyring-rs`; it is unavailable
+on Linux and embedded targets rather than falling back to an in-process mock
+credential store.
+
+```toml
+splash-storage = { version = "0.1", features = ["keyring"] }
+```
+
+```rust
+use splash_storage::{
+    platform_keyring::{PlatformKeyringEntry, PlatformKeyringKeyring}, StorageKeyId,
+};
+
+let active = PlatformKeyringEntry::new(
+    StorageKeyId::new("storage-v2")?,
+    "com.ymote.splash",
+    "workflow-storage-v2",
+)?;
+let previous = PlatformKeyringEntry::new(
+    StorageKeyId::new("storage-v1")?,
+    "com.ymote.splash",
+    "workflow-storage-v1",
+)?;
+let storage_keyring = PlatformKeyringKeyring::new(active, vec![previous])?.load()?;
+```
+
+Each configured service/account pair must already contain exactly 32 binary
+secret bytes. The module only reads them: it never generates, writes, rotates,
+or deletes a credential. Provision the active key through an app installer,
+MDM, enrollment flow, or another platform-specific trusted host process; use a
+separate location for every key ID. This keeps key enrollment and recovery out
+of script-visible code and avoids silent first-run key races. On supported
+targets the loader calls the explicit native credential implementation rather
+than `keyring-rs`'s process-configurable default builder, so an in-process mock
+cannot become a production fallback.
+
+Native credential storage protects key material, not the version of a durable
+record. It does **not** implement `RollbackAnchor`, provide linearizable
+compare-and-swap for anchor state, or make a local SQLite file rollback-proof.
+Continue to supply a trusted monotonic anchor for `AnchoredSqliteStore`.
+
 ## Workflow Integration
 
 Persist the serialized ledger under a stable host record key before dispatch

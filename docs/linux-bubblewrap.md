@@ -288,17 +288,52 @@ legacy `clone`, where the namespace flags are checked. This can break a worker
 that requires `clone3` semantics; validate the exact worker and its runtime
 before selecting the profile.
 
-This is defense in depth, not a general syscall sandbox. It deliberately
-allows `execve`, because Bubblewrap applies the filter before the optional
-trusted pre-exec runner must execute the fixed worker. It also permits every
-syscall outside the fixed deny set, including future kernel interfaces. It
-therefore cannot constrain arbitrary executable chaining from exposed runtime
-mounts, replace a worker-specific syscall allowlist, mediate networking, or
-make a capability decision. Keep runtime mounts minimal and immutable, retain
-the no-host-network namespace, and treat a dedicated worker-specific allowlist
-as future work. Bubblewrap requires `no_new_privs` before it installs the
-filter, so a worker cannot weaken it by adding another seccomp program; a
-worker may still add a stricter filter of its own.
+This compatibility profile is defense in depth, not a general syscall
+sandbox. It deliberately allows `execve`, because Bubblewrap applies the
+filter before the optional trusted pre-exec runner must execute the fixed
+worker. It also permits every syscall outside the fixed deny set, including
+future kernel interfaces. It cannot mediate networking or make a capability
+decision. Keep runtime mounts minimal and immutable and retain the
+no-host-network namespace. Bubblewrap requires `no_new_privs` before it
+installs the filter, so a worker cannot weaken it by adding another seccomp
+program; a worker may still add a stricter filter of its own.
+
+### Strict Worker Syscall Allowlist
+
+`WorkerSeccompAllowlist` is the independent strict profile for a particular
+trusted worker runtime. A host constructs it from a bounded set of raw syscall
+numbers for the current Linux ABI, then installs it atomically with
+`BubblewrapWorkerPolicy::set_seccomp_allowlist`. It is not serializable Splash
+configuration, LLM output, worker input, or caller-provided cBPF. Empty,
+duplicate, and more-than-512-entry lists are rejected; selecting
+`WorkerSeccompProfile::StrictAllowlist` without using that setter fails policy
+compilation rather than falling back to the default-allow profile.
+
+The strict filter performs the same ABI and x32 checks as the compatibility
+profile, applies the fixed escape-surface guards first, then returns `ALLOW`
+only for an entry in the host list. Every other syscall returns
+`SECCOMP_RET_KILL_PROCESS`. Policy compilation rejects a list that contains an
+unconditionally blocked x32 ABI number, `clone3`, or a fixed mount,
+kernel-control, tracing, cross-process-memory, keyring, or `personality`
+syscall. The remaining argument-sensitive fixed guards still take precedence:
+namespace-creating legacy `clone` calls and `TIOCSTI` return `EPERM` even when
+the host lists ordinary `clone` or `ioctl`.
+
+A strict list must cover the entire post-filter execution path: Bubblewrap's
+fixed `execve`, any selected `splash-limit-runner`, the dynamic loader, and the
+exact fixed worker and libraries. Build and test it per target ABI with the
+same immutable runtime mounts deployed to production. Splash does not infer a
+list from source, profile a worker at runtime, or widen a list after launch.
+Policy compilation explicitly rejects a list without Bubblewrap's required
+`execve`; any other incomplete list stops the worker rather than weakening
+containment.
+
+This is a syscall boundary, not executable-path mediation. A working strict
+profile normally has to allow an execution syscall, so a compromised worker
+can still chain to another executable deliberately exposed in a runtime mount.
+Mount layout and a separately designed executable policy remain responsible for
+that authority. The strict profile likewise does not mediate a network origin,
+D-Bus, device access, secrets, or capability grants.
 
 `splash-limit-runner` is an optional Linux-only, fixed pre-exec runner. Build
 the bundled binary on the target Linux platform with:
@@ -411,13 +446,14 @@ which capability grant applies to each invocation. Hosts needing filesystem
 isolation for each individual call must launch a separate worker using a
 narrower manifest, rather than relying on one multi-tool worker process.
 
-The fixed worker program is not an executable syscall policy. A trusted adapter
+The fixed worker program is not an executable-path policy. A trusted adapter
 cannot receive a script-selected executable through this backend, but a
 compromised worker can still execute or read any file deliberately exposed in a
-runtime mount. `DenyKnownEscapeSurface` protects only its explicit
-default-allow deny set and intentionally permits `execve`; hosts must keep
-runtime mounts minimal and immutable. Preventing unexpected executable chaining
-requires a separately designed worker-specific syscall allowlist.
+runtime mount. `DenyKnownEscapeSurface` protects only its explicit default-allow
+deny set; `StrictAllowlist` reduces the syscall surface but normally needs an
+execution syscall itself. Hosts must keep runtime mounts minimal and immutable
+and use a separately designed executable policy where executable chaining must
+be mediated.
 
 ## Non-Guarantees
 
@@ -436,16 +472,20 @@ It does not yet provide:
   filesystem quota. An optional runner adds the narrower rlimits, a configured
   private `/tmp` size limits only that Bubblewrap `tmpfs`, and the watchdog
   adds a process-lifetime wall-clock deadline;
-- a worker-specific syscall allowlist, D-Bus mediation, device-specific policy,
-  or a network proxy. `DenyKnownEscapeSurface` is a narrow default-allow
-  hardening filter, not a replacement for any of these;
+- D-Bus mediation, device-specific policy, an executable-path policy, or a
+  network proxy. `DenyKnownEscapeSurface` is a narrow default-allow hardening
+  filter, while `StrictAllowlist` is a target-specific syscall boundary, not a
+  replacement for any of these;
 - a safe per-origin network allowlist, arbitrary executable selection, secret
   broker, or filesystem access outside registered directory roots;
-- authenticated in-band cancellation delivery, worker cancellation
-  acknowledgements, post-exit reconciliation, or durable operation storage.
-  The optional watchdog supplies a host wall-clock force-stop for one
-  synchronous transport invocation, not proof that an adapter effect was
-  cancelled; and
+- authenticated in-band cancellation delivery or worker cancellation
+  acknowledgements. The optional watchdog supplies a host wall-clock force-stop
+  for one synchronous transport invocation, not proof that an adapter effect
+  was cancelled. Bubblewrap also does not automate post-exit recovery or supply
+  durable operation storage: a host may pair a fresh contained worker session
+  with the one-shot durable-operation transport and separately authenticated
+  journal/ledger storage, but it must select and execute that recovery policy;
+  and
 - protection from a trusted host changing a policy source path between plan
   compilation and worker exit. Policy sources and their contents, including
   executable and symlink targets, must be owned and immutable to untrusted

@@ -38,12 +38,47 @@ not resolve imports, construct a capability host, or execute source.
 and editor-tool workflows; it emits diagnostics and exits nonzero when the
 source is invalid.
 
+For a pre-approval effect summary, hosts can call
+`splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash
+tool-calls <file>` exposes the same result as structured JSON. The report
+retains at most 1,024 direct sites and marks `truncated` when later sites were
+omitted. A hint recognizes only the direct source spelling `tool.call`,
+`tool.start`, `tool.call_json`, or `tool.start_json`, with a decoded name only
+when the first argument is a direct string literal. It does not resolve
+imports, aliases, shadowing, control flow, or runtime values, and it never
+evaluates source or creates a capability host. It is therefore a review
+presentation, not static authorization: the host must still issue a capability
+lease and runtime reservation validates every actual call.
+
+For an ordered LLM workflow, `WorkflowPlan::review` returns one data-only
+`WorkflowStepReview` per trusted step. Each item contains the step ID,
+canonical syntax report, and direct tool-call hints only when that step is
+valid. `tool_calls_truncated` records whether that step's result was capped by
+the core 1,024-site or workflow-wide 4,096-site limit. This keeps an invalid
+step distinguishable from a valid step with no direct calls. The review uses no
+capability host, never evaluates source, and does not issue an approval or
+lease. A host may use it to prepare a human or policy review surface before calling
+`approve_with_step_capability_leases` or the host-policy convenience API
+`approve_with_step_capability_policies`, but it must not derive authority from
+hints: aliases, reachability, and computed names remain runtime checks. The
+policy form checks its named bindings to trusted plan steps before issuing
+non-serializable runtime leases; it is not Splash-visible authority.
+
+An LLM can submit the ordered source list through the bounded versioned
+`WorkflowDraft` JSON format before any engine-owned plan exists. Its
+`review` path and the `splash workflow-review` CLI command return the same
+per-step syntax and bounded hint data without creating a capability runtime.
+The draft contains no grant or approval and must still pass a separate trusted
+host policy decision; see [Workflow drafts](workflow-drafts.md).
+
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
 execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape
 hatch for Makepad migration code; do not expose it to generated source or a
 capability host. `WorkflowEngine` preserves a preflight failure as a
-step-scoped `WorkflowError::StepRejected` and event, including the structured
-syntax report and completed-prefix count.
+step-scoped `WorkflowError::StepRejected` with the structured syntax report.
+Its retained event records only the diagnostic count, truncation flag, and
+completed-prefix count so long-lived workflow telemetry does not cache source
+diagnostic text.
 
 The canonical checker and the vendored VM parser are separate implementations.
 Every canonical source first passes the profile, then is parsed by the VM before
@@ -83,6 +118,15 @@ The core runtime does not install `mod.fs`, `mod.run`, or `mod.net`. A script
 cannot acquire authority by importing a name. The host must create a runtime
 with a registered tool policy before `tool.call` or `tool.start` can succeed.
 
+For an operator-approved execution, a host can issue a process-local
+`CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or
+place the lease in a workflow approval. The lease can only narrow registered
+tool names and call budgets, records the exact host catalog fingerprint, and
+checks every call when it is reserved. Consequently, using a computed string
+as the `name` argument does not bypass approval. A lease remains active across
+`await` and the resulting continuation; it is a host-side authority object,
+not a Splash value or a serialized credential.
+
 The v0.1 tool contract accepts string input and returns string output.
 `tool.call` is synchronous. `tool.start` reserves the same capability and
 returns an opaque promise; `await()` pauses the current script until the
@@ -103,6 +147,22 @@ JSON envelopes. Contract checks run before the handler and before output
 returns to Splash; metadata-only schemas in the catalog do not enforce input
 or output. The exact supported subset is defined in
 [JSON tool contracts](schema-contracts.md).
+
+For an approved `WorkflowEngine` dataflow run, the host may inject a bounded
+JSON `workflow` value with `input` and completed-prefix `outputs` fields. It
+is reconstructed by the host for each step and is not a capability, module,
+or ambient global available to ordinary evaluation. The context is bound to
+the workflow approval and remains stable through `await`; a computed tool name
+read from it still passes through the active capability lease. Completed script
+values must convert to bounded JSON before they can become a later step's
+output. A host can bind a `WorkflowDataContract` with a compiled input schema
+and one ordered output schema for every trusted plan step. The host validates
+the input before approval and each output before it becomes a later step's
+data; the contract is not Splash-visible, serializable, or selected from a
+workflow draft or checkpoint. Contract-aware checkpoints retain only its
+digest and require the matching host-rebuilt contract during resume. See
+[Workflow drafts](workflow-drafts.md) and
+[Workflow checkpoints](workflow-checkpoints.md).
 
 The promise API is cooperative. It does not grant a script a thread, a task
 runtime, or a way to invoke an adapter without the host's pump. Structured
@@ -148,6 +208,11 @@ Workflow restart state is also host-owned. Splash source cannot create or load
 a checkpoint, and a persisted checkpoint never restores variables, promises,
 or tool authority. The host reconstructs a trusted plan and explicitly approves
 the remaining suffix; see [Workflow checkpoints](workflow-checkpoints.md).
+For a live external `await`, the workflow engine retains its nonserializable
+approval and returns `StepSuspended`; the trusted host must claim and complete
+or cancel that exact operation through the engine before the workflow can
+continue. This is not a restart mechanism or an authority grant to the
+external adapter.
 For uncertain external effects, a host may additionally keep a
 [durable operation ledger](workflow-operations.md), but the script cannot read
 or mutate its keys, input digest, worker observation, or restart policy.
@@ -171,6 +236,11 @@ or mutate its keys, input digest, worker observation, or restart policy.
 - Keep effectful work in named tools and pure transformations in Splash code.
 - Generate against the host-supplied tool catalog only; descriptions and
   schemas do not grant access to unlisted tools.
+- Use the effect-free `tool-calls` outline to present direct candidate calls to
+  an operator, but do not treat it as proof of the executed tool set. Dynamic
+  names and aliases are resolved only by the runtime capability boundary.
+- Treat an approval as a bound set of names and call limits, including when a
+  tool name comes from a computed string; it cannot be widened from Splash.
 - Await a deferred tool result before using it; do not assume `start` performs
   an effect until a host pump or external completion has delivered its result.
 - Use record or array envelopes for JSON tools, then call `parse_json()` on

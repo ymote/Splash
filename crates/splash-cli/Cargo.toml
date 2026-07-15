@@ -16,3 +16,4 @@ path = "src/main.rs"
 [dependencies]
 splash-capabilities = { path = "../splash-capabilities" }
 splash-core = { path = "../splash-core" }
+splash-workflow = { version = "0.1.0", path = "../splash-workflow" }

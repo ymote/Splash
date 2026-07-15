@@ -40,6 +40,13 @@ use splash_protocol::{
 
 const MAX_PRIVATE_TMPFS_BYTES: usize = usize::MAX >> 1;
 const MAX_FINITE_RESOURCE_LIMIT: u64 = u64::MAX - 1;
+const MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS: usize = 4_096;
+
+/// Upper bound for syscalls in one strict worker seccomp policy.
+///
+/// The cap keeps the generated cBPF program comfortably below Linux's 4,096
+/// instruction limit even after Splash's fixed ABI and escape-surface guards.
+pub const MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS: usize = 512;
 
 /// Access mode for a host-selected file-root binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,9 +78,10 @@ pub enum UserNamespacePolicy {
 /// [`Self::DenyKnownEscapeSurface`] is intentionally a default-allow cBPF
 /// filter: it denies a reviewed set of namespace, mount, kernel-control,
 /// tracing, keyring, and terminal-injection operations while preserving the
-/// broad syscall compatibility required by a dynamic worker. It is useful
-/// defense in depth, but it is not a worker-specific syscall allowlist or a
-/// complete syscall sandbox.
+/// broad syscall compatibility required by a dynamic worker.
+/// [`Self::StrictAllowlist`] instead allows only a bounded, host-reviewed
+/// [`WorkerSeccompAllowlist`] and kills every other syscall. Both profiles are
+/// defense in depth, not a capability mechanism or a complete syscall sandbox.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WorkerSeccompProfile {
@@ -87,10 +95,112 @@ pub enum WorkerSeccompProfile {
     /// `clone3` so common libc implementations can use legacy `clone`.
     /// Legacy `clone` remains available for processes and threads but is
     /// rejected when it requests any namespace-creation flag. Applications
-    /// that require `clone3` must not enable this compatibility-oriented
-    /// profile until a worker-specific allowlist is available.
+    /// that require `clone3` must not enable this profile: its flags are
+    /// indirect and cannot be inspected by the cBPF hardening layer.
     DenyKnownEscapeSurface,
+    /// Allows only the host-configured [`WorkerSeccompAllowlist`].
+    ///
+    /// The filter still performs Splash's ABI/x32 checks and rejects the fixed
+    /// namespace, kernel-control, tracing, keyring, and terminal-injection
+    /// escape surface before it consults the selected allowlist. Every other
+    /// syscall kills the worker. Use
+    /// [`BubblewrapWorkerPolicy::set_seccomp_allowlist`] to select this mode;
+    /// choosing it through [`BubblewrapWorkerPolicy::set_seccomp_profile`]
+    /// without a list makes policy compilation fail closed.
+    StrictAllowlist,
 }
+
+/// Trusted host-selected syscall numbers for a strict worker seccomp policy.
+///
+/// The numbers target the current Linux syscall ABI. They are intentionally
+/// neither Splash values nor serializable policy: a host must construct and
+/// review them alongside the exact Bubblewrap, optional pre-exec runner, and
+/// fixed worker executable it will run. The list is sorted before compilation
+/// so its cBPF representation is deterministic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerSeccompAllowlist {
+    syscalls: BTreeSet<u32>,
+}
+
+impl WorkerSeccompAllowlist {
+    /// Creates a bounded strict allowlist from raw Linux syscall numbers.
+    ///
+    /// Duplicate entries are rejected rather than silently deduplicated so a
+    /// host review sees exactly the policy that will be installed. The list is
+    /// never empty: an empty list can only produce a worker that dies before
+    /// it can execute its fixed program.
+    pub fn new<I>(syscalls: I) -> Result<Self, WorkerSeccompAllowlistError>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let mut selected = BTreeSet::new();
+        for syscall in syscalls {
+            if selected.contains(&syscall) {
+                return Err(WorkerSeccompAllowlistError::DuplicateSyscall { syscall });
+            }
+            if selected.len() == MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS {
+                return Err(WorkerSeccompAllowlistError::TooManySyscalls {
+                    maximum: MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS,
+                });
+            }
+            selected.insert(syscall);
+        }
+        if selected.is_empty() {
+            return Err(WorkerSeccompAllowlistError::Empty);
+        }
+        Ok(Self { syscalls: selected })
+    }
+
+    /// Returns the syscall count in this policy.
+    pub fn len(&self) -> usize {
+        self.syscalls.len()
+    }
+
+    /// Returns whether this policy contains no syscall numbers.
+    ///
+    /// Valid policies are never empty; this accessor exists for callers that
+    /// retain a policy through a generic collection.
+    pub fn is_empty(&self) -> bool {
+        self.syscalls.is_empty()
+    }
+
+    /// Iterates the selected syscall numbers in ascending order.
+    pub fn syscalls(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.syscalls.iter().copied()
+    }
+}
+
+/// Rejection while constructing a strict worker seccomp allowlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WorkerSeccompAllowlistError {
+    /// A strict worker policy needs at least one syscall.
+    Empty,
+    /// A syscall appeared more than once in the trusted configuration.
+    DuplicateSyscall { syscall: u32 },
+    /// The bounded cBPF policy would contain too many syscall entries.
+    TooManySyscalls { maximum: usize },
+}
+
+impl Display for WorkerSeccompAllowlistError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("strict seccomp allowlist must not be empty"),
+            Self::DuplicateSyscall { syscall } => {
+                write!(
+                    formatter,
+                    "strict seccomp allowlist repeats syscall {syscall}"
+                )
+            }
+            Self::TooManySyscalls { maximum } => write!(
+                formatter,
+                "strict seccomp allowlist exceeds its {maximum}-syscall limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkerSeccompAllowlistError {}
 
 /// One Linux resource controlled by [`WorkerResourceLimits`].
 ///
@@ -468,6 +578,7 @@ pub struct BubblewrapWorkerPolicy {
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
     seccomp_profile: WorkerSeccompProfile,
+    seccomp_allowlist: Option<WorkerSeccompAllowlist>,
 }
 
 impl BubblewrapWorkerPolicy {
@@ -494,6 +605,7 @@ impl BubblewrapWorkerPolicy {
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
             seccomp_profile: WorkerSeccompProfile::Disabled,
+            seccomp_allowlist: None,
         })
     }
 
@@ -606,15 +718,39 @@ impl BubblewrapWorkerPolicy {
         self.seccomp_profile
     }
 
+    /// Returns the strict seccomp allowlist selected for this worker, if any.
+    pub fn seccomp_allowlist(&self) -> Option<&WorkerSeccompAllowlist> {
+        self.seccomp_allowlist.as_ref()
+    }
+
     /// Selects a typed, Splash-owned seccomp hardening profile.
     ///
     /// A selected profile is compiled by Splash and transferred to Bubblewrap
     /// over an anonymous launch-only descriptor. Callers cannot provide raw
-    /// cBPF, syscall numbers, or a descriptor. Unsupported platforms and
-    /// architectures reject a selected profile during compilation; launch does
-    /// not fall back to an unfiltered worker.
+    /// cBPF or a descriptor. Unsupported platforms and architectures reject a
+    /// selected profile during compilation; launch does not fall back to an
+    /// unfiltered worker.
+    ///
+    /// Selecting [`WorkerSeccompProfile::StrictAllowlist`] through this method
+    /// intentionally clears any old allowlist and makes compilation fail. Use
+    /// [`Self::set_seccomp_allowlist`] to atomically select a new strict list.
     pub fn set_seccomp_profile(&mut self, profile: WorkerSeccompProfile) -> &mut Self {
         self.seccomp_profile = profile;
+        self.seccomp_allowlist = None;
+        self
+    }
+
+    /// Selects a strict, host-reviewed syscall allowlist for this worker.
+    ///
+    /// The raw syscall numbers remain trusted host configuration. Splash adds
+    /// its fixed ABI and escape-surface guards before the list, then kills on
+    /// every syscall the host did not select. The list must cover Bubblewrap's
+    /// final execution path, any fixed pre-exec runner, and the worker's exact
+    /// runtime; Linux policy compilation explicitly requires `execve`. It is
+    /// never derived from Splash source or an LLM request.
+    pub fn set_seccomp_allowlist(&mut self, allowlist: WorkerSeccompAllowlist) -> &mut Self {
+        self.seccomp_profile = WorkerSeccompProfile::StrictAllowlist;
+        self.seccomp_allowlist = Some(allowlist);
         self
     }
 
@@ -684,7 +820,8 @@ impl BubblewrapWorkerPolicy {
                 "resource limit runner source",
             )?;
         }
-        let seccomp_program = compile_seccomp_program(self.seccomp_profile)?;
+        let seccomp_program =
+            compile_seccomp_program(self.seccomp_profile, self.seccomp_allowlist.as_ref())?;
 
         let mut arguments = vec![
             OsString::from("--die-with-parent"),
@@ -1018,19 +1155,27 @@ impl SeccompProgram {
 
 fn compile_seccomp_program(
     profile: WorkerSeccompProfile,
+    allowlist: Option<&WorkerSeccompAllowlist>,
 ) -> Result<Option<SeccompProgram>, BubblewrapPolicyError> {
     if profile == WorkerSeccompProfile::Disabled {
         return Ok(None);
     }
 
+    let allowlist = match profile {
+        WorkerSeccompProfile::Disabled | WorkerSeccompProfile::DenyKnownEscapeSurface => None,
+        WorkerSeccompProfile::StrictAllowlist => {
+            Some(allowlist.ok_or(BubblewrapPolicyError::MissingSeccompAllowlist)?)
+        }
+    };
+
     #[cfg(target_os = "linux")]
     {
-        linux_seccomp::compile(profile).map(Some)
+        linux_seccomp::compile(profile, allowlist).map(Some)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = profile;
+        let _ = (profile, allowlist);
         Err(BubblewrapPolicyError::SeccompUnsupportedPlatform)
     }
 }
@@ -1942,6 +2087,14 @@ pub enum BubblewrapPolicyError {
         maximum_bytes: usize,
     },
     EmptyResourceLimits,
+    MissingSeccompAllowlist,
+    MissingSeccompExecve,
+    SeccompAllowlistConflictsWithHardening {
+        syscall: u32,
+    },
+    SeccompProgramTooLarge {
+        instructions: usize,
+    },
     SeccompUnsupportedPlatform,
     SeccompUnsupportedArchitecture {
         architecture: &'static str,
@@ -2014,6 +2167,20 @@ impl Display for BubblewrapPolicyError {
             Self::EmptyResourceLimits => {
                 formatter.write_str("resource limit runner requires at least one finite limit")
             }
+            Self::MissingSeccompAllowlist => formatter.write_str(
+                "strict seccomp profile requires a host-selected syscall allowlist",
+            ),
+            Self::MissingSeccompExecve => formatter.write_str(
+                "strict seccomp allowlist must include Bubblewrap's required execve syscall",
+            ),
+            Self::SeccompAllowlistConflictsWithHardening { syscall } => write!(
+                formatter,
+                "strict seccomp allowlist syscall {syscall} conflicts with Splash's fixed hardening"
+            ),
+            Self::SeccompProgramTooLarge { instructions } => write!(
+                formatter,
+                "generated seccomp program has {instructions} instructions, exceeding Linux's {MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS} instruction limit"
+            ),
             Self::SeccompUnsupportedPlatform => {
                 formatter.write_str("selected seccomp profile is supported only on Linux")
             }
@@ -2117,6 +2284,10 @@ impl std::error::Error for BubblewrapPolicyError {
             Self::SourceIo { source, .. } => Some(source),
             Self::InvalidPrivateTmpfsSize { .. }
             | Self::EmptyResourceLimits
+            | Self::MissingSeccompAllowlist
+            | Self::MissingSeccompExecve
+            | Self::SeccompAllowlistConflictsWithHardening { .. }
+            | Self::SeccompProgramTooLarge { .. }
             | Self::SeccompUnsupportedPlatform
             | Self::SeccompUnsupportedArchitecture { .. }
             | Self::InvalidPath { .. }
@@ -2736,7 +2907,10 @@ fn wait_for_cgroup_join(
 
 #[cfg(target_os = "linux")]
 mod linux_seccomp {
-    use super::{BubblewrapPolicyError, SeccompProgram, WorkerSeccompProfile};
+    use super::{
+        BubblewrapPolicyError, SeccompProgram, WorkerSeccompAllowlist, WorkerSeccompProfile,
+        MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS,
+    };
     use linux_raw_sys::{errno, general, ioctl, ptrace};
 
     const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -2894,32 +3068,36 @@ mod linux_seccomp {
             self.return_value(action);
         }
 
-        fn into_bytes(self) -> Vec<u8> {
+        fn allow_syscall(&mut self, syscall: u32) {
+            self.jump_equal(syscall, 0, 1);
+            self.return_value(ptrace::SECCOMP_RET_ALLOW);
+        }
+
+        fn into_bytes(self) -> Result<Vec<u8>, BubblewrapPolicyError> {
+            if self.instructions.len() > MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS {
+                return Err(BubblewrapPolicyError::SeccompProgramTooLarge {
+                    instructions: self.instructions.len(),
+                });
+            }
             let mut bytes =
                 Vec::with_capacity(self.instructions.len() * SECCOMP_FILTER_INSTRUCTION_BYTES);
             for instruction in self.instructions {
                 instruction.append_to(&mut bytes);
             }
-            bytes
+            Ok(bytes)
         }
     }
 
     pub(super) fn compile(
         profile: WorkerSeccompProfile,
+        allowlist: Option<&WorkerSeccompAllowlist>,
     ) -> Result<SeccompProgram, BubblewrapPolicyError> {
         let architecture = current_audit_architecture()?;
         let mut program = ProgramBuilder::new();
 
-        match profile {
-            WorkerSeccompProfile::DenyKnownEscapeSurface => {}
-            WorkerSeccompProfile::Disabled => {
-                unreachable!("disabled seccomp profiles are not compiled")
-            }
-        }
-
         // Linux recommends checking the ABI before interpreting syscall
-        // numbers. A mismatch or x32 ABI attempt must not fall through this
-        // default-allow hardening profile.
+        // numbers. A mismatch or x32 ABI attempt must not reach either
+        // compatibility or strict allowlist policy.
         program.load_word(SECCOMP_DATA_ARCH_OFFSET);
         program.jump_equal(architecture, 1, 0);
         program.return_value(ptrace::SECCOMP_RET_KILL_PROCESS);
@@ -2930,6 +3108,32 @@ mod linux_seccomp {
             program.return_value(ptrace::SECCOMP_RET_KILL_PROCESS);
         }
 
+        append_escape_surface_guards(&mut program);
+
+        match profile {
+            WorkerSeccompProfile::DenyKnownEscapeSurface => {
+                program.return_value(ptrace::SECCOMP_RET_ALLOW);
+            }
+            WorkerSeccompProfile::StrictAllowlist => {
+                let allowlist = allowlist.ok_or(BubblewrapPolicyError::MissingSeccompAllowlist)?;
+                validate_strict_allowlist(allowlist)?;
+                for syscall in allowlist.syscalls() {
+                    program.allow_syscall(syscall);
+                }
+                program.return_value(ptrace::SECCOMP_RET_KILL_PROCESS);
+            }
+            WorkerSeccompProfile::Disabled => {
+                unreachable!("disabled seccomp profiles are not compiled")
+            }
+        }
+
+        Ok(SeccompProgram {
+            profile,
+            bytes: program.into_bytes()?,
+        })
+    }
+
+    fn append_escape_surface_guards(program: &mut ProgramBuilder) {
         // Retain ordinary processes and threads through legacy clone, while
         // rejecting every namespace-creation flag. x86-64, AArch64, and
         // RISC-V all pass raw clone flags as argument 0. clone3 carries flags
@@ -2954,12 +3158,32 @@ mod linux_seccomp {
         for &syscall in DENIED_SYSCALLS {
             program.deny_syscall(syscall, DENY_WITH_EPERM);
         }
-        program.return_value(ptrace::SECCOMP_RET_ALLOW);
+    }
 
-        Ok(SeccompProgram {
-            profile,
-            bytes: program.into_bytes(),
-        })
+    fn validate_strict_allowlist(
+        allowlist: &WorkerSeccompAllowlist,
+    ) -> Result<(), BubblewrapPolicyError> {
+        let mut has_execve = false;
+        for syscall in allowlist.syscalls() {
+            #[cfg(target_arch = "x86_64")]
+            if syscall & general::__X32_SYSCALL_BIT != 0 {
+                return Err(
+                    BubblewrapPolicyError::SeccompAllowlistConflictsWithHardening { syscall },
+                );
+            }
+            if syscall == general::__NR_clone3 || DENIED_SYSCALLS.contains(&syscall) {
+                return Err(
+                    BubblewrapPolicyError::SeccompAllowlistConflictsWithHardening { syscall },
+                );
+            }
+            if syscall == general::__NR_execve {
+                has_execve = true;
+            }
+        }
+        if !has_execve {
+            return Err(BubblewrapPolicyError::MissingSeccompExecve);
+        }
+        Ok(())
     }
 
     fn current_audit_architecture() -> Result<u32, BubblewrapPolicyError> {
@@ -3249,6 +3473,45 @@ mod tests {
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
     }
 
+    #[test]
+    fn strict_seccomp_allowlists_are_bounded_deterministic_and_selected_atomically() {
+        let allowlist = WorkerSeccompAllowlist::new([91, 7, 28]).unwrap();
+        assert_eq!(allowlist.len(), 3);
+        assert!(!allowlist.is_empty());
+        assert_eq!(allowlist.syscalls().collect::<Vec<_>>(), vec![7, 28, 91]);
+        assert_eq!(
+            WorkerSeccompAllowlist::new([7, 7]),
+            Err(WorkerSeccompAllowlistError::DuplicateSyscall { syscall: 7 })
+        );
+        assert_eq!(
+            WorkerSeccompAllowlist::new([]),
+            Err(WorkerSeccompAllowlistError::Empty)
+        );
+        assert_eq!(
+            WorkerSeccompAllowlist::new(0..=MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS as u32),
+            Err(WorkerSeccompAllowlistError::TooManySyscalls {
+                maximum: MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS,
+            })
+        );
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_seccomp_profile(WorkerSeccompProfile::StrictAllowlist);
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::MissingSeccompAllowlist)
+        ));
+
+        policy.set_seccomp_allowlist(allowlist.clone());
+        assert_eq!(
+            policy.seccomp_profile(),
+            WorkerSeccompProfile::StrictAllowlist
+        );
+        assert_eq!(policy.seccomp_allowlist(), Some(&allowlist));
+        policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
+        assert!(policy.seccomp_allowlist().is_none());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn seccomp_hardening_is_typed_and_rejects_its_documented_escape_surface() {
@@ -3339,6 +3602,151 @@ mod tests {
                 [0; 6],
             ),
             ptrace::SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_seccomp_allowlist_kills_unselected_syscalls_and_retains_fixed_guards() {
+        use linux_raw_sys::{errno, general, ioctl, ptrace};
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        let allowlist = WorkerSeccompAllowlist::new([
+            general::__NR_read,
+            general::__NR_execve,
+            general::__NR_clone,
+            general::__NR_ioctl,
+        ])
+        .unwrap();
+        policy.set_seccomp_allowlist(allowlist);
+
+        let plan = policy.compile(&manifest([])).unwrap();
+        let program = plan.seccomp_program.as_ref().unwrap();
+        let architecture = u32::from_ne_bytes(program.bytes[12..16].try_into().unwrap());
+        let denied_with_eperm = ptrace::SECCOMP_RET_ERRNO | errno::EPERM;
+        let denied_with_enosys = ptrace::SECCOMP_RET_ERRNO | errno::ENOSYS;
+
+        assert_eq!(
+            plan.seccomp_profile(),
+            WorkerSeccompProfile::StrictAllowlist
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_read, [0; 6]),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_execve, [0; 6],),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        // Unconditionally guarded syscalls cannot be listed, and continue to
+        // receive their fixed action when a worker attempts them.
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_mount, [0; 6]),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_clone, [0; 6]),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture,
+                general::__NR_clone,
+                [u64::from(general::CLONE_NEWNET); 6],
+            ),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_clone3, [0; 6],),
+            denied_with_enosys
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, general::__NR_ioctl, [0; 6],),
+            ptrace::SECCOMP_RET_ALLOW
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(
+                program,
+                architecture,
+                general::__NR_ioctl,
+                [0, u64::from(ioctl::TIOCSTI), 0, 0, 0, 0],
+            ),
+            denied_with_eperm
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture, 0x3fff_ffff, [0; 6],),
+            ptrace::SECCOMP_RET_KILL_PROCESS
+        );
+        assert_eq!(
+            linux_seccomp::evaluate_for_test(program, architecture ^ 1, general::__NR_read, [0; 6],),
+            ptrace::SECCOMP_RET_KILL_PROCESS
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_seccomp_allowlist_requires_execve_and_rejects_unconditional_guards() {
+        use linux_raw_sys::general;
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_seccomp_allowlist(WorkerSeccompAllowlist::new([general::__NR_read]).unwrap());
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::MissingSeccompExecve)
+        ));
+
+        for syscall in [general::__NR_mount, general::__NR_clone3] {
+            let mut policy = base_policy(&root);
+            policy.set_seccomp_allowlist(
+                WorkerSeccompAllowlist::new([general::__NR_execve, syscall]).unwrap(),
+            );
+            assert!(matches!(
+                policy.compile(&manifest([])),
+                Err(BubblewrapPolicyError::SeccompAllowlistConflictsWithHardening {
+                    syscall: rejected,
+                }) if rejected == syscall
+            ));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let syscall = general::__NR_read | general::__X32_SYSCALL_BIT;
+            let mut policy = base_policy(&root);
+            policy.set_seccomp_allowlist(
+                WorkerSeccompAllowlist::new([general::__NR_execve, syscall]).unwrap(),
+            );
+            assert!(matches!(
+                policy.compile(&manifest([])),
+                Err(BubblewrapPolicyError::SeccompAllowlistConflictsWithHardening {
+                    syscall: rejected,
+                }) if rejected == syscall
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_seccomp_allowlist_capacity_stays_within_the_linux_c_bpf_limit() {
+        use linux_raw_sys::general;
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        let start = 10_000_u32;
+        let allowlist = WorkerSeccompAllowlist::new(
+            std::iter::once(general::__NR_execve)
+                .chain(start..start + (MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS - 1) as u32),
+        )
+        .unwrap();
+        policy.set_seccomp_allowlist(allowlist);
+
+        let plan = policy.compile(&manifest([])).unwrap();
+        let program = plan.seccomp_program.as_ref().unwrap();
+        assert!(
+            program.bytes.len() / 8 <= MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS,
+            "strict seccomp program exceeds the Linux cBPF instruction limit"
         );
     }
 
@@ -3474,11 +3882,17 @@ print("seccomp-active")
 
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn selected_seccomp_hardening_fails_closed_off_linux() {
+    fn selected_seccomp_profiles_fail_closed_off_linux() {
         let root = TestDirectory::new();
         let mut policy = base_policy(&root);
         policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
 
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::SeccompUnsupportedPlatform)
+        ));
+
+        policy.set_seccomp_allowlist(WorkerSeccompAllowlist::new([1]).unwrap());
         assert!(matches!(
             policy.compile(&manifest([])),
             Err(BubblewrapPolicyError::SeccompUnsupportedPlatform)

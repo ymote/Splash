@@ -178,7 +178,11 @@ pub struct ScriptRunBudget {
 }
 
 impl ScriptRunBudget {
-    pub fn from_durations(soft: Duration, hard: Duration, sample_interval_instructions: u32) -> Self {
+    pub fn from_durations(
+        soft: Duration,
+        hard: Duration,
+        sample_interval_instructions: u32,
+    ) -> Self {
         let now = Instant::now();
         let sample_interval_instructions = sample_interval_instructions.max(1);
         Self {

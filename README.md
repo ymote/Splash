@@ -11,6 +11,16 @@ and keeps UI support optional rather than making UI the language boundary.
   diagnostics for generated source and editor tooling.
 - An effect-free canonical formatter that preserves comments and literal
   spellings while normalizing valid Splash source for LLM and editor workflows.
+- An effect-free per-step workflow review that pairs syntax status with direct
+  tool-call hints before a host issues ordered capability leases.
+- A bounded, data-only workflow-draft JSON format and CLI review path for LLM
+  plans before a host creates a trusted plan or issues authority.
+- Approval-bound bounded JSON workflow dataflow: host input and completed step
+  outputs are injected as data only, remain lease-constrained, and are never
+  copied into workflow telemetry.
+- Optional host-owned dataflow schema contracts that validate input and every
+  completed step output before a later step's authority can become active, and
+  bind their digest into contract-aware dataflow checkpoints.
 - A host-only stdio language server that publishes canonical syntax diagnostics,
   full-document formatting edits, and top-level declaration symbols without
   reading files or evaluating code.
@@ -19,6 +29,12 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded evaluator with source, instruction, and deadline limits.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
+- A bounded LLM-facing tool catalog with aggregate descriptor-count and
+  serialized-byte limits in addition to per-tool metadata and schema bounds.
+- Bounded capability audit and workflow-event views with explicit eviction
+  counters, plus an authenticated durable workflow-event journal for
+  host-owned operator/audit replay that remains separate from workflow
+  authority.
 - Audited tool calls with input/output and call-count limits.
 - Bounded executable JSON contracts for structured tool inputs and outputs.
 - Schema-required Serde bridges for reviewed Rust input and output types.
@@ -26,6 +42,10 @@ and keeps UI support optional rather than making UI the language boundary.
   embedded event loops.
 - A sealed static-catalog mobile and embedded profile for reviewed local Rust
   adapters, with executable JSON contracts for structured script-visible data.
+- A sealed mobile and embedded workflow profile that exposes data-only drafts,
+  bounded JSON dataflow and schema contracts, host-owned plans, named per-step
+  policies, checkpoints, and execution without exposing mutable capability
+  registration.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
@@ -42,10 +62,21 @@ and keeps UI support optional rather than making UI the language boundary.
   registered Rust adapters and enforces durable operation ordering.
 - Host-approved, current-policy-revalidated durable compensation intents with
   one inverse effect per succeeded operation and replay-safe worker recovery.
+- Approval-bound, catalog-fingerprinted capability leases that attenuate
+  dynamic workflow tool calls across `await` and resume, including one
+  least-privilege lease per trusted workflow step.
+- Host-owned, ordered per-step capability policies that bind named trusted
+  steps to grants before issuing those leases; they are configuration, not
+  serialized or script-visible authority.
 - Bounded, data-only workflow checkpoints with fresh host approval required
-  for a restart to run the remaining plan suffix.
+  for a restart to run the remaining plan suffix, with dataflow checkpoints
+  retaining only a context digest rather than raw input or prior outputs.
+- Resumable live external workflow steps that retain the approved capability
+  lease through host completion or a two-phase cooperative adapter
+  cancellation request and acknowledgement.
 - Plan-bound durable external-operation ledgers with input fingerprints,
-  derived worker keys, and revision-watermark hooks for host storage policy.
+  derived worker keys, revision-watermark hooks, and a two-stage
+  prepare/persist/exact-claim bridge for suspended external workflow steps.
 - Host-only authenticated storage envelopes with key rotation and a strict
   rollback-protected compare-and-swap backend contract.
 - Optional SQLite payload storage paired with an explicit trusted rollback
@@ -58,6 +89,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Feature-gated bounded JSON-line worker channel and authenticated transport
   for host-provided contained-worker pipes; process creation, deadlines, and
   containment remain host policy.
+- Feature-gated one-shot authenticated durable-operation transport for a fresh
+  contained-worker session; it validates one dispatch, reconciliation, or
+  compensation result but does not automate recovery policy.
 - Linux Bubblewrap worker-policy compiler and launcher for a fixed,
   host-selected worker and manifest-selected file roots; it rejects network,
   executable, and secret selectors rather than claiming unsupported policy.
@@ -71,6 +105,9 @@ and keeps UI support optional rather than making UI the language boundary.
   memory, swap, task, and per-device I/O limits; a fixed runner joins the
   cgroup before Bubblewrap starts, and managed lifecycle teardown kills the
   whole worker process tree.
+- Optional Linux Bubblewrap seccomp profiles: a compatibility-oriented fixed
+  deny set and a bounded host-selected strict syscall allowlist that kills
+  unlisted syscalls. Neither mediates executable paths or capability grants.
 - Optional Bubblewrap watchdog and generic bounded worker transport with
   host-selected per-invocation and total-session wall-clock deadlines; expiry
   or host termination poisons the session and remains indeterminate.
@@ -166,6 +203,66 @@ The command emits JSON with `function` and `let` declarations plus UTF-8 byte
 spans for each declaration and identifier. Invalid source still emits the
 structured syntax diagnostics and exits nonzero with an empty declaration list.
 
+Inspect direct source-level `tool.call`, `tool.start`, `tool.call_json`, and
+`tool.start_json` sites before requesting approval:
+
+```sh
+cargo run -p splash-cli -- tool-calls examples/json_tool_workflow.splash
+```
+
+The command emits JSON locations plus a literal tool name when the first
+argument is directly written as a string. It never evaluates source or creates
+a capability host. It is a review aid only: aliases, shadowing, control flow,
+and computed names remain unresolved, so the host must still issue a lease and
+the runtime must authorize every actual call. The output retains at most 1,024
+direct sites and sets `tool_calls_truncated` when later sites were omitted.
+
+Review an LLM-generated multi-step draft before it becomes a host-owned plan:
+
+```sh
+cargo run -p splash-cli -- workflow-review examples/release_workflow_draft.json
+```
+
+The versioned JSON draft contains only step IDs and source. Review output
+includes per-step syntax status and direct tool-call hints, never grants or
+approvals. Each step reports `tool_calls_truncated` when its direct-call review
+was capped; a workflow retains at most 4,096 hints across all steps. See
+[workflow drafts](docs/workflow-drafts.md) for its bounds and host lifecycle.
+
+Run the bounded local demonstration catalog only with explicit host-selected
+per-step grants:
+
+```sh
+cargo run -p splash-cli -- workflow-run --allow-echo --allow-json-add \
+  --grant prepare:text.echo:1 --grant calculate:math.add:1 \
+  examples/local_workflow_draft.json
+```
+
+Run the bounded dataflow example with explicit input and one reviewed grant:
+
+```sh
+cargo run -p splash-cli -- workflow-run --allow-json-add \
+  --input examples/dataflow_input.json \
+  --grant prepare:math.add:1 \
+  examples/dataflow_workflow_draft.json
+```
+
+`workflow-run` accepts only the two opt-in local demo adapters and prints a
+structured execution/audit summary. It never derives grants from source hints,
+opens filesystem/network/process authority, or supports external workers. A
+production host must construct its own reviewed catalog and policy. With
+`--input`, the direct result also contains raw dataflow input and outputs for
+local inspection; the audit and workflow event views never do.
+
+For production dataflow, a host can additionally bind compiled input and
+per-step output schemas through `WorkflowDataContract`. Those schemas are
+trusted application configuration, not draft or checkpoint fields; a failed
+output contract stops the workflow before a later authorized step runs. Use the
+paired contract-aware checkpoint/resume APIs to keep that policy across a
+restart. See
+[workflow drafts](docs/workflow-drafts.md) and
+[workflow checkpoints](docs/workflow-checkpoints.md).
+
 Format valid canonical source without creating a capability host or rewriting
 the input file:
 
@@ -195,9 +292,10 @@ an import, creates a capability host, or loads a Rust adapter.
 ## Workspace
 
 - `splash-core`: bounded VM wrapper and diagnostics.
-- `splash-capabilities`: explicit tool policy, audit log, deferred promises,
-  LLM-facing host catalog, JSON contracts, safe host bridge, and a sealed
-  static-catalog mobile/embedded profile.
+- `splash-capabilities`: explicit tool policy, bounded audit view, deferred promises,
+  LLM-facing host catalog, approval-bound capability leases, JSON contracts,
+  aggregate catalog limits, safe host bridge, and a sealed static-catalog
+  mobile/embedded profile.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
@@ -209,8 +307,10 @@ an import, creates a capability host, or loads a Rust adapter.
   storage backend.
 - `splash-sandbox`: target-specific worker containment policy; its initial
   Bubblewrap backend is Linux-only and deliberately narrow.
-- `splash-workflow`: host-owned planning, approval, checkpointing, durable
-  operation records, and sequential execution.
+- `splash-workflow`: host-owned planning, lease-bound approval, bounded JSON
+  dataflow, bounded in-memory and authenticated durable event replay,
+  checkpointing, durable operation records, sequential execution, and a sealed
+  mobile/embedded workflow facade for static local adapters.
 - `splash-cli`: local development CLI.
 - `splash-lsp`: host-only stdio diagnostics, canonical formatting, and
   top-level declaration symbols for open editor documents.
@@ -228,6 +328,17 @@ and the live-operation reconciliation boundary.
 
 [Workflow checkpoints](docs/workflow-checkpoints.md) define the durable
 host-orchestration boundary.
+
+[Durable workflow events](docs/workflow-events.md) define the authenticated
+telemetry replay boundary, which deliberately remains separate from recovery
+authority.
+
+[Workflow drafts](docs/workflow-drafts.md) define the untrusted LLM-plan
+interchange and review boundary before a host-owned approval.
+
+[Positioning and feasibility](docs/positioning.md) compares Splash with its
+Makepad substrate and defines the realistic boundary for Python/JavaScript
+replacement claims.
 
 [Durable operation ledgers](docs/workflow-operations.md) define how a host
 records and safely reconciles uncertain external effects across a restart.

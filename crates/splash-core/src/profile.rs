@@ -5,7 +5,8 @@
 //! Splash, without producing bytecode or evaluating source.
 
 use super::{
-    SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, MAX_SYNTAX_DIAGNOSTICS,
+    SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration,
+    TopLevelDeclarationKind, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_CANONICAL_PROFILE_NESTING: usize = 128;
@@ -43,6 +44,16 @@ pub(super) fn collect_top_level_declarations(
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
     top_level_declarations_from_tokens(&tokens)
+}
+
+/// Extracts direct `mod.tool` call syntax after the public caller has already
+/// confirmed canonical VM-compatible source. This deliberately scans tokens
+/// rather than attempting name or flow resolution: it is a bounded review hint
+/// that must never become an authorization decision.
+pub(super) fn collect_tool_call_hints(source: &str, max_tokens: usize) -> ToolCallHintReport {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    tool_call_hints_from_tokens(source, &tokens)
 }
 
 /// Formats source after validating the canonical grammar without evaluating it.
@@ -144,6 +155,148 @@ fn top_level_declarations_from_tokens(tokens: &[Token]) -> Vec<TopLevelDeclarati
     }
 
     declarations
+}
+
+fn tool_call_hints_from_tokens(source: &str, tokens: &[Token]) -> ToolCallHintReport {
+    let mut hints = Vec::new();
+    let mut truncated = false;
+
+    for index in 0..tokens.len() {
+        let Some(kind) = direct_tool_call_kind(tokens, index) else {
+            continue;
+        };
+
+        // `object.tool.call(...)` is a member access rather than the direct
+        // `mod.tool` identifier. We keep the scanner intentionally narrow.
+        if index > 0 && is_operator(&tokens[index - 1].kind, ".") {
+            continue;
+        }
+
+        if hints.len() == MAX_TOOL_CALL_HINTS {
+            truncated = true;
+            continue;
+        }
+
+        let callee = &tokens[index];
+        let method = &tokens[index + 2];
+        let literal = tokens
+            .get(index + 4)
+            .filter(|token| matches!(&token.kind, TokenKind::StringLiteral));
+        let (literal_name, literal_name_start_byte, literal_name_end_byte) =
+            literal.map_or((None, None, None), |token| {
+                (
+                    decode_canonical_string_literal(source, token),
+                    Some(token.start_byte),
+                    Some(token.end_byte),
+                )
+            });
+
+        hints.push(ToolCallHint {
+            kind,
+            literal_name,
+            line: callee.line,
+            column: callee.column,
+            callee_start_byte: callee.start_byte,
+            callee_end_byte: method.end_byte,
+            literal_name_start_byte,
+            literal_name_end_byte,
+        });
+    }
+
+    ToolCallHintReport { hints, truncated }
+}
+
+fn direct_tool_call_kind(tokens: &[Token], index: usize) -> Option<ToolCallKind> {
+    let tool = tokens.get(index)?;
+    let separator = tokens.get(index + 1)?;
+    let method = tokens.get(index + 2)?;
+    let opening = tokens.get(index + 3)?;
+
+    if !is_identifier_named(tool, "tool")
+        || !is_operator(&separator.kind, ".")
+        || !matches!(&opening.kind, TokenKind::OpenRound)
+    {
+        return None;
+    }
+
+    let TokenKind::Identifier(name) = &method.kind else {
+        return None;
+    };
+    match name.as_str() {
+        "call" => Some(ToolCallKind::Call),
+        "start" => Some(ToolCallKind::Start),
+        "call_json" => Some(ToolCallKind::CallJson),
+        "start_json" => Some(ToolCallKind::StartJson),
+        _ => None,
+    }
+}
+
+fn is_identifier_named(token: &Token, expected: &str) -> bool {
+    matches!(&token.kind, TokenKind::Identifier(identifier) if identifier == expected)
+}
+
+fn decode_canonical_string_literal(source: &str, token: &Token) -> Option<String> {
+    let literal = source.get(token.start_byte..token.end_byte)?;
+    let content = literal.strip_prefix('"')?.strip_suffix('"')?;
+    let mut characters = content.chars();
+    let mut decoded = String::with_capacity(content.len());
+
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+
+        let escaped = match characters.next()? {
+            '"' => '"',
+            '\\' => '\\',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => decode_unicode_escape(&mut characters)?,
+            _ => return None,
+        };
+        decoded.push(escaped);
+    }
+
+    Some(decoded)
+}
+
+fn decode_unicode_escape(characters: &mut std::str::Chars<'_>) -> Option<char> {
+    let first = characters.next()?;
+    let mut digits = String::new();
+
+    if first == '{' {
+        loop {
+            let character = characters.next()?;
+            if character == '}' {
+                break;
+            }
+            if !character.is_ascii_hexdigit() || digits.len() >= 6 {
+                return None;
+            }
+            digits.push(character);
+        }
+        if digits.is_empty() {
+            return None;
+        }
+    } else {
+        if !first.is_ascii_hexdigit() {
+            return None;
+        }
+        digits.push(first);
+        for _ in 0..3 {
+            let character = characters.next()?;
+            if !character.is_ascii_hexdigit() {
+                return None;
+            }
+            digits.push(character);
+        }
+    }
+
+    u32::from_str_radix(&digits, 16)
+        .ok()
+        .and_then(char::from_u32)
 }
 
 struct IdentifierToken<'token> {
@@ -529,11 +682,19 @@ impl<'source> ProfileLexer<'source> {
         if self.current() == Some('{') {
             self.advance();
             let mut digits = 0_usize;
+            let mut value = 0_u32;
             while self
                 .current()
                 .is_some_and(|character| character.is_ascii_hexdigit())
             {
                 digits += 1;
+                if digits <= 6 {
+                    let digit = self
+                        .current()
+                        .and_then(|character| character.to_digit(16))
+                        .expect("ASCII hexadecimal digits have a base-16 value");
+                    value = value.saturating_mul(16).saturating_add(digit);
+                }
                 self.advance();
             }
             if !(1..=6).contains(&digits) || self.current() != Some('}') {
@@ -548,6 +709,12 @@ impl<'source> ProfileLexer<'source> {
                 {
                     self.advance();
                 }
+            } else if char::from_u32(value).is_none() {
+                self.report(
+                    string_line,
+                    string_column,
+                    "unicode escapes must encode a valid Unicode scalar value",
+                );
             }
             if self.current() == Some('}') {
                 self.advance();
@@ -556,12 +723,18 @@ impl<'source> ProfileLexer<'source> {
         }
 
         let mut digits = 0_usize;
+        let mut value = 0_u32;
         while digits < 4
             && self
                 .current()
                 .is_some_and(|character| character.is_ascii_hexdigit())
         {
             digits += 1;
+            let digit = self
+                .current()
+                .and_then(|character| character.to_digit(16))
+                .expect("ASCII hexadecimal digits have a base-16 value");
+            value = value.saturating_mul(16).saturating_add(digit);
             self.advance();
         }
         if digits != 4 {
@@ -569,6 +742,12 @@ impl<'source> ProfileLexer<'source> {
                 string_line,
                 string_column,
                 "unicode escapes must use four hexadecimal digits or `\\u{...}` with one to six hexadecimal digits",
+            );
+        } else if char::from_u32(value).is_none() {
+            self.report(
+                string_line,
+                string_column,
+                "unicode escapes must encode a valid Unicode scalar value",
             );
         }
     }

@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "steps": [
+    {
+      "id": "prepare",
+      "source": "use mod.tool\nlet raw = tool.call_json(\"math.add\", workflow.input)\nlet result = raw.parse_json()\nresult"
+    },
+    {
+      "id": "summarize",
+      "source": "let result = {label: \"total\", total: workflow.outputs.prepare.total}\nresult"
+    }
+  ]
+}

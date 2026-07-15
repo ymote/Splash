@@ -9,14 +9,16 @@
 mod profile;
 
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 pub use makepad_script as vm;
 use profile::{
-    check_canonical_profile, collect_top_level_declarations, format_canonical_source,
-    ProfileFormatError,
+    check_canonical_profile, collect_tool_call_hints, collect_top_level_declarations,
+    format_canonical_source, ProfileFormatError,
 };
+pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
@@ -31,8 +33,21 @@ pub const DEFAULT_INSTRUCTION_LIMIT: usize = 200_000;
 pub const DEFAULT_SOFT_TIMEOUT: Duration = Duration::from_millis(32);
 pub const DEFAULT_HARD_TIMEOUT: Duration = Duration::from_millis(64);
 pub const DEFAULT_BUDGET_SAMPLE_INTERVAL: u32 = 1_024;
+/// Default maximum encoded size of JSON injected into or extracted from a
+/// Splash runtime.
+pub const DEFAULT_MAX_JSON_DATA_BYTES: usize = 64 * 1024;
+/// Default maximum JSON container nesting accepted at a host-data boundary.
+pub const DEFAULT_MAX_JSON_DATA_DEPTH: usize = 64;
+/// Maximum byte length of a host-selected injected-global identifier.
+pub const MAX_JSON_GLOBAL_NAME_BYTES: usize = 64;
 /// Maximum structured syntax diagnostics returned for one source check.
 pub const MAX_SYNTAX_DIAGNOSTICS: usize = 32;
+/// Maximum direct tool-call hints retained for one canonical source document.
+///
+/// This bounds review-memory and operator/LLM output growth independently of
+/// source and token limits. Use [`ToolCallHintReport::truncated`] to detect
+/// when a source contains additional direct call sites.
+pub const MAX_TOOL_CALL_HINTS: usize = 1_024;
 
 /// Bounds applied to one source evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +115,7 @@ pub enum RuntimeError {
     FormattedSourceTooLarge { actual: usize, maximum: usize },
     InvalidLimits(&'static str),
     SyntaxRejected(SyntaxReport),
+    JsonData(RuntimeJsonError),
     EvaluationInProgress,
     UnknownThread { thread_index: usize },
 }
@@ -132,6 +148,7 @@ impl Display for RuntimeError {
                 );
                 write!(formatter, "canonical Splash syntax rejected: {detail}")
             }
+            Self::JsonData(error) => write!(formatter, "JSON data boundary rejected: {error}"),
             Self::EvaluationInProgress => {
                 formatter.write_str("a suspended Splash evaluation must be resumed first")
             }
@@ -143,6 +160,72 @@ impl Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+/// Rejection at a bounded JSON boundary between a Rust host and Splash.
+///
+/// These checks are intentionally separate from capability authorization:
+/// JSON data can influence a permitted script's computation, but it cannot add
+/// tools, alter a lease, or bypass the runtime's source and execution limits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeJsonError {
+    InvalidGlobalName,
+    InvalidLimit,
+    TooLarge { actual: usize, maximum: usize },
+    TooDeep { maximum: usize },
+    InvalidEncoding,
+    NonFiniteNumber,
+    UnsupportedScriptValue,
+    NonStringObjectKey,
+    UnknownObjectKey,
+    DuplicateObjectKey,
+    CyclicScriptValue,
+}
+
+impl Display for RuntimeJsonError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidGlobalName => {
+                formatter.write_str("JSON global name must be a bounded ASCII identifier")
+            }
+            Self::InvalidLimit => {
+                formatter.write_str("JSON data byte and depth limits must be greater than zero")
+            }
+            Self::TooLarge { actual, maximum } => {
+                write!(
+                    formatter,
+                    "JSON data is {actual} bytes; maximum is {maximum} bytes"
+                )
+            }
+            Self::TooDeep { maximum } => {
+                write!(
+                    formatter,
+                    "JSON data exceeds the maximum nesting depth of {maximum}"
+                )
+            }
+            Self::InvalidEncoding => formatter.write_str("JSON data is not valid JSON"),
+            Self::NonFiniteNumber => {
+                formatter.write_str("a Splash non-finite number cannot cross a JSON boundary")
+            }
+            Self::UnsupportedScriptValue => {
+                formatter.write_str("a Splash value cannot be represented as JSON")
+            }
+            Self::NonStringObjectKey => {
+                formatter.write_str("a Splash object has a non-string JSON key")
+            }
+            Self::UnknownObjectKey => {
+                formatter.write_str("a Splash object key has no stable string spelling")
+            }
+            Self::DuplicateObjectKey => {
+                formatter.write_str("a Splash object has duplicate JSON keys")
+            }
+            Self::CyclicScriptValue => {
+                formatter.write_str("a cyclic Splash value cannot cross a JSON boundary")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuntimeJsonError {}
 
 /// Result of a single evaluation. `value` remains valid for the lifetime of
 /// its owning [`Runtime`].
@@ -194,6 +277,67 @@ pub struct TopLevelDeclaration {
     pub declaration_end_byte: usize,
     pub selection_start_byte: usize,
     pub selection_end_byte: usize,
+}
+
+/// The direct `mod.tool` method named by one source-level tool-call hint.
+///
+/// This is a syntactic classification only. It does not resolve bindings,
+/// control flow, or the value of a dynamically computed tool name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCallKind {
+    /// `tool.call(name, input)`.
+    Call,
+    /// `tool.start(name, input)`.
+    Start,
+    /// `tool.call_json(name, input)`.
+    CallJson,
+    /// `tool.start_json(name, input)`.
+    StartJson,
+}
+
+impl ToolCallKind {
+    /// Stable lowercase spelling used by host tools and the development CLI.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Start => "start",
+            Self::CallJson => "call_json",
+            Self::StartJson => "start_json",
+        }
+    }
+}
+
+/// A bounded, effect-free hint for a direct source-level `mod.tool` call.
+///
+/// The callee span covers `tool.<method>`. A literal-name span is present when
+/// the first argument is syntactically a string literal; `literal_name` is
+/// present when that literal can be decoded under the canonical escape rules.
+/// Any other first argument is dynamic. These hints are intentionally not a
+/// capability analysis: aliases, shadowing, control flow, expression values,
+/// imports, and runtime dispatch are not resolved. Hosts must still authorize
+/// every tool reservation through their capability catalog and lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallHint {
+    pub kind: ToolCallKind,
+    pub literal_name: Option<String>,
+    pub line: usize,
+    pub column: usize,
+    pub callee_start_byte: usize,
+    pub callee_end_byte: usize,
+    pub literal_name_start_byte: Option<usize>,
+    pub literal_name_end_byte: Option<usize>,
+}
+
+/// Bounded effect-free direct tool-call review output.
+///
+/// `hints` retains source-order entries up to [`MAX_TOOL_CALL_HINTS`]. When
+/// `truncated` is true, the source contains one or more additional direct
+/// `mod.tool` call sites that were intentionally omitted from this review
+/// output. This is not an authorization decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallHintReport {
+    pub hints: Vec<ToolCallHint>,
+    pub truncated: bool,
 }
 
 impl Evaluation {
@@ -255,6 +399,73 @@ impl<H: Any, S: Any> Runtime<H, S> {
         self.with_vm(configure);
     }
 
+    /// Injects a host-owned JSON value under one identifier for later Splash
+    /// evaluations. The value is copied into the VM; Splash code cannot retain
+    /// a Rust handle to it or use it to acquire capability authority.
+    ///
+    /// The global cannot be changed while an evaluation is suspended because a
+    /// resumed continuation must observe the exact context it started with.
+    pub fn set_json_global(
+        &mut self,
+        name: &str,
+        value: &JsonValue,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<(), RuntimeError> {
+        if !is_valid_json_global_name(name) {
+            return Err(RuntimeError::JsonData(RuntimeJsonError::InvalidGlobalName));
+        }
+        let encoded =
+            serialize_bounded_json(value, max_bytes, max_depth).map_err(RuntimeError::JsonData)?;
+        self.with_vm(|vm| {
+            if has_paused_thread(vm) {
+                return Err(RuntimeError::EvaluationInProgress);
+            }
+            let mut parser = vm::json::JsonParserThread::default();
+            let value = parser.read_json(&encoded, &mut vm.bx.heap);
+            vm.set_injected_global(vm::LiveId::from_str(name), value);
+            Ok(())
+        })
+    }
+
+    /// Drops the current JSON value from a host-injected global without
+    /// deleting the identifier itself. Replacing it with `nil` lets the VM
+    /// collect prior context after the next host-selected garbage collection.
+    pub fn clear_json_global(&mut self, name: &str) -> Result<(), RuntimeError> {
+        if !is_valid_json_global_name(name) {
+            return Err(RuntimeError::JsonData(RuntimeJsonError::InvalidGlobalName));
+        }
+        self.with_vm(|vm| {
+            if has_paused_thread(vm) {
+                return Err(RuntimeError::EvaluationInProgress);
+            }
+            vm.set_injected_global(vm::LiveId::from_str(name), vm::ScriptValue::NIL);
+            Ok(())
+        })
+    }
+
+    /// Converts a completed Splash value to bounded JSON without constructing
+    /// an unbounded intermediate serialization. Functions, handles, cyclic
+    /// objects, non-string object keys, and non-finite numbers are rejected.
+    pub fn script_value_as_json(
+        &mut self,
+        value: vm::ScriptValue,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<JsonValue, RuntimeError> {
+        if max_bytes == 0 || max_depth == 0 {
+            return Err(RuntimeError::JsonData(RuntimeJsonError::InvalidLimit));
+        }
+        let encoded = self
+            .with_vm(|vm| {
+                let mut writer = BoundedJsonWriter::new(max_bytes);
+                write_script_json(vm, value, max_depth, &mut Vec::new(), &mut writer)?;
+                Ok::<_, RuntimeJsonError>(writer.into_string())
+            })
+            .map_err(RuntimeError::JsonData)?;
+        parse_bounded_json(&encoded, max_bytes, max_depth).map_err(RuntimeError::JsonData)
+    }
+
     /// Validates canonical Splash source without evaluating it or entering any
     /// host binding.
     ///
@@ -274,6 +485,25 @@ impl<H: Any, S: Any> Runtime<H, S> {
     /// being silently rewritten into a different language contract.
     pub fn format_source(&self, source: &str) -> Result<String, RuntimeError> {
         format_source_named("inline.splash", source, self.limits)
+    }
+
+    /// Lists direct source-level `mod.tool` call hints without evaluating
+    /// bytecode or entering any host binding.
+    ///
+    /// The result is useful for an LLM or operator review surface, but it is
+    /// not an authority decision. See [`tool_call_hints_named`] for the full
+    /// syntactic limitations.
+    pub fn tool_call_hints(&self, source: &str) -> Result<Vec<ToolCallHint>, RuntimeError> {
+        Ok(self.tool_call_hint_report(source)?.hints)
+    }
+
+    /// Lists bounded direct source-level `mod.tool` call hints without
+    /// evaluating bytecode or entering any host binding.
+    ///
+    /// Unlike [`Self::tool_call_hints`], this reports whether additional
+    /// direct call sites were omitted at the fixed review limit.
+    pub fn tool_call_hint_report(&self, source: &str) -> Result<ToolCallHintReport, RuntimeError> {
+        tool_call_hint_report_named("inline.splash", source, self.limits)
     }
 
     /// Evaluates source only after it passes the canonical Splash v0.1 profile.
@@ -371,6 +601,33 @@ pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
 /// [`check_syntax`] to obtain the corresponding diagnostics.
 pub fn top_level_declarations(source: &str) -> Result<Vec<TopLevelDeclaration>, RuntimeError> {
     top_level_declarations_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Lists direct source-level `mod.tool` call hints in valid canonical Splash
+/// without evaluating source, resolving imports, or creating a capability
+/// host.
+///
+/// This is an LLM and operator-review aid, not static authorization. It sees
+/// only a literal `tool.call`, `tool.start`, `tool.call_json`, or
+/// `tool.start_json` token sequence. It deliberately does not infer aliases,
+/// control flow, runtime string values, imports, or whether a call is
+/// reachable. Invalid or VM-incompatible source produces no hints. A host must
+/// issue an explicit capability lease and rely on runtime reservation checks
+/// for every actual effect. This compatibility helper returns the retained
+/// prefix only; use [`tool_call_hint_report`] when a host needs to detect
+/// truncation.
+pub fn tool_call_hints(source: &str) -> Result<Vec<ToolCallHint>, RuntimeError> {
+    Ok(tool_call_hint_report(source)?.hints)
+}
+
+/// Lists bounded direct source-level `mod.tool` call hints with an explicit
+/// truncation signal.
+///
+/// This applies the same syntax checks and non-authoritative semantics as
+/// [`tool_call_hints`]. `hints` retains at most [`MAX_TOOL_CALL_HINTS`] source
+/// sites; `truncated` records whether later direct sites were omitted.
+pub fn tool_call_hint_report(source: &str) -> Result<ToolCallHintReport, RuntimeError> {
+    tool_call_hint_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Formats canonical Splash source with default bounds without evaluating it.
@@ -472,6 +729,48 @@ pub fn top_level_declarations_named(
     ))
 }
 
+/// Lists direct source-level `mod.tool` call hints in named canonical source
+/// without evaluating it, resolving imports, or creating a capability host.
+///
+/// This applies the same source, token, canonical-profile, and vendored
+/// parser-compatibility checks as [`check_syntax_named`]. It reports no hints
+/// for invalid source. The result is intentionally incomplete and
+/// non-authoritative; use it only to present a review summary before the host
+/// issues a lease and evaluates the source. This compatibility helper returns
+/// the retained prefix only; use [`tool_call_hint_report_named`] when a host
+/// needs to detect truncation.
+pub fn tool_call_hints_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<Vec<ToolCallHint>, RuntimeError> {
+    Ok(tool_call_hint_report_named(file, source, limits)?.hints)
+}
+
+/// Lists bounded direct source-level `mod.tool` call hints in named canonical
+/// source with an explicit truncation signal.
+///
+/// This applies the same source, token, canonical-profile, and vendored
+/// parser-compatibility checks as [`check_syntax_named`]. It reports no hints
+/// for invalid source. The result is intentionally incomplete and
+/// non-authoritative; use it only to present a review summary before the host
+/// issues a lease and evaluates the source.
+pub fn tool_call_hint_report_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<ToolCallHintReport, RuntimeError> {
+    let report = check_syntax_named(file, source, limits)?;
+    if !report.valid {
+        return Ok(ToolCallHintReport {
+            hints: Vec::new(),
+            truncated: false,
+        });
+    }
+
+    Ok(collect_tool_call_hints(source, limits.max_syntax_tokens))
+}
+
 /// Formats named canonical Splash source without evaluating it.
 ///
 /// `file` is used only while confirming compatibility with the vendored VM
@@ -544,6 +843,263 @@ fn validate_source_length(source: &str, limits: ExecutionLimits) -> Result<(), R
         });
     }
     Ok(())
+}
+
+/// Parses JSON after enforcing raw-byte and container-depth bounds.
+///
+/// Hosts can use this before handing external data to [`Runtime::set_json_global`]
+/// or a higher-level workflow API. Parsing creates data only; it never loads a
+/// module, creates a capability, or executes Splash source.
+pub fn parse_bounded_json(
+    document: &str,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<JsonValue, RuntimeJsonError> {
+    if max_bytes == 0 || max_depth == 0 {
+        return Err(RuntimeJsonError::InvalidLimit);
+    }
+    if document.len() > max_bytes {
+        return Err(RuntimeJsonError::TooLarge {
+            actual: document.len(),
+            maximum: max_bytes,
+        });
+    }
+    let value = serde_json::from_str(document).map_err(|_| RuntimeJsonError::InvalidEncoding)?;
+    validate_json_depth(&value, 0, max_depth)?;
+    Ok(value)
+}
+
+/// Encodes a host-owned JSON value after enforcing JSON container-depth and
+/// serialized-byte bounds.
+pub fn serialize_bounded_json(
+    value: &JsonValue,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<String, RuntimeJsonError> {
+    if max_bytes == 0 || max_depth == 0 {
+        return Err(RuntimeJsonError::InvalidLimit);
+    }
+    validate_json_depth(value, 0, max_depth)?;
+    let encoded = serde_json::to_string(value).map_err(|_| RuntimeJsonError::InvalidEncoding)?;
+    if encoded.len() > max_bytes {
+        return Err(RuntimeJsonError::TooLarge {
+            actual: encoded.len(),
+            maximum: max_bytes,
+        });
+    }
+    Ok(encoded)
+}
+
+fn validate_json_depth(
+    value: &JsonValue,
+    container_depth: usize,
+    maximum: usize,
+) -> Result<(), RuntimeJsonError> {
+    match value {
+        JsonValue::Array(values) => {
+            if container_depth >= maximum {
+                return Err(RuntimeJsonError::TooDeep { maximum });
+            }
+            for value in values {
+                validate_json_depth(value, container_depth.saturating_add(1), maximum)?;
+            }
+        }
+        JsonValue::Object(values) => {
+            if container_depth >= maximum {
+                return Err(RuntimeJsonError::TooDeep { maximum });
+            }
+            for value in values.values() {
+                validate_json_depth(value, container_depth.saturating_add(1), maximum)?;
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {}
+    }
+    Ok(())
+}
+
+fn is_valid_json_global_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_JSON_GLOBAL_NAME_BYTES
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic() || byte == b'_' || (index != 0 && byte.is_ascii_digit())
+        })
+}
+
+struct BoundedJsonWriter {
+    output: String,
+    maximum: usize,
+}
+
+impl BoundedJsonWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            output: String::new(),
+            maximum,
+        }
+    }
+
+    fn append(&mut self, text: &str) -> Result<(), RuntimeJsonError> {
+        let actual = self.output.len().saturating_add(text.len());
+        if actual > self.maximum {
+            return Err(RuntimeJsonError::TooLarge {
+                actual,
+                maximum: self.maximum,
+            });
+        }
+        self.output.push_str(text);
+        Ok(())
+    }
+
+    fn append_char(&mut self, character: char) -> Result<(), RuntimeJsonError> {
+        let mut encoded = [0_u8; 4];
+        self.append(character.encode_utf8(&mut encoded))
+    }
+
+    fn append_string(&mut self, value: &str) -> Result<(), RuntimeJsonError> {
+        self.append("\"")?;
+        for character in value.chars() {
+            match character {
+                '"' => self.append("\\\"")?,
+                '\\' => self.append("\\\\")?,
+                '\u{0008}' => self.append("\\b")?,
+                '\u{000C}' => self.append("\\f")?,
+                '\n' => self.append("\\n")?,
+                '\r' => self.append("\\r")?,
+                '\t' => self.append("\\t")?,
+                character if character <= '\u{001F}' => {
+                    let escaped = format!("\\u{:04x}", character as u32);
+                    self.append(&escaped)?;
+                }
+                character => self.append_char(character)?,
+            }
+        }
+        self.append("\"")
+    }
+
+    fn into_string(self) -> String {
+        self.output
+    }
+}
+
+fn write_script_json(
+    vm: &mut vm::ScriptVm,
+    value: vm::ScriptValue,
+    maximum_depth: usize,
+    path: &mut Vec<vm::ScriptValue>,
+    writer: &mut BoundedJsonWriter,
+) -> Result<(), RuntimeJsonError> {
+    if value.is_nil() {
+        return writer.append("null");
+    }
+    if let Some(value) = value.as_bool() {
+        return writer.append(if value { "true" } else { "false" });
+    }
+    if let Some(value) = value.as_number() {
+        if !value.is_finite() {
+            return Err(RuntimeJsonError::NonFiniteNumber);
+        }
+        if value.fract() == 0.0 {
+            return writer.append(&value.to_string());
+        }
+        let Some(number) = serde_json::Number::from_f64(value) else {
+            return Err(RuntimeJsonError::NonFiniteNumber);
+        };
+        return writer.append(&number.to_string());
+    }
+    if let Some(identifier) = value.as_id() {
+        let value = identifier
+            .as_string(|value| value.map(str::to_owned))
+            .ok_or(RuntimeJsonError::UnknownObjectKey)?;
+        return writer.append_string(&value);
+    }
+    if let Some(value) = vm.bx.heap.string_with(value, |_, value| value.to_owned()) {
+        return writer.append_string(&value);
+    }
+    if let Some(object) = value.as_object() {
+        if vm.bx.heap.is_fn(object) {
+            return Err(RuntimeJsonError::UnsupportedScriptValue);
+        }
+        if path.len() >= maximum_depth {
+            return Err(RuntimeJsonError::TooDeep {
+                maximum: maximum_depth,
+            });
+        }
+        if path.contains(&value) {
+            return Err(RuntimeJsonError::CyclicScriptValue);
+        }
+        path.push(value);
+        let result = (|| {
+            let entries = {
+                let object = vm.bx.heap.object_data(object);
+                let mut entries = Vec::with_capacity(object.map_len() + object.vec.len());
+                object.map_iter(|key, value| entries.push((key, value)));
+                entries.extend(object.vec.iter().map(|entry| (entry.key, entry.value)));
+                entries
+            };
+            writer.append("{")?;
+            let mut seen = BTreeSet::new();
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                let key = script_json_key(vm, key)?;
+                if !seen.insert(key.clone()) {
+                    return Err(RuntimeJsonError::DuplicateObjectKey);
+                }
+                if index != 0 {
+                    writer.append(",")?;
+                }
+                writer.append_string(&key)?;
+                writer.append(":")?;
+                write_script_json(vm, value, maximum_depth, path, writer)?;
+            }
+            writer.append("}")
+        })();
+        path.pop();
+        return result;
+    }
+    if let Some(array) = value.as_array() {
+        if path.len() >= maximum_depth {
+            return Err(RuntimeJsonError::TooDeep {
+                maximum: maximum_depth,
+            });
+        }
+        if path.contains(&value) {
+            return Err(RuntimeJsonError::CyclicScriptValue);
+        }
+        path.push(value);
+        let result = (|| {
+            let values = {
+                let storage = vm.bx.heap.array_storage(array);
+                (0..storage.len())
+                    .filter_map(|index| storage.index(index))
+                    .collect::<Vec<_>>()
+            };
+            writer.append("[")?;
+            for (index, value) in values.into_iter().enumerate() {
+                if index != 0 {
+                    writer.append(",")?;
+                }
+                write_script_json(vm, value, maximum_depth, path, writer)?;
+            }
+            writer.append("]")
+        })();
+        path.pop();
+        return result;
+    }
+    Err(RuntimeJsonError::UnsupportedScriptValue)
+}
+
+fn script_json_key(
+    vm: &mut vm::ScriptVm,
+    value: vm::ScriptValue,
+) -> Result<String, RuntimeJsonError> {
+    if let Some(identifier) = value.as_id() {
+        return identifier
+            .as_string(|value| value.map(str::to_owned))
+            .ok_or(RuntimeJsonError::UnknownObjectKey);
+    }
+    vm.bx
+        .heap
+        .string_with(value, |_, value| value.to_owned())
+        .ok_or(RuntimeJsonError::NonStringObjectKey)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -743,6 +1299,70 @@ mod tests {
     }
 
     #[test]
+    fn injects_bounded_json_and_extracts_a_script_result() {
+        let mut runtime = Runtime::default();
+        runtime
+            .set_json_global(
+                "workflow",
+                &serde_json::json!({"input": {"left": 20, "right": 22}}),
+                DEFAULT_MAX_JSON_DATA_BYTES,
+                DEFAULT_MAX_JSON_DATA_DEPTH,
+            )
+            .unwrap();
+        let report = runtime
+            .eval(
+                "let total = workflow.input.left + workflow.input.right\n\
+                 let result = {total: total}\n\
+                 result",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!({"total": 42})
+        );
+        runtime.clear_json_global("workflow").unwrap();
+    }
+
+    #[test]
+    fn bounded_json_rejects_excess_depth_and_non_json_script_values() {
+        assert_eq!(
+            parse_bounded_json("[[[0]]]", 64, 2).unwrap_err(),
+            RuntimeJsonError::TooDeep { maximum: 2 }
+        );
+
+        let mut runtime = Runtime::default();
+        let report = runtime.eval("let callback = || 1\ncallback").unwrap();
+        assert_eq!(
+            runtime
+                .script_value_as_json(report.value, 64, DEFAULT_MAX_JSON_DATA_DEPTH)
+                .unwrap_err(),
+            RuntimeError::JsonData(RuntimeJsonError::UnsupportedScriptValue)
+        );
+    }
+
+    #[test]
+    fn bounded_json_output_stops_at_its_serialized_byte_limit() {
+        let mut runtime = Runtime::default();
+        let report = runtime.eval("\"this value is too large\"").unwrap();
+
+        assert!(matches!(
+            runtime.script_value_as_json(report.value, 8, DEFAULT_MAX_JSON_DATA_DEPTH),
+            Err(RuntimeError::JsonData(RuntimeJsonError::TooLarge {
+                maximum: 8,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn default_evaluation_rejects_makepad_compatibility_syntax() {
         let mut runtime = Runtime::default();
         let error = runtime.eval("var value = 42").unwrap_err();
@@ -798,6 +1418,95 @@ mod tests {
         let report = check_syntax("use mod.tool\ntool.call(\"text.echo\", \"hello\")").unwrap();
 
         assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn outlines_direct_tool_calls_without_resolving_runtime_values() {
+        let source = r#"use mod.tool
+let plain = tool.call("text.echo", "hello")
+let delayed = tool.start("text.remote", "hello")
+let structured = tool.call_json("math.add", {left: 20, right: 22})
+let selected = "shell.exec"
+let deferred = tool.start_json(selected, {command: "id"})
+let escaped = tool.call("text.\u0065cho", "escaped")
+let wrapper = {tool: tool}
+wrapper.tool.call("must.not.appear", "x")
+let alias = tool
+alias.call("also.not.direct", "x")
+let noise = "tool.call(\"also.ignored\", \"x\")"
+// tool.start("comment.ignored", "x")
+"#;
+
+        let hints = tool_call_hints(source).expect("canonical source has tool-call hints");
+
+        assert_eq!(hints.len(), 5);
+        assert_eq!(hints[0].kind, ToolCallKind::Call);
+        assert_eq!(hints[0].literal_name.as_deref(), Some("text.echo"));
+        assert_eq!(hints[1].kind, ToolCallKind::Start);
+        assert_eq!(hints[1].literal_name.as_deref(), Some("text.remote"));
+        assert_eq!(hints[2].kind, ToolCallKind::CallJson);
+        assert_eq!(hints[2].literal_name.as_deref(), Some("math.add"));
+        assert_eq!(hints[3].kind, ToolCallKind::StartJson);
+        assert_eq!(hints[3].literal_name, None);
+        assert_eq!(hints[3].literal_name_start_byte, None);
+        assert_eq!(hints[4].kind, ToolCallKind::Call);
+        assert_eq!(hints[4].literal_name.as_deref(), Some("text.echo"));
+
+        for hint in &hints {
+            assert_eq!(
+                &source[hint.callee_start_byte..hint.callee_end_byte],
+                format!("tool.{}", hint.kind.as_str()),
+            );
+            assert!(source.is_char_boundary(hint.callee_start_byte));
+            assert!(source.is_char_boundary(hint.callee_end_byte));
+            assert!(hint.line >= 1 && hint.column >= 1);
+        }
+        assert_eq!(
+            &source[hints[4].literal_name_start_byte.unwrap()
+                ..hints[4].literal_name_end_byte.unwrap()],
+            "\"text.\\u0065cho\"",
+        );
+
+        let runtime = Runtime::default();
+        assert_eq!(runtime.tool_call_hints(source).unwrap(), hints);
+    }
+
+    #[test]
+    fn bounds_direct_tool_call_hint_reports_with_a_truncation_signal() {
+        let mut source = String::from("use mod.tool\n");
+        for index in 0..=MAX_TOOL_CALL_HINTS {
+            source.push_str(&format!("tool.call(\"tool.{index}\", \"\")\n"));
+        }
+
+        let report = tool_call_hint_report(&source).expect("generated source is canonical");
+
+        assert_eq!(report.hints.len(), MAX_TOOL_CALL_HINTS);
+        assert!(report.truncated);
+        assert_eq!(
+            report
+                .hints
+                .first()
+                .and_then(|hint| hint.literal_name.as_deref()),
+            Some("tool.0")
+        );
+        assert_eq!(
+            report
+                .hints
+                .last()
+                .and_then(|hint| hint.literal_name.as_deref()),
+            Some("tool.1023")
+        );
+        assert_eq!(tool_call_hints(&source).unwrap(), report.hints);
+
+        let runtime = Runtime::default();
+        assert_eq!(runtime.tool_call_hint_report(&source).unwrap(), report);
+    }
+
+    #[test]
+    fn tool_call_hints_are_empty_for_invalid_or_compatibility_source() {
+        assert!(tool_call_hints("var tool = {call: |name, value| value}")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1223,6 +1932,27 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("unterminated string")));
+    }
+
+    #[test]
+    fn rejects_unicode_escapes_that_are_not_unicode_scalars() {
+        for source in [
+            r#"let value = "\uD800""#,
+            r#"let value = "\u{D800}""#,
+            r#"let value = "\u{110000}""#,
+        ] {
+            let report = check_syntax(source).unwrap();
+
+            assert!(!report.valid, "unexpectedly accepted: {source}");
+            assert!(report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("must encode a valid Unicode scalar value")
+            }));
+        }
+
+        let report = check_syntax(r#"let value = "\u{10FFFF}""#).unwrap();
+        assert!(report.valid, "{:?}", report.diagnostics);
     }
 
     #[test]

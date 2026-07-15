@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "steps": [
+    {
+      "id": "prepare",
+      "source": "use mod.tool\nlet notes = tool.call(\"text.echo\", \"draft release notes\")\nnotes"
+    },
+    {
+      "id": "publish",
+      "source": "use mod.tool\ntool.start(\"release.publish\", \"v1.0.0\").await()"
+    }
+  ]
+}

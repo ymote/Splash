@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 makepad-script = { path = "../../vendor/makepad/platform/script" }
+serde_json = "1.0.150"

@@ -1,0 +1,10 @@
+use mod.tool
+
+let direct = tool.call("text.echo", "ready")
+let name = "text.remote"
+let deferred = tool.start(name, "release")
+let payload = tool.call_json("math.add", {left: 20, right: 22})
+let wrapper = {tool: tool}
+wrapper.tool.call("not.a.direct.tool.call", "ignored")
+let alias = tool
+alias.call("also.not.a.direct.tool.call", "ignored")

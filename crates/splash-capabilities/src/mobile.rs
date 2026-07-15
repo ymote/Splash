@@ -1,9 +1,11 @@
 //! Static-catalog profile for mobile and embedded Splash hosts.
 //!
-//! A [`MobileRuntimeBuilder`] owns the setup phase for reviewed, app-provided
-//! adapters. Calling [`MobileRuntimeBuilder::build`] consumes that builder and
-//! yields a [`MobileRuntime`] without any registration or external-dispatch
-//! API. Dynamic Splash source can still use the catalog through `mod.tool`,
+//! A [`crate::mobile::MobileRuntimeBuilder`] owns the setup phase for reviewed,
+//! app-provided adapters. Calling
+//! [`crate::mobile::MobileRuntimeBuilder::build`] consumes that builder and
+//! yields a [`crate::mobile::MobileRuntime`] without any registration or
+//! external-dispatch API. Dynamic Splash source can still use the catalog
+//! through `mod.tool`,
 //! but cannot add tools, claim work, or complete an externally dispatched
 //! operation.
 //!
@@ -12,12 +14,14 @@
 //! arbitrary executable, filesystem, network-origin, plugin, or crate selector
 //! through an app-provided adapter.
 
+use std::num::NonZeroUsize;
+
 use serde::{de::DeserializeOwned, Serialize};
 use splash_core::{Evaluation, ExecutionLimits, RuntimeError};
 
 use crate::{
-    CapabilityRuntime, JsonToolContract, JsonValue, PumpReport, ToolError, ToolMetadata,
-    ToolPolicy, ToolRegistrationError, ToolRequest,
+    CapabilityCatalogLimits, CapabilityRuntime, JsonToolContract, JsonValue, PumpReport, ToolError,
+    ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
 };
 
 /// Setup-only builder for a static mobile or embedded capability catalog.
@@ -28,6 +32,7 @@ use crate::{
 pub struct MobileRuntimeBuilder {
     runtime: CapabilityRuntime,
     limits: ExecutionLimits,
+    catalog_limits: CapabilityCatalogLimits,
 }
 
 impl MobileRuntimeBuilder {
@@ -47,8 +52,44 @@ impl MobileRuntimeBuilder {
         limits: ExecutionLimits,
         max_pending_tools: usize,
     ) -> Result<Self, RuntimeError> {
-        let runtime = CapabilityRuntime::with_limits_and_pending(limits, max_pending_tools)?;
-        Ok(Self { runtime, limits })
+        Self::with_limits_and_catalog(
+            limits,
+            max_pending_tools,
+            CapabilityCatalogLimits::default(),
+        )
+    }
+
+    /// Creates a builder with explicit aggregate catalog bounds in addition
+    /// to execution and pending-promise limits. Use this for a deliberately
+    /// small embedded prompt or catalog allocation budget.
+    pub fn with_limits_and_catalog(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+    ) -> Result<Self, RuntimeError> {
+        let runtime = CapabilityRuntime::with_limits_pending_and_catalog(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+        )?;
+        Ok(Self {
+            runtime,
+            limits,
+            catalog_limits,
+        })
+    }
+
+    /// Sets a bounded in-memory audit capacity before sealing the runtime.
+    ///
+    /// Audit eviction affects observability only. Hosts that require complete
+    /// retention must export the ordered audit view to their own durable sink.
+    /// Values above [`crate::MAX_AUDIT_EVENTS`] are rejected.
+    pub fn with_max_audit_events(
+        mut self,
+        max_audit_events: NonZeroUsize,
+    ) -> Result<Self, RuntimeError> {
+        self.runtime.set_max_audit_events(max_audit_events)?;
+        Ok(self)
     }
 
     /// Registers one reviewed text adapter for the static catalog.
@@ -108,6 +149,7 @@ impl MobileRuntimeBuilder {
         MobileRuntime {
             runtime: self.runtime,
             limits: self.limits,
+            catalog_limits: self.catalog_limits,
         }
     }
 }
@@ -121,6 +163,7 @@ impl MobileRuntimeBuilder {
 pub struct MobileRuntime {
     runtime: CapabilityRuntime,
     limits: ExecutionLimits,
+    catalog_limits: CapabilityCatalogLimits,
 }
 
 impl MobileRuntime {
@@ -132,6 +175,11 @@ impl MobileRuntime {
     /// Returns the immutable execution bounds selected during setup.
     pub const fn limits(&self) -> ExecutionLimits {
         self.limits
+    }
+
+    /// Returns the immutable aggregate catalog limits selected during setup.
+    pub const fn catalog_limits(&self) -> CapabilityCatalogLimits {
+        self.catalog_limits
     }
 
     /// Returns the maximum number of deferred local calls retained at once.
@@ -176,12 +224,22 @@ impl MobileRuntime {
         self.runtime.tool_catalog_json()
     }
 
-    /// Returns the bounded audit trail accumulated by the sealed host.
-    pub fn audit(&self) -> &[crate::AuditEvent] {
+    /// Returns the bounded ordered audit view accumulated by the sealed host.
+    pub fn audit(&self) -> crate::AuditLog<'_> {
         self.runtime.audit()
     }
 
-    /// Clears the host-owned audit trail without changing catalog authority.
+    /// Returns the fixed in-memory audit capacity selected during setup.
+    pub fn max_audit_events(&self) -> usize {
+        self.runtime.max_audit_events()
+    }
+
+    /// Returns the number of oldest audit entries evicted since the last clear.
+    pub fn dropped_audit_events(&self) -> u64 {
+        self.runtime.dropped_audit_events()
+    }
+
+    /// Clears the host-owned audit view without changing catalog authority.
     pub fn clear_audit(&mut self) {
         self.runtime.clear_audit();
     }
@@ -189,12 +247,13 @@ impl MobileRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::time::Duration;
 
     use splash_core::{DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MAX_SOURCE_BYTES};
 
     use super::*;
-    use crate::{json, ToolDataFormat, ToolDispatch};
+    use crate::{json, CapabilityCatalogLimits, ToolDataFormat, ToolDispatch};
 
     #[derive(serde::Deserialize)]
     struct AddInput {
@@ -326,6 +385,44 @@ mod tests {
             error,
             ToolRegistrationError::InvalidPolicy("stream policy requires an external tool",)
         );
+    }
+
+    #[test]
+    fn preserves_explicit_catalog_limits_after_sealing() {
+        let catalog_limits = CapabilityCatalogLimits {
+            max_tools: 1,
+            max_serialized_bytes: 8 * 1024,
+        };
+        let mut builder = MobileRuntimeBuilder::with_limits_and_catalog(
+            ExecutionLimits::default(),
+            2,
+            catalog_limits,
+        )
+        .expect("catalog limits are valid")
+        .with_max_audit_events(NonZeroUsize::new(1).unwrap())
+        .expect("audit limit is valid");
+        builder
+            .register_text_tool(
+                ToolPolicy::new("text.first"),
+                ToolMetadata::new("First reviewed mobile adapter."),
+                |request| Ok(request.input.clone()),
+            )
+            .expect("first static adapter registers");
+        assert_eq!(
+            builder
+                .register_text_tool(
+                    ToolPolicy::new("text.second"),
+                    ToolMetadata::new("Second reviewed mobile adapter."),
+                    |request| Ok(request.input.clone()),
+                )
+                .unwrap_err(),
+            ToolRegistrationError::CatalogToolLimitExceeded { maximum: 1 }
+        );
+
+        let runtime = builder.build();
+        assert_eq!(runtime.catalog_limits(), catalog_limits);
+        assert_eq!(runtime.max_audit_events(), 1);
+        assert_eq!(runtime.tool_catalog().len(), 1);
     }
 
     #[test]
