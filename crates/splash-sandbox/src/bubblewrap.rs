@@ -1720,7 +1720,7 @@ impl BubblewrapWorkerWatchdog {
             Err(source) => {
                 return Err(BubblewrapWorkerWatchdogStartError {
                     source: Some(source),
-                    lifecycle: take_pending_lifecycle(&pending_lifecycle),
+                    lifecycle: Box::new(take_pending_lifecycle(&pending_lifecycle)),
                 });
             }
         };
@@ -1876,20 +1876,20 @@ pub enum BubblewrapWorkerInvocationOutcome {
 #[derive(Debug)]
 pub struct BubblewrapWorkerWatchdogStartError {
     source: Option<io::Error>,
-    lifecycle: BubblewrapWorkerLifecycle,
+    lifecycle: Box<BubblewrapWorkerLifecycle>,
 }
 
 impl BubblewrapWorkerWatchdogStartError {
     fn deadline_overflow(lifecycle: BubblewrapWorkerLifecycle) -> Self {
         Self {
             source: None,
-            lifecycle,
+            lifecycle: Box::new(lifecycle),
         }
     }
 
     /// Returns the worker lifecycle so the caller can terminate and reap it.
     pub fn into_lifecycle(self) -> BubblewrapWorkerLifecycle {
-        self.lifecycle
+        *self.lifecycle
     }
 }
 

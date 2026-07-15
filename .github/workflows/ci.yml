@@ -35,6 +35,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: cargo +nightly fmt --manifest-path fuzz/Cargo.toml --check
       - run: RUSTFLAGS='--cfg fuzzing' cargo +nightly check --locked --manifest-path fuzz/Cargo.toml
