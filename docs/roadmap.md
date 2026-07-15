@@ -95,13 +95,21 @@
 - Linux Bubblewrap policy compiler and launcher for fixed workers and
   manifest-selected file roots. It fails closed for network-origin,
   executable, and secret selectors, and does not fall back to unrestricted
-  process launch.
+  process launch. It unconditionally drops every Linux capability before the
+  worker executes, including when the host invokes Bubblewrap as root.
 - Versioned private-pipe session bootstrap for a compiled Linux Bubblewrap
   worker. It checks the manifest session before launch and never places the
   host-generated key in command-line arguments or environment variables.
 - Optional bounded private `/tmp` capacity for Bubblewrap workers and a
   lifecycle handle that force-terminates and reaps a worker. Neither is a
   general resource quota or proof that an adapter effect was cancelled.
+- Manifest-selected bounded ephemeral `file_root` mounts at arbitrary
+  host-configured worker paths, with common overlap validation and an opt-in
+  policy that rejects active read-write host bindings and an unbounded private
+  `/tmp`, requires further-user-namespace lockdown, and remounts the namespace
+  root, `/proc`, and `/dev` read-only. Each mount has a kernel-enforced `tmpfs`
+  data-block ceiling but no independent inode cap and is neither durable
+  storage, an executable-path policy, nor a persistent-filesystem quota.
 - Optional Bubblewrap user-namespace hardening that requires a usable user
   namespace and prevents further user namespace creation, with no compatibility
   fallback to a weaker worker policy.
@@ -140,8 +148,9 @@
 
 ## Next: contained local effects
 
-- Aggregate-disk quotas for writable worker storage beyond the bounded private
-  `/tmp` mount.
+- Aggregate-disk quotas for persistent writable host-backed worker storage.
+  Bounded ephemeral file roots now cover scratch output beyond `/tmp`, but
+  their per-mount `tmpfs` ceilings do not quota a persistent filesystem.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

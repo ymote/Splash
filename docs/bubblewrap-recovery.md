@@ -144,8 +144,10 @@ This coordinator does not:
 - turn a worker `succeeded` status into product-level proof or approval;
 - implement the worker journal, rollback anchor, storage-key provisioning, or
   platform containment outside Linux; or
-- add aggregate-disk quotas, in-band cancellation, network-origin mediation,
-  executable policy, or a secret broker.
+- add an aggregate quota for persistent host-backed storage, in-band
+  cancellation, network-origin mediation, executable policy, or a secret
+  broker. Bounded ephemeral roots are launch policy retained by the compiled
+  command, not durable recovery storage.
 
 Use a production `RollbackAnchor` and fenced backend for both host and worker
 records. `VolatileMemoryStore` and `VolatileRollbackAnchor` remain tests and

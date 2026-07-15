@@ -6,7 +6,16 @@ Run the Splash-owned quality gate:
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+cargo check --locked -p splash-sandbox --tests --target aarch64-unknown-linux-gnu
+cargo check --locked -p splash-sandbox --tests --target riscv64gc-unknown-linux-gnu
+cargo check --locked -p splash-sandbox --tests --target x86_64-pc-windows-gnu
 ```
+
+The Linux target checks compile the real Bubblewrap and cgroup paths on the two
+architectures supported by CI. The Windows check compiles the explicit
+unsupported-platform path and prevents Linux-only runner dependencies from
+leaking into non-Linux builds; it does not provide a Windows containment
+backend.
 
 The Makepad compatibility import is deliberately outside the workspace lint
 scope. Verify it explicitly after an upstream import or vendor patch:

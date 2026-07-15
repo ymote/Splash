@@ -105,7 +105,8 @@ and keeps UI support optional rather than making UI the language boundary.
   the observation through fenced authenticated compare-and-swap storage.
 - Linux Bubblewrap worker-policy compiler and launcher for a fixed,
   host-selected worker and manifest-selected file roots; it rejects network,
-  executable, and secret selectors rather than claiming unsupported policy.
+  executable, and secret selectors rather than claiming unsupported policy,
+  and drops every Linux capability before worker execution.
 - A one-shot, versioned private-pipe session bootstrap for Linux Bubblewrap
   workers that is bound to the exact manifest retained by the compiled command
   and precedes JSON worker frames without exposing the key through argv or
@@ -113,6 +114,12 @@ and keeps UI support optional rather than making UI the language boundary.
 - Optional bounded private `/tmp` capacity and a host lifecycle handle that
   force-terminates and reaps a Bubblewrap worker without treating termination
   as an adapter-effect result.
+- Manifest-selected bounded ephemeral `file_root` mounts at host-chosen worker
+  paths, with an opt-in policy that rejects active writable host binds and an
+  unbounded private `/tmp`, requires further-user-namespace lockdown, and
+  remounts the base namespace filesystems read-only. Each root has its own
+  `tmpfs` allocation ceiling; this does not independently cap inodes and is not
+  persistent storage, a `noexec` guarantee, or a host-filesystem quota.
 - Optional Linux cgroup-v2 worker sessions with host-delegated CPU bandwidth,
   memory, swap, task, and per-device I/O limits; a fixed runner joins the
   cgroup before Bubblewrap starts, and managed lifecycle teardown kills the
@@ -319,7 +326,8 @@ an import, creates a capability host, or loads a Rust adapter.
   cancellable ordinary-invocation driver, and authenticated journal-store
   bridge; it is not an OS sandbox or platform storage backend.
 - `splash-sandbox`: target-specific worker containment policy; its initial
-  Bubblewrap backend is Linux-only and deliberately narrow.
+  Bubblewrap backend is Linux-only and deliberately narrow, with bounded
+  manifest-selected ephemeral file roots for scratch data.
 - `splash-workflow`: host-owned planning, lease-bound approval, bounded JSON
   dataflow, bounded in-memory and authenticated durable event replay,
   checkpointing, durable operation records, optional fenced Bubblewrap

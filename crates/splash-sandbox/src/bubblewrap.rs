@@ -38,7 +38,7 @@ use splash_protocol::{
     ResourceKind, ResourceSelector,
 };
 
-const MAX_PRIVATE_TMPFS_BYTES: usize = usize::MAX >> 1;
+const MAX_TMPFS_BYTES: usize = usize::MAX >> 1;
 const MAX_FINITE_RESOURCE_LIMIT: u64 = u64::MAX - 1;
 const MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS: usize = 4_096;
 
@@ -506,6 +506,58 @@ pub struct FileRootBinding {
     access: FileRootAccess,
 }
 
+/// One empty, writable, manifest-selected `tmpfs` file root.
+///
+/// The root is private to one Bubblewrap worker mount namespace and disappears
+/// with that worker. Its maximum is an aggregate data-block allocation ceiling
+/// for this mount only; it is not an inode-count limit, persistent-filesystem
+/// quota, or process-memory limit. The destination and maximum are trusted host
+/// configuration, never Splash values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EphemeralFileRoot {
+    destination: PathBuf,
+    maximum_bytes: NonZeroUsize,
+}
+
+impl EphemeralFileRoot {
+    /// Creates a bounded private file root at a worker-visible destination.
+    pub fn new(
+        destination: impl Into<PathBuf>,
+        maximum_bytes: usize,
+    ) -> Result<Self, BubblewrapPolicyError> {
+        let destination = destination.into();
+        validate_sandbox_path("ephemeral file-root destination", &destination)?;
+        let Some(maximum_bytes) = NonZeroUsize::new(maximum_bytes) else {
+            return Err(BubblewrapPolicyError::InvalidEphemeralFileRootSize { maximum_bytes });
+        };
+        if maximum_bytes.get() > MAX_TMPFS_BYTES {
+            return Err(BubblewrapPolicyError::InvalidEphemeralFileRootSize {
+                maximum_bytes: maximum_bytes.get(),
+            });
+        }
+        Ok(Self {
+            destination,
+            maximum_bytes,
+        })
+    }
+
+    /// Returns the worker-visible absolute mount destination.
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Returns the aggregate data-block allocation ceiling for this mount.
+    pub const fn maximum_bytes(&self) -> usize {
+        self.maximum_bytes.get()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RegisteredFileRoot {
+    Host(FileRootBinding),
+    Ephemeral(EphemeralFileRoot),
+}
+
 impl FileRootBinding {
     /// Creates a file-root binding for one opaque selector ID.
     pub fn new(
@@ -573,8 +625,9 @@ pub struct BubblewrapWorkerPolicy {
     worker_program: PathBuf,
     worker_arguments: Vec<OsString>,
     runtime_mounts: Vec<ReadOnlyMount>,
-    file_roots: BTreeMap<String, FileRootBinding>,
+    file_roots: BTreeMap<String, RegisteredFileRoot>,
     private_tmpfs: PrivateTmpfs,
+    bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
     seccomp_profile: WorkerSeccompProfile,
@@ -602,6 +655,7 @@ impl BubblewrapWorkerPolicy {
             runtime_mounts: Vec::new(),
             file_roots: BTreeMap::new(),
             private_tmpfs: PrivateTmpfs::Disabled,
+            bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
             seccomp_profile: WorkerSeccompProfile::Disabled,
@@ -637,14 +691,57 @@ impl BubblewrapWorkerPolicy {
         id: impl Into<String>,
         binding: FileRootBinding,
     ) -> Result<&mut Self, BubblewrapPolicyError> {
+        self.add_registered_file_root(id, RegisteredFileRoot::Host(binding))
+    }
+
+    /// Registers one bounded, empty `tmpfs` under an opaque `file_root` ID.
+    ///
+    /// The selector shares the same namespace as host-backed file roots, so a
+    /// duplicate ID is rejected across both kinds. An absent selector creates
+    /// no mount. An active root is writable, private to the worker session, and
+    /// discarded when that mount namespace exits.
+    pub fn add_ephemeral_file_root(
+        &mut self,
+        id: impl Into<String>,
+        root: EphemeralFileRoot,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
+        self.add_registered_file_root(id, RegisteredFileRoot::Ephemeral(root))
+    }
+
+    fn add_registered_file_root(
+        &mut self,
+        id: impl Into<String>,
+        root: RegisteredFileRoot,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
         let id = id.into();
         ResourceSelector::new(ResourceKind::FileRoot, id.clone())
             .map_err(BubblewrapPolicyError::Protocol)?;
         if self.file_roots.contains_key(&id) {
             return Err(BubblewrapPolicyError::DuplicateFileRoot { id });
         }
-        self.file_roots.insert(id, binding);
+        self.file_roots.insert(id, root);
         Ok(self)
+    }
+
+    /// Requires every active writable data mount configured by this policy to
+    /// have an aggregate data-block allocation ceiling.
+    ///
+    /// Compilation then rejects host-backed read-write file roots and an
+    /// unbounded private `/tmp`. Read-only host roots, bounded ephemeral roots,
+    /// and a bounded private `/tmp` remain valid. Compilation also requires
+    /// [`UserNamespacePolicy::RequireNoFurtherUserNamespaces`] so the worker
+    /// cannot reacquire namespace-scoped mount authority. `/proc`, `/dev`, and
+    /// the empty namespace root are remounted read-only after all selected
+    /// mounts are created. This does not constrain process memory, device or
+    /// proc semantics, or downstream effects performed by a trusted adapter.
+    pub fn require_bounded_file_root_writes(&mut self) -> &mut Self {
+        self.bounded_file_root_writes_required = true;
+        self
+    }
+
+    /// Returns whether bounded writable data mounts are required.
+    pub const fn bounded_file_root_writes_required(&self) -> bool {
+        self.bounded_file_root_writes_required
     }
 
     /// Enables an empty private `tmpfs` at `/tmp` for the worker.
@@ -671,7 +768,7 @@ impl BubblewrapWorkerPolicy {
         let Some(maximum_bytes) = NonZeroUsize::new(maximum_bytes) else {
             return Err(BubblewrapPolicyError::InvalidPrivateTmpfsSize { maximum_bytes });
         };
-        if maximum_bytes.get() > MAX_PRIVATE_TMPFS_BYTES {
+        if maximum_bytes.get() > MAX_TMPFS_BYTES {
             return Err(BubblewrapPolicyError::InvalidPrivateTmpfsSize {
                 maximum_bytes: maximum_bytes.get(),
             });
@@ -768,6 +865,14 @@ impl BubblewrapWorkerPolicy {
         manifest
             .validate()
             .map_err(BubblewrapPolicyError::Protocol)?;
+        if self.bounded_file_root_writes_required && self.private_tmpfs == PrivateTmpfs::Unbounded {
+            return Err(BubblewrapPolicyError::UnboundedPrivateTmpfsForbidden);
+        }
+        if self.bounded_file_root_writes_required
+            && self.user_namespace_policy != UserNamespacePolicy::RequireNoFurtherUserNamespaces
+        {
+            return Err(BubblewrapPolicyError::BoundedFileRootWritesRequireUserNamespaceLockdown);
+        }
         let bwrap_program =
             resolve_regular_executable_file("Bubblewrap program", &self.bwrap_program)?;
 
@@ -785,12 +890,28 @@ impl BubblewrapWorkerPolicy {
         for resource in resources {
             match resource.kind {
                 ResourceKind::FileRoot => {
-                    let binding = self.file_roots.get(&resource.id).ok_or_else(|| {
+                    let root = self.file_roots.get(&resource.id).ok_or_else(|| {
                         BubblewrapPolicyError::MissingFileRoot {
                             id: resource.id.clone(),
                         }
                     })?;
-                    mounts.push(resolve_file_root(binding)?);
+                    match root {
+                        RegisteredFileRoot::Host(binding) => {
+                            if self.bounded_file_root_writes_required
+                                && binding.access == FileRootAccess::ReadWrite
+                            {
+                                return Err(
+                                    BubblewrapPolicyError::UnboundedFileRootWriteForbidden {
+                                        id: resource.id,
+                                    },
+                                );
+                            }
+                            mounts.push(resolve_file_root(binding)?);
+                        }
+                        RegisteredFileRoot::Ephemeral(root) => {
+                            mounts.push(resolve_ephemeral_file_root(root));
+                        }
+                    }
                 }
                 ResourceKind::Executable | ResourceKind::NetworkOrigin | ResourceKind::Secret => {
                     return Err(BubblewrapPolicyError::UnsupportedResource { resource });
@@ -841,6 +962,8 @@ impl BubblewrapWorkerPolicy {
             OsString::from("--chdir"),
             OsString::from("/"),
         ]);
+        arguments.push(OsString::from("--cap-drop"));
+        arguments.push(OsString::from("ALL"));
         if let Some(maximum_bytes) = self.private_tmpfs.maximum_bytes() {
             arguments.push(OsString::from("--size"));
             arguments.push(OsString::from(maximum_bytes.get().to_string()));
@@ -850,12 +973,13 @@ impl BubblewrapWorkerPolicy {
             arguments.push(OsString::from("/tmp"));
         }
         for mount in &mounts {
-            arguments.push(OsString::from(match mount.access {
-                FileRootAccess::ReadOnly => "--ro-bind",
-                FileRootAccess::ReadWrite => "--bind",
-            }));
-            arguments.push(mount.source.clone().into_os_string());
-            arguments.push(mount.destination.clone().into_os_string());
+            mount.append_arguments(&mut arguments);
+        }
+        if self.bounded_file_root_writes_required {
+            for destination in ["/proc", "/dev", "/"] {
+                arguments.push(OsString::from("--remount-ro"));
+                arguments.push(OsString::from(destination));
+            }
         }
         arguments.push(OsString::from("--"));
         if let Some(runner) = &self.resource_limit_runner {
@@ -2242,6 +2366,14 @@ pub enum BubblewrapPolicyError {
     InvalidPrivateTmpfsSize {
         maximum_bytes: usize,
     },
+    InvalidEphemeralFileRootSize {
+        maximum_bytes: usize,
+    },
+    UnboundedFileRootWriteForbidden {
+        id: String,
+    },
+    UnboundedPrivateTmpfsForbidden,
+    BoundedFileRootWritesRequireUserNamespaceLockdown,
     EmptyResourceLimits,
     MissingSeccompAllowlist,
     MissingSeccompExecve,
@@ -2318,7 +2450,21 @@ impl Display for BubblewrapPolicyError {
             Self::Protocol(error) => write!(formatter, "invalid capability manifest: {error}"),
             Self::InvalidPrivateTmpfsSize { maximum_bytes } => write!(
                 formatter,
-                "private tmpfs maximum must be within 1..={MAX_PRIVATE_TMPFS_BYTES} bytes; got {maximum_bytes}"
+                "private tmpfs maximum must be within 1..={MAX_TMPFS_BYTES} bytes; got {maximum_bytes}"
+            ),
+            Self::InvalidEphemeralFileRootSize { maximum_bytes } => write!(
+                formatter,
+                "ephemeral file-root maximum must be within 1..={MAX_TMPFS_BYTES} bytes; got {maximum_bytes}"
+            ),
+            Self::UnboundedFileRootWriteForbidden { id } => write!(
+                formatter,
+                "file-root selector {id:?} is a host-backed writable mount, but bounded file-root writes are required"
+            ),
+            Self::UnboundedPrivateTmpfsForbidden => formatter.write_str(
+                "private /tmp is unbounded, but bounded file-root writes are required",
+            ),
+            Self::BoundedFileRootWritesRequireUserNamespaceLockdown => formatter.write_str(
+                "bounded file-root writes require mandatory further-user-namespace lockdown",
             ),
             Self::EmptyResourceLimits => {
                 formatter.write_str("resource limit runner requires at least one finite limit")
@@ -2379,7 +2525,7 @@ impl Display for BubblewrapPolicyError {
             Self::MissingFileRoot { id } => {
                 write!(
                     formatter,
-                    "no host binding exists for file-root selector {id:?}"
+                    "no host registration exists for file-root selector {id:?}"
                 )
             }
             Self::UnsupportedResource { resource } => write!(
@@ -2439,6 +2585,10 @@ impl std::error::Error for BubblewrapPolicyError {
             Self::Protocol(error) => Some(error),
             Self::SourceIo { source, .. } => Some(source),
             Self::InvalidPrivateTmpfsSize { .. }
+            | Self::InvalidEphemeralFileRootSize { .. }
+            | Self::UnboundedFileRootWriteForbidden { .. }
+            | Self::UnboundedPrivateTmpfsForbidden
+            | Self::BoundedFileRootWritesRequireUserNamespaceLockdown
             | Self::EmptyResourceLimits
             | Self::MissingSeccompAllowlist
             | Self::MissingSeccompExecve
@@ -2669,21 +2819,38 @@ enum MountSourceType {
 
 #[derive(Clone, Debug)]
 struct CompiledMount {
-    source: PathBuf,
     destination: PathBuf,
-    access: FileRootAccess,
-    source_type: MountSourceType,
-    is_runtime: bool,
+    kind: CompiledMountKind,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledMountKind {
+    Bind {
+        source: PathBuf,
+        access: FileRootAccess,
+        source_type: MountSourceType,
+        is_runtime: bool,
+    },
+    BoundedTmpfs {
+        maximum_bytes: NonZeroUsize,
+    },
 }
 
 impl CompiledMount {
     fn exposes_program(&self, program: &Path) -> bool {
-        if !self.is_runtime {
-            return false;
-        }
-        match self.source_type {
-            MountSourceType::File => program == self.destination,
-            MountSourceType::Directory => path_is_within(program, &self.destination),
+        match &self.kind {
+            CompiledMountKind::Bind {
+                source_type,
+                is_runtime: true,
+                ..
+            } => match *source_type {
+                MountSourceType::File => program == self.destination,
+                MountSourceType::Directory => path_is_within(program, &self.destination),
+            },
+            CompiledMountKind::Bind {
+                is_runtime: false, ..
+            }
+            | CompiledMountKind::BoundedTmpfs { .. } => false,
         }
     }
 
@@ -2691,12 +2858,38 @@ impl CompiledMount {
         if !self.exposes_program(program) {
             return None;
         }
-        match self.source_type {
-            MountSourceType::File => Some(self.source.clone()),
-            MountSourceType::Directory => program
-                .strip_prefix(&self.destination)
-                .ok()
-                .map(|relative| self.source.join(relative)),
+        match &self.kind {
+            CompiledMountKind::Bind {
+                source,
+                source_type,
+                ..
+            } => match source_type {
+                MountSourceType::File => Some(source.clone()),
+                MountSourceType::Directory => program
+                    .strip_prefix(&self.destination)
+                    .ok()
+                    .map(|relative| source.join(relative)),
+            },
+            CompiledMountKind::BoundedTmpfs { .. } => None,
+        }
+    }
+
+    fn append_arguments(&self, arguments: &mut Vec<OsString>) {
+        match &self.kind {
+            CompiledMountKind::Bind { source, access, .. } => {
+                arguments.push(OsString::from(match access {
+                    FileRootAccess::ReadOnly => "--ro-bind",
+                    FileRootAccess::ReadWrite => "--bind",
+                }));
+                arguments.push(source.clone().into_os_string());
+                arguments.push(self.destination.clone().into_os_string());
+            }
+            CompiledMountKind::BoundedTmpfs { maximum_bytes } => {
+                arguments.push(OsString::from("--size"));
+                arguments.push(OsString::from(maximum_bytes.get().to_string()));
+                arguments.push(OsString::from("--tmpfs"));
+                arguments.push(self.destination.clone().into_os_string());
+            }
         }
     }
 }
@@ -2773,11 +2966,13 @@ fn resolve_runtime_mount(mount: &ReadOnlyMount) -> Result<CompiledMount, Bubblew
         })?;
     let source_type = source_type("runtime mount source", source.clone(), &metadata)?;
     Ok(CompiledMount {
-        source,
         destination: mount.destination.clone(),
-        access: FileRootAccess::ReadOnly,
-        source_type,
-        is_runtime: true,
+        kind: CompiledMountKind::Bind {
+            source,
+            access: FileRootAccess::ReadOnly,
+            source_type,
+            is_runtime: true,
+        },
     })
 }
 
@@ -2797,12 +2992,23 @@ fn resolve_file_root(binding: &FileRootBinding) -> Result<CompiledMount, Bubblew
         });
     }
     Ok(CompiledMount {
-        source,
         destination: binding.destination.clone(),
-        access: binding.access,
-        source_type: MountSourceType::Directory,
-        is_runtime: false,
+        kind: CompiledMountKind::Bind {
+            source,
+            access: binding.access,
+            source_type: MountSourceType::Directory,
+            is_runtime: false,
+        },
     })
+}
+
+fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
+    CompiledMount {
+        destination: root.destination.clone(),
+        kind: CompiledMountKind::BoundedTmpfs {
+            maximum_bytes: root.maximum_bytes,
+        },
+    }
 }
 
 fn canonical_existing_path(
@@ -2856,11 +3062,7 @@ fn validate_mount_layout(
         }
     }
 
-    mounts.sort_by(|left, right| {
-        left.destination
-            .cmp(&right.destination)
-            .then_with(|| left.source.cmp(&right.source))
-    });
+    mounts.sort_by(|left, right| left.destination.cmp(&right.destination));
     for (index, mount) in mounts.iter().enumerate() {
         for later_mount in &mounts[index + 1..] {
             if paths_overlap(&mount.destination, &later_mount.destination) {
@@ -3582,6 +3784,7 @@ mod tests {
             &["--bind", output.to_str().unwrap(), "/workspace/output"]
         ));
         assert!(has_arguments(&arguments, &["--unshare-all"]));
+        assert!(has_arguments(&arguments, &["--cap-drop", "ALL"]));
         assert!(has_arguments(&arguments, &["--new-session"]));
         assert!(has_arguments(&arguments, &["--clearenv"]));
         assert!(has_arguments(&arguments, &["--chdir", "/"]));
@@ -3592,6 +3795,7 @@ mod tests {
             .iter()
             .any(|argument| argument == "--disable-userns"));
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+        assert!(!has_arguments(&arguments, &["--remount-ro", "/"]));
         assert!(has_arguments(
             &arguments,
             &["--", "/opt/splash/worker", "--json-lines"]
@@ -3935,7 +4139,7 @@ mod tests {
             .unwrap()
             .with_worker_arguments(["-c", seccomp_test_worker_script()]);
         policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
-        add_seccomp_test_library_mounts(&mut policy);
+        add_linux_runtime_library_mounts(&mut policy);
         policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
 
         let manifest =
@@ -3970,7 +4174,7 @@ mod tests {
             .unwrap()
             .with_worker_arguments(["60"]);
         policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
-        add_seccomp_test_library_mounts(&mut policy);
+        add_linux_runtime_library_mounts(&mut policy);
 
         let plan = policy.compile(&manifest([])).unwrap();
         let worker = plan.spawn().unwrap();
@@ -3990,7 +4194,85 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn add_seccomp_test_library_mounts(policy: &mut BubblewrapWorkerPolicy) {
+    #[test]
+    #[ignore = "requires a runner that can configure Bubblewrap's isolated loopback device"]
+    fn bubblewrap_enforces_bounded_ephemeral_storage_and_readonly_root() {
+        use std::io::Read;
+
+        let python = fs::canonicalize("/usr/bin/python3").unwrap();
+        let script = r#"
+import errno
+
+with open("/proc/self/status", encoding="utf-8") as status_file:
+    status = status_file.read().splitlines()
+capability_fields = {
+    key: int(value, 16)
+    for key, value in (line.split(":", 1) for line in status)
+    if key in {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"}
+}
+if len(capability_fields) != 5 or any(capability_fields.values()):
+    raise RuntimeError(f"worker retained Linux capabilities: {capability_fields}")
+
+try:
+    with open("/outside", "wb") as outside:
+        outside.write(b"unexpected")
+except OSError as error:
+    if error.errno != errno.EROFS:
+        raise
+else:
+    raise RuntimeError("namespace root remained writable")
+
+try:
+    with open("/scratch/payload", "wb", buffering=0) as payload:
+        while True:
+            payload.write(b"x" * 4096)
+except OSError as error:
+    if error.errno != errno.ENOSPC:
+        raise
+else:
+    raise RuntimeError("bounded scratch root did not fill")
+
+print("bounded-storage-active")
+"#;
+        let mut policy = BubblewrapWorkerPolicy::new("/usr/bin/bwrap", python)
+            .unwrap()
+            .with_worker_arguments(["-B", "-c", script]);
+        policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
+        add_linux_runtime_library_mounts(&mut policy);
+        policy
+            .add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/scratch", 64 * 1024).unwrap(),
+            )
+            .unwrap();
+        policy
+            .require_no_further_user_namespaces()
+            .require_bounded_file_root_writes();
+
+        let plan = policy
+            .compile(&manifest([selector(ResourceKind::FileRoot, "scratch")]))
+            .unwrap();
+        let (worker, mut standard_error) = plan.spawn_capturing_stderr().unwrap();
+        let (mut child, stdin, mut stdout) = worker.into_parts();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        let mut standard_error_output = String::new();
+        standard_error
+            .read_to_string(&mut standard_error_output)
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "worker failed: {status}; stdout: {output:?}; stderr: {standard_error_output:?}"
+        );
+        assert_eq!(output, "bounded-storage-active\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_linux_runtime_library_mounts(policy: &mut BubblewrapWorkerPolicy) {
         for path in ["/lib", "/lib64"] {
             if Path::new(path).exists() {
                 policy.add_runtime_mount(ReadOnlyMount::new(path, path).unwrap());
@@ -4205,6 +4487,270 @@ print("seccomp-active")
         assert!(!arguments
             .iter()
             .any(|argument| argument == "/workspace/unused"));
+    }
+
+    #[test]
+    fn mounts_only_selected_ephemeral_file_roots_with_contiguous_size_policy() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        let scratch = EphemeralFileRoot::new("/workspace/scratch", 64 * 1024).unwrap();
+        assert_eq!(scratch.destination(), Path::new("/workspace/scratch"));
+        assert_eq!(scratch.maximum_bytes(), 64 * 1024);
+        policy.add_ephemeral_file_root("scratch", scratch).unwrap();
+
+        let inactive = policy.compile(&manifest([])).unwrap();
+        let inactive_arguments = argument_strings(&inactive);
+        assert!(!inactive_arguments
+            .iter()
+            .any(|argument| argument == "/workspace/scratch"));
+
+        let active = policy
+            .compile(&manifest([selector(ResourceKind::FileRoot, "scratch")]))
+            .unwrap();
+        let active_arguments = argument_strings(&active);
+        assert!(has_arguments(
+            &active_arguments,
+            &["--size", "65536", "--tmpfs", "/workspace/scratch"]
+        ));
+        assert!(!active_arguments.iter().any(|argument| argument == "--bind"));
+    }
+
+    #[test]
+    fn host_and_ephemeral_file_roots_share_one_selector_namespace() {
+        let root = TestDirectory::new();
+        let mut host_first = base_policy(&root);
+        host_first
+            .add_file_root(
+                "scratch",
+                binding(
+                    &root,
+                    "host-first",
+                    "/workspace/host-first",
+                    FileRootAccess::ReadOnly,
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            host_first.add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/workspace/scratch", 1024).unwrap(),
+            ),
+            Err(BubblewrapPolicyError::DuplicateFileRoot { id }) if id == "scratch"
+        ));
+
+        let mut ephemeral_first = base_policy(&root);
+        ephemeral_first
+            .add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/workspace/scratch", 1024).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            ephemeral_first.add_file_root(
+                "scratch",
+                binding(
+                    &root,
+                    "ephemeral-first",
+                    "/workspace/ephemeral-first",
+                    FileRootAccess::ReadOnly,
+                ),
+            ),
+            Err(BubblewrapPolicyError::DuplicateFileRoot { id }) if id == "scratch"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_ephemeral_file_root_configuration() {
+        assert!(matches!(
+            EphemeralFileRoot::new("scratch", 1024),
+            Err(BubblewrapPolicyError::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            EphemeralFileRoot::new("/scratch", 0),
+            Err(BubblewrapPolicyError::InvalidEphemeralFileRootSize { maximum_bytes: 0 })
+        ));
+        assert!(matches!(
+            EphemeralFileRoot::new("/scratch", usize::MAX),
+            Err(BubblewrapPolicyError::InvalidEphemeralFileRootSize { maximum_bytes })
+                if maximum_bytes == usize::MAX
+        ));
+    }
+
+    #[test]
+    fn ephemeral_file_roots_share_all_mount_overlap_checks() {
+        let root = TestDirectory::new();
+
+        for destination in ["/proc/scratch", "/dev/scratch", "/opt/splash/scratch"] {
+            let mut policy = base_policy(&root);
+            policy
+                .add_ephemeral_file_root(
+                    "scratch",
+                    EphemeralFileRoot::new(destination, 1024).unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                policy.compile(&manifest([selector(ResourceKind::FileRoot, "scratch")])),
+                Err(BubblewrapPolicyError::ReservedMountDestination { .. })
+                    | Err(BubblewrapPolicyError::OverlappingMountDestinations { .. })
+            ));
+        }
+
+        let mut private_tmp = base_policy(&root);
+        private_tmp.enable_private_tmpfs();
+        private_tmp
+            .add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/tmp/scratch", 1024).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            private_tmp.compile(&manifest([selector(ResourceKind::FileRoot, "scratch")])),
+            Err(BubblewrapPolicyError::ReservedMountDestination { .. })
+        ));
+
+        let mut host_overlap = base_policy(&root);
+        host_overlap
+            .add_file_root(
+                "workspace",
+                binding(&root, "workspace", "/workspace", FileRootAccess::ReadOnly),
+            )
+            .unwrap();
+        host_overlap
+            .add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/workspace/scratch", 1024).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            host_overlap.compile(&manifest([
+                selector(ResourceKind::FileRoot, "workspace"),
+                selector(ResourceKind::FileRoot, "scratch"),
+            ])),
+            Err(BubblewrapPolicyError::OverlappingMountDestinations { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_file_root_mode_rejects_unbounded_active_writes() {
+        let root = TestDirectory::new();
+        let mut missing_lockdown = base_policy(&root);
+        missing_lockdown.require_bounded_file_root_writes();
+        assert!(matches!(
+            missing_lockdown.compile(&manifest([])),
+            Err(BubblewrapPolicyError::BoundedFileRootWritesRequireUserNamespaceLockdown)
+        ));
+
+        let mut policy = base_policy(&root);
+        assert!(!policy.bounded_file_root_writes_required());
+        policy
+            .add_file_root(
+                "output",
+                binding(
+                    &root,
+                    "output",
+                    "/workspace/output",
+                    FileRootAccess::ReadWrite,
+                ),
+            )
+            .unwrap();
+        policy.require_no_further_user_namespaces();
+        policy.require_bounded_file_root_writes();
+        assert!(policy.bounded_file_root_writes_required());
+
+        assert!(policy.compile(&manifest([])).is_ok());
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+            Err(BubblewrapPolicyError::UnboundedFileRootWriteForbidden { id })
+                if id == "output"
+        ));
+
+        let mut private_tmp = base_policy(&root);
+        private_tmp
+            .enable_private_tmpfs()
+            .require_no_further_user_namespaces()
+            .require_bounded_file_root_writes();
+        assert!(matches!(
+            private_tmp.compile(&manifest([])),
+            Err(BubblewrapPolicyError::UnboundedPrivateTmpfsForbidden)
+        ));
+    }
+
+    #[test]
+    fn bounded_file_root_mode_accepts_read_only_and_bounded_mounts() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy
+            .add_file_root(
+                "input",
+                binding(&root, "input", "/workspace/input", FileRootAccess::ReadOnly),
+            )
+            .unwrap();
+        policy
+            .add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/workspace/scratch", 64 * 1024).unwrap(),
+            )
+            .unwrap();
+        policy
+            .enable_private_tmpfs_with_maximum_bytes(32 * 1024)
+            .unwrap()
+            .require_no_further_user_namespaces()
+            .require_bounded_file_root_writes();
+
+        let plan = policy
+            .compile(&manifest([
+                selector(ResourceKind::FileRoot, "input"),
+                selector(ResourceKind::FileRoot, "scratch"),
+            ]))
+            .unwrap();
+        let arguments = argument_strings(&plan);
+        assert!(has_arguments(
+            &arguments,
+            &["--size", "32768", "--tmpfs", "/tmp"]
+        ));
+        assert!(has_arguments(
+            &arguments,
+            &["--size", "65536", "--tmpfs", "/workspace/scratch"]
+        ));
+        assert!(has_arguments(&arguments, &["--remount-ro", "/proc"]));
+        assert!(has_arguments(&arguments, &["--remount-ro", "/dev"]));
+        assert!(has_arguments(&arguments, &["--remount-ro", "/"]));
+        let scratch_mount = arguments
+            .windows(4)
+            .position(|window| {
+                window.iter().map(String::as_str).eq([
+                    "--size",
+                    "65536",
+                    "--tmpfs",
+                    "/workspace/scratch",
+                ])
+            })
+            .unwrap();
+        let root_lockdown = arguments
+            .windows(2)
+            .position(|window| window.iter().map(String::as_str).eq(["--remount-ro", "/"]))
+            .unwrap();
+        assert!(scratch_mount < root_lockdown);
+    }
+
+    #[test]
+    fn ephemeral_file_root_cannot_supply_the_worker_program() {
+        let root = TestDirectory::new();
+        let bwrap = root.path().join("bwrap");
+        create_executable(&bwrap);
+        let mut policy = BubblewrapWorkerPolicy::new(bwrap, "/opt/splash/worker").unwrap();
+        policy
+            .add_ephemeral_file_root(
+                "runtime",
+                EphemeralFileRoot::new("/opt/splash", 1024).unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "runtime")])),
+            Err(BubblewrapPolicyError::WorkerProgramNotMounted { program })
+                if program == Path::new("/opt/splash/worker")
+        ));
     }
 
     #[test]

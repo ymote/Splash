@@ -3,8 +3,8 @@
 `splash-sandbox::bubblewrap` builds and launches a Linux Bubblewrap worker from
 trusted host Rust configuration. It is the first execution-boundary backend for
 Splash. The policy accepts a fixed worker program, fixed worker arguments,
-read-only runtime mounts, and opaque `file_root` bindings selected by an active
-`CapabilityManifest`.
+read-only runtime mounts, and opaque host-backed or bounded ephemeral
+`file_root` entries selected by an active `CapabilityManifest`.
 
 It is deliberately not a general command runner. Splash source, tool payloads,
 and resource selector IDs never become a host path, command line, origin, or
@@ -18,8 +18,9 @@ provide it.
 
 ```rust
 use splash_sandbox::bubblewrap::{
-    BubblewrapWorkerPolicy, FileRootAccess, FileRootBinding, ReadOnlyMount,
-    ResourceLimitRunner, WorkerResourceLimits, WorkerSeccompProfile,
+    BubblewrapWorkerPolicy, EphemeralFileRoot, FileRootAccess, FileRootBinding,
+    ReadOnlyMount, ResourceLimitRunner, WorkerResourceLimits,
+    WorkerSeccompProfile,
 };
 use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
 
@@ -41,6 +42,11 @@ policy.add_file_root(
         FileRootAccess::ReadOnly,
     )?,
 )?;
+policy.add_ephemeral_file_root(
+    "scratch",
+    EphemeralFileRoot::new("/workspace/scratch", 32 * 1024 * 1024)?,
+)?;
+policy.require_bounded_file_root_writes();
 policy.require_no_further_user_namespaces();
 policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
 policy.enable_private_tmpfs_with_maximum_bytes(64 * 1024 * 1024)?;
@@ -325,6 +331,38 @@ that enable it must use a Bubblewrap version that
 supports `--size`; an unsupported option is a launch failure, never a fallback
 to an unbounded worker.
 
+`EphemeralFileRoot` applies the same bounded `tmpfs` primitive to an opaque,
+manifest-selected `file_root` at any valid host-configured worker destination.
+The compiler emits one contiguous `--size BYTES --tmpfs DESTINATION` sequence
+for each active root. It validates that destination in the same mount layout as
+runtime mounts, host-backed roots, `/proc`, `/dev`, and an optional private
+`/tmp`, so a scratch mount cannot shadow another selected path. The root starts
+empty and disappears with the worker mount namespace. Its ceiling is aggregate
+for data blocks in that mount, but it does not independently cap inode count or
+directory-entry metadata. Separate active roots have separate ceilings; there
+is no shared session-wide disk budget. A tmpfs can consume memory or swap, so
+use cgroup memory and swap controls when those resources and metadata also need
+a hard limit. Never use an ephemeral root for a durable worker journal or
+effect record. Bubblewrap's tmpfs mount is `nosuid,nodev`, but it is not an
+executable-path policy or a guaranteed `noexec` mount. A compromised worker can
+write an executable file there and invoke it when the exposed runtime and
+syscall policy permit. Keep the fixed worker free of subprocess behavior or add
+a separately reviewed execution mediator; rejecting an `executable` selector
+does not prevent a native worker from calling `execve`.
+
+`require_bounded_file_root_writes` is an opt-in compile-time hardening mode. It
+allows read-only host roots and bounded ephemeral roots, but rejects every
+active host-backed read-write root. It also rejects an enabled unbounded
+private `/tmp`; a disabled or explicitly bounded `/tmp` remains valid. The mode
+requires `require_no_further_user_namespaces`, preventing the worker from
+creating a user namespace in which it could reacquire namespace-scoped mount
+authority. It then non-recursively remounts `/proc`, `/dev`, and `/` read-only
+after constructing the selected mounts, preventing regular-file writes outside
+bounded data tmpfs mounts. Device and proc interfaces remain available under
+their kernel semantics. The mode does not constrain process memory or
+downstream adapter effects. Any unsupported Bubblewrap lockdown option is a
+launch failure; there is no weaker fallback.
+
 `require_no_further_user_namespaces` is an opt-in hardening mode for Linux
 deployments that require it. It emits `--unshare-user --disable-userns` after
 `--unshare-all`: Bubblewrap's default `--unshare-all` requests a user namespace
@@ -477,6 +515,8 @@ destination, or conflicts with `/proc`, `/dev`, or an enabled private `/tmp`.
 The resulting command uses:
 
 - `--unshare-all`, so it does not retain the host network namespace;
+- unconditional `--cap-drop ALL`, so even a host that launches Bubblewrap as
+  root does not pass Linux capabilities into the fixed worker;
 - optional `--unshare-user --disable-userns` immediately after
   `--unshare-all`, requiring a usable user namespace and preventing the worker
   from creating further user namespaces;
@@ -492,6 +532,11 @@ The resulting command uses:
   read-write file roots; and
 - optional `--size BYTES` immediately before a private `--tmpfs /tmp`, limiting
   only allocations in that mount; and
+- manifest-selected `--size BYTES --tmpfs DESTINATION` pairs for bounded
+  ephemeral file roots; and
+- optional final `--remount-ro /proc`, `--remount-ro /dev`, and
+  `--remount-ro /` operations in bounded-write mode, leaving selected
+  submounts under their independently compiled access policies; and
 - optional `splash-limit-runner` invocation before the fixed worker, with only
   host-selected rlimit flags and no script-controlled target or arguments; and
 - private stdin/stdout pipes, with stderr sent to `/dev/null` to prevent an
@@ -509,9 +554,12 @@ The backend implements only file-root visibility at the operating-system
 boundary:
 
 - `file_root`: allowed only when its opaque ID is registered in the trusted
-  policy. The bound source must be a directory. Access mode is selected by the
-  host binding, so hosts should use distinct opaque IDs for read-only and
-  read-write views of the same source.
+  policy. A host-backed source must be a directory, and its access mode is
+  selected by the host binding. A bounded ephemeral entry has no host source;
+  it creates an empty writable `tmpfs` for that worker session. Both kinds
+  share one selector namespace, so a duplicate ID is rejected rather than
+  resolved ambiguously. Hosts should use distinct opaque IDs for read-only and
+  read-write views of the same host source.
 - `executable`: rejected. The worker program is fixed by host configuration;
   scripts cannot choose a second executable.
 - `network_origin`: rejected. The worker has no host network namespace, and
@@ -527,12 +575,16 @@ narrower manifest, rather than relying on one multi-tool worker process.
 
 The fixed worker program is not an executable-path policy. A trusted adapter
 cannot receive a script-selected executable through this backend, but a
-compromised worker can still execute or read any file deliberately exposed in a
-runtime mount. `DenyKnownEscapeSurface` protects only its explicit default-allow
-deny set; `StrictAllowlist` reduces the syscall surface but normally needs an
-execution syscall itself. Hosts must keep runtime mounts minimal and immutable
-and use a separately designed executable policy where executable chaining must
-be mediated.
+compromised worker can still execute or read any file deliberately exposed in
+a runtime mount and can create executable content in a writable ephemeral root.
+The command drops every Linux capability before worker execution, including
+when the host launches Bubblewrap as root; a worker that needs a privileged
+operation must use a narrower separately mediated adapter, not regain an
+ambient capability. `DenyKnownEscapeSurface` protects only its explicit
+default-allow deny set; `StrictAllowlist` reduces the syscall surface but
+normally needs an execution syscall itself. Hosts must keep runtime mounts
+minimal and immutable and use a separately designed executable policy where
+executable chaining must be mediated.
 
 ## Non-Guarantees
 
@@ -546,11 +598,12 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- aggregate-disk or device quotas. An optional cgroup-v2 policy adds CPU
-  bandwidth, memory, swap, task, and per-device I/O controls; it is not a
-  filesystem quota. An optional runner adds the narrower rlimits, a configured
-  private `/tmp` size limits only that Bubblewrap `tmpfs`, and the watchdog
-  adds a process-lifetime wall-clock deadline;
+- aggregate quotas for persistent host-backed storage or device quotas. An
+  optional cgroup-v2 policy adds CPU bandwidth, memory, swap, task, and
+  per-device I/O controls; it is not a filesystem quota. An optional runner
+  adds the narrower rlimits. A configured private `/tmp` and each active
+  ephemeral root have independent per-`tmpfs` allocation ceilings, and the
+  watchdog adds a process-lifetime wall-clock deadline;
 - D-Bus mediation, device-specific policy, an executable-path policy, or a
   network proxy. `DenyKnownEscapeSurface` is a narrow default-allow hardening
   filter, while `StrictAllowlist` is a target-specific syscall boundary, not a

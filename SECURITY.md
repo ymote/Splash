@@ -177,13 +177,16 @@ bypassed accidentally.
 It accepts only a fixed host-selected worker executable and fixed arguments,
 constructs a fresh Bubblewrap mount namespace, clears the worker environment,
 creates a new session, binds the worker to its parent lifecycle, and mounts
-only read-only runtime paths plus active manifest-selected `file_root`
-directories. It uses `--unshare-all` and never emits `--share-net`, so it does
-not retain the host network namespace. It rejects `network_origin`,
-`executable`, and `secret` selectors because this backend cannot correctly
-enforce them. It also rejects overlapping or root mounts and requires the
-worker program to live in a read-only runtime mount, avoiding a writable grant
-as an executable source. Hosts that explicitly select
+only read-only runtime paths plus active manifest-selected host-backed or
+bounded ephemeral `file_root` entries. It uses `--unshare-all` and never emits
+`--share-net`, so it does not retain the host network namespace. It also emits
+`--cap-drop ALL` unconditionally, including when Bubblewrap is launched by
+root, so the worker cannot retain Linux capabilities needed to undo mount or
+namespace policy. It rejects `network_origin`, `executable`, and `secret`
+selectors because this backend cannot correctly enforce them. It also rejects
+overlapping or root mounts and requires the worker program to live in a
+read-only runtime mount, avoiding a writable grant as an executable source.
+Hosts that explicitly select
 `require_no_further_user_namespaces` also get Bubblewrap's mandatory
 `--unshare-user --disable-userns` sequence, which prevents the worker from
 creating further user namespaces. That mode has no compatibility fallback and
@@ -310,18 +313,36 @@ kill without that disposition is still indeterminate. Durable operation,
 compensation, and reconciliation frames do not acquire in-band cancellation
 through this path.
 
-An explicit private `/tmp` can have a Bubblewrap `--size` allocation ceiling.
-That bounds only this tmpfs mount and must not be described as a process-memory,
-CPU, process-count, or general disk quota. After transport pipes move out of
-the startup handle, `BubblewrapWorkerLifecycle::terminate` force-terminates and
-reaps the worker. It is process control only: the host must drop the session and
-reconcile a durable effect rather than infer that process termination cancelled
-or rolled it back.
+An explicit private `/tmp` and each active `EphemeralFileRoot` can have a
+Bubblewrap `--size` allocation ceiling. Each ceiling bounds aggregate
+data-block allocation in that one `tmpfs` mount, not its independent inode or
+directory-entry count. Ephemeral roots are empty on worker startup, disappear
+with the mount namespace, and may consume memory or swap; they must not hold a
+durable journal or effect record. Multiple roots have independent ceilings,
+not a shared session budget. None of these limits is a process-memory, CPU,
+process-count, or persistent-filesystem quota.
+The tmpfs mounts are `nosuid,nodev`, but Splash does not claim they are
+`noexec`: a compromised worker can write executable content into an ephemeral
+root and invoke it when the runtime and syscall policy allow. Denying an
+`executable` capability selector prevents generated source from selecting a
+host command; it does not mediate native `execve` calls inside the worker.
+`require_bounded_file_root_writes` rejects active host-backed read-write roots
+and an enabled unbounded private `/tmp`, then non-recursively remounts the empty
+namespace root, `/proc`, and `/dev` read-only after all selected submounts are
+created. It also requires mandatory further-user-namespace lockdown; otherwise
+a worker could reacquire namespace-scoped mount authority after capabilities
+were dropped. Device and proc interfaces retain their kernel-defined semantics,
+and the mode does not constrain downstream adapter effects. After transport
+pipes move out of the startup handle,
+`BubblewrapWorkerLifecycle::terminate` force-terminates and reaps the worker. It
+is process control only: the host must drop the session and reconcile a durable
+effect rather than infer that process termination cancelled or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no aggregate-disk or device quota, per-origin network proxy,
-D-Bus mediation, executable-path policy, secret broker, or universal
-cancellation for arbitrary or durable adapters. Protocol v5 can layer an exact
+This backend has no aggregate quota for persistent host-backed storage, no
+device quota, per-origin network proxy, D-Bus mediation, executable-path
+policy, secret broker, or universal cancellation for arbitrary or durable
+adapters. Protocol v5 can layer an exact
 ordinary-call request over its private pipes only for reviewed cancellable
 adapters. Its optional strict allowlist is a target-specific
 syscall boundary, not a replacement for those missing controls. The optional
@@ -339,11 +360,14 @@ neither a filesystem quota nor a guarantee that buffered writeback will be
 attributed to the worker on every filesystem.
 `DenyKnownEscapeSurface` provides only the fixed default-allow hardening
 described above. `StrictAllowlist` kills unlisted syscalls but does not replace
-an executable-path or capability policy. A private `/tmp` is opt-in and
-unbounded unless the host selects its explicit Bubblewrap size limit; that
-limit does not replace a memory or disk policy. Its filesystem boundary is per
-worker session, not per individual invocation: an attenuated manifest should
-be narrowed before launch when per-call filesystem isolation is required.
+an executable-path or capability policy, and normally has to retain the
+worker's initial execution syscall. A private `/tmp` is opt-in and
+unbounded unless the host selects its explicit Bubblewrap size limit; active
+ephemeral file roots are always bounded individually. Those ceilings do not
+replace a cgroup memory policy or persistent-filesystem quota. The filesystem
+boundary is per worker session, not per individual invocation: an attenuated
+manifest should be narrowed before launch when per-call filesystem isolation
+is required.
 Policy source paths must be host-owned and immutable to untrusted actors from
 compilation through worker exit, including their executable and symlink
 targets; the current path-based launcher cannot eliminate that race. A fixed
