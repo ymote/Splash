@@ -13,6 +13,8 @@
 - Bounded grammar-aware same-document lexical definition/reference navigation
   for imports and runtime-scope bindings, with explicit truncation and no URI
   reads, evaluation, type inference, or authority.
+- Binding-kind hover and neutral same-document symbol highlights over the same
+  bounded lexical index.
 - Effect-free CLI top-level declaration outline for LLM and editor tooling.
 - Bounded effect-free direct tool-call outline for LLM and operator
   pre-approval review; it is explicitly non-authoritative and backed by
@@ -164,8 +166,7 @@
 ## Before a stable language release
 
 - Additional semantic editor features beyond lexical navigation, including
-  completion, hover, rename, imported-module resolution, and type-aware field
-  semantics.
+  completion, rename, imported-module resolution, and type-aware field semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Centralized event retention/aggregation and product-specific compensation

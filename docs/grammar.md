@@ -273,19 +273,22 @@ and never evaluate code.
 `splash-lsp` exposes the same effect-free validation and formatting operations
 over stdio LSP. It uses UTF-16 positions, requests full-document sync, and
 supports `textDocument/didOpen`, `textDocument/didChange`,
-`textDocument/didClose`, `textDocument/formatting`, and
-`textDocument/documentSymbol`, `textDocument/definition`, and
-`textDocument/references`. Document symbols list only top-level `fn` and `let`
-declarations after canonical syntax succeeds. Definition and reference requests
+`textDocument/didClose`, `textDocument/formatting`,
+`textDocument/documentSymbol`, `textDocument/definition`,
+`textDocument/references`, `textDocument/hover`, and
+`textDocument/documentHighlight`. Document symbols list only top-level `fn` and
+`let` declarations after canonical syntax succeeds. The other semantic requests
 use a grammar-aware same-document lexical index for the final binding introduced
 by `use`, named functions, `let`, function and lambda parameters, and `for`
-bindings already introduced in a visible runtime scope. The index is bounded to
-4,096 retained definition/reference occurrences. A retained definition remains
-sound after truncation, but an exhaustive reference request fails when that
-bound is exceeded.
+bindings already introduced in a visible runtime scope. Hover reports only that
+lexical binding kind, and highlights use the neutral text kind rather than
+claiming read/write analysis. The index is bounded to 4,096 retained
+definition/reference occurrences. Retained definition and hover results remain
+sound after truncation, but exhaustive reference and highlight requests fail
+when that bound is exceeded.
 
 The lexical service does not load or resolve imported modules, infer forward
 references or types, treat record keys or member fields as variables, or grant
 tool authority. The server does not open the URI supplied by the client or run
-source; all diagnostics, edits, symbols, definitions, and references derive
-from the client-provided document text.
+source; all diagnostics, edits, symbols, definitions, references, hovers, and
+highlights derive from the client-provided document text.

@@ -33,8 +33,8 @@ separate behavioral coverage for the imported VM.
 `splash-lsp` is a host-only stdio server for editor clients. It advertises
 UTF-16 positions, full document synchronization, syntax diagnostics,
 whole-document canonical formatting, top-level `fn`/`let` document symbols,
-and same-document lexical definition/reference requests for valid canonical
-source:
+same-document lexical definition/reference requests, binding-kind hover, and
+symbol highlights for valid canonical source:
 
 ```sh
 cargo run -p splash-lsp
@@ -47,8 +47,10 @@ the final binding introduced by `use`, named functions, `let`, function and
 lambda parameters, and `for` bindings already introduced in a visible runtime
 scope. It does not infer forward references, types, record keys, or member
 fields. A definition retained before the fixed 4,096-occurrence budget is
-exhausted remains available, while reference requests fail instead of returning
-a partial set from a truncated index.
+exhausted remains available for definition and hover, while reference and
+highlight requests fail instead of returning a partial set from a truncated
+index. Highlights are neutral resolved occurrences of one lexical binding
+because the index does not classify assignment reads and writes.
 The server retains at most 128 open documents and refuses to retain document
 text above the normal 256 KiB Splash source cap.
 

@@ -31,13 +31,15 @@ must return disclosure-safe messages and keep private detail in trusted logs.
 reads a document URI, evaluates source, creates a capability host, resolves an
 imported module, or loads an adapter. Its top-level `fn`/`let` outline and
 same-document lexical definition/reference index are derived only from valid
-client-provided canonical source and grant no tool authority. The lexical index
-is source-local, conservative, bounded to 4,096 retained definitions and
-resolved references, and rejects exhaustive reference requests when truncated;
-a definition is returned only when its retained occurrence has an exact binding.
-The index is not a type checker, module resolver, capability analysis, or
-authorization decision. The server retains at most 128 document states and no source text
-larger than the canonical 256 KiB limit, but the underlying LSP framing layer
+client-provided canonical source and grant no tool authority. Binding-kind hover
+and neutral symbol highlights use that same index; they do not expose runtime
+values or claim read/write analysis. The lexical index is source-local,
+conservative, bounded to 4,096 retained definitions and resolved references, and
+rejects exhaustive reference or highlight requests when truncated; a definition
+or hover is returned only when its retained occurrence has an exact binding. The
+index is not a type checker, module resolver, capability analysis, or
+authorization decision. The server retains at most 128 document states and no
+source text larger than the canonical 256 KiB limit, but the underlying LSP framing layer
 decodes an inbound message before that retention limit applies. Do not expose
 its stdio transport to a hostile peer or describe it as an IPC resource sandbox;
 place a separate bounded transport or operating-system boundary in front of

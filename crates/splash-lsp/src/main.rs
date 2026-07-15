@@ -15,20 +15,23 @@ use lsp_types::{
         Notification as LspNotification, PublishDiagnostics,
     },
     request::{
-        DocumentSymbolRequest, Formatting, GotoDefinition, References, Request as LspRequest,
+        DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
+        References, Request as LspRequest,
     },
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Location, OneOf,
-    Position, PositionEncodingKind, PublishDiagnosticsParams, Range, ReferenceParams,
-    ServerCapabilities, SymbolKind, TextDocumentItem, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Uri,
+    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
+    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location,
+    MarkupContent, MarkupKind, OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams,
+    Range, ReferenceParams, ServerCapabilities, SymbolKind, TextDocumentItem,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
 };
 use splash_core::{
     check_syntax_named, format_source_named, lexical_symbol_report_named,
-    top_level_declarations_named, ExecutionLimits, LexicalSymbol, LexicalSymbolReport, SourceSpan,
-    SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
+    top_level_declarations_named, ExecutionLimits, LexicalSymbol, LexicalSymbolKind,
+    LexicalSymbolReport, SourceSpan, SyntaxDiagnostic, TopLevelDeclaration,
+    TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -129,6 +132,28 @@ impl SplashLanguageServer {
         Ok(Some(symbol_location(uri, source, symbol.definition)))
     }
 
+    fn hover(&self, uri: &Uri, position: Position) -> Result<Option<Hover>, String> {
+        let (source, report) = self.lexical_symbols(uri)?;
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(None);
+        };
+        let Some((symbol, occurrence)) = symbol_occurrence_at_byte(&report, byte_offset) else {
+            return Ok(None);
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!(
+                    "**{}** `{}`",
+                    lexical_symbol_kind_label(symbol.kind),
+                    symbol.name
+                ),
+            }),
+            range: Some(span_range(source, occurrence)),
+        }))
+    }
+
     fn references(
         &self,
         uri: &Uri,
@@ -161,6 +186,33 @@ impl SplashLanguageServer {
                 .map(|span| symbol_location(uri, source, span)),
         );
         Ok(locations)
+    }
+
+    fn document_highlights(
+        &self,
+        uri: &Uri,
+        position: Position,
+    ) -> Result<Vec<DocumentHighlight>, String> {
+        let (source, report) = self.lexical_symbols(uri)?;
+        if report.truncated {
+            return Err(format!(
+                "the lexical index exceeds Splash's {MAX_LEXICAL_SYMBOL_OCCURRENCES}-occurrence limit"
+            ));
+        }
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(Vec::new());
+        };
+        let Some(symbol) = symbol_at_byte(&report, byte_offset) else {
+            return Ok(Vec::new());
+        };
+
+        Ok(std::iter::once(symbol.definition)
+            .chain(symbol.references.iter().copied())
+            .map(|span| DocumentHighlight {
+                range: span_range(source, span),
+                kind: Some(DocumentHighlightKind::TEXT),
+            })
+            .collect())
     }
 
     fn lexical_symbols(&self, uri: &Uri) -> Result<(&str, LexicalSymbolReport), String> {
@@ -276,6 +328,8 @@ fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(true.into()),
+        document_highlight_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
     }
 }
@@ -332,6 +386,25 @@ fn handle_request(
                 format!("invalid textDocument/definition parameters: {error}"),
             ),
         }
+    } else if request.method == HoverRequest::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<HoverParams>(request.params) {
+            Ok(params) => {
+                let text_document_position = params.text_document_position_params;
+                match server.hover(
+                    &text_document_position.text_document.uri,
+                    text_document_position.position,
+                ) {
+                    Ok(hover) => Response::new_ok(id, hover),
+                    Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+                }
+            }
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/hover parameters: {error}"),
+            ),
+        }
     } else if request.method == References::METHOD {
         let id = request.id.clone();
         match serde_json::from_value::<ReferenceParams>(request.params) {
@@ -347,6 +420,25 @@ fn handle_request(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("invalid textDocument/references parameters: {error}"),
+            ),
+        }
+    } else if request.method == DocumentHighlightRequest::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<DocumentHighlightParams>(request.params) {
+            Ok(params) => {
+                let text_document_position = params.text_document_position_params;
+                match server.document_highlights(
+                    &text_document_position.text_document.uri,
+                    text_document_position.position,
+                ) {
+                    Ok(highlights) => Response::new_ok(id, Some(highlights)),
+                    Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+                }
+            }
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/documentHighlight parameters: {error}"),
             ),
         }
     } else {
@@ -512,12 +604,23 @@ fn outline_symbol(source: &str, declaration: &TopLevelDeclaration) -> DocumentSy
 }
 
 fn symbol_at_byte(report: &LexicalSymbolReport, byte_offset: usize) -> Option<&LexicalSymbol> {
-    report.symbols.iter().find(|symbol| {
-        span_contains(symbol.definition, byte_offset)
-            || symbol
-                .references
-                .iter()
-                .any(|span| span_contains(*span, byte_offset))
+    symbol_occurrence_at_byte(report, byte_offset).map(|(symbol, _)| symbol)
+}
+
+fn symbol_occurrence_at_byte(
+    report: &LexicalSymbolReport,
+    byte_offset: usize,
+) -> Option<(&LexicalSymbol, SourceSpan)> {
+    report.symbols.iter().find_map(|symbol| {
+        if span_contains(symbol.definition, byte_offset) {
+            return Some((symbol, symbol.definition));
+        }
+        symbol
+            .references
+            .iter()
+            .copied()
+            .find(|span| span_contains(*span, byte_offset))
+            .map(|span| (symbol, span))
     })
 }
 
@@ -526,13 +629,25 @@ fn span_contains(span: SourceSpan, byte_offset: usize) -> bool {
 }
 
 fn symbol_location(uri: &Uri, source: &str, span: SourceSpan) -> Location {
-    Location::new(
-        uri.clone(),
-        Range::new(
-            position_at_byte(source, span.start_byte),
-            position_at_byte(source, span.end_byte),
-        ),
+    Location::new(uri.clone(), span_range(source, span))
+}
+
+fn span_range(source: &str, span: SourceSpan) -> Range {
+    Range::new(
+        position_at_byte(source, span.start_byte),
+        position_at_byte(source, span.end_byte),
     )
+}
+
+fn lexical_symbol_kind_label(kind: LexicalSymbolKind) -> &'static str {
+    match kind {
+        LexicalSymbolKind::Import => "import binding",
+        LexicalSymbolKind::Function => "function",
+        LexicalSymbolKind::Let => "binding",
+        LexicalSymbolKind::Parameter => "function parameter",
+        LexicalSymbolKind::LoopBinding => "loop binding",
+        LexicalSymbolKind::LambdaParameter => "lambda parameter",
+    }
 }
 
 fn byte_at_position(source: &str, position: Position) -> Option<usize> {
@@ -639,6 +754,31 @@ mod tests {
     }
 
     #[test]
+    fn lexical_hover_labels_cover_every_binding_kind() {
+        assert_eq!(
+            lexical_symbol_kind_label(LexicalSymbolKind::Import),
+            "import binding"
+        );
+        assert_eq!(
+            lexical_symbol_kind_label(LexicalSymbolKind::Function),
+            "function"
+        );
+        assert_eq!(lexical_symbol_kind_label(LexicalSymbolKind::Let), "binding");
+        assert_eq!(
+            lexical_symbol_kind_label(LexicalSymbolKind::Parameter),
+            "function parameter"
+        );
+        assert_eq!(
+            lexical_symbol_kind_label(LexicalSymbolKind::LoopBinding),
+            "loop binding"
+        );
+        assert_eq!(
+            lexical_symbol_kind_label(LexicalSymbolKind::LambdaParameter),
+            "lambda parameter"
+        );
+    }
+
+    #[test]
     fn reports_syntax_diagnostics_without_executing_source() {
         let mut server = SplashLanguageServer::default();
         let diagnostics = server.open_document(document(1, "var value = 42"));
@@ -723,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_same_document_definitions_and_references() {
+    fn resolves_same_document_lexical_editor_features() {
         let source = "let marker = \"\u{1f642}\"\r\n\
                       fn echo(value) {\r\n\
                           let local = value\r\n\
@@ -752,6 +892,51 @@ mod tests {
                 .expect("symbol index succeeds")
                 .expect("a definition resolves to itself"),
             definition
+        );
+
+        let hover = server
+            .hover(&test_uri(), position_at_byte(source, local_reference))
+            .expect("hover index succeeds")
+            .expect("local reference has hover information");
+        assert_eq!(
+            hover.range,
+            Some(Range::new(
+                position_at_byte(source, local_reference),
+                position_at_byte(source, local_reference + "local".len()),
+            ))
+        );
+        assert_eq!(
+            hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "**binding** `local`".to_owned(),
+            })
+        );
+
+        let highlights = server
+            .document_highlights(&test_uri(), position_at_byte(source, local_reference))
+            .expect("highlight index succeeds");
+        assert_eq!(highlights.len(), 2);
+        assert_eq!(
+            highlights
+                .iter()
+                .map(|highlight| highlight.kind)
+                .collect::<Vec<_>>(),
+            [
+                Some(DocumentHighlightKind::TEXT),
+                Some(DocumentHighlightKind::TEXT),
+            ]
+        );
+        assert_eq!(
+            highlights[0].range,
+            Range::new(
+                position_at_byte(source, local_definition),
+                position_at_byte(source, local_definition + "local".len()),
+            )
+        );
+        assert_eq!(
+            highlights[1].range,
+            hover.range.expect("hover range exists")
         );
 
         let value_reference = source.rfind("value").expect("value reference exists");
@@ -833,6 +1018,16 @@ mod tests {
             .references(&test_uri(), Position::new(0, 3), true)
             .expect("invalid source produces an empty index")
             .is_empty());
+        assert_eq!(
+            server
+                .hover(&test_uri(), Position::new(0, 3))
+                .expect("invalid source produces an empty index"),
+            None
+        );
+        assert!(server
+            .document_highlights(&test_uri(), Position::new(0, 3))
+            .expect("invalid source produces an empty index")
+            .is_empty());
 
         server.open_document(document(2, "let value = 1"));
         assert_eq!(
@@ -856,18 +1051,30 @@ mod tests {
             .definition(&test_uri(), Position::new(0, 4))
             .expect("retained definitions remain sound")
             .is_some());
+        assert!(server
+            .hover(&test_uri(), Position::new(0, 4))
+            .expect("retained hover information remains sound")
+            .is_some());
+        let omitted_position = Position::new(to_u32(MAX_LEXICAL_SYMBOL_OCCURRENCES), 4);
         assert_eq!(
             server
-                .definition(
-                    &test_uri(),
-                    Position::new(to_u32(MAX_LEXICAL_SYMBOL_OCCURRENCES), 4),
-                )
+                .definition(&test_uri(), omitted_position)
                 .expect("an omitted definition produces no location"),
+            None
+        );
+        assert_eq!(
+            server
+                .hover(&test_uri(), omitted_position)
+                .expect("an omitted definition produces no hover"),
             None
         );
         let error = server
             .references(&test_uri(), Position::new(0, 4), true)
             .expect_err("truncated reference sets are not returned as complete results");
+        assert!(error.contains("occurrence limit"));
+        let error = server
+            .document_highlights(&test_uri(), Position::new(0, 4))
+            .expect_err("truncated highlight sets are not returned as complete results");
         assert!(error.contains("occurrence limit"));
     }
 
@@ -958,6 +1165,10 @@ mod tests {
         assert_eq!(diagnostics.diagnostics.len(), 1);
         assert!(server.format_document(&test_uri()).is_err());
         assert!(server.document_symbols(&test_uri()).is_err());
+        assert!(server.hover(&test_uri(), Position::new(0, 0)).is_err());
+        assert!(server
+            .document_highlights(&test_uri(), Position::new(0, 0))
+            .is_err());
 
         let update = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier::new(test_uri(), 2),
@@ -972,6 +1183,7 @@ mod tests {
             .expect("full replacement is accepted");
         assert!(diagnostics.diagnostics.is_empty());
         assert!(server.format_document(&test_uri()).is_ok());
+        assert!(server.hover(&test_uri(), Position::new(0, 5)).is_ok());
     }
 
     #[test]
@@ -1009,6 +1221,8 @@ mod tests {
         assert_eq!(capabilities["documentSymbolProvider"], true);
         assert_eq!(capabilities["definitionProvider"], true);
         assert_eq!(capabilities["referencesProvider"], true);
+        assert_eq!(capabilities["hoverProvider"], true);
+        assert_eq!(capabilities["documentHighlightProvider"], true);
 
         client_connection
             .sender
@@ -1156,7 +1370,75 @@ mod tests {
 
         client_connection
             .sender
-            .send(Request::new(6.into(), "shutdown".to_owned(), ()).into())
+            .send(
+                Request::new(
+                    6.into(),
+                    HoverRequest::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 1}
+                    }),
+                )
+                .into(),
+            )
+            .expect("hover request send succeeds");
+        let hover_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("hover response arrives");
+        let Message::Response(response) = hover_response else {
+            panic!("expected hover response");
+        };
+        let hover = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("hover request failed: {}", error.message)
+            }
+        };
+        assert_eq!(hover["contents"]["kind"], "markdown");
+        assert_eq!(hover["contents"]["value"], "**binding** `value`");
+        assert_eq!(
+            hover["range"],
+            serde_json::json!({
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 1, "character": 5}
+            })
+        );
+
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    7.into(),
+                    DocumentHighlightRequest::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 1}
+                    }),
+                )
+                .into(),
+            )
+            .expect("document highlight request send succeeds");
+        let highlight_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("document highlight response arrives");
+        let Message::Response(response) = highlight_response else {
+            panic!("expected document highlight response");
+        };
+        let highlights = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("document highlight request failed: {}", error.message)
+            }
+        };
+        assert_eq!(highlights.as_array().map(Vec::len), Some(2));
+        assert_eq!(highlights[0]["kind"], 1);
+        assert_eq!(highlights[1]["kind"], 1);
+
+        client_connection
+            .sender
+            .send(Request::new(8.into(), "shutdown".to_owned(), ()).into())
             .expect("shutdown send succeeds");
         let shutdown_response = client_connection
             .receiver

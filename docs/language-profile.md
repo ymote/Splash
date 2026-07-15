@@ -52,7 +52,10 @@ This is a conservative lexical service, not a module or type checker. It does
 not load imported modules, infer forward references, resolve record keys or
 member fields, evaluate source, create a capability host, or authorize a tool.
 The LSP can serve a retained definition from a truncated report, but rejects a
-reference request instead of presenting an incomplete set as exhaustive.
+reference request instead of presenting an incomplete set as exhaustive. It
+also exposes binding-kind hover for a retained occurrence and neutral
+same-document highlights; a truncated report cannot produce an exhaustive
+highlight set.
 
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash
