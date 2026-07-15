@@ -591,7 +591,9 @@ impl<E> std::error::Error for OneShotAuthenticatedOperationWorkerTransportError<
 {
 }
 
-fn read_json_line<R: BufRead>(reader: &mut R) -> Result<String, JsonLineWorkerChannelError> {
+pub(crate) fn read_json_line<R: BufRead>(
+    reader: &mut R,
+) -> Result<String, JsonLineWorkerChannelError> {
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf().map_err(JsonLineWorkerChannelError::Io)?;

@@ -16,6 +16,11 @@ pub mod mobile;
 /// capability lease, suspended promise, or external operation.
 pub mod durable_events;
 
+/// Applies authenticated cancellable worker events through the workflow
+/// engine's suspended-step lifecycle.
+#[cfg(feature = "multiplexed-worker")]
+pub mod multiplexed_worker;
+
 /// Fenced, reconciliation-only recovery for a reaped Linux Bubblewrap worker.
 ///
 /// This integration is host-only and feature gated because it owns process

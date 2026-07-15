@@ -1,6 +1,6 @@
 # Durable Worker Compensation
 
-Worker protocol v4 adds a narrow, host-controlled path for one compensating
+Worker protocol v5 retains a narrow, host-controlled path for one compensating
 effect of a previously succeeded durable operation. It is deliberately not a
 Splash language feature: generated source cannot create a compensation key,
 approve one, select a tenant, change a grant, or call a worker compensation
@@ -158,7 +158,7 @@ Treat every uncertain state conservatively:
 | Grant, tenant, tool, key, or input drift | Fail closed. A policy change cannot reuse the stored intent automatically. |
 | Lost worker response | Reuse the existing durable intent under a fresh host approval; never infer that the inverse did or did not happen from transport loss alone. |
 
-Version 4 does not define a universal inverse-status API because external
+Version 5 does not define a universal inverse-status API because external
 systems differ. A worker adapter must implement bounded status lookup or
 manual escalation for ambiguous `pending` and `running` compensation records.
 It must not convert an `Existing` record into a second execution merely to make

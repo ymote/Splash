@@ -372,6 +372,7 @@ dependencies = [
  "constant_time_eq",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

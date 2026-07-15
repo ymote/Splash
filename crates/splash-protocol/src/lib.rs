@@ -13,8 +13,9 @@ use std::io::{self, Read, Write};
 use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use zeroize::Zeroize;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
 pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
 /// Current format version for a private host-to-worker session bootstrap.
@@ -410,6 +411,120 @@ impl ToolResult {
         validate_protocol_version(self.protocol_version)?;
         validate_token("session id", &self.session_id)?;
         validate_token("request id", &self.request_id)
+    }
+}
+
+/// Host request to cooperatively cancel one active ordinary invocation.
+///
+/// `cancellation_id` identifies this control exchange. `request_id` and `tool`
+/// repeat the exact invocation target so an authenticated frame cannot be
+/// redirected to other in-flight work. This request is not proof that the
+/// adapter stopped; only a matching [`WorkerCancellationOutcome::Acknowledged`]
+/// result can provide that acknowledgement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCancellationRequest {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub cancellation_id: String,
+    pub request_id: String,
+    pub tool: String,
+}
+
+impl WorkerCancellationRequest {
+    pub fn new(
+        session_id: impl Into<String>,
+        cancellation_id: impl Into<String>,
+        request_id: impl Into<String>,
+        tool: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: session_id.into(),
+            cancellation_id: cancellation_id.into(),
+            request_id: request_id.into(),
+            tool: tool.into(),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("cancellation id", &self.cancellation_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        if self.cancellation_id == self.request_id {
+            return Err(ProtocolError::CancellationIdMatchesRequest);
+        }
+        Ok(())
+    }
+}
+
+/// Worker disposition for one authenticated cooperative-cancellation request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCancellationOutcome {
+    /// The reviewed adapter has stopped the target and guarantees that no
+    /// ordinary result for it will follow.
+    Acknowledged,
+    /// The ordinary result won the race. The host must consume that result and
+    /// must not report cancellation.
+    TooLate,
+    /// The adapter cannot provide a cooperative cancellation contract. The host
+    /// may force-stop containment, but that remains indeterminate.
+    Unsupported,
+}
+
+/// Authenticated worker response to one cooperative-cancellation request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCancellationResult {
+    pub protocol_version: u16,
+    pub session_id: String,
+    pub cancellation_id: String,
+    pub request_id: String,
+    pub tool: String,
+    pub outcome: WorkerCancellationOutcome,
+}
+
+impl WorkerCancellationResult {
+    pub fn new(
+        request: &WorkerCancellationRequest,
+        outcome: WorkerCancellationOutcome,
+    ) -> Result<Self, ProtocolError> {
+        request.validate()?;
+        let result = Self {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: request.session_id.clone(),
+            cancellation_id: request.cancellation_id.clone(),
+            request_id: request.request_id.clone(),
+            tool: request.tool.clone(),
+            outcome,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        validate_protocol_version(self.protocol_version)?;
+        validate_token("session id", &self.session_id)?;
+        validate_token("cancellation id", &self.cancellation_id)?;
+        validate_token("request id", &self.request_id)?;
+        validate_token("tool", &self.tool)?;
+        if self.cancellation_id == self.request_id {
+            return Err(ProtocolError::CancellationIdMatchesRequest);
+        }
+        Ok(())
+    }
+
+    pub fn matches_request(&self, request: &WorkerCancellationRequest) -> bool {
+        self.protocol_version == request.protocol_version
+            && self.session_id == request.session_id
+            && self.cancellation_id == request.cancellation_id
+            && self.request_id == request.request_id
+            && self.tool == request.tool
     }
 }
 
@@ -1395,17 +1510,11 @@ pub enum WorkerMessage {
     ReconciledOperation {
         result: OperationReconcileResult,
     },
-    /// Reserved for a future multiplexed worker transport.
-    ///
-    /// The v0.1 `splash-worker::WorkerSession` does not accept this message:
-    /// a single-flight synchronous transport cannot deliver it while an
-    /// invocation is blocked, so it must not be presented as cooperative
-    /// cancellation. Hosts currently use lifecycle control and treat a forced
-    /// stop as indeterminate.
     Cancel {
-        protocol_version: u16,
-        session_id: String,
-        request_id: String,
+        request: WorkerCancellationRequest,
+    },
+    CancellationResult {
+        result: WorkerCancellationResult,
     },
     CloseSession {
         protocol_version: u16,
@@ -1425,15 +1534,8 @@ impl WorkerMessage {
             Self::CompensationResult { result } => result.validate(),
             Self::ReconcileOperation { request } => request.validate(),
             Self::ReconciledOperation { result } => result.validate(),
-            Self::Cancel {
-                protocol_version,
-                session_id,
-                request_id,
-            } => {
-                validate_protocol_version(*protocol_version)?;
-                validate_token("session id", session_id)?;
-                validate_token("request id", request_id)
-            }
+            Self::Cancel { request } => request.validate(),
+            Self::CancellationResult { result } => result.validate(),
             Self::CloseSession {
                 protocol_version,
                 session_id,
@@ -1456,7 +1558,9 @@ impl WorkerMessage {
             Self::CompensationResult { result } => &result.session_id,
             Self::ReconcileOperation { request } => &request.session_id,
             Self::ReconciledOperation { result } => &result.session_id,
-            Self::Cancel { session_id, .. } | Self::CloseSession { session_id, .. } => session_id,
+            Self::Cancel { request } => &request.session_id,
+            Self::CancellationResult { result } => &result.session_id,
+            Self::CloseSession { session_id, .. } => session_id,
         }
     }
 
@@ -1542,6 +1646,12 @@ impl SessionKey {
 impl fmt::Debug for SessionKey {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionKey([redacted])")
+    }
+}
+
+impl Drop for SessionKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -1810,6 +1920,27 @@ impl SessionAuthenticator {
         self.role
     }
 
+    /// Consumes this session into independently owned directional states.
+    ///
+    /// Outgoing and incoming sequence spaces are already independent, so a
+    /// multiplexed transport may move the sealer to its writer owner and the
+    /// opener to its reader owner without a shared authenticator lock.
+    pub fn into_directional(self) -> (SessionFrameSealer, SessionFrameOpener) {
+        let opener = SessionFrameOpener {
+            session_id: self.session_id.clone(),
+            key: self.key.clone(),
+            role: self.role,
+            next_incoming_sequence: self.next_incoming_sequence,
+        };
+        let sealer = SessionFrameSealer {
+            session_id: self.session_id,
+            key: self.key,
+            role: self.role,
+            next_outgoing_sequence: self.next_outgoing_sequence,
+        };
+        (sealer, opener)
+    }
+
     pub fn seal(
         &mut self,
         message: WorkerMessage,
@@ -1877,6 +2008,115 @@ impl SessionAuthenticator {
     }
 }
 
+/// Outgoing half of one authenticated worker session.
+///
+/// This type owns the directional sequence and key material. It is intended to
+/// have exactly one writer owner; cloning it would fork the sequence space and
+/// is deliberately unsupported.
+pub struct SessionFrameSealer {
+    session_id: String,
+    key: SessionKey,
+    role: SessionRole,
+    next_outgoing_sequence: u64,
+}
+
+impl SessionFrameSealer {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn role(&self) -> SessionRole {
+        self.role
+    }
+
+    pub fn seal(
+        &mut self,
+        message: WorkerMessage,
+    ) -> Result<AuthenticatedWorkerMessage, ProtocolError> {
+        message.validate()?;
+        if message.session_id() != self.session_id {
+            return Err(ProtocolError::UnknownSession(
+                message.session_id().to_owned(),
+            ));
+        }
+        if self.next_outgoing_sequence == u64::MAX {
+            return Err(ProtocolError::SequenceExhausted);
+        }
+
+        let sequence = self.next_outgoing_sequence;
+        let auth_tag = encode_auth_tag(&authentication_tag(
+            &self.key,
+            &self.session_id,
+            self.role,
+            sequence,
+            &message,
+        )?);
+        let frame = AuthenticatedWorkerMessage {
+            sequence,
+            message,
+            auth_tag,
+        };
+        frame.to_json_line()?;
+        self.next_outgoing_sequence = self.next_outgoing_sequence.saturating_add(1);
+        Ok(frame)
+    }
+}
+
+/// Incoming half of one authenticated worker session.
+///
+/// This type owns the directional replay window and key material. It is
+/// intended to have exactly one reader owner.
+pub struct SessionFrameOpener {
+    session_id: String,
+    key: SessionKey,
+    role: SessionRole,
+    next_incoming_sequence: u64,
+}
+
+impl SessionFrameOpener {
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn role(&self) -> SessionRole {
+        self.role
+    }
+
+    pub fn open(
+        &mut self,
+        frame: AuthenticatedWorkerMessage,
+    ) -> Result<WorkerMessage, ProtocolError> {
+        frame.validate_syntax()?;
+        let supplied_tag = decode_auth_tag(&frame.auth_tag)?;
+        let expected_tag = authentication_tag(
+            &self.key,
+            &self.session_id,
+            self.role.peer(),
+            frame.sequence,
+            &frame.message,
+        )?;
+        if !constant_time_eq(&expected_tag, &supplied_tag) {
+            return Err(ProtocolError::InvalidAuthenticationTag);
+        }
+        if frame.message.session_id() != self.session_id {
+            return Err(ProtocolError::UnknownSession(
+                frame.message.session_id().to_owned(),
+            ));
+        }
+        if frame.sequence != self.next_incoming_sequence {
+            return Err(ProtocolError::UnexpectedSequence {
+                expected: self.next_incoming_sequence,
+                actual: frame.sequence,
+            });
+        }
+        if self.next_incoming_sequence == u64::MAX {
+            return Err(ProtocolError::SequenceExhausted);
+        }
+        self.next_incoming_sequence = self.next_incoming_sequence.saturating_add(1);
+        Ok(frame.message)
+    }
+}
+
 #[derive(Serialize)]
 struct AuthenticationPayload<'a> {
     domain: &'static str,
@@ -1895,7 +2135,7 @@ fn authentication_tag(
     message: &WorkerMessage,
 ) -> Result<[u8; AUTH_TAG_BYTES], ProtocolError> {
     let encoded = serde_json::to_vec(&AuthenticationPayload {
-        domain: "splash-worker-auth-v4",
+        domain: "splash-worker-auth-v5",
         protocol_version: PROTOCOL_VERSION,
         sender: sender.tag(),
         sequence,
@@ -1966,6 +2206,23 @@ impl AuthorizedInvocation {
 
     pub fn grant(&self) -> &CapabilityGrant {
         &self.grant
+    }
+}
+
+/// A cancellation request bound to one previously authorized invocation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthorizedWorkerCancellation {
+    request: WorkerCancellationRequest,
+    target: ToolInvocation,
+}
+
+impl AuthorizedWorkerCancellation {
+    pub fn request(&self) -> &WorkerCancellationRequest {
+        &self.request
+    }
+
+    pub fn target(&self) -> &ToolInvocation {
+        &self.target
     }
 }
 
@@ -2064,6 +2321,8 @@ pub struct SessionAuthorizer {
     compensation_identities: BTreeSet<CompensationRequestIdentity>,
     seen_request_ids: BTreeSet<String>,
     completed_request_ids: BTreeSet<String>,
+    cancellation_requested_ids: BTreeSet<String>,
+    cancelled_request_ids: BTreeSet<String>,
 }
 
 impl SessionAuthorizer {
@@ -2076,6 +2335,8 @@ impl SessionAuthorizer {
             compensation_identities: BTreeSet::new(),
             seen_request_ids: BTreeSet::new(),
             completed_request_ids: BTreeSet::new(),
+            cancellation_requested_ids: BTreeSet::new(),
+            cancelled_request_ids: BTreeSet::new(),
         })
     }
 
@@ -2107,6 +2368,52 @@ impl SessionAuthorizer {
         )?;
 
         Ok(AuthorizedInvocation { invocation, grant })
+    }
+
+    /// Validates one cooperative-cancellation request against an exact active
+    /// ordinary invocation.
+    ///
+    /// Cancellation has no independent capability budget and cannot introduce
+    /// a new tool name. Its own ID still shares the session request namespace,
+    /// preventing replay or ambiguous result correlation.
+    pub fn authorize_cancellation(
+        &mut self,
+        request: WorkerCancellationRequest,
+        target: &AuthorizedInvocation,
+    ) -> Result<AuthorizedWorkerCancellation, ProtocolError> {
+        request.validate()?;
+        if request.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(request.session_id));
+        }
+        let invocation = target.invocation();
+        if request.session_id != invocation.session_id
+            || request.request_id != invocation.request_id
+            || request.tool != invocation.tool
+        {
+            return Err(ProtocolError::CancellationTargetMismatch);
+        }
+        if self.cancelled_request_ids.contains(&request.request_id) {
+            return Err(ProtocolError::RequestAlreadyCancelled(request.request_id));
+        }
+        if self
+            .cancellation_requested_ids
+            .contains(&request.request_id)
+        {
+            return Err(ProtocolError::CancellationAlreadyRequested(
+                request.request_id,
+            ));
+        }
+        if self.seen_request_ids.contains(&request.cancellation_id) {
+            return Err(ProtocolError::DuplicateRequest(request.cancellation_id));
+        }
+        self.seen_request_ids
+            .insert(request.cancellation_id.clone());
+        self.cancellation_requested_ids
+            .insert(request.request_id.clone());
+        Ok(AuthorizedWorkerCancellation {
+            request,
+            target: invocation.clone(),
+        })
     }
 
     /// Validates and reserves one durable operation dispatch against this
@@ -2224,6 +2531,11 @@ impl SessionAuthorizer {
                 actual: result.request_id.clone(),
             });
         }
+        if self.cancelled_request_ids.contains(&result.request_id) {
+            return Err(ProtocolError::ResultAfterCancellation(
+                result.request_id.clone(),
+            ));
+        }
         if self.completed_request_ids.contains(&result.request_id) {
             return Err(ProtocolError::DuplicateResult(result.request_id.clone()));
         }
@@ -2235,6 +2547,57 @@ impl SessionAuthorizer {
             });
         }
         self.completed_request_ids.insert(result.request_id.clone());
+        Ok(())
+    }
+
+    /// Validates the worker disposition for one authorized cancellation.
+    ///
+    /// Only `Acknowledged` terminally cancels the target. `TooLate` is accepted
+    /// only after the ordinary result has already been validated in directional
+    /// frame order. `Unsupported` leaves the invocation active.
+    pub fn validate_cancellation_result(
+        &mut self,
+        authorized: &AuthorizedWorkerCancellation,
+        result: &WorkerCancellationResult,
+    ) -> Result<(), ProtocolError> {
+        result.validate()?;
+        if result.session_id != self.manifest.session_id {
+            return Err(ProtocolError::UnknownSession(result.session_id.clone()));
+        }
+        if !result.matches_request(authorized.request()) {
+            return Err(ProtocolError::CancellationResultMismatch);
+        }
+        if self.completed_request_ids.contains(&result.cancellation_id) {
+            return Err(ProtocolError::DuplicateResult(
+                result.cancellation_id.clone(),
+            ));
+        }
+        match result.outcome {
+            WorkerCancellationOutcome::Acknowledged => {
+                if self.completed_request_ids.contains(&result.request_id) {
+                    return Err(ProtocolError::CancellationAcknowledgedAfterResult(
+                        result.request_id.clone(),
+                    ));
+                }
+                self.cancelled_request_ids.insert(result.request_id.clone());
+            }
+            WorkerCancellationOutcome::TooLate => {
+                if !self.completed_request_ids.contains(&result.request_id) {
+                    return Err(ProtocolError::CancellationTooLateBeforeResult(
+                        result.request_id.clone(),
+                    ));
+                }
+            }
+            WorkerCancellationOutcome::Unsupported => {
+                if self.completed_request_ids.contains(&result.request_id) {
+                    return Err(ProtocolError::CancellationUnsupportedAfterResult(
+                        result.request_id.clone(),
+                    ));
+                }
+            }
+        }
+        self.completed_request_ids
+            .insert(result.cancellation_id.clone());
         Ok(())
     }
 
@@ -2403,6 +2766,15 @@ pub enum ProtocolError {
     InvalidAuthenticationTag,
     DuplicateRequest(String),
     DuplicateResult(String),
+    CancellationIdMatchesRequest,
+    CancellationTargetMismatch,
+    CancellationResultMismatch,
+    RequestAlreadyCancelled(String),
+    CancellationAlreadyRequested(String),
+    ResultAfterCancellation(String),
+    CancellationAcknowledgedAfterResult(String),
+    CancellationTooLateBeforeResult(String),
+    CancellationUnsupportedAfterResult(String),
     OperationResultMismatch,
     InvalidCompensationKey,
     InvalidCompensationGrantFingerprint,
@@ -2536,6 +2908,35 @@ impl Display for ProtocolError {
             Self::DuplicateResult(request_id) => {
                 write!(formatter, "duplicate worker result: {request_id}")
             }
+            Self::CancellationIdMatchesRequest => formatter
+                .write_str("worker cancellation ID must differ from its target request ID"),
+            Self::CancellationTargetMismatch => formatter
+                .write_str("worker cancellation does not match its authorized invocation"),
+            Self::CancellationResultMismatch => formatter
+                .write_str("worker cancellation result does not match its request"),
+            Self::RequestAlreadyCancelled(request_id) => {
+                write!(formatter, "worker request is already cancelled: {request_id}")
+            }
+            Self::CancellationAlreadyRequested(request_id) => write!(
+                formatter,
+                "worker request already has a cancellation request: {request_id}"
+            ),
+            Self::ResultAfterCancellation(request_id) => write!(
+                formatter,
+                "worker returned a result after acknowledging cancellation: {request_id}"
+            ),
+            Self::CancellationAcknowledgedAfterResult(request_id) => write!(
+                formatter,
+                "worker acknowledged cancellation after returning a result: {request_id}"
+            ),
+            Self::CancellationTooLateBeforeResult(request_id) => write!(
+                formatter,
+                "worker reported cancellation too late before its result: {request_id}"
+            ),
+            Self::CancellationUnsupportedAfterResult(request_id) => write!(
+                formatter,
+                "worker reported unsupported cancellation after returning a result: {request_id}"
+            ),
             Self::OperationResultMismatch => {
                 formatter.write_str("worker operation result does not match its dispatch")
             }
@@ -3121,6 +3522,203 @@ mod tests {
             authorizer.validate_result(&authorized, &oversized),
             Err(ProtocolError::OutputTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn acknowledged_cancellation_is_terminal_for_the_target_request() {
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let invocation = ToolInvocation::new(
+            "session-1",
+            "request-1",
+            "math.add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        )
+        .unwrap();
+        let authorized = authorizer.authorize(invocation).unwrap();
+        let request =
+            WorkerCancellationRequest::new("session-1", "cancel-1", "request-1", "math.add")
+                .unwrap();
+        let cancellation = authorizer
+            .authorize_cancellation(request.clone(), &authorized)
+            .unwrap();
+        let acknowledged =
+            WorkerCancellationResult::new(&request, WorkerCancellationOutcome::Acknowledged)
+                .unwrap();
+        authorizer
+            .validate_cancellation_result(&cancellation, &acknowledged)
+            .unwrap();
+        assert_eq!(
+            authorizer
+                .validate_cancellation_result(&cancellation, &acknowledged)
+                .unwrap_err(),
+            ProtocolError::DuplicateResult("cancel-1".to_owned())
+        );
+
+        let late_result = ToolResult::new(
+            "session-1",
+            "request-1",
+            ToolPayload::Json(json!({"total": 42})),
+        )
+        .unwrap();
+        assert_eq!(
+            authorizer
+                .validate_result(&authorized, &late_result)
+                .unwrap_err(),
+            ProtocolError::ResultAfterCancellation("request-1".to_owned())
+        );
+        let repeated =
+            WorkerCancellationRequest::new("session-1", "cancel-2", "request-1", "math.add")
+                .unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_cancellation(repeated, &authorized)
+                .unwrap_err(),
+            ProtocolError::RequestAlreadyCancelled("request-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn ordinary_result_must_precede_a_too_late_cancellation_disposition() {
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let invocation = ToolInvocation::new(
+            "session-1",
+            "request-1",
+            "math.add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        )
+        .unwrap();
+        let authorized = authorizer.authorize(invocation).unwrap();
+        let first_request =
+            WorkerCancellationRequest::new("session-1", "cancel-1", "request-1", "math.add")
+                .unwrap();
+        let first = authorizer
+            .authorize_cancellation(first_request.clone(), &authorized)
+            .unwrap();
+        let premature =
+            WorkerCancellationResult::new(&first_request, WorkerCancellationOutcome::TooLate)
+                .unwrap();
+        assert_eq!(
+            authorizer
+                .validate_cancellation_result(&first, &premature)
+                .unwrap_err(),
+            ProtocolError::CancellationTooLateBeforeResult("request-1".to_owned())
+        );
+
+        let result = ToolResult::new(
+            "session-1",
+            "request-1",
+            ToolPayload::Json(json!({"total": 42})),
+        )
+        .unwrap();
+        authorizer.validate_result(&authorized, &result).unwrap();
+        authorizer
+            .validate_cancellation_result(&first, &premature)
+            .unwrap();
+
+        let mut contradictory_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let second_invocation = ToolInvocation::new(
+            "session-1",
+            "request-1",
+            "math.add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        )
+        .unwrap();
+        let second_authorized = contradictory_authorizer
+            .authorize(second_invocation)
+            .unwrap();
+        contradictory_authorizer
+            .validate_result(&second_authorized, &result)
+            .unwrap();
+        let second_request =
+            WorkerCancellationRequest::new("session-1", "cancel-2", "request-1", "math.add")
+                .unwrap();
+        let second = contradictory_authorizer
+            .authorize_cancellation(second_request.clone(), &second_authorized)
+            .unwrap();
+        let contradictory =
+            WorkerCancellationResult::new(&second_request, WorkerCancellationOutcome::Acknowledged)
+                .unwrap();
+        assert_eq!(
+            contradictory_authorizer
+                .validate_cancellation_result(&second, &contradictory)
+                .unwrap_err(),
+            ProtocolError::CancellationAcknowledgedAfterResult("request-1".to_owned())
+        );
+
+        let mut unsupported_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let third_authorized = unsupported_authorizer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-1",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        unsupported_authorizer
+            .validate_result(&third_authorized, &result)
+            .unwrap();
+        let third_request =
+            WorkerCancellationRequest::new("session-1", "cancel-3", "request-1", "math.add")
+                .unwrap();
+        let third = unsupported_authorizer
+            .authorize_cancellation(third_request.clone(), &third_authorized)
+            .unwrap();
+        let unsupported =
+            WorkerCancellationResult::new(&third_request, WorkerCancellationOutcome::Unsupported)
+                .unwrap();
+        assert_eq!(
+            unsupported_authorizer
+                .validate_cancellation_result(&third, &unsupported)
+                .unwrap_err(),
+            ProtocolError::CancellationUnsupportedAfterResult("request-1".to_owned())
+        );
+    }
+
+    #[test]
+    fn cancellation_identity_and_target_binding_are_strict() {
+        assert_eq!(
+            WorkerCancellationRequest::new("session-1", "request-1", "request-1", "math.add")
+                .unwrap_err(),
+            ProtocolError::CancellationIdMatchesRequest
+        );
+
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let invocation = ToolInvocation::new(
+            "session-1",
+            "request-1",
+            "math.add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        )
+        .unwrap();
+        let authorized = authorizer.authorize(invocation).unwrap();
+        let wrong_tool =
+            WorkerCancellationRequest::new("session-1", "cancel-1", "request-1", "text.echo")
+                .unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_cancellation(wrong_tool, &authorized)
+                .unwrap_err(),
+            ProtocolError::CancellationTargetMismatch
+        );
+
+        let first =
+            WorkerCancellationRequest::new("session-1", "cancel-2", "request-1", "math.add")
+                .unwrap();
+        authorizer
+            .authorize_cancellation(first, &authorized)
+            .unwrap();
+        let duplicate_target =
+            WorkerCancellationRequest::new("session-1", "cancel-3", "request-1", "math.add")
+                .unwrap();
+        assert_eq!(
+            authorizer
+                .authorize_cancellation(duplicate_target, &authorized)
+                .unwrap_err(),
+            ProtocolError::CancellationAlreadyRequested("request-1".to_owned())
+        );
     }
 
     fn operation_request(
@@ -3995,6 +4593,56 @@ mod tests {
         };
         let outbound = worker.seal(response.clone()).unwrap();
         assert_eq!(host.open(outbound).unwrap(), response);
+    }
+
+    #[test]
+    fn directional_authentication_halves_preserve_sequences_for_multiplexing() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SessionFrameSealer>();
+        assert_send::<SessionFrameOpener>();
+
+        let host =
+            SessionAuthenticator::new("session-1", session_key(17), SessionRole::Host).unwrap();
+        let worker =
+            SessionAuthenticator::new("session-1", session_key(17), SessionRole::Worker).unwrap();
+        let (mut host_sealer, mut host_opener) = host.into_directional();
+        let (mut worker_sealer, mut worker_opener) = worker.into_directional();
+
+        let opening = WorkerMessage::OpenSession {
+            manifest: manifest(),
+        };
+        assert_eq!(
+            worker_opener
+                .open(host_sealer.seal(opening.clone()).unwrap())
+                .unwrap(),
+            opening
+        );
+
+        let cancellation =
+            WorkerCancellationRequest::new("session-1", "cancel-1", "request-1", "math.add")
+                .unwrap();
+        let cancel_message = WorkerMessage::Cancel {
+            request: cancellation.clone(),
+        };
+        assert_eq!(
+            worker_opener
+                .open(host_sealer.seal(cancel_message.clone()).unwrap())
+                .unwrap(),
+            cancel_message
+        );
+
+        let result =
+            WorkerCancellationResult::new(&cancellation, WorkerCancellationOutcome::Unsupported)
+                .unwrap();
+        let response = WorkerMessage::CancellationResult {
+            result: result.clone(),
+        };
+        assert_eq!(
+            host_opener
+                .open(worker_sealer.seal(response.clone()).unwrap())
+                .unwrap(),
+            response
+        );
     }
 
     #[test]

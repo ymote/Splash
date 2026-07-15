@@ -22,8 +22,9 @@ splash-schema = { version = "0.1.0", path = "../splash-schema" }
 splash-storage = { version = "0.1.0", path = "../splash-storage" }
 
 [features]
+multiplexed-worker = ["splash-capabilities/json-line-worker"]
 bubblewrap-recovery = [
     "dep:getrandom",
     "dep:splash-sandbox",
-    "splash-capabilities/json-line-worker",
+    "multiplexed-worker",
 ]

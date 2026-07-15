@@ -79,6 +79,16 @@
 - Feature-gated bounded JSON-line frame channel and authenticated ordinary-call
   transport for host-provided contained-worker I/O; it does not launch or
   sandbox a process.
+- Protocol v5 authenticated cooperative cancellation for one active ordinary
+  invocation, with strict request/target identity, directional ordering,
+  positive acknowledgement, result-wins `too_late`, and nonterminal
+  `unsupported` semantics.
+- Feature-gated cancellable worker driver and multiplexed host JSON-line
+  transport. Only explicitly registered cancellable Rust adapters can use the
+  path; normal synchronous and durable adapters remain excluded.
+- Session-bound process-supervision bridge that arms before dispatch and
+  resolves deadline/termination races before applying worker events, plus a
+  workflow completion sink that preserves suspended-step state.
 - Feature-gated one-shot authenticated durable-operation transport for one
   fresh-session dispatch, reconciliation, or compensation exchange; it is
   bounded and verified but does not provide automatic recovery policy.
@@ -130,8 +140,8 @@
 
 ## Next: contained local effects
 
-- Aggregate-disk quotas and authenticated in-band cancellation around the
-  Linux Bubblewrap launcher.
+- Aggregate-disk quotas for writable worker storage beyond the bounded private
+  `/tmp` mount.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A mediated origin-aware network policy, secret broker, and audited executable

@@ -631,6 +631,7 @@ dependencies = [
  "serde",
  "serde_json",
  "splash-storage",
+ "zeroize",
 ]
 
 [[package]]

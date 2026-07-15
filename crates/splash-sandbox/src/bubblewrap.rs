@@ -1607,6 +1607,11 @@ impl BubblewrapWorkerWatchdog {
         })
     }
 
+    /// Returns the authenticated worker session controlled by this watchdog.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Returns a clonable trusted host control that can force-stop this worker.
     ///
     /// This is intentionally narrower than a worker protocol handle. It can

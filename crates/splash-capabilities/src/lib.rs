@@ -28,6 +28,7 @@ pub use splash_protocol::{
     OperationDispatchRequest, OperationReconcileRequest, OperationReconcileResult, OperationStatus,
     ProtocolError, SessionAuthenticator, SessionKey, SessionRole,
     ToolInvocation as WorkerInvocation, ToolPayload as WorkerPayload, ToolResult as WorkerResult,
+    WorkerCancellationOutcome, WorkerCancellationRequest, WorkerCancellationResult,
     WorkerCompensationAdmission, WorkerCompensationRecord, WorkerMessage, WorkerOperationAdmission,
     WorkerOperationJournal, WorkerOperationState, WorkerOperationStateKind,
 };
@@ -65,6 +66,11 @@ pub mod in_process_worker;
 /// durable-operation exchanges, but does not create or contain a process.
 #[cfg(feature = "json-line-worker")]
 pub mod json_line_worker;
+
+/// Concurrent authenticated JSON-line transport for cancellable ordinary
+/// worker invocations.
+#[cfg(feature = "json-line-worker")]
+pub mod multiplexed_worker;
 
 /// Maximum number of tool promises a runtime may retain at once.
 ///

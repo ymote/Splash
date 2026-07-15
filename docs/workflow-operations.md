@@ -70,7 +70,7 @@ identity: pass opaque secret selectors or handles to the worker policy instead.
 Authenticated durable storage remains required even when no raw secret appears
 in the ledger.
 
-When dispatching through worker protocol v4, record
+When dispatching through worker protocol v5, record
 `canonical_operation_input_bytes(&payload)` rather than an ad hoc JSON string.
 `operation_dispatch_request` recreates those same bytes and rejects a payload
 whose durable identity differs from the ledger entry.
@@ -167,6 +167,46 @@ approval, or worker session. After a process restart, rebuild the trusted plan
 and capability policy, restore and validate the ledger, reconcile the durable
 operation, then choose an explicit policy for a new workflow execution. A
 terminal ledger state alone is not permission to skip or resume a Splash step.
+
+## Live Ordinary Cancellation
+
+Protocol v5 also has a non-durable cooperative path for an external workflow
+step dispatched as an ordinary `invoke`. Enable
+`splash-workflow/multiplexed-worker`, start the claimed invocation through a
+`SupervisedMultiplexedWorkerSession`, and use the workflow module's helpers:
+
+~~~rust
+use splash_workflow::multiplexed_worker::{
+    poll_external_tool, request_external_tool_cancellation,
+};
+
+worker_session.start_external_tool(&invocation, "invoke-1")?;
+let request = request_external_tool_cancellation(
+    &mut worker_session,
+    &mut engine,
+    invocation.id,
+    "cancel-1",
+)?;
+let event = poll_external_tool(&mut worker_session, &mut engine)?;
+~~~
+
+The request helper verifies that the workflow ID matches the active worker
+binding before it changes engine state, then records the runtime's two-phase
+cancellation request before sending the frame. If delivery fails afterward,
+the workflow remains cancellation-requested and the operation is
+indeterminate; it is not silently made dispatchable again.
+
+The poll helper applies ordinary completion through
+`WorkflowEngine::complete_external_tool` and a positive acknowledgement
+through `WorkflowEngine::confirm_external_tool_cancellation`. It never mutates
+`engine.runtime_mut()` directly. `too_late` leaves the ordinary result as the
+winner, `unsupported` leaves the step suspended, and a watchdog or process
+termination produces an indeterminate event without advancing the workflow.
+
+This live path supplies no durable operation identity. Use the ledgered
+dispatch and fresh-session reconciliation sequence above for an effect that
+must survive a crash. Do not send ordinary `cancel` for `dispatch_operation`,
+compensation, or reconciliation frames.
 
 ## Reconcile After Restart
 

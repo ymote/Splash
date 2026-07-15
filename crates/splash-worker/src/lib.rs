@@ -8,9 +8,13 @@
 //! responsible for process containment, session-key provisioning, resource
 //! selector resolution, and durable journal storage.
 
+pub mod cancellable;
+
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::{de::DeserializeOwned, Serialize};
 use splash_protocol::{
@@ -593,10 +597,61 @@ pub trait WorkerAdapter {
     }
 }
 
+/// Shared cooperative-cancellation signal for one active worker invocation.
+///
+/// The worker driver sets this flag only after authenticating an exact
+/// [`splash_protocol::WorkerCancellationRequest`]. An adapter may poll it or
+/// pass a clone into its own reviewed I/O layer. Observing the flag is not an
+/// acknowledgement; the adapter must return
+/// [`CancellableWorkerInvocationResult::CancellationAcknowledged`] only after
+/// the effect is known to have stopped and no result can still win.
+#[derive(Clone, Debug, Default)]
+pub struct WorkerCancellationToken {
+    requested: Arc<AtomicBool>,
+}
+
+impl WorkerCancellationToken {
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+}
+
+/// Completion returned by an explicitly cancellable ordinary adapter.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CancellableWorkerInvocationResult {
+    Completed(ToolPayload),
+    /// Positive adapter acknowledgement that the requested cancellation won.
+    CancellationAcknowledged,
+}
+
+/// Opt-in ordinary-invocation adapter that can run outside the authenticated
+/// frame loop and cooperatively acknowledge cancellation.
+///
+/// This contract applies only to [`ToolInvocation`]. Durable dispatch and
+/// compensation continue to use [`WorkerAdapter`] journal sequencing and must
+/// be reconciled after an ambiguous stop.
+pub trait CancellableWorkerAdapter: WorkerAdapter + Send {
+    fn invoke_cancellable(
+        &mut self,
+        request: &ToolInvocation,
+        grant: &CapabilityGrant,
+        cancellation: &WorkerCancellationToken,
+    ) -> Result<CancellableWorkerInvocationResult, WorkerAdapterError>;
+}
+
+enum WorkerAdapterEntry {
+    Standard(Box<dyn WorkerAdapter>),
+    Cancellable(Box<dyn CancellableWorkerAdapter>),
+}
+
 /// Explicit mapping from a capability name to a trusted Rust adapter.
 #[derive(Default)]
 pub struct WorkerAdapterRegistry {
-    adapters: BTreeMap<String, Box<dyn WorkerAdapter>>,
+    adapters: BTreeMap<String, WorkerAdapterEntry>,
 }
 
 impl WorkerAdapterRegistry {
@@ -623,7 +678,30 @@ impl WorkerAdapterRegistry {
         if self.adapters.contains_key(&tool) {
             return Err(WorkerAdapterRegistryError::DuplicateTool(tool));
         }
-        self.adapters.insert(tool, adapter);
+        self.adapters
+            .insert(tool, WorkerAdapterEntry::Standard(adapter));
+        Ok(())
+    }
+
+    /// Registers an ordinary adapter that explicitly supports cooperative
+    /// cancellation in the multiplexed worker driver.
+    pub fn register_cancellable<A>(
+        &mut self,
+        tool: impl Into<String>,
+        adapter: A,
+    ) -> Result<(), WorkerAdapterRegistryError>
+    where
+        A: CancellableWorkerAdapter + 'static,
+    {
+        let tool = tool.into();
+        if !is_valid_tool_name(&tool) {
+            return Err(WorkerAdapterRegistryError::InvalidTool(tool));
+        }
+        if self.adapters.contains_key(&tool) {
+            return Err(WorkerAdapterRegistryError::DuplicateTool(tool));
+        }
+        self.adapters
+            .insert(tool, WorkerAdapterEntry::Cancellable(Box::new(adapter)));
         Ok(())
     }
 
@@ -631,9 +709,44 @@ impl WorkerAdapterRegistry {
         self.adapters.contains_key(tool)
     }
 
+    pub fn is_cancellable(&self, tool: &str) -> bool {
+        matches!(
+            self.adapters.get(tool),
+            Some(WorkerAdapterEntry::Cancellable(_))
+        )
+    }
+
     fn adapter_mut(&mut self, tool: &str) -> Option<&mut (dyn WorkerAdapter + '_)> {
-        let adapter = self.adapters.get_mut(tool)?;
-        Some(adapter.as_mut())
+        match self.adapters.get_mut(tool)? {
+            WorkerAdapterEntry::Standard(adapter) => Some(adapter.as_mut()),
+            WorkerAdapterEntry::Cancellable(adapter) => Some(adapter.as_mut()),
+        }
+    }
+
+    pub(crate) fn take_cancellable(
+        &mut self,
+        tool: &str,
+    ) -> Option<Box<dyn CancellableWorkerAdapter>> {
+        match self.adapters.remove(tool)? {
+            WorkerAdapterEntry::Cancellable(adapter) => Some(adapter),
+            standard @ WorkerAdapterEntry::Standard(_) => {
+                self.adapters.insert(tool.to_owned(), standard);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn restore_cancellable(
+        &mut self,
+        tool: String,
+        adapter: Box<dyn CancellableWorkerAdapter>,
+    ) -> Result<(), WorkerAdapterRegistryError> {
+        if self.adapters.contains_key(&tool) {
+            return Err(WorkerAdapterRegistryError::DuplicateTool(tool));
+        }
+        self.adapters
+            .insert(tool, WorkerAdapterEntry::Cancellable(adapter));
+        Ok(())
     }
 }
 
@@ -818,6 +931,9 @@ impl WorkerSession {
                 WorkerSessionError::UnexpectedMessage("reconciled_operation"),
             ),
             WorkerMessage::Cancel { .. } => Err(WorkerSessionError::UnexpectedMessage("cancel")),
+            WorkerMessage::CancellationResult { .. } => {
+                Err(WorkerSessionError::UnexpectedMessage("cancellation_result"))
+            }
             WorkerMessage::CloseSession { .. } => {
                 Err(WorkerSessionError::UnexpectedMessage("close_session"))
             }

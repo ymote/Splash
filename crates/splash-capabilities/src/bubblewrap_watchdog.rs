@@ -11,7 +11,8 @@ use splash_sandbox::bubblewrap::{
 };
 
 use crate::bounded_worker::{
-    WorkerExecutionSupervisor, WorkerInvocationDeadline, WorkerInvocationOutcome,
+    SessionBoundWorkerExecutionSupervisor, WorkerExecutionSupervisor, WorkerInvocationDeadline,
+    WorkerInvocationOutcome,
 };
 
 impl WorkerExecutionSupervisor for BubblewrapWorkerWatchdog {
@@ -48,3 +49,15 @@ impl WorkerExecutionSupervisor for BubblewrapWorkerWatchdog {
         BubblewrapWorkerWatchdog::terminate(self)
     }
 }
+
+impl SessionBoundWorkerExecutionSupervisor for BubblewrapWorkerWatchdog {
+    fn session_id(&self) -> &str {
+        self.session_id()
+    }
+}
+
+/// Authenticated cancellable transport coupled to the exact Bubblewrap
+/// watchdog session that owns its process lifecycle.
+#[cfg(feature = "json-line-worker")]
+pub type BubblewrapMultiplexedWorkerSession =
+    crate::multiplexed_worker::SupervisedMultiplexedWorkerSession<BubblewrapWorkerWatchdog>;

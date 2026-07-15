@@ -108,6 +108,19 @@ pub trait WorkerExecutionSupervisor {
     fn terminate(&mut self) -> Result<Self::Termination, Self::Error>;
 }
 
+/// A lifecycle supervisor contract operationally bound to one authenticated
+/// worker session.
+///
+/// Concurrent transports use this narrower contract so a watchdog for one
+/// process cannot accidentally supervise frames for another session. The
+/// implementer is trusted host code; returning an ID is not attestation.
+/// Session identifiers are public routing identities, not authentication
+/// secrets.
+pub trait SessionBoundWorkerExecutionSupervisor: WorkerExecutionSupervisor {
+    /// Returns the exact worker-protocol session controlled by this supervisor.
+    fn session_id(&self) -> &str;
+}
+
 /// Why a bounded worker result must be treated as indeterminate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkerIndeterminateCause {

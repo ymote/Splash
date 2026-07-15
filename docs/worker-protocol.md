@@ -1,4 +1,4 @@
-# Worker Protocol v4
+# Worker Protocol v5
 
 `splash-protocol` is the portable data contract between a trusted Splash host
 and a platform-contained worker. It defines capability attenuation, bounded
@@ -9,10 +9,13 @@ applies an OS sandbox, or supplies rollback-resistant persistence. A host must
 select the containment backend and provision its key through a trusted platform
 channel before it sends an effectful invocation.
 
-Version 4 is a breaking wire and durable-journal revision. Version 3 frames
-and version 1 worker journals are rejected rather than silently interpreted
-under the new compensation rules. A host upgrading a live system must make an
-explicit migration or recovery decision for any unfinished v3 operation.
+Version 5 is a breaking wire revision for authenticated cooperative
+cancellation. Version 4 and earlier frames are rejected, and the keyed-frame
+domain is distinct, so an upgrade must create a fresh session and key rather
+than reuse an active v4 stream. The durable worker-journal format remains at
+version 2, introduced with protocol v4; version 1 journals are still rejected.
+An unfinished durable operation therefore keeps its journal identity and must
+be reconciled under a fresh v5 session rather than redispatched.
 
 ## Capability manifest
 
@@ -31,7 +34,7 @@ only inside its chosen worker backend.
 
 ```json
 {
-  "protocol_version": 4,
+  "protocol_version": 5,
   "session_id": "release-42",
   "grants": [
     {
@@ -78,8 +81,10 @@ and directional sequence number to a BLAKE3 keyed tag.
 `open` rejects tampering, a wrong key, reflected host frames, replayed frames,
 and any non-next sequence number before it returns the message. Incoming and
 outgoing sequences are independent. `SessionKey` is intentionally neither
-serializable nor displayable, and must never appear in a Splash script,
-manifest, audit event, or worker command line.
+serializable nor displayable, and each owned copy is zeroized on drop. This
+reduces residual key lifetime but is not a memory-locking or crash-dump
+guarantee. The key must never appear in a Splash script, manifest, audit event,
+or worker command line.
 
 The key is a 32-byte symmetric secret. Generate and transfer it through an
 OS-provided CSPRNG and a platform-specific trusted bootstrap channel. The
@@ -126,17 +131,64 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
    against the authorized invocation before exposing it to Splash. A
    successful result is accepted once; replayed results are rejected.
 
-Transport framing, worker lifecycle, cancellation delivery, durable replay,
-and OS policy remain backend responsibilities.
+Transport framing, worker lifecycle, durable replay, and OS policy remain
+backend responsibilities.
 
-`WorkerMessage::Cancel` is reserved wire syntax, not a v0.1 cooperative
-cancellation protocol. `splash-worker::WorkerSession` rejects it. The current
-JSON-line transport is single-flight, so it cannot safely send a second frame
-while it is blocked waiting for an invocation result. A host deadline or
-lifecycle stop must discard the session and treat any effect as indeterminate;
-it must not report a worker acknowledgement that does not exist. A future
-multiplexed transport needs an explicit authenticated cancellation and recovery
-contract before it can use this frame.
+## Cooperative Cancellation
+
+Protocol v5 defines `cancel` and `cancellation_result` for one active ordinary
+`invoke`. A `WorkerCancellationRequest` has its own unique cancellation ID and
+repeats the exact session, target request ID, and tool. It contains no tool
+input, `ExternalToolId`, path, executable, origin, secret, or new capability.
+The host and worker independently bind it to the already authorized invocation.
+Only one cancellation request is admitted for a target.
+
+The worker returns one of three dispositions:
+
+- `acknowledged`: the reviewed adapter has stopped the operation and guarantees
+  that no ordinary result will follow;
+- `too_late`: the ordinary result won and must appear first in authenticated
+  worker-to-host frame order; or
+- `unsupported`: the adapter cannot make the cooperative guarantee, so the
+  invocation remains active and may still return a result.
+
+An acknowledgement after a result, a result after an acknowledgement,
+`too_late` before a result, `unsupported` after a result, a second cancellation,
+and any identity mismatch are rejected. A process exit, pipe EOF, transport
+error, watchdog deadline, or host kill is not an acknowledgement.
+
+`splash-worker::cancellable::CancellableWorkerSessionDriver` keeps the
+authenticated frame loop responsive while one explicitly registered
+`CancellableWorkerAdapter` executes on an owned thread. Its cancellation token
+is set only after the request frame authenticates and reauthorizes. The adapter
+may return `CancellationAcknowledged` only after its effect and downstream I/O
+are stopped. The driver refuses manifests containing a normal synchronous
+adapter; the baseline `WorkerSession` continues to reject cancellation frames.
+On a fatal session error, the driver requests adapter cancellation and joins
+the thread instead of returning a detached effect. An adapter that ignores the
+token can therefore block worker teardown and must be bounded by the host
+process watchdog.
+
+On the host, `MultiplexedAuthenticatedWorkerTransport` owns one directional
+sealer, one directional opener, and one active ordinary invocation. It can send
+`cancel` while a result is pending and buffers a result-wins race until the
+matching `too_late` disposition has also validated. `ExternalToolWorkerBinding`
+keeps the runtime's opaque identity and input local, and maps only a positive
+acknowledgement to `confirm_external_tool_cancellation`.
+
+`SupervisedMultiplexedWorkerSession` additionally binds the transport to a
+`SessionBoundWorkerExecutionSupervisor`, arms its deadline before `invoke`, and
+resolves the watchdog race before exposing a terminal worker event. The Linux
+`BubblewrapWorkerWatchdog` implements this contract. If lifecycle control wins,
+the session is poisoned and the external operation remains pending for
+reconciliation. `splash-workflow/multiplexed-worker` applies successful events
+through `WorkflowEngine`, preserving suspended-step bookkeeping instead of
+mutating its underlying runtime directly.
+
+This path is deliberately limited to ordinary invocations whose adapter has a
+reviewed cooperative contract. `dispatch_operation`, compensation, and
+reconciliation keep their journaled one-shot semantics. An ambiguous stop of a
+durable effect must use the existing fresh-session reconciliation path.
 
 ## Rust Adapter Runtime
 
@@ -177,7 +229,7 @@ service. It must not calculate `current_fence + 1` from a separate read. See
 
 ## Durable Operation Dispatch
 
-`dispatch_operation` is the v4 path for an effect whose idempotency must
+`dispatch_operation` is the v5 path for an effect whose idempotency must
 survive a worker restart. It carries the normal session, request ID, tool, and
 bounded text or JSON payload plus a host-owned non-authorizing `operation_key`.
 The worker returns `operation_result` using the existing operation status
@@ -221,7 +273,7 @@ complete state machine and restart sequence.
 
 ## Explicit Compensation
 
-`compensate_operation` is the narrow v4 path for one inverse effect of a
+`compensate_operation` is the narrow v5 path for one inverse effect of a
 previously succeeded durable operation. It is not exposed to Splash source and
 it is not a generic retry or rollback command. The trusted host must first
 persist a compensation intent in its workflow ledger, then issue a one-use,
@@ -337,6 +389,14 @@ transports poison themselves on an invalid or unexpected response. The durable
 transport is consumed after one exchange, so a host recovering a stopped worker
 must start a fresh session from the durable journal rather than replaying an
 effect on an interrupted stream.
+
+The same feature also provides `MultiplexedAuthenticatedWorkerTransport` for
+one cancellable ordinary invocation at a time. Unlike the synchronous channel
+wrapper, it keeps authenticated reads and writes independently owned so a
+trusted event loop can send cancellation during a running adapter. Pair it
+with `CancellableWorkerSessionDriver` on the worker and a session-bound process
+supervisor on the host. Do not mix it with durable dispatch frames or adapters
+registered only through the synchronous worker contract.
 
 The JSON-line adapter is not a process launcher, sandbox, timeout mechanism,
 key-exchange protocol, or worker attestation scheme. A host using the Linux

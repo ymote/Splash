@@ -237,6 +237,69 @@ device use or an adapter's downstream I/O. Keep cgroup-backed workers in their
 managed lifecycle when process-tree teardown is required. Both deadlines are
 trusted host configuration and are never Splash values.
 
+## Authenticated Cooperative Cancellation
+
+For one explicitly cancellable ordinary invocation, enable
+`splash-capabilities/json-line-worker` and
+`splash-capabilities/bubblewrap-watchdog`. The worker must read the private
+bootstrap, authenticate `open_session`, and run
+`CancellableWorkerSessionDriver` with a manifest whose adapters were all
+registered through `register_cancellable`.
+
+The host hands the same watchdog and private pipes to the multiplexed
+transport. Unlike the synchronous wrapper above, the transport retains a
+single authenticated writer owner and a single authenticated reader owner, so
+the event loop can send `cancel` while the adapter thread runs:
+
+```rust
+use std::io::BufReader;
+use std::time::Duration;
+
+use splash_capabilities::bounded_worker::WorkerInvocationDeadline;
+use splash_capabilities::bubblewrap_watchdog::BubblewrapMultiplexedWorkerSession;
+use splash_capabilities::multiplexed_worker::MultiplexedAuthenticatedWorkerTransport;
+use splash_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
+
+let session_deadline =
+    BubblewrapWorkerSessionDeadline::new(Duration::from_secs(300))?;
+let (watchdog, worker_stdin, worker_stdout) =
+    worker.into_session_watchdog_parts(session_deadline)?;
+let transport = MultiplexedAuthenticatedWorkerTransport::new(
+    attenuated_manifest,
+    host_authenticator,
+    BufReader::new(worker_stdout),
+    worker_stdin,
+)?;
+let call_deadline = WorkerInvocationDeadline::new(Duration::from_secs(30))?;
+let mut session =
+    BubblewrapMultiplexedWorkerSession::new(transport, watchdog, call_deadline)?;
+
+session.start_external_tool(&claimed_invocation, "invoke-1")?;
+let request = runtime.request_external_tool_cancellation(claimed_invocation.id)?;
+session.request_external_tool_cancellation(&request, "cancel-1")?;
+// Poll `session.poll_external_tool(&mut runtime)` from the trusted event loop.
+```
+
+For an external workflow step, enable `splash-workflow/multiplexed-worker` and
+use its `request_external_tool_cancellation` and `poll_external_tool` helpers.
+They apply terminal events through `WorkflowEngine`; calling
+`engine.runtime_mut()` would bypass retained-step bookkeeping.
+
+The call deadline is armed before `invoke` is written and disarmed before a
+result or positive acknowledgement reaches the runtime. The transport and
+watchdog session IDs must match. A valid `acknowledged` disposition is accepted
+only from the exact authenticated request and only when the watchdog reports
+that lifecycle termination did not win. `too_late` requires the ordinary
+result first; `unsupported` leaves the invocation active.
+
+Bubblewrap containment does not make an adapter honestly cancellable. The
+reviewed Rust adapter may acknowledge only after it has stopped its own effect
+and downstream I/O and can guarantee no normal result follows. A watchdog
+deadline, `cgroup.kill`, pipe EOF, worker crash, transport error, or explicit
+host termination remains indeterminate and poisons the session. Durable
+dispatch, compensation, and reconciliation continue to use their journaled
+fresh-session recovery path.
+
 ## Durable Post-Stop Reconciliation
 
 The optional `splash-workflow/bubblewrap-recovery` feature composes the
@@ -494,13 +557,13 @@ It does not yet provide:
   replacement for any of these;
 - a safe per-origin network allowlist, arbitrary executable selection, secret
   broker, or filesystem access outside registered directory roots;
-- authenticated in-band cancellation delivery or worker cancellation
-  acknowledgements. The optional watchdog supplies a host wall-clock force-stop
-  for one synchronous transport invocation, not proof that an adapter effect
-  was cancelled. The optional workflow coordinator automates a narrow
-  reconciliation-only post-stop sequence but does not supply durable worker
-  journal storage, retry effects, select compensation, or resume a workflow;
-  and
+- universal cancellation for synchronous, durable, or arbitrary adapters. The
+  optional multiplexed protocol delivers one authenticated ordinary-call
+  request only to explicitly cancellable adapters. The watchdog remains a
+  force-stop, not proof of cancellation. The optional workflow recovery
+  coordinator automates a narrow reconciliation-only post-stop sequence but
+  does not supply durable worker journal storage, retry effects, select
+  compensation, or resume a workflow; and
 - protection from a trusted host changing a policy source path between plan
   compilation and worker exit. Policy sources and their contents, including
   executable and symlink targets, must be owned and immutable to untrusted

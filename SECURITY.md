@@ -151,6 +151,28 @@ stops for one synchronous transport invocation and for a whole worker session
 measured from spawn, but it is not an authenticated cancellation
 acknowledgement or effect-recovery decision.
 
+Protocol v5's optional multiplexed JSON-line path is separate from that
+synchronous transport. It admits one active ordinary invocation and one exact
+authenticated cancellation request, with independently owned directional
+authentication state. The worker path accepts only adapters explicitly
+registered as `CancellableWorkerAdapter`; it keeps frame processing outside the
+adapter thread and sets a cancellation token only after request authentication
+and reauthorization. A positive acknowledgement is valid only when the adapter
+has stopped its effect and guarantees no result follows. `too_late` requires a
+validated ordinary result first, while `unsupported` keeps the call active.
+These are trusted Rust adapter contracts, not properties asserted by Splash
+source or inferred from a process exit.
+
+`SupervisedMultiplexedWorkerSession` additionally requires its transport and
+lifecycle supervisor to name the same session, arms the deadline before
+dispatch, and resolves the watchdog race before exposing a terminal event. A
+deadline, forced stop, EOF, authentication failure, or transport error poisons
+the session and remains indeterminate. Only an authenticated positive
+acknowledgement whose supervision completed normally may drive the runtime's
+two-phase cancellation confirmation. The workflow integration applies events
+through `WorkflowEngine`, not `runtime_mut()`, so retained-step state cannot be
+bypassed accidentally.
+
 `splash-sandbox::bubblewrap` is the first such platform sandbox integration.
 It accepts only a fixed host-selected worker executable and fixed arguments,
 constructs a fresh Bubblewrap mount namespace, clears the worker environment,
@@ -280,6 +302,14 @@ termination on a monotonic timer, discard the session, and reconcile any
 durable effect. The runner does not implement that timer or a worker
 cancellation acknowledgement.
 
+The optional multiplexed ordinary-call transport can send a protocol v5
+cooperative request while this same watchdog remains armed. This does not
+change watchdog semantics: only the worker adapter's exact authenticated
+`acknowledged` disposition is cancellation proof. A deadline or process-tree
+kill without that disposition is still indeterminate. Durable operation,
+compensation, and reconciliation frames do not acquire in-band cancellation
+through this path.
+
 An explicit private `/tmp` can have a Bubblewrap `--size` allocation ceiling.
 That bounds only this tmpfs mount and must not be described as a process-memory,
 CPU, process-count, or general disk quota. After transport pipes move out of
@@ -290,8 +320,10 @@ or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no aggregate-disk or device quota, per-origin network proxy,
-D-Bus mediation, executable-path policy, secret broker, authenticated
-cancellation delivery. Its optional strict allowlist is a target-specific
+D-Bus mediation, executable-path policy, secret broker, or universal
+cancellation for arbitrary or durable adapters. Protocol v5 can layer an exact
+ordinary-call request over its private pipes only for reviewed cancellable
+adapters. Its optional strict allowlist is a target-specific
 syscall boundary, not a replacement for those missing controls. The optional
 `splash-workflow/bubblewrap-recovery` coordinator adds a narrow post-exit path:
 it requires a session-bound reaping proof, reloads a fenced authenticated host
@@ -384,6 +416,17 @@ exists, but the trusted host remains responsible for deciding whether an
 adapter acknowledgement is credible. This does not terminate a worker or
 enforce an operating-system policy. A force-stop is indeterminate and must not
 be reported as cooperative cancellation without separate proof.
+
+The multiplexed worker bridge keeps `ExternalToolId`, external input, and the
+runtime cancellation identity on the host. The wire request repeats only its
+own control ID and the exact already-authorized session, invocation request,
+and tool. `ExternalToolWorkerBinding` rejects drift in host ID, tool, call
+index, attempt, or idempotency key before sending. It accepts only one request
+per target. A result-wins race is not exposed until `result` and `too_late`
+have both authenticated in required order. An acknowledged race suppresses the
+ordinary result. The host must still treat the contained worker and reviewed
+adapter implementation as part of the trusted cancellation contract; keyed
+framing authenticates the session and ordering, not semantic honesty.
 
 External retries are also host-only. A script receives no retry API and cannot
 spend another capability call by requesting another attempt. For each claimed
@@ -565,8 +608,10 @@ database, or mobile key-value adapter must not claim rollback protection unless
 it has a separate platform trust anchor and the required atomic semantics.
 Generated Splash source receives neither a store nor a key.
 
-Worker protocol v4 adds authenticated operation-dispatch and explicit
-compensation frames. A contained worker's `WorkerOperationJournal` records
+Worker protocol v5 provides authenticated ordinary-call cancellation,
+operation-dispatch, and explicit compensation frames. Cancellation is an
+ephemeral adapter contract; durable effects still rely on the journal. A
+contained worker's `WorkerOperationJournal` records
 the tool, key, canonical-input digest, state, and at most one compensation
 record before its adapter runs an effect. A compensation is admitted only for
 a succeeded original operation under the same tool and tenant scope, with an

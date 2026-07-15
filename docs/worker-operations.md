@@ -1,6 +1,6 @@
 # Worker Durable Operations
 
-Worker protocol v4 gives a contained adapter a durable operation identity
+Worker protocol v5 gives a contained adapter a durable operation identity
 without exposing worker state, a journal, or a storage key to Splash source.
 It complements the host-side [workflow operation ledger](workflow-operations.md):
 the host decides whether an effect is allowed, while the worker makes an exact

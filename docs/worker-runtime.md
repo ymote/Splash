@@ -330,20 +330,37 @@ and compare-and-swap persists the observation. See
 [Bubblewrap post-stop recovery](bubblewrap-recovery.md). The worker must still
 load its own fenced durable journal and satisfy fresh-session admission.
 
-The channel performs synchronous I/O, so it cannot deliver an in-band `cancel`
-frame while a call is blocked waiting for its result. On Linux, the optional
-`bubblewrap-watchdog` feature connects a
+The baseline `AuthenticatedFrameWorkerTransport` performs synchronous I/O, so
+it cannot deliver an in-band `cancel` while blocked on a result. On Linux, the
+optional `bubblewrap-watchdog` feature connects a
 `BubblewrapWorkerLifecycle::into_watchdog` lifecycle to the generic
 `BoundedWorkerTransport`. It arms a trusted host-selected nonzero deadline
 before each `invoke`; `BubblewrapWorkerSessionDeadline` can additionally bound
 the worker's total lifetime from spawn, including idle time. Either expiry
 force-stops and reaps Bubblewrap from a separate host thread. An explicit host
-lifecycle control can do the same. All outcomes are deliberately reported as
-indeterminate, poison the transport session, and require the host to discard
-it and reconcile any durable effect. This is a wall-clock process-stop
-mechanism, not authenticated cooperative cancellation, an adapter
-acknowledgement, or a durable recovery decision. Other platforms must supply
-their own process, I/O, deadline, cancellation, and resource policy.
+lifecycle control can do the same. Those outcomes remain indeterminate, poison
+the transport, and require reconciliation for any durable effect.
+
+Protocol v5 adds a separate opt-in path for cooperative ordinary calls.
+`CancellableWorkerSessionDriver` runs an explicitly registered
+`CancellableWorkerAdapter` outside its authenticated frame loop, which lets
+the loop receive one exact `cancel` while the adapter runs. The adapter sees a
+`WorkerCancellationToken`; polling the token is not acknowledgement. It may
+return `CancellationAcknowledged` only after it has stopped the effect and can
+guarantee no result follows. The driver refuses mixed manifests containing a
+normal synchronous adapter.
+
+On the host, `MultiplexedAuthenticatedWorkerTransport` owns independent
+directional authentication state and remains responsive to cancellation while
+one call is active. `SupervisedMultiplexedWorkerSession` binds that transport
+to a session-matched watchdog, arms before dispatch, and resolves the watchdog
+race before exposing a worker event. A positive authenticated acknowledgement
+can confirm runtime cancellation only when supervision reports the call
+completed first. Any deadline, force-stop, EOF, authentication error, or
+transport failure remains indeterminate. Durable dispatch and recovery stay on
+the one-shot journaled path; they are never cancelled through this ordinary
+call driver. Other platforms must supply their own session-bound process, I/O,
+deadline, cancellation, and resource policy.
 
 ## Mobile and Embedded Profiles
 

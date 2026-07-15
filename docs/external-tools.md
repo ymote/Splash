@@ -264,7 +264,10 @@ cancel a worker process by itself. A contained adapter must apply its own I/O
 deadline and lifecycle policy. For a synchronous Linux Bubblewrap JSON-line
 worker, `BoundedWorkerTransport` can arm a host-owned watchdog that force-stops
 the worker at a deadline, but that result is indeterminate rather than a
-cooperative cancellation acknowledgement.
+cooperative cancellation acknowledgement. For an explicitly cancellable
+ordinary adapter, the multiplexed transport can deliver an authenticated
+request during execution; its session-bound supervisor still treats a
+watchdog race as indeterminate.
 
 ## Cancellation and containment
 
@@ -290,11 +293,44 @@ does not send or stage a cancellation request. Do not use it merely because the
 host wants work to stop.
 
 None of these runtime calls kill an OS process or network request. The host must
-translate the request into its adapter's own cooperative contract. The current
-single-flight JSON-line worker transport cannot deliver `WorkerMessage::Cancel`
-while an invocation is blocked. A Linux Bubblewrap host can force-stop it
-through the watchdog, but must then discard the session and reconcile any
-durable effect instead of confirming cancellation.
+translate the request into its adapter's own cooperative contract. The
+single-flight `AuthenticatedFrameWorkerTransport` cannot deliver
+`WorkerMessage::Cancel` while an invocation is blocked. With the optional
+`json-line-worker` feature, `MultiplexedAuthenticatedWorkerTransport` keeps its
+authenticated read and write directions independently owned and can send one
+exact request-bound cancellation during an active ordinary invocation.
+
+The worker side must use `CancellableWorkerSessionDriver`, and every granted
+tool in that session must have been registered through `register_cancellable`.
+Its adapter receives a `WorkerCancellationToken` and may return
+`CancellationAcknowledged` only after its own effect and downstream I/O are
+stopped and no normal result can follow. A normal result wins only when it is
+authenticated before the matching `too_late` disposition. `unsupported` keeps
+the call pending. Duplicate, mismatched, reordered, replayed, or contradictory
+frames fail closed.
+
+`ExternalToolWorkerBinding` binds a claimed invocation to the worker request
+without serializing `ExternalToolId` or repeating the external input in a
+cancellation frame. Call the runtime cancellation-request method first, then
+pass its returned `ExternalToolCancellationRequest` to the binding. Its
+standalone `poll` convenience applies a validated result or acknowledgement to
+`CapabilityRuntime`. `poll_event` exposes the same authenticated observation
+without choosing a completion sink.
+
+For a contained process, wrap the transport in
+`SupervisedMultiplexedWorkerSession`. Its supervisor must report the exact same
+session ID. It arms the host deadline before writing `invoke`, disarms it before
+exposing a terminal event, and poisons the session when a deadline or lifecycle
+stop wins. `splash-workflow/multiplexed-worker` consumes those events through
+`WorkflowEngine`, so completion advances the retained step and acknowledged
+cancellation follows the engine's normal step-failure path. Do not use
+`runtime_mut()` for this integration.
+
+A Linux Bubblewrap host can still force-stop any unresponsive or unsupported
+call through its watchdog. Without an authenticated positive acknowledgement,
+it must discard the session and reconcile any durable effect instead of
+confirming cancellation. Durable dispatch, compensation, and reconciliation
+do not use the ordinary cancellation path.
 
 External dispatch is a capability boundary, not an OS sandbox. A production
 adapter still needs an authenticated transport and a separately contained

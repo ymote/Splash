@@ -89,6 +89,13 @@ and keeps UI support optional rather than making UI the language boundary.
 - Feature-gated bounded JSON-line worker channel and authenticated transport
   for host-provided contained-worker pipes; process creation, deadlines, and
   containment remain host policy.
+- Feature-gated multiplexed JSON-line transport and worker driver for one
+  authenticated ordinary invocation, with exact request-bound cooperative
+  cancellation, explicit cancellable-adapter opt-in, and no false
+  acknowledgement on process termination.
+- A session-bound supervisor bridge that resolves watchdog races before it
+  applies worker completion or cancellation to `CapabilityRuntime`, plus a
+  workflow adapter that advances suspended steps through `WorkflowEngine`.
 - Feature-gated one-shot authenticated durable-operation transport for a fresh
   contained-worker session; it validates one dispatch, reconciliation, or
   compensation result but does not automate recovery policy.
@@ -306,17 +313,19 @@ an import, creates a capability host, or loads a Rust adapter.
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
   payload adapter that requires a platform trust anchor.
 - `splash-protocol`: portable worker messages, capability attenuation,
-  keyed session framing, and host-side invocation/result validation.
+  keyed session framing, strict ordinary-call cancellation, and host-side
+  invocation/result validation.
 - `splash-worker`: worker-side session runtime, explicit Rust adapter registry,
-  and authenticated journal-store bridge; it is not an OS sandbox or platform
-  storage backend.
+  cancellable ordinary-invocation driver, and authenticated journal-store
+  bridge; it is not an OS sandbox or platform storage backend.
 - `splash-sandbox`: target-specific worker containment policy; its initial
   Bubblewrap backend is Linux-only and deliberately narrow.
 - `splash-workflow`: host-owned planning, lease-bound approval, bounded JSON
   dataflow, bounded in-memory and authenticated durable event replay,
   checkpointing, durable operation records, optional fenced Bubblewrap
-  post-stop reconciliation, sequential execution, and a sealed mobile/embedded
-  workflow facade for static local adapters.
+  post-stop reconciliation, a multiplexed-worker completion sink, sequential
+  execution, and a sealed mobile/embedded workflow facade for static local
+  adapters.
 - `splash-cli`: local development CLI.
 - `splash-lsp`: host-only stdio diagnostics, canonical formatting, and
   top-level declaration symbols for open editor documents.
@@ -329,7 +338,7 @@ defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schem
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
 
-[Worker protocol v4](docs/worker-protocol.md) also defines keyed worker frames
+[Worker protocol v5](docs/worker-protocol.md) also defines keyed worker frames
 and the live-operation reconciliation boundary.
 
 [Workflow checkpoints](docs/workflow-checkpoints.md) define the durable
