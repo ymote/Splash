@@ -189,6 +189,12 @@ LLM-generated or otherwise untrusted source. A profile rejection returns before
 the inherited tokenizer or parser sees the source. The development CLI also
 performs this preflight automatically for `eval` and `run`.
 
+The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
+fixture is parsed directly by the vendored Makepad parser to catch compatibility
+drift, but it remains outside this grammar and cannot run through `splash-cli`.
+It requires a Makepad UI host that supplies widget modules and `ui`; see
+[Makepad UI compatibility](makepad-ui-compatibility.md).
+
 ## Canonical Workflow Source
 
 ```splash

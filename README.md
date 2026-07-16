@@ -216,6 +216,16 @@ The JSON dataflow example is runnable with:
 cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.splash
 ```
 
+## Makepad UI compatibility
+
+[`examples/makepad_ui_counter.splash`](examples/makepad_ui_counter.splash) is a
+small current-style Makepad UI body retained as a parser compatibility fixture.
+It is deliberately not runnable through `splash-cli`: the standalone runtime
+does not install Makepad widget modules, an event loop, or the `ui` handle.
+The canonical workflow profile continues to reject it. See
+[Makepad UI compatibility](docs/makepad-ui-compatibility.md) for the current
+upstream example distinction and the exact boundary.
+
 Inspect the exact demo-tool catalog supplied to an LLM host with:
 
 ```sh

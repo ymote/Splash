@@ -1,0 +1,51 @@
+// This is a Makepad Splash UI body, not a standalone splash-cli workflow.
+// A Makepad Splash host supplies widget modules and the `ui` handle.
+
+let count = 0
+
+View {
+    width: Fill
+    height: Fit
+    flow: Down
+    spacing: 12
+    padding: 16
+
+    title := Label {
+        text: "Counter"
+    }
+
+    display := Label {
+        text: "0"
+    }
+
+    controls := View {
+        width: Fill
+        height: Fit
+        flow: Right
+        spacing: 8
+
+        ButtonFlat {
+            text: "-"
+            on_click: || {
+                count -= 1
+                ui.display.set_text("" + count)
+            }
+        }
+
+        ButtonFlat {
+            text: "Reset"
+            on_click: || {
+                count = 0
+                ui.display.set_text("0")
+            }
+        }
+
+        ButtonFlat {
+            text: "+"
+            on_click: || {
+                count += 1
+                ui.display.set_text("" + count)
+            }
+        }
+    }
+}
