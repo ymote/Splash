@@ -29,6 +29,9 @@
   direct tool-call hints before ordered capability approval.
 - Bounded, data-only versioned workflow-draft interchange and CLI review for
   LLM-generated step lists before a host creates a plan or issues authority.
+- Machine-readable JSON Schema producer contract for the data-only workflow
+  draft envelope, with explicit wire, aggregate-source, and unique-step-ID
+  limits and no policy-bearing fields.
 - Approval-bound bounded JSON workflow dataflow with completed-prefix output
   binding, host-owned input/per-step output schema contracts, context and
   contract digest-only checkpoints, and a sealed mobile/embedded facade.

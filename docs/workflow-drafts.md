@@ -34,6 +34,22 @@ host impose an even smaller ingress limit; it cannot raise the 2 MiB hard
 limit. The bounded step decoder skips surplus array entries instead of
 retaining an unbounded vector before rejecting the draft.
 
+## Producer Schema
+
+`splash workflow-schema` emits the machine-readable JSON Schema producer
+contract for this envelope without reading a draft, creating a runtime, or
+registering a capability. Its `x-splash` extension states bounds that ordinary
+JSON Schema cannot express: aggregate decoded source bytes, total wire bytes,
+unique IDs across object items, ordered-step semantics, the canonical source
+profile, and the fact that the document carries no authority. The schema is
+intended to help an LLM or editor construct the proposal;
+`WorkflowDraft::from_json` remains authoritative and a host may use
+`from_json_with_max_bytes` to impose a lower ingress limit.
+
+The schema's `source` field is only a string at the draft boundary. Canonical
+Splash syntax is checked separately during `review`; a valid JSON envelope is
+not a valid, approved, or executable workflow.
+
 ## Host Lifecycle
 
 ```rust

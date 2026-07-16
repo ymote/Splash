@@ -247,6 +247,19 @@ a tool catalog, capability grant, or substitute for the normative
 [Splash Grammar v0.2](docs/grammar.md). Query the host's separate catalog
 before proposing effectful calls.
 
+For an LLM-generated ordered workflow, query the bounded draft producer schema
+before writing its JSON envelope:
+
+```sh
+cargo run -p splash-cli -- workflow-schema
+```
+
+The schema describes only `format_version` and ordered `id`/`source` steps,
+including the decoder's limits. It deliberately has no fields for capabilities,
+approvals, contracts, checkpoints, results, or external-operation handles;
+review the resulting file with `splash workflow-review` before the host plans
+or approves anything.
+
 Validate generated source against the canonical Splash v0.2 profile without
 creating a capability host or running any bytecode:
 

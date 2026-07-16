@@ -45,7 +45,7 @@ use splash_capabilities::{
 use splash_core::{
     check_syntax_named, parse_bounded_json, serialize_bounded_json, tool_call_hint_report_named,
     Evaluation, ExecutionLimits, RuntimeError, RuntimeJsonError, SyntaxReport, ToolCallHint,
-    MAX_SYNTAX_DIAGNOSTICS,
+    CANONICAL_PROFILE_ID, MAX_SYNTAX_DIAGNOSTICS,
 };
 use splash_protocol::{
     canonical_operation_input_bytes, AuthenticatedWorkerMessage, CapabilityGrant,
@@ -85,6 +85,12 @@ pub const MAX_WORKFLOW_PLAN_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_WORKFLOW_REVIEW_TOOL_CALL_HINTS: usize = 4_096;
 /// Current serialized LLM workflow-draft format version.
 pub const WORKFLOW_DRAFT_FORMAT_VERSION: u8 = 1;
+/// Version of the machine-readable schema returned by
+/// [`workflow_draft_json_schema`].
+///
+/// The schema describes the generated draft envelope, not a capability,
+/// approval, dataflow contract, or execution request.
+pub const WORKFLOW_DRAFT_SCHEMA_VERSION: u8 = 1;
 /// Maximum JSON bytes accepted for one untrusted workflow draft.
 ///
 /// This is separate from the aggregate decoded source limit. The wire format
@@ -621,6 +627,68 @@ impl WorkflowDraft {
     fn into_steps(self) -> Vec<WorkflowStep> {
         self.steps
     }
+}
+
+/// Returns the versioned JSON Schema producer contract for [`WorkflowDraft`].
+///
+/// The JSON Schema describes the fields, step-ID spelling, and per-array
+/// bounds that ordinary schema tooling can validate. The `x-splash` extension
+/// records the aggregate decoded-source and wire-byte bounds plus the
+/// step-ID uniqueness rule, which JSON Schema cannot express for objects
+/// uniquely keyed by one property. [`WorkflowDraft::from_json`] remains the
+/// authoritative bounded decoder and can apply a smaller host-selected wire
+/// limit through [`WorkflowDraft::from_json_with_max_bytes`].
+///
+/// The returned value is data for an LLM or editor. It creates no runtime,
+/// plan, lease, approval, tool capability, or dataflow contract.
+pub fn workflow_draft_json_schema() -> JsonValue {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Splash Workflow Draft",
+        "description": "A data-only proposal for ordered Splash workflow steps.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["format_version", "steps"],
+        "properties": {
+            "format_version": {
+                "type": "integer",
+                "const": WORKFLOW_DRAFT_FORMAT_VERSION,
+            },
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_WORKFLOW_STEPS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "source"],
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_WORKFLOW_STEP_ID_BYTES,
+                            "pattern": "^[a-z0-9._-]+$",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Canonical Splash source reviewed separately from draft decoding.",
+                        },
+                    },
+                },
+            },
+        },
+        "x-splash": {
+            "schema_version": WORKFLOW_DRAFT_SCHEMA_VERSION,
+            "format_version": WORKFLOW_DRAFT_FORMAT_VERSION,
+            "maximum_wire_bytes": MAX_WORKFLOW_DRAFT_BYTES,
+            "maximum_aggregate_source_bytes": MAX_WORKFLOW_PLAN_SOURCE_BYTES,
+            "step_ids_must_be_unique": true,
+            "steps_are_ordered": true,
+            "source_profile": CANONICAL_PROFILE_ID,
+            "host_may_lower_wire_limit": true,
+            "authority": "none",
+        },
+    })
 }
 
 /// Host-owned capability grant configuration for one trusted workflow step.
@@ -6619,6 +6687,58 @@ mod tests {
             event,
             WorkflowEvent::Approved { .. } | WorkflowEvent::ResumeApproved { .. }
         )));
+    }
+
+    #[test]
+    fn workflow_draft_schema_matches_the_bounded_wire_contract() {
+        let schema = workflow_draft_json_schema();
+        let steps = &schema["properties"]["steps"];
+        let step = &steps["items"];
+        let step_id = &step["properties"]["id"];
+
+        assert_eq!(
+            schema["$schema"],
+            serde_json::json!("https://json-schema.org/draft/2020-12/schema")
+        );
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            schema["properties"]["format_version"]["const"],
+            serde_json::json!(WORKFLOW_DRAFT_FORMAT_VERSION)
+        );
+        assert_eq!(steps["minItems"], serde_json::json!(1));
+        assert_eq!(steps["maxItems"], serde_json::json!(MAX_WORKFLOW_STEPS));
+        assert_eq!(step["additionalProperties"], serde_json::json!(false));
+        assert_eq!(step_id["minLength"], serde_json::json!(1));
+        assert_eq!(
+            step_id["maxLength"],
+            serde_json::json!(MAX_WORKFLOW_STEP_ID_BYTES)
+        );
+        assert_eq!(step_id["pattern"], serde_json::json!("^[a-z0-9._-]+$"));
+        assert_eq!(
+            schema["x-splash"]["schema_version"],
+            serde_json::json!(WORKFLOW_DRAFT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            schema["x-splash"]["maximum_wire_bytes"],
+            serde_json::json!(MAX_WORKFLOW_DRAFT_BYTES)
+        );
+        assert_eq!(
+            schema["x-splash"]["maximum_aggregate_source_bytes"],
+            serde_json::json!(MAX_WORKFLOW_PLAN_SOURCE_BYTES)
+        );
+        assert_eq!(
+            schema["x-splash"]["step_ids_must_be_unique"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            schema["x-splash"]["steps_are_ordered"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            schema["x-splash"]["source_profile"],
+            serde_json::json!(CANONICAL_PROFILE_ID)
+        );
+        assert_eq!(schema["x-splash"]["authority"], serde_json::json!("none"));
     }
 
     #[test]

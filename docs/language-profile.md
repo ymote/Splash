@@ -19,7 +19,19 @@ model. It creates no capability runtime and does not read source. The response
 is metadata only: it is neither a complete grammar nor a substitute for the
 normative [Splash Grammar v0.2](grammar.md), a host tool catalog, a capability
 grant, or workflow approval. A host must supply its own current catalog
-separately before an agent can propose effectful calls.
+separately before an agent can propose effectful calls. Within one
+`schema_version`, response objects may gain additive fields; integrations must
+consume named fields and ignore unknown ones. A breaking response change must
+use a new schema version.
+
+For a multi-step proposal, call `splash workflow-schema` before producing a
+workflow draft JSON document. It emits a JSON Schema draft plus an `x-splash`
+extension for the decoder's aggregate source, wire-byte, and unique-step-ID
+bounds. It describes only the data-only proposal envelope; it cannot select
+tools, grants, dataflow schemas, approvals, checkpoints, results, or external
+operation handles. Submit the resulting document to `splash workflow-review`
+for effect-free syntax and direct-call review, then let the trusted host decide
+whether to create a plan and issue any authority.
 
 Run `splash check <file>` before execution when an LLM or editor produced the
 source. The check enforces the canonical v0.2 grammar rather than merely

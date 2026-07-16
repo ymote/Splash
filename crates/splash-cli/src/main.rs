@@ -18,8 +18,9 @@ use splash_core::{
 };
 use splash_workflow::{
     mobile::{MobileWorkflowBuilder, MobileWorkflowRuntime},
-    WorkflowData, WorkflowDraft, WorkflowEvent, WorkflowPlan, WorkflowStepCapabilityPolicy,
-    MAX_WORKFLOW_DATA_BYTES, MAX_WORKFLOW_DRAFT_BYTES, MAX_WORKFLOW_STEP_ID_BYTES,
+    workflow_draft_json_schema, WorkflowData, WorkflowDraft, WorkflowEvent, WorkflowPlan,
+    WorkflowStepCapabilityPolicy, MAX_WORKFLOW_DATA_BYTES, MAX_WORKFLOW_DRAFT_BYTES,
+    MAX_WORKFLOW_STEP_ID_BYTES,
 };
 
 const MAX_WORKFLOW_CLI_GRANTS: usize = 4_096;
@@ -45,6 +46,7 @@ enum CliCommand {
         file: String,
         source: String,
     },
+    WorkflowSchema,
     WorkflowRun {
         file: String,
         source: String,
@@ -102,6 +104,9 @@ fn run_options(options: CliOptions) -> Result<(), String> {
     if let CliCommand::WorkflowReview { file, source } = &options.command {
         return run_workflow_review(file, source);
     }
+    if matches!(&options.command, CliCommand::WorkflowSchema) {
+        return run_workflow_schema();
+    }
     if let CliCommand::WorkflowRun {
         source,
         grants,
@@ -146,6 +151,9 @@ fn run_options(options: CliOptions) -> Result<(), String> {
         }
         CliCommand::Profile => {
             unreachable!("profile returns before creating a host")
+        }
+        CliCommand::WorkflowSchema => {
+            unreachable!("workflow schema returns before creating a host")
         }
         CliCommand::Check { .. }
         | CliCommand::Outline { .. }
@@ -192,6 +200,11 @@ fn run_profile() -> Result<(), String> {
     Ok(())
 }
 
+fn run_workflow_schema() -> Result<(), String> {
+    println!("{}", workflow_schema_output());
+    Ok(())
+}
+
 /// Versioned, host-free metadata for generated-source and workflow tooling.
 ///
 /// This describes the standalone language boundary only. In particular, it
@@ -235,6 +248,7 @@ fn profile_output() -> JsonValue {
             "outline": "splash outline <file>",
             "tool_calls": "splash tool-calls <file>",
             "workflow_review": "splash workflow-review <draft.json>",
+            "workflow_schema": "splash workflow-schema",
         },
         "tool_api": {
             "import": "use mod.tool",
@@ -279,6 +293,10 @@ fn profile_output() -> JsonValue {
             "workflow_approvals": "host_owned",
         },
     })
+}
+
+fn workflow_schema_output() -> JsonValue {
+    workflow_draft_json_schema()
 }
 
 fn register_demo_tools(
@@ -858,8 +876,10 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                     return Err("workflow-run accepts at most one --input file".to_owned());
                 }
             }
-            "check" | "outline" | "tool-calls" | "workflow-review" | "workflow-run" | "eval"
-            | "run" | "format" | "catalog" | "profile" => positional.push(argument),
+            "check" | "outline" | "tool-calls" | "workflow-review" | "workflow-schema"
+            | "workflow-run" | "eval" | "run" | "format" | "catalog" | "profile" => {
+                positional.push(argument)
+            }
             _ => positional.push(argument),
         }
     }
@@ -936,6 +956,11 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_json_add,
             })
         }
+        [command] if command == "workflow-schema" => Ok(CliOptions {
+            command: CliCommand::WorkflowSchema,
+            allow_echo,
+            allow_json_add,
+        }),
         [command, path] if command == "workflow-run" => {
             read_utf8_file_with_max_bytes(path, MAX_WORKFLOW_DRAFT_BYTES).map(|source| {
                 CliOptions {
@@ -972,7 +997,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
             allow_json_add,
         }),
         _ => Err(
-            "usage: splash profile | splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
+            "usage: splash profile | splash workflow-schema | splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
         ),
     }
 }
@@ -1016,6 +1041,18 @@ mod tests {
             parse_args(vec!["profile".to_owned()]).unwrap(),
             CliOptions {
                 command: CliCommand::Profile,
+                allow_echo: false,
+                allow_json_add: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_workflow_schema_invocation() {
+        assert_eq!(
+            parse_args(vec!["workflow-schema".to_owned()]).unwrap(),
+            CliOptions {
+                command: CliCommand::WorkflowSchema,
                 allow_echo: false,
                 allow_json_add: false,
             }
@@ -1091,6 +1128,10 @@ mod tests {
             output["effect_free_commands"]["profile"],
             json!("splash profile")
         );
+        assert_eq!(
+            output["effect_free_commands"]["workflow_schema"],
+            json!("splash workflow-schema")
+        );
         assert_eq!(output["authority"]["ambient_os_apis"], json!(false));
         assert_eq!(output["authority"]["imports_grant_authority"], json!(false));
         assert_eq!(
@@ -1106,6 +1147,18 @@ mod tests {
             Some(4)
         );
         assert_eq!(output["tool_api"]["await_method"], json!(".await()"));
+    }
+
+    #[test]
+    fn workflow_schema_output_remains_data_only() {
+        let output = workflow_schema_output();
+
+        assert_eq!(output["type"], json!("object"));
+        assert_eq!(output["x-splash"]["authority"], json!("none"));
+        assert_eq!(
+            output["properties"]["steps"]["items"]["additionalProperties"],
+            json!(false)
+        );
     }
 
     #[test]
