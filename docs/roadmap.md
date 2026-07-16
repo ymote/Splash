@@ -15,6 +15,9 @@
   reads, evaluation, type inference, or authority.
 - Binding-kind hover and neutral same-document symbol highlights over the same
   bounded lexical index.
+- Version-bound same-document rename with canonical identifier validation,
+  import-path refusal, truncation refusal, and whole-report lexical drift
+  detection.
 - Effect-free CLI top-level declaration outline for LLM and editor tooling.
 - Bounded effect-free direct tool-call outline for LLM and operator
   pre-approval review; it is explicitly non-authoritative and backed by
@@ -166,7 +169,7 @@
 ## Before a stable language release
 
 - Additional semantic editor features beyond lexical navigation, including
-  completion, rename, imported-module resolution, and type-aware field semantics.
+  completion, imported-module resolution, and type-aware field semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Centralized event retention/aggregation and product-specific compensation

@@ -26,7 +26,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A host-only stdio language server that publishes canonical syntax diagnostics,
   full-document formatting edits, top-level declaration symbols, and
   same-document lexical definitions, references, binding-kind hover, and symbol
-  highlights without reading files or evaluating code.
+  highlights plus version-bound guarded rename without reading files or
+  evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -325,13 +326,17 @@ It accepts only client-provided open-document text, retains at most 128
 document states and no document text above the standard 256 KiB source cap,
 and provides full-sync diagnostics, whole-document formatting, and top-level
 declaration symbols plus bounded same-document lexical definition/reference
-requests, binding-kind hover, and symbol highlights. It never reads a document
-URI, evaluates source, resolves an imported module, creates a capability host,
-or loads a Rust adapter. The lexical index is conservative: it does not infer
-forward references, types, record keys, or member fields. A truncated
-4,096-occurrence index can still serve retained, sound definitions and hover,
-but exhaustive reference and highlight requests fail instead of returning a
-partial set.
+requests, binding-kind hover, symbol highlights, and guarded rename. Rename is
+advertised only when the client supports versioned `documentChanges`; every
+edit is bound to the exact open-document version. It rejects truncated indexes,
+import path changes, invalid identifiers, and rewrites that change the complete
+indexed lexical binding report. It never reads a document URI, evaluates
+source, resolves an imported module, creates a capability host, or loads a Rust
+adapter. The lexical index is conservative: it does not infer forward
+references, types, record keys, or member fields. A truncated 4,096-occurrence
+index can still serve retained, sound definitions and hover, but exhaustive
+reference, highlight, and rename requests fail instead of returning a partial
+set.
 
 ## Workspace
 
@@ -362,7 +367,7 @@ partial set.
 - `splash-cli`: local development CLI.
 - `splash-lsp`: host-only stdio diagnostics, canonical formatting, top-level
   declaration symbols, and bounded same-document lexical navigation, hover, and
-  highlights for open editor documents.
+  highlights plus version-bound guarded rename for open editor documents.
 - `vendor/makepad`: provenance-preserving compatibility import.
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)

@@ -276,19 +276,32 @@ supports `textDocument/didOpen`, `textDocument/didChange`,
 `textDocument/didClose`, `textDocument/formatting`,
 `textDocument/documentSymbol`, `textDocument/definition`,
 `textDocument/references`, `textDocument/hover`, and
-`textDocument/documentHighlight`. Document symbols list only top-level `fn` and
-`let` declarations after canonical syntax succeeds. The other semantic requests
-use a grammar-aware same-document lexical index for the final binding introduced
-by `use`, named functions, `let`, function and lambda parameters, and `for`
+`textDocument/documentHighlight`. When the client supports versioned
+`documentChanges`, it also advertises `textDocument/prepareRename` and
+`textDocument/rename`. Document symbols list only top-level `fn` and `let`
+declarations after canonical syntax succeeds. The other semantic requests use a
+grammar-aware same-document lexical index for the final binding introduced by
+`use`, named functions, `let`, function and lambda parameters, and `for`
 bindings already introduced in a visible runtime scope. Hover reports only that
 lexical binding kind, and highlights use the neutral text kind rather than
 claiming read/write analysis. The index is bounded to 4,096 retained
 definition/reference occurrences. Retained definition and hover results remain
-sound after truncation, but exhaustive reference and highlight requests fail
-when that bound is exceeded.
+sound after truncation, but exhaustive reference, highlight, and rename
+requests fail when that bound is exceeded.
+
+Rename does not edit the final segment of a `use` path. For another indexed
+binding it accepts exactly one non-reserved canonical identifier, rewrites the
+definition and resolved references in memory, validates the resulting canonical
+and VM-compatible source, remaps every symbol span, and requires the entire new
+lexical report to match. A capture or shadowing change therefore fails closed.
+The returned edit targets only the client-supplied URI and carries the exact
+open-document version. This preserves the indexed lexical model only; unindexed
+forward references, modules, fields, types, and name-coupled runtime behavior
+remain outside the claim.
 
 The lexical service does not load or resolve imported modules, infer forward
 references or types, treat record keys or member fields as variables, or grant
 tool authority. The server does not open the URI supplied by the client or run
 source; all diagnostics, edits, symbols, definitions, references, hovers, and
-highlights derive from the client-provided document text.
+highlights, as well as all rename validation, derive from the client-provided
+document text.

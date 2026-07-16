@@ -55,7 +55,14 @@ The LSP can serve a retained definition from a truncated report, but rejects a
 reference request instead of presenting an incomplete set as exhaustive. It
 also exposes binding-kind hover for a retained occurrence and neutral
 same-document highlights; a truncated report cannot produce an exhaustive
-highlight set.
+highlight set. A client with versioned-document-edit support can also request a
+guarded same-document rename. Splash validates the new name through
+`splash_core::is_canonical_identifier`, reparses the bounded rewritten source,
+and returns a version-bound edit only when the complete remapped lexical report
+is identical apart from the selected name and shifted spans. Import paths and
+truncated reports are not renameable. This is a fail-closed indexed lexical
+guarantee, not module, field, type, reflection, forward-reference, or runtime
+semantic analysis.
 
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash

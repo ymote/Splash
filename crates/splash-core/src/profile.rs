@@ -37,6 +37,22 @@ pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> Profil
     CanonicalParser::new(tokens).parse()
 }
 
+pub(super) fn is_canonical_identifier(name: &str) -> bool {
+    // `End` is appended outside the ordinary token budget, so one slot accepts
+    // exactly one identifier token and no second source token.
+    let lexer = ProfileLexer::new(name, 1);
+    let (tokens, diagnostics, diagnostics_truncated) = lexer.tokenize();
+    if !diagnostics.is_empty() || diagnostics_truncated || tokens.len() != 2 {
+        return false;
+    }
+
+    matches!(
+        &tokens[0].kind,
+        TokenKind::Identifier(identifier)
+            if identifier == name && !is_reserved_identifier(identifier)
+    ) && matches!(tokens[1].kind, TokenKind::End)
+}
+
 /// Extracts declarations after the public caller has confirmed that the source
 /// is canonical and compatible with the vendored parser. Reusing the profile
 /// lexer keeps tooling structure aligned with canonical token rules.

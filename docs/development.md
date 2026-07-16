@@ -34,7 +34,7 @@ separate behavioral coverage for the imported VM.
 UTF-16 positions, full document synchronization, syntax diagnostics,
 whole-document canonical formatting, top-level `fn`/`let` document symbols,
 same-document lexical definition/reference requests, binding-kind hover, and
-symbol highlights for valid canonical source:
+symbol highlights plus guarded rename for valid canonical source:
 
 ```sh
 cargo run -p splash-lsp
@@ -51,8 +51,17 @@ exhausted remains available for definition and hover, while reference and
 highlight requests fail instead of returning a partial set from a truncated
 index. Highlights are neutral resolved occurrences of one lexical binding
 because the index does not classify assignment reads and writes.
-The server retains at most 128 open documents and refuses to retain document
-text above the normal 256 KiB Splash source cap.
+Rename is advertised only when the editor supports versioned
+`documentChanges`. It refuses import path edits and truncated reports, validates
+the new name with the canonical lexer, reparses the rewritten source, and
+requires its complete lexical report to equal the remapped original report.
+This prevents indexed capture and shadowing drift; it does not claim module,
+field, type, reflection, or forward-reference semantics. Returned edits carry
+the exact open-document version.
+
+Lexical reports are lazily cached per document version and discarded on a full
+change or close. The server retains at most 128 open documents and refuses to
+retain document text above the normal 256 KiB Splash source cap.
 
 ## Syntax fuzzing
 

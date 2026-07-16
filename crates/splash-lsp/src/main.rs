@@ -6,7 +6,7 @@
 //! formatting, outline, and lexical symbol helpers. It never reads document
 //! URIs, evaluates Splash code, creates a capability host, or loads an adapter.
 
-use std::{collections::HashMap, error::Error, io, process::ExitCode};
+use std::{cell::OnceCell, collections::HashMap, error::Error, io, process::ExitCode};
 
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
@@ -16,18 +16,20 @@ use lsp_types::{
     },
     request::{
         DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-        References, Request as LspRequest,
+        PrepareRenameRequest, References, Rename, Request as LspRequest,
     },
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
-    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location,
-    MarkupContent, MarkupKind, OneOf, Position, PositionEncodingKind, PublishDiagnosticsParams,
-    Range, ReferenceParams, ServerCapabilities, SymbolKind, TextDocumentItem,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    DidOpenTextDocumentParams, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, PrepareRenameResponse,
+    PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
+    ServerCapabilities, SymbolKind, TextDocumentEdit, TextDocumentItem, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use splash_core::{
-    check_syntax_named, format_source_named, lexical_symbol_report_named,
+    check_syntax_named, format_source_named, is_canonical_identifier, lexical_symbol_report_named,
     top_level_declarations_named, ExecutionLimits, LexicalSymbol, LexicalSymbolKind,
     LexicalSymbolReport, SourceSpan, SyntaxDiagnostic, TopLevelDeclaration,
     TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
@@ -39,10 +41,37 @@ const DIAGNOSTIC_SOURCE: &str = "splash";
 
 type ServerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct DocumentState {
     source: Option<String>,
     version: i32,
+    lexical_report: OnceCell<Result<LexicalSymbolReport, String>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct VersionedRenameEdits {
+    uri: Uri,
+    version: i32,
+    edits: Vec<TextEdit>,
+}
+
+impl VersionedRenameEdits {
+    fn into_workspace_edit(self) -> WorkspaceEdit {
+        WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier::new(self.uri, self.version),
+                edits: self.edits.into_iter().map(OneOf::Left).collect(),
+            }])),
+            change_annotations: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpanReplacement {
+    original: SourceSpan,
+    replacement: SourceSpan,
 }
 
 #[derive(Default)]
@@ -121,11 +150,11 @@ impl SplashLanguageServer {
     }
 
     fn definition(&self, uri: &Uri, position: Position) -> Result<Option<Location>, String> {
-        let (source, report) = self.lexical_symbols(uri)?;
+        let (source, _, report) = self.lexical_symbols(uri)?;
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(None);
         };
-        let Some(symbol) = symbol_at_byte(&report, byte_offset) else {
+        let Some(symbol) = symbol_at_byte(report, byte_offset) else {
             return Ok(None);
         };
 
@@ -133,11 +162,11 @@ impl SplashLanguageServer {
     }
 
     fn hover(&self, uri: &Uri, position: Position) -> Result<Option<Hover>, String> {
-        let (source, report) = self.lexical_symbols(uri)?;
+        let (source, _, report) = self.lexical_symbols(uri)?;
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(None);
         };
-        let Some((symbol, occurrence)) = symbol_occurrence_at_byte(&report, byte_offset) else {
+        let Some((symbol, occurrence)) = symbol_occurrence_at_byte(report, byte_offset) else {
             return Ok(None);
         };
 
@@ -160,7 +189,7 @@ impl SplashLanguageServer {
         position: Position,
         include_declaration: bool,
     ) -> Result<Vec<Location>, String> {
-        let (source, report) = self.lexical_symbols(uri)?;
+        let (source, _, report) = self.lexical_symbols(uri)?;
         if report.truncated {
             return Err(format!(
                 "the lexical index exceeds Splash's {MAX_LEXICAL_SYMBOL_OCCURRENCES}-occurrence limit"
@@ -169,7 +198,7 @@ impl SplashLanguageServer {
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(Vec::new());
         };
-        let Some(symbol) = symbol_at_byte(&report, byte_offset) else {
+        let Some(symbol) = symbol_at_byte(report, byte_offset) else {
             return Ok(Vec::new());
         };
 
@@ -193,7 +222,7 @@ impl SplashLanguageServer {
         uri: &Uri,
         position: Position,
     ) -> Result<Vec<DocumentHighlight>, String> {
-        let (source, report) = self.lexical_symbols(uri)?;
+        let (source, _, report) = self.lexical_symbols(uri)?;
         if report.truncated {
             return Err(format!(
                 "the lexical index exceeds Splash's {MAX_LEXICAL_SYMBOL_OCCURRENCES}-occurrence limit"
@@ -202,7 +231,7 @@ impl SplashLanguageServer {
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(Vec::new());
         };
-        let Some(symbol) = symbol_at_byte(&report, byte_offset) else {
+        let Some(symbol) = symbol_at_byte(report, byte_offset) else {
             return Ok(Vec::new());
         };
 
@@ -215,7 +244,100 @@ impl SplashLanguageServer {
             .collect())
     }
 
-    fn lexical_symbols(&self, uri: &Uri) -> Result<(&str, LexicalSymbolReport), String> {
+    fn prepare_rename(
+        &self,
+        uri: &Uri,
+        position: Position,
+    ) -> Result<Option<PrepareRenameResponse>, String> {
+        let (source, _, report) = self.lexical_symbols(uri)?;
+        require_complete_lexical_report(report)?;
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(None);
+        };
+        let Some((symbol_index, occurrence)) =
+            rename_symbol_occurrence_at_byte(report, byte_offset)
+        else {
+            return Ok(None);
+        };
+        let symbol = &report.symbols[symbol_index];
+        if symbol.kind == LexicalSymbolKind::Import {
+            return Ok(None);
+        }
+
+        Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range: span_range(source, occurrence),
+            placeholder: symbol.name.clone(),
+        }))
+    }
+
+    fn rename(
+        &self,
+        uri: &Uri,
+        position: Position,
+        new_name: &str,
+    ) -> Result<Option<VersionedRenameEdits>, String> {
+        let (source, version, report) = self.lexical_symbols(uri)?;
+        require_complete_lexical_report(report)?;
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(None);
+        };
+        let Some((symbol_index, _)) = rename_symbol_occurrence_at_byte(report, byte_offset) else {
+            return Ok(None);
+        };
+        let symbol = &report.symbols[symbol_index];
+        if symbol.kind == LexicalSymbolKind::Import {
+            return Err(
+                "Splash cannot rename an import binding without changing its module path"
+                    .to_owned(),
+            );
+        }
+        if new_name == symbol.name {
+            return Ok(None);
+        }
+        if new_name.len() > DEFAULT_MAX_SOURCE_BYTES {
+            return Err(format!(
+                "the rename identifier exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit"
+            ));
+        }
+        if !is_canonical_identifier(new_name) {
+            return Err(
+                "the requested name is not a non-reserved canonical Splash identifier".to_owned(),
+            );
+        }
+
+        let (renamed_source, replacements) = rewrite_symbol_occurrences(source, symbol, new_name)?;
+        let syntax = check_syntax_named(uri.as_str(), &renamed_source, ExecutionLimits::default())
+            .map_err(|error| format!("cannot validate renamed Splash source: {error}"))?;
+        if !syntax.valid {
+            return Err("the requested rename does not produce canonical Splash source".to_owned());
+        }
+
+        let renamed_report =
+            lexical_symbol_report_named(uri.as_str(), &renamed_source, ExecutionLimits::default())
+                .map_err(|error| format!("cannot index renamed Splash source: {error}"))?;
+        let expected_report = remap_lexical_report(report, symbol_index, new_name, &replacements)?;
+        if renamed_report != expected_report {
+            return Err(
+                "the requested rename would change indexed lexical binding resolution".to_owned(),
+            );
+        }
+
+        Ok(Some(VersionedRenameEdits {
+            uri: uri.clone(),
+            version,
+            edits: replacements
+                .iter()
+                .map(|replacement| {
+                    TextEdit::new(
+                        span_range(source, replacement.original),
+                        new_name.to_owned(),
+                    )
+                })
+                .collect(),
+        }))
+    }
+
+    fn lexical_symbols(&self, uri: &Uri) -> Result<(&str, i32, &LexicalSymbolReport), String> {
         let state = self
             .documents
             .get(uri)
@@ -223,9 +345,14 @@ impl SplashLanguageServer {
         let source = state.source.as_deref().ok_or_else(|| {
             format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
         })?;
-        let report = lexical_symbol_report_named(uri.as_str(), source, ExecutionLimits::default())
-            .map_err(|error| format!("cannot index canonical Splash source: {error}"))?;
-        Ok((source, report))
+        let report = state.lexical_report.get_or_init(|| {
+            lexical_symbol_report_named(uri.as_str(), source, ExecutionLimits::default())
+                .map_err(|error| format!("cannot index canonical Splash source: {error}"))
+        });
+        match report {
+            Ok(report) => Ok((source, state.version, report)),
+            Err(message) => Err(message.clone()),
+        }
     }
 
     fn replace_document(
@@ -250,6 +377,7 @@ impl SplashLanguageServer {
                 DocumentState {
                     source: None,
                     version,
+                    lexical_report: OnceCell::new(),
                 },
             );
             return resource_diagnostics(
@@ -268,6 +396,7 @@ impl SplashLanguageServer {
             DocumentState {
                 source: Some(source),
                 version,
+                lexical_report: OnceCell::new(),
             },
         );
         PublishDiagnosticsParams::new(uri, diagnostics, Some(version))
@@ -293,7 +422,16 @@ fn run_stdio() -> ServerResult<()> {
 }
 
 fn run_connection(connection: &Connection) -> ServerResult<()> {
-    connection.initialize(serde_json::to_value(server_capabilities())?)?;
+    let (initialize_id, initialize_value) = connection.initialize_start()?;
+    let initialize_params =
+        serde_json::from_value::<InitializeParams>(initialize_value).unwrap_or_default();
+    let versioned_document_edits = supports_versioned_document_edits(&initialize_params);
+    connection.initialize_finish(
+        initialize_id,
+        serde_json::json!({
+            "capabilities": server_capabilities(versioned_document_edits),
+        }),
+    )?;
 
     let mut server = SplashLanguageServer::default();
     while let Ok(message) = connection.receiver.recv() {
@@ -302,7 +440,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
                 if connection.handle_shutdown(&request)? {
                     return Ok(());
                 }
-                handle_request(connection, &server, request)?;
+                handle_request(connection, &server, versioned_document_edits, request)?;
             }
             Message::Notification(notification) => {
                 if notification.method == Exit::METHOD {
@@ -320,7 +458,17 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
     Ok(())
 }
 
-fn server_capabilities() -> ServerCapabilities {
+fn supports_versioned_document_edits(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.workspace_edit.as_ref())
+        .and_then(|workspace_edit| workspace_edit.document_changes)
+        == Some(true)
+}
+
+fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(PositionEncodingKind::UTF16),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -330,6 +478,12 @@ fn server_capabilities() -> ServerCapabilities {
         references_provider: Some(OneOf::Left(true)),
         hover_provider: Some(true.into()),
         document_highlight_provider: Some(OneOf::Left(true)),
+        rename_provider: versioned_document_edits.then(|| {
+            OneOf::Right(RenameOptions {
+                prepare_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            })
+        }),
         ..ServerCapabilities::default()
     }
 }
@@ -337,6 +491,7 @@ fn server_capabilities() -> ServerCapabilities {
 fn handle_request(
     connection: &Connection,
     server: &SplashLanguageServer,
+    versioned_document_edits: bool,
     request: Request,
 ) -> ServerResult<()> {
     let response = if request.method == Formatting::METHOD {
@@ -439,6 +594,38 @@ fn handle_request(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("invalid textDocument/documentHighlight parameters: {error}"),
+            ),
+        }
+    } else if versioned_document_edits && request.method == PrepareRenameRequest::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<TextDocumentPositionParams>(request.params) {
+            Ok(params) => match server.prepare_rename(&params.text_document.uri, params.position) {
+                Ok(prepared) => Response::new_ok(id, prepared),
+                Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+            },
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/prepareRename parameters: {error}"),
+            ),
+        }
+    } else if versioned_document_edits && request.method == Rename::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<RenameParams>(request.params) {
+            Ok(params) => match server.rename(
+                &params.text_document_position.text_document.uri,
+                params.text_document_position.position,
+                &params.new_name,
+            ) {
+                Ok(rename) => {
+                    Response::new_ok(id, rename.map(VersionedRenameEdits::into_workspace_edit))
+                }
+                Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+            },
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/rename parameters: {error}"),
             ),
         }
     } else {
@@ -650,6 +837,190 @@ fn lexical_symbol_kind_label(kind: LexicalSymbolKind) -> &'static str {
     }
 }
 
+fn require_complete_lexical_report(report: &LexicalSymbolReport) -> Result<(), String> {
+    if report.truncated {
+        Err(format!(
+            "the lexical index exceeds Splash's {MAX_LEXICAL_SYMBOL_OCCURRENCES}-occurrence limit"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn rename_symbol_occurrence_at_byte(
+    report: &LexicalSymbolReport,
+    byte_offset: usize,
+) -> Option<(usize, SourceSpan)> {
+    symbol_occurrence_index_at_byte(report, byte_offset).or_else(|| {
+        report
+            .symbols
+            .iter()
+            .enumerate()
+            .find_map(|(index, symbol)| {
+                std::iter::once(symbol.definition)
+                    .chain(symbol.references.iter().copied())
+                    .find(|span| span.end_byte == byte_offset)
+                    .map(|span| (index, span))
+            })
+    })
+}
+
+fn symbol_occurrence_index_at_byte(
+    report: &LexicalSymbolReport,
+    byte_offset: usize,
+) -> Option<(usize, SourceSpan)> {
+    report
+        .symbols
+        .iter()
+        .enumerate()
+        .find_map(|(index, symbol)| {
+            if span_contains(symbol.definition, byte_offset) {
+                return Some((index, symbol.definition));
+            }
+            symbol
+                .references
+                .iter()
+                .copied()
+                .find(|span| span_contains(*span, byte_offset))
+                .map(|span| (index, span))
+        })
+}
+
+fn rewrite_symbol_occurrences(
+    source: &str,
+    symbol: &LexicalSymbol,
+    new_name: &str,
+) -> Result<(String, Vec<SpanReplacement>), String> {
+    let mut spans = std::iter::once(symbol.definition)
+        .chain(symbol.references.iter().copied())
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+    spans.dedup();
+
+    let removed_bytes = spans.iter().try_fold(0_usize, |total, span| {
+        span.end_byte
+            .checked_sub(span.start_byte)
+            .and_then(|width| total.checked_add(width))
+    });
+    let replacement_bytes = new_name.len().checked_mul(spans.len());
+    let rewritten_len = removed_bytes
+        .and_then(|removed| source.len().checked_sub(removed))
+        .and_then(|retained| replacement_bytes.and_then(|added| retained.checked_add(added)))
+        .ok_or_else(|| "the requested rename exceeds Splash's source-size arithmetic".to_owned())?;
+    if rewritten_len > DEFAULT_MAX_SOURCE_BYTES {
+        return Err(format!(
+            "the renamed document would exceed Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit"
+        ));
+    }
+
+    let mut rewritten = String::with_capacity(rewritten_len);
+    let mut replacements = Vec::with_capacity(spans.len());
+    let mut cursor = 0_usize;
+    for span in spans {
+        if span.start_byte < cursor || span.end_byte < span.start_byte {
+            return Err("the lexical index contains overlapping rename occurrences".to_owned());
+        }
+        let prefix = source
+            .get(cursor..span.start_byte)
+            .ok_or_else(|| "the lexical index contains an invalid source span".to_owned())?;
+        let occurrence = source
+            .get(span.start_byte..span.end_byte)
+            .ok_or_else(|| "the lexical index contains an invalid source span".to_owned())?;
+        if occurrence != symbol.name {
+            return Err("the lexical index occurrence does not match its symbol name".to_owned());
+        }
+        rewritten.push_str(prefix);
+        let replacement_start = rewritten.len();
+        rewritten.push_str(new_name);
+        replacements.push(SpanReplacement {
+            original: span,
+            replacement: SourceSpan {
+                start_byte: replacement_start,
+                end_byte: rewritten.len(),
+            },
+        });
+        cursor = span.end_byte;
+    }
+    rewritten.push_str(
+        source
+            .get(cursor..)
+            .ok_or_else(|| "the lexical index contains an invalid source span".to_owned())?,
+    );
+    if rewritten.len() != rewritten_len {
+        return Err("the renamed document did not match its bounded size calculation".to_owned());
+    }
+    Ok((rewritten, replacements))
+}
+
+fn remap_lexical_report(
+    report: &LexicalSymbolReport,
+    renamed_symbol_index: usize,
+    new_name: &str,
+    replacements: &[SpanReplacement],
+) -> Result<LexicalSymbolReport, String> {
+    let mut expected = report.clone();
+    let symbol = expected
+        .symbols
+        .get_mut(renamed_symbol_index)
+        .ok_or_else(|| "the rename target is absent from the lexical index".to_owned())?;
+    symbol.name = new_name.to_owned();
+
+    for symbol in &mut expected.symbols {
+        symbol.definition = remap_source_span(symbol.definition, replacements)?;
+        for reference in &mut symbol.references {
+            *reference = remap_source_span(*reference, replacements)?;
+        }
+    }
+    Ok(expected)
+}
+
+fn remap_source_span(
+    span: SourceSpan,
+    replacements: &[SpanReplacement],
+) -> Result<SourceSpan, String> {
+    let mut removed_before = 0_usize;
+    let mut added_before = 0_usize;
+    for replacement in replacements {
+        if replacement.original == span {
+            return Ok(replacement.replacement);
+        }
+        if replacement.original.end_byte <= span.start_byte {
+            let original_width = replacement
+                .original
+                .end_byte
+                .checked_sub(replacement.original.start_byte)
+                .ok_or_else(|| "rename span remapping underflowed".to_owned())?;
+            let replacement_width = replacement
+                .replacement
+                .end_byte
+                .checked_sub(replacement.replacement.start_byte)
+                .ok_or_else(|| "rename span remapping underflowed".to_owned())?;
+            removed_before = removed_before
+                .checked_add(original_width)
+                .ok_or_else(|| "rename span remapping overflowed".to_owned())?;
+            added_before = added_before
+                .checked_add(replacement_width)
+                .ok_or_else(|| "rename span remapping overflowed".to_owned())?;
+            continue;
+        }
+        if replacement.original.start_byte >= span.end_byte {
+            break;
+        }
+        return Err("a rename edit partially overlaps another lexical occurrence".to_owned());
+    }
+
+    let remap_offset = |offset: usize| {
+        offset
+            .checked_sub(removed_before)
+            .and_then(|value| value.checked_add(added_before))
+            .ok_or_else(|| "rename span remapping overflowed".to_owned())
+    };
+    Ok(SourceSpan {
+        start_byte: remap_offset(span.start_byte)?,
+        end_byte: remap_offset(span.end_byte)?,
+    })
+}
+
 fn byte_at_position(source: &str, position: Position) -> Option<usize> {
     let mut line = 0_u32;
     let mut line_start = 0_usize;
@@ -751,6 +1122,29 @@ mod tests {
 
     fn document(version: i32, text: &str) -> TextDocumentItem {
         TextDocumentItem::new(test_uri(), "splash".to_owned(), version, text.to_owned())
+    }
+
+    fn apply_text_edits(source: &str, edits: &[TextEdit]) -> String {
+        let mut byte_edits = edits
+            .iter()
+            .map(|edit| {
+                let start = byte_at_position(source, edit.range.start)
+                    .expect("edit start is a valid source position");
+                let end = byte_at_position(source, edit.range.end)
+                    .expect("edit end is a valid source position");
+                (start, end, edit.new_text.as_str())
+            })
+            .collect::<Vec<_>>();
+        byte_edits.sort_by_key(|(start, end, _)| (*start, *end));
+        for pair in byte_edits.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "rename edits do not overlap");
+        }
+
+        let mut edited = source.to_owned();
+        for (start, end, replacement) in byte_edits.into_iter().rev() {
+            edited.replace_range(start..end, replacement);
+        }
+        edited
     }
 
     #[test]
@@ -959,6 +1353,196 @@ mod tests {
     }
 
     #[test]
+    fn prepares_and_applies_versioned_semantics_preserving_renames() {
+        let source = "let value = 1\r\n\
+                      fn read() {\r\n\
+                          \"\u{1f642}\" + value\r\n\
+                      }\r\n\
+                      read() + value";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(7, source));
+
+        let unicode_reference = source
+            .find("\"\u{1f642}\" + value")
+            .expect("Unicode reference line exists")
+            + "\"\u{1f642}\" + ".len();
+        let reference_end = unicode_reference + "value".len();
+        assert_eq!(
+            position_at_byte(source, unicode_reference),
+            Position::new(2, 7)
+        );
+        let prepared = server
+            .prepare_rename(&test_uri(), position_at_byte(source, reference_end))
+            .expect("prepare rename succeeds")
+            .expect("cursor at the identifier end remains renameable");
+        assert_eq!(
+            prepared,
+            PrepareRenameResponse::RangeWithPlaceholder {
+                range: Range::new(Position::new(2, 7), Position::new(2, 12)),
+                placeholder: "value".to_owned(),
+            }
+        );
+        let final_reference = source.rfind("value").expect("final reference exists");
+        let prepared_at_eof = server
+            .prepare_rename(&test_uri(), position_at_byte(source, source.len()))
+            .expect("prepare at end of file succeeds")
+            .expect("the final identifier remains renameable at its end");
+        assert_eq!(
+            prepared_at_eof,
+            PrepareRenameResponse::RangeWithPlaceholder {
+                range: Range::new(
+                    position_at_byte(source, final_reference),
+                    position_at_byte(source, source.len()),
+                ),
+                placeholder: "value".to_owned(),
+            }
+        );
+
+        let rename = server
+            .rename(
+                &test_uri(),
+                position_at_byte(source, reference_end),
+                "renamed",
+            )
+            .expect("rename analysis succeeds")
+            .expect("the lexical reference is renameable");
+        assert_eq!(rename.uri, test_uri());
+        assert_eq!(rename.version, 7);
+        assert_eq!(rename.edits.len(), 3);
+        assert!(rename.edits.iter().all(|edit| edit.new_text == "renamed"));
+        assert_eq!(
+            rename.edits[1].range,
+            Range::new(Position::new(2, 7), Position::new(2, 12))
+        );
+        assert_eq!(
+            apply_text_edits(source, &rename.edits),
+            "let renamed = 1\r\nfn read() {\r\n\"\u{1f642}\" + renamed\r\n}\r\nread() + renamed"
+        );
+
+        let shortened = server
+            .rename(
+                &test_uri(),
+                position_at_byte(source, unicode_reference),
+                "v",
+            )
+            .expect("shortening rename analysis succeeds")
+            .expect("the lexical reference is renameable");
+        assert_eq!(
+            apply_text_edits(source, &shortened.edits),
+            "let v = 1\r\nfn read() {\r\n\"\u{1f642}\" + v\r\n}\r\nread() + v"
+        );
+
+        let function_reference = source.rfind("read").expect("function reference exists");
+        let function_rename = server
+            .rename(
+                &test_uri(),
+                position_at_byte(source, function_reference),
+                "read_value",
+            )
+            .expect("function rename analysis succeeds")
+            .expect("function reference is renameable");
+        assert_eq!(function_rename.edits.len(), 2);
+
+        assert_eq!(
+            server
+                .rename(
+                    &test_uri(),
+                    position_at_byte(source, unicode_reference),
+                    "value",
+                )
+                .expect("an identical rename succeeds"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_renames_that_are_invalid_ambiguous_or_change_binding_resolution() {
+        let source = "use mod.std.assert\n\
+                      let outer = 1\n\
+                      fn compute() {\n\
+                          let inner = 2\n\
+                          assert(inner + outer)\n\
+                      }";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let inner = source.find("inner").expect("inner definition exists");
+        let collision = server
+            .rename(&test_uri(), position_at_byte(source, inner), "outer")
+            .expect_err("capturing an outer reference must be rejected");
+        assert!(collision.contains("binding resolution"));
+
+        let local = source.find("outer").expect("outer definition exists");
+        let builtin_capture = server
+            .rename(&test_uri(), position_at_byte(source, local), "assert")
+            .expect_err("capturing an imported call must be rejected");
+        assert!(builtin_capture.contains("binding resolution"));
+
+        for invalid in [
+            "try",
+            "false",
+            "nil",
+            "two words",
+            "name/*comment*/",
+            "name\nnext",
+            "name\rnext",
+            "name\0next",
+            "\u{feff}name",
+            "\u{1f642}",
+        ] {
+            let error = server
+                .rename(&test_uri(), position_at_byte(source, inner), invalid)
+                .expect_err("invalid identifier spelling must be rejected");
+            assert!(error.contains("canonical Splash identifier"), "{error}");
+        }
+
+        let import = source.find("assert").expect("import binding exists");
+        assert_eq!(
+            server
+                .prepare_rename(&test_uri(), position_at_byte(source, import))
+                .expect("import prepare is bounded"),
+            None
+        );
+        let error = server
+            .rename(&test_uri(), position_at_byte(source, import), "verify")
+            .expect_err("renaming an import path is not a local binding rename");
+        assert!(error.contains("module path"));
+
+        let oversized_name = "a".repeat(DEFAULT_MAX_SOURCE_BYTES);
+        let error = server
+            .rename(
+                &test_uri(),
+                position_at_byte(source, inner),
+                &oversized_name,
+            )
+            .expect_err("renamed source remains bounded");
+        assert!(error.contains("source limit"));
+    }
+
+    #[test]
+    fn allows_a_rename_that_preserves_safe_lexical_shadowing() {
+        let source = "let value = 1\n\
+                      fn compute() {\n\
+                          let inner = 2\n\
+                          inner\n\
+                      }\n\
+                      value";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+        let inner = source.find("inner").expect("inner definition exists");
+
+        let rename = server
+            .rename(&test_uri(), position_at_byte(source, inner), "value")
+            .expect("safe shadowing analysis succeeds")
+            .expect("safe local shadowing remains renameable");
+        assert_eq!(rename.edits.len(), 2);
+        assert_eq!(
+            apply_text_edits(source, &rename.edits),
+            "let value = 1\nfn compute() {\nlet value = 2\nvalue\n}\nvalue"
+        );
+    }
+
+    #[test]
     fn resolves_imports_and_loop_bindings_without_cross_document_leakage() {
         let source = "use mod.std.assert\n\
                       for index in [1] {\n\
@@ -1028,6 +1612,18 @@ mod tests {
             .document_highlights(&test_uri(), Position::new(0, 3))
             .expect("invalid source produces an empty index")
             .is_empty());
+        assert_eq!(
+            server
+                .prepare_rename(&test_uri(), Position::new(0, 3))
+                .expect("invalid source produces an empty index"),
+            None
+        );
+        assert_eq!(
+            server
+                .rename(&test_uri(), Position::new(0, 3), "valid")
+                .expect("invalid source produces an empty index"),
+            None
+        );
 
         server.open_document(document(2, "let value = 1"));
         assert_eq!(
@@ -1075,6 +1671,14 @@ mod tests {
         let error = server
             .document_highlights(&test_uri(), Position::new(0, 4))
             .expect_err("truncated highlight sets are not returned as complete results");
+        assert!(error.contains("occurrence limit"));
+        let error = server
+            .prepare_rename(&test_uri(), Position::new(0, 4))
+            .expect_err("truncated indexes cannot prepare an exhaustive rename");
+        assert!(error.contains("occurrence limit"));
+        let error = server
+            .rename(&test_uri(), Position::new(0, 4), "renamed")
+            .expect_err("truncated indexes cannot produce an exhaustive rename");
         assert!(error.contains("occurrence limit"));
     }
 
@@ -1150,11 +1754,56 @@ mod tests {
             }],
         };
         assert!(server.change_document(incremental).is_none());
+        let rename = server
+            .rename(&test_uri(), Position::new(0, 5), "renamed")
+            .expect("rename uses the last accepted full snapshot")
+            .expect("the retained binding is renameable");
+        assert_eq!(rename.version, 3);
         let edits = server
             .format_document(&test_uri())
             .expect("original document remains available");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "let value = 1\n");
+    }
+
+    #[test]
+    fn invalidates_the_cached_lexical_report_on_a_full_document_change() {
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, "let first = 1\nfirst"));
+        assert!(server
+            .definition(&test_uri(), Position::new(1, 1))
+            .expect("the first lexical report is cached")
+            .is_some());
+
+        let diagnostics = server
+            .change_document(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(test_uri(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "let second = 2\nsecond".to_owned(),
+                }],
+            })
+            .expect("a newer full document replaces the cached snapshot");
+        assert!(diagnostics.diagnostics.is_empty());
+
+        let prepared = server
+            .prepare_rename(&test_uri(), Position::new(1, 1))
+            .expect("the replacement document builds a fresh lexical report")
+            .expect("the replacement binding is renameable");
+        assert_eq!(
+            prepared,
+            PrepareRenameResponse::RangeWithPlaceholder {
+                range: Range::new(Position::new(1, 0), Position::new(1, 6)),
+                placeholder: "second".to_owned(),
+            }
+        );
+        let rename = server
+            .rename(&test_uri(), Position::new(1, 1), "updated")
+            .expect("rename uses the replacement lexical report")
+            .expect("the replacement binding is renameable");
+        assert_eq!(rename.version, 2);
+        assert_eq!(rename.edits.len(), 2);
     }
 
     #[test]
@@ -1168,6 +1817,12 @@ mod tests {
         assert!(server.hover(&test_uri(), Position::new(0, 0)).is_err());
         assert!(server
             .document_highlights(&test_uri(), Position::new(0, 0))
+            .is_err());
+        assert!(server
+            .prepare_rename(&test_uri(), Position::new(0, 0))
+            .is_err());
+        assert!(server
+            .rename(&test_uri(), Position::new(0, 0), "valid")
             .is_err());
 
         let update = DidChangeTextDocumentParams {
@@ -1184,6 +1839,10 @@ mod tests {
         assert!(diagnostics.diagnostics.is_empty());
         assert!(server.format_document(&test_uri()).is_ok());
         assert!(server.hover(&test_uri(), Position::new(0, 5)).is_ok());
+        assert!(server
+            .prepare_rename(&test_uri(), Position::new(0, 5))
+            .expect("replacement source has a fresh lexical cache")
+            .is_some());
     }
 
     #[test]
@@ -1197,7 +1856,13 @@ mod tests {
                 Request::new(
                     1.into(),
                     "initialize".to_owned(),
-                    serde_json::json!({"capabilities": {}}),
+                    serde_json::json!({
+                        "capabilities": {
+                            "workspace": {
+                                "workspaceEdit": {"documentChanges": true}
+                            }
+                        }
+                    }),
                 )
                 .into(),
             )
@@ -1223,6 +1888,7 @@ mod tests {
         assert_eq!(capabilities["referencesProvider"], true);
         assert_eq!(capabilities["hoverProvider"], true);
         assert_eq!(capabilities["documentHighlightProvider"], true);
+        assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
 
         client_connection
             .sender
@@ -1438,7 +2104,88 @@ mod tests {
 
         client_connection
             .sender
-            .send(Request::new(8.into(), "shutdown".to_owned(), ()).into())
+            .send(
+                Request::new(
+                    8.into(),
+                    PrepareRenameRequest::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 5}
+                    }),
+                )
+                .into(),
+            )
+            .expect("prepare rename request send succeeds");
+        let prepare_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("prepare rename response arrives");
+        let Message::Response(response) = prepare_response else {
+            panic!("expected prepare rename response");
+        };
+        let prepared = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("prepare rename request failed: {}", error.message)
+            }
+        };
+        assert_eq!(prepared["placeholder"], "value");
+        assert_eq!(
+            prepared["range"],
+            serde_json::json!({
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 1, "character": 5}
+            })
+        );
+
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    9.into(),
+                    Rename::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 1},
+                        "newName": "renamed"
+                    }),
+                )
+                .into(),
+            )
+            .expect("rename request send succeeds");
+        let rename_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rename response arrives");
+        let Message::Response(response) = rename_response else {
+            panic!("expected rename response");
+        };
+        let rename = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("rename request failed: {}", error.message)
+            }
+        };
+        assert!(rename.get("changes").is_none());
+        assert_eq!(rename["documentChanges"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            rename["documentChanges"][0]["textDocument"],
+            serde_json::json!({"uri": test_uri(), "version": 1})
+        );
+        assert_eq!(
+            rename["documentChanges"][0]["edits"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            rename["documentChanges"][0]["edits"][0]["newText"],
+            "renamed"
+        );
+
+        client_connection
+            .sender
+            .send(Request::new(10.into(), "shutdown".to_owned(), ()).into())
             .expect("shutdown send succeeds");
         let shutdown_response = client_connection
             .receiver
@@ -1450,6 +2197,84 @@ mod tests {
             .send(Notification::new("exit".to_owned(), ()).into())
             .expect("exit send succeeds");
 
+        server_thread
+            .join()
+            .expect("server thread does not panic")
+            .expect("server shuts down cleanly");
+    }
+
+    #[test]
+    fn malformed_or_legacy_initialization_fails_closed_without_rename() {
+        let (server_connection, client_connection) = Connection::memory();
+        let server_thread = std::thread::spawn(move || run_connection(&server_connection));
+
+        client_connection
+            .sender
+            .send(Request::new(1.into(), "initialize".to_owned(), serde_json::json!({})).into())
+            .expect("malformed initialize send succeeds");
+        let initialize_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("malformed initialize still receives a response");
+        let Message::Response(response) = initialize_response else {
+            panic!("expected initialize response");
+        };
+        let capabilities = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result["capabilities"].clone(),
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("initialize failed: {}", error.message)
+            }
+        };
+        assert!(capabilities.get("renameProvider").is_none());
+
+        client_connection
+            .sender
+            .send(Notification::new(Initialized::METHOD.to_owned(), ()).into())
+            .expect("initialized send succeeds");
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    2.into(),
+                    Rename::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 0, "character": 0},
+                        "newName": "renamed"
+                    }),
+                )
+                .into(),
+            )
+            .expect("unadvertised rename request send succeeds");
+        let rename_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unadvertised rename response arrives");
+        let Message::Response(response) = rename_response else {
+            panic!("expected rename response");
+        };
+        match response.response_kind {
+            lsp_server::ResponseKind::Err { error } => {
+                assert_eq!(error.code, ErrorCode::MethodNotFound as i32);
+            }
+            lsp_server::ResponseKind::Ok { result } => {
+                panic!("unadvertised rename unexpectedly succeeded: {result}")
+            }
+        }
+
+        client_connection
+            .sender
+            .send(Request::new(3.into(), "shutdown".to_owned(), ()).into())
+            .expect("shutdown send succeeds");
+        let shutdown_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown response arrives");
+        assert!(matches!(shutdown_response, Message::Response(_)));
+        client_connection
+            .sender
+            .send(Notification::new(Exit::METHOD.to_owned(), ()).into())
+            .expect("exit send succeeds");
         server_thread
             .join()
             .expect("server thread does not panic")
@@ -1494,8 +2319,16 @@ mod tests {
     #[test]
     fn declares_utf16_position_encoding() {
         assert_eq!(
-            server_capabilities().position_encoding,
+            server_capabilities(false).position_encoding,
             Some(PositionEncodingKind::UTF16)
         );
+        assert!(server_capabilities(false).rename_provider.is_none());
+        assert!(matches!(
+            server_capabilities(true).rename_provider,
+            Some(OneOf::Right(RenameOptions {
+                prepare_provider: Some(true),
+                ..
+            }))
+        ));
     }
 }

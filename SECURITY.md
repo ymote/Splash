@@ -33,17 +33,25 @@ imported module, or loads an adapter. Its top-level `fn`/`let` outline and
 same-document lexical definition/reference index are derived only from valid
 client-provided canonical source and grant no tool authority. Binding-kind hover
 and neutral symbol highlights use that same index; they do not expose runtime
-values or claim read/write analysis. The lexical index is source-local,
-conservative, bounded to 4,096 retained definitions and resolved references, and
-rejects exhaustive reference or highlight requests when truncated; a definition
-or hover is returned only when its retained occurrence has an exact binding. The
-index is not a type checker, module resolver, capability analysis, or
-authorization decision. The server retains at most 128 document states and no
-source text larger than the canonical 256 KiB limit, but the underlying LSP framing layer
-decodes an inbound message before that retention limit applies. Do not expose
-its stdio transport to a hostile peer or describe it as an IPC resource sandbox;
-place a separate bounded transport or operating-system boundary in front of
-such a peer.
+values or claim read/write analysis. Guarded rename is advertised only to a
+client that supports versioned document edits. It never renames an import path,
+never operates on a truncated index, validates the replacement with the
+canonical lexer and parser, and returns edits only when the complete remapped
+lexical report is unchanged apart from the selected name and byte offsets. This
+is indexed lexical preservation, not proof about unindexed forward references,
+fields, reflection, or other name-coupled runtime semantics. Every returned edit
+is bound to the source version used for analysis.
+
+The lexical index is source-local, conservative, bounded to 4,096 retained
+definitions and resolved references, and lazily cached only for the current
+document version. A definition or hover is returned only when its retained
+occurrence has an exact binding. The index is not a type checker, module
+resolver, capability analysis, or authorization decision. The server retains
+at most 128 document states and no source text larger than the canonical 256
+KiB limit, but the underlying LSP framing layer decodes an inbound message
+before that retention limit applies. Do not expose its stdio transport to a
+hostile peer or describe it as an IPC resource sandbox; place a separate bounded
+transport or operating-system boundary in front of such a peer.
 
 `splash-protocol` defines the portable, attenuated handoff from a policy host
 to a contained worker. It validates manifests, request uniqueness, formats,

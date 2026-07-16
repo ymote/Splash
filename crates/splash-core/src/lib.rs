@@ -16,7 +16,8 @@ use std::time::Duration;
 pub use makepad_script as vm;
 use profile::{
     check_canonical_profile, collect_lexical_symbols, collect_tool_call_hints,
-    collect_top_level_declarations, format_canonical_source, ProfileFormatError,
+    collect_top_level_declarations, format_canonical_source,
+    is_canonical_identifier as profile_is_canonical_identifier, ProfileFormatError,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -654,6 +655,16 @@ impl<H: Any, S: Any> Runtime<H, S> {
 /// executing it.
 pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
     check_syntax_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Returns whether `name` is exactly one non-reserved canonical Splash
+/// identifier.
+///
+/// This uses the same lexer and reserved-word table as canonical source
+/// preflight. It does not accept surrounding whitespace, comments, literals,
+/// punctuation, or compatibility-only identifier spellings.
+pub fn is_canonical_identifier(name: &str) -> bool {
+    profile_is_canonical_identifier(name)
 }
 
 /// Lists top-level declarations in valid canonical source without evaluating
@@ -2349,6 +2360,25 @@ compute(outer, 2)
             .symbols
             .iter()
             .all(|symbol| symbol.references.is_empty()));
+    }
+
+    #[test]
+    fn canonical_identifier_validation_reuses_the_profile_lexer() {
+        for accepted in ["value", "_private", "Value42"] {
+            assert!(is_canonical_identifier(accepted), "{accepted}");
+        }
+        for rejected in [
+            "",
+            "try",
+            "true",
+            "two words",
+            "value ",
+            "value/*comment*/",
+            "value.name",
+            "\u{1f642}",
+        ] {
+            assert!(!is_canonical_identifier(rejected), "{rejected}");
+        }
     }
 
     #[test]
