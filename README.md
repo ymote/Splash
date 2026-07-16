@@ -14,7 +14,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded, grammar-aware lexical symbol index for imports, functions, local
   bindings, parameters, and loop bindings without evaluating source.
 - Bounded same-document lexical completion at expression identifiers, with
-  scope-aware candidates and exact-token replacement edits.
+  scope-aware candidates, exact-token replacement edits, and fixed `mod.tool`
+  member suggestions only for an exact visible `use mod.tool` binding.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -28,8 +29,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A host-only stdio language server that publishes canonical syntax diagnostics,
   full-document formatting edits, top-level declaration symbols, and
   same-document lexical definitions, references, binding-kind hover, and symbol
-  highlights, lexical completion, and version-bound guarded rename without
-  reading files or evaluating code.
+  highlights, lexical completion including the fixed `mod.tool` API, and
+  version-bound guarded rename without reading files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -380,13 +381,17 @@ when the client supports
 versioned `documentChanges`; every edit is bound to the exact open-document
 version. It rejects truncated indexes, import path changes, invalid identifiers,
 and rewrites that change the complete indexed lexical binding report. It never
-reads a document URI, evaluates source, resolves an imported module, creates a
-capability host, or loads a Rust adapter. The lexical service is conservative:
-it does not infer forward references, types, record keys, member fields,
-builtins, tool catalogs, or imported-module exports. A truncated lexical index
-can still serve retained, sound definitions and hover, but exhaustive
-reference, highlight, and rename requests fail instead of returning a partial
-set.
+reads a document URI, evaluates source, loads or resolves arbitrary imported
+modules, creates a capability host, or loads a Rust adapter. For an exact,
+lexically visible `use mod.tool` binding, it additionally suggests only the
+fixed `call`, `call_json`, `start`, and `start_json` methods at a direct
+`tool.` member site. Those suggestions use no tool-catalog or adapter lookup
+and do not imply a capability grant. The lexical service otherwise remains
+conservative: it does not infer forward references, types, record keys,
+arbitrary member fields, builtins, tool catalogs, or imported-module exports. A
+truncated lexical index can still serve retained, sound definitions and hover,
+but exhaustive reference, highlight, and rename requests fail instead of
+returning a partial set.
 
 ## Workspace
 

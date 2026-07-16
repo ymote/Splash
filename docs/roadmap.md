@@ -17,7 +17,9 @@
   bounded lexical index.
 - Bounded scope-aware lexical completion at expression identifiers, including
   exact-token edits, conservative invalid-prefix support, independent site
-  truncation, and no module, type, field, catalog, or authority inference.
+  truncation, and fixed `mod.tool` method suggestions only for an exact visible
+  import binding. It performs no arbitrary module, type, field, catalog, or
+  authority inference.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.
@@ -179,8 +181,9 @@
 
 ## Before a stable language release
 
-- Additional semantic editor features beyond lexical completion, including
-  imported-module resolution and type-aware field semantics.
+- Additional semantic editor features beyond lexical completion and the fixed
+  `mod.tool` surface, including general imported-module resolution and
+  type-aware field semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Centralized event retention/aggregation and product-specific compensation

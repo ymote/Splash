@@ -76,6 +76,16 @@ an exact UTF-8 identifier boundary. The combined definition/reference count is
 fixed at 4,096 and `truncated` makes an incomplete result explicit. Invalid or
 VM-incompatible source produces an empty report.
 
+For bounded source-only import metadata, Rust hosts can call
+`splash_core::module_import_report` or its named, limit-aware variant. Each
+retained entry names the exact `mod.<path>` segments plus byte spans for the
+full path and its final binding. It retains at most 1,024 complete imports and
+sets `truncated` when later imports in the safe prefix were omitted. On an
+incomplete editor snapshot, it retains only imports ending at or before
+`valid_prefix_end_byte`; it never loads, resolves, or validates a referenced
+module. A reported path is therefore not evidence that a Rust adapter exists,
+that a tool appears in the current catalog, or that any capability was granted.
+
 This is a conservative lexical service, not a module or type checker. It does
 not load imported modules, infer forward references, resolve record keys or
 member fields, evaluate source, create a capability host, or authorize a tool.
@@ -108,11 +118,16 @@ invalid or incomplete source, `valid_prefix_end_byte` is the first syntax
 diagnostic byte; a consumer may use only sites ending at or before that
 boundary. This permits a partial identifier immediately before an end-of-file
 diagnostic without assigning meaning to later recovery tokens. The report does
-not provide keywords, builtins, tool-catalog names, imported-module exports,
-types, record keys, or member fields, and it carries no runtime values or
-authority. Consumers must not derive candidates from a symbol-truncated report:
-an omitted inner definition may shadow a retained outer binding. The LSP
-therefore returns an incomplete empty candidate set in that case.
+not provide keywords, builtins, tool-catalog names, arbitrary imported-module
+exports, types, record keys, or member fields, and it carries no runtime values
+or authority. The LSP uses the separate import report only to recognize an
+exact visible `use mod.tool` binding and suggest the four fixed language
+methods `call`, `call_json`, `start`, and `start_json`. It never reads the host
+catalog for those suggestions, and their presence is neither module resolution
+nor a capability grant. Consumers must not derive candidates from a
+symbol-truncated report: an omitted inner definition may shadow a retained
+outer binding. The LSP therefore returns an incomplete empty candidate set in
+that case.
 
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash

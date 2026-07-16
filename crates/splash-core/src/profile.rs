@@ -7,10 +7,11 @@
 use std::collections::HashMap;
 
 use super::{
-    LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, SourceSpan,
-    SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration,
-    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
-    MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
+    ModuleImportReport, SourceSpan, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport,
+    ToolCallKind, TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_SYNTAX_DIAGNOSTICS,
+    MAX_TOOL_CALL_HINTS,
 };
 
 pub(super) struct ProfileReport {
@@ -106,6 +107,21 @@ pub(super) fn collect_lexical_completions(
         sites_truncated: collected.completion_sites_truncated,
         valid_prefix_end_byte,
     }
+}
+
+/// Extracts complete import declarations from the bounded canonical token
+/// stream. The caller supplies the syntax-safe prefix boundary so this can
+/// support incomplete editor snapshots without treating later recovery tokens
+/// as semantic import metadata.
+pub(super) fn collect_module_imports(
+    source: &str,
+    max_tokens: usize,
+    max_nesting: usize,
+    valid_prefix_end_byte: usize,
+) -> ModuleImportReport {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    CanonicalParser::new(tokens, max_nesting).collect_module_imports(valid_prefix_end_byte)
 }
 
 /// Extracts direct `mod.tool` call syntax after the public caller has already
@@ -205,6 +221,45 @@ struct CollectedLexicalData {
     completion_sites: Vec<SourceSpan>,
     symbols_truncated: bool,
     completion_sites_truncated: bool,
+}
+
+struct ModuleImportCollector {
+    imports: Vec<ModuleImport>,
+    truncated: bool,
+    valid_prefix_end_byte: usize,
+}
+
+impl ModuleImportCollector {
+    fn new(valid_prefix_end_byte: usize) -> Self {
+        Self {
+            imports: Vec::new(),
+            truncated: false,
+            valid_prefix_end_byte,
+        }
+    }
+
+    fn record(&mut self, path: Vec<String>, path_span: SourceSpan, binding: SourceSpan) {
+        if path_span.end_byte > self.valid_prefix_end_byte {
+            return;
+        }
+        if self.imports.len() == MAX_MODULE_IMPORTS {
+            self.truncated = true;
+            return;
+        }
+        self.imports.push(ModuleImport {
+            path,
+            path_span,
+            binding,
+        });
+    }
+
+    fn finish(self) -> ModuleImportReport {
+        ModuleImportReport {
+            imports: self.imports,
+            truncated: self.truncated,
+            valid_prefix_end_byte: self.valid_prefix_end_byte,
+        }
+    }
 }
 
 impl SymbolCollector {
@@ -1349,6 +1404,7 @@ struct CanonicalParser {
     diagnostics: Vec<SyntaxDiagnostic>,
     diagnostics_truncated: bool,
     symbols: Option<SymbolCollector>,
+    imports: Option<ModuleImportCollector>,
 }
 
 impl CanonicalParser {
@@ -1361,6 +1417,7 @@ impl CanonicalParser {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             symbols: None,
+            imports: None,
         }
     }
 
@@ -1379,6 +1436,15 @@ impl CanonicalParser {
             .take()
             .expect("symbol collection was enabled")
             .finish(source_end_byte)
+    }
+
+    fn collect_module_imports(mut self, valid_prefix_end_byte: usize) -> ModuleImportReport {
+        self.imports = Some(ModuleImportCollector::new(valid_prefix_end_byte));
+        self.parse_program();
+        self.imports
+            .take()
+            .expect("module import collection was enabled")
+            .finish()
     }
 
     fn parse_program(&mut self) {
@@ -1445,6 +1511,7 @@ impl CanonicalParser {
     }
 
     fn parse_import(&mut self) {
+        let module_token = self.index;
         if !self.take_identifier_named("mod") {
             self.report_current("expected `mod` after `use`");
             return;
@@ -1453,12 +1520,39 @@ impl CanonicalParser {
             self.report_current("expected `.` after `use mod`");
             return;
         }
+        let module_start_byte = self.tokens[module_token].start_byte;
+        let mut path = vec!["mod".to_owned()];
+        let mut path_end_byte = self.tokens[module_token].end_byte;
         let mut binding =
             self.take_plain_identifier("expected a module identifier after `use mod.`");
+        if let Some(binding) = binding {
+            if let Some((segment, span)) = self.symbol_token(binding) {
+                path.push(segment);
+                path_end_byte = span.end_byte;
+            }
+        }
         while self.take_operator(".") {
             binding = self.take_plain_identifier("expected a module identifier after `.`");
+            if let Some(binding) = binding {
+                if let Some((segment, span)) = self.symbol_token(binding) {
+                    path.push(segment);
+                    path_end_byte = span.end_byte;
+                }
+            }
         }
         if let Some(binding) = binding {
+            if self.at_import_statement_end() {
+                if let Some((_, binding_span)) = self.symbol_token(binding) {
+                    self.record_import(
+                        path,
+                        SourceSpan {
+                            start_byte: module_start_byte,
+                            end_byte: path_end_byte,
+                        },
+                        binding_span,
+                    );
+                }
+            }
             self.define_symbol(binding, LexicalSymbolKind::Import);
         }
     }
@@ -1958,6 +2052,10 @@ impl CanonicalParser {
             || self.at_end()
     }
 
+    fn at_import_statement_end(&self) -> bool {
+        self.at_kind(&TokenKind::Newline) || self.at_kind(&TokenKind::Semicolon) || self.at_end()
+    }
+
     fn at_expression_boundary(&self) -> bool {
         self.at_statement_boundary()
             || self.at_kind(&TokenKind::Comma)
@@ -2016,6 +2114,12 @@ impl CanonicalParser {
         let visibility_start_byte = self.current().start_byte;
         if let Some(symbols) = &mut self.symbols {
             symbols.define(name, span, kind, visibility_start_byte);
+        }
+    }
+
+    fn record_import(&mut self, path: Vec<String>, path_span: SourceSpan, binding: SourceSpan) {
+        if let Some(imports) = &mut self.imports {
+            imports.record(path, path_span, binding);
         }
     }
 

@@ -42,15 +42,16 @@ cargo run -p splash-lsp
 
 It receives document text through LSP notifications only. It does not read the
 document URI, evaluate Splash code, construct a capability host, resolve
-imported modules, or load a Rust adapter. The grammar-aware lexical index covers
-the final binding introduced by `use`, named functions, `let`, function and
-lambda parameters, and `for` bindings already introduced in a visible runtime
-scope. It does not infer forward references, types, record keys, or member
-fields. A definition retained before the fixed 4,096-occurrence budget is
-exhausted remains available for definition and hover, while reference and
-highlight requests fail instead of returning a partial set from a truncated
-index. Highlights are neutral resolved occurrences of one lexical binding
-because the index does not classify assignment reads and writes.
+arbitrary imported modules, or load a Rust adapter. The grammar-aware lexical
+index covers the final binding introduced by `use`, named functions, `let`,
+function and lambda parameters, and `for` bindings already introduced in a
+visible runtime scope. It does not infer forward references, types, record
+keys, or arbitrary member fields. A definition retained before the fixed
+4,096-occurrence budget is exhausted remains available for definition and
+hover, while reference and highlight requests fail instead of returning a
+partial set from a truncated index. Highlights are neutral resolved occurrences
+of one lexical binding because the index does not classify assignment reads and
+writes.
 
 Completion uses a separate lazily cached report. Expression-position
 identifiers, including unresolved partial names, are retained as sites; binding
@@ -65,6 +66,14 @@ Symbols and sites have independent 4,096-entry caps; either truncation sets
 `isIncomplete`. A retained site remains usable when only the site list is
 truncated. When symbols are truncated the server returns no candidates, because
 an omitted inner definition could shadow a retained outer binding.
+
+The server separately recognizes a complete, lexically visible `use mod.tool`
+binding before the safe syntax boundary. At a direct `tool.` member site it
+offers only `call`, `call_json`, `start`, and `start_json`, with an exact member
+replacement edit. It does not offer those members for a shadowed `tool`, a
+different import path, chained property access, or source after the first
+diagnostic. This uses no catalog or adapter lookup, and a suggestion never
+implies a capability grant.
 
 Rename is advertised only when the editor supports versioned
 `documentChanges`. It refuses import path edits and truncated reports, validates
@@ -103,7 +112,11 @@ ordered, every retained definition and resolved reference is an exact UTF-8
 identifier span, and the combined count never exceeds 4,096 occurrences.
 For every bounded UTF-8 input, including invalid source, it also checks lexical
 completion site ordering and identity, half-open visibility intervals, valid
-prefix boundaries, independent symbol/site caps, and truncation signals.
+prefix boundaries, independent symbol/site caps, and truncation signals. The
+same invalid-source coverage validates bounded source-only import reports:
+every retained `mod.<path>` spelling and final binding span is ordered,
+UTF-8-safe, within the safe prefix, and structurally consistent; truncation is
+explicit at the fixed import cap.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 4,096 instruction cap, one-instruction deadline sampling, and a 32 ms

@@ -16,8 +16,9 @@ use std::time::Duration;
 pub use makepad_script as vm;
 use profile::{
     check_canonical_profile, collect_lexical_completions, collect_lexical_symbols,
-    collect_tool_call_hints, collect_top_level_declarations, format_canonical_source,
-    is_canonical_identifier as profile_is_canonical_identifier, ProfileFormatError,
+    collect_module_imports, collect_tool_call_hints, collect_top_level_declarations,
+    format_canonical_source, is_canonical_identifier as profile_is_canonical_identifier,
+    ProfileFormatError,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -62,6 +63,12 @@ pub const MAX_SYNTAX_DIAGNOSTICS: usize = 32;
 /// source and token limits. Use [`ToolCallHintReport::truncated`] to detect
 /// when a source contains additional direct call sites.
 pub const MAX_TOOL_CALL_HINTS: usize = 1_024;
+/// Maximum complete `use mod.<path>` declarations retained in one
+/// source-only import report.
+///
+/// This is separate from lexical definition/reference and completion-site
+/// bounds so editor metadata cannot grow with a generated import list.
+pub const MAX_MODULE_IMPORTS: usize = 1_024;
 /// Maximum retained lexical definition and reference occurrences per source.
 ///
 /// The symbol index counts each definition and each resolved reference toward
@@ -333,6 +340,35 @@ pub enum LexicalSymbolKind {
 pub struct SourceSpan {
     pub start_byte: usize,
     pub end_byte: usize,
+}
+
+/// One complete canonical `use mod.<path>` declaration.
+///
+/// `path` always begins with `"mod"`, contains at least one following
+/// identifier, and is ordered as it appeared in source. `path_span` covers
+/// the complete `mod.<path>` spelling; `binding` covers its final identifier.
+/// This is source metadata only. It neither loads a module nor proves that a
+/// corresponding host binding, capability, or adapter exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleImport {
+    pub path: Vec<String>,
+    pub path_span: SourceSpan,
+    pub binding: SourceSpan,
+}
+
+/// Bounded source-only import metadata for one canonical source snapshot.
+///
+/// Imports are retained in source order only when their complete path ends at
+/// or before `valid_prefix_end_byte`. This allows an editor to retain imports
+/// established before an incomplete trailing expression without assigning
+/// meaning to recovery tokens after the first diagnostic. `truncated` means
+/// one or more imports in that safe prefix were omitted at
+/// [`MAX_MODULE_IMPORTS`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModuleImportReport {
+    pub imports: Vec<ModuleImport>,
+    pub truncated: bool,
+    pub valid_prefix_end_byte: usize,
 }
 
 /// One lexical binding and the source references resolved to it.
@@ -626,6 +662,12 @@ impl<H: Any, S: Any> Runtime<H, S> {
         tool_call_hint_report_named("inline.splash", source, self.limits)
     }
 
+    /// Builds bounded source-only import metadata without evaluating bytecode,
+    /// loading a module, or entering any host binding.
+    pub fn module_import_report(&self, source: &str) -> Result<ModuleImportReport, RuntimeError> {
+        module_import_report_named("inline.splash", source, self.limits)
+    }
+
     /// Builds a bounded lexical symbol index without evaluating bytecode or
     /// entering any host binding.
     pub fn lexical_symbol_report(&self, source: &str) -> Result<LexicalSymbolReport, RuntimeError> {
@@ -786,6 +828,17 @@ pub fn lexical_symbol_report(source: &str) -> Result<LexicalSymbolReport, Runtim
 /// [`LexicalCompletionReport::valid_prefix_end_byte`].
 pub fn lexical_completion_report(source: &str) -> Result<LexicalCompletionReport, RuntimeError> {
     lexical_completion_report_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Builds bounded source-only import metadata without evaluating source,
+/// loading a module, or creating a capability host.
+///
+/// Complete imports before the first diagnostic remain available to support
+/// conservative editor completion on an incomplete trailing expression. This
+/// is not module resolution: a reported path does not imply that a module,
+/// capability, or Rust adapter exists.
+pub fn module_import_report(source: &str) -> Result<ModuleImportReport, RuntimeError> {
+    module_import_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Lists direct source-level `mod.tool` call hints in valid canonical Splash
@@ -1080,22 +1133,34 @@ pub fn lexical_completion_report_named(
     limits: ExecutionLimits,
 ) -> Result<LexicalCompletionReport, RuntimeError> {
     let syntax = check_syntax_named(file, source, limits)?;
-    let valid_prefix_end_byte = if syntax.valid {
-        source.len()
-    } else if syntax.diagnostics.is_empty() {
-        0
-    } else {
-        syntax
-            .diagnostics
-            .iter()
-            .try_fold(source.len(), |first_byte, diagnostic| {
-                source_byte_at_position(source, diagnostic.line, diagnostic.column)
-                    .map(|byte| first_byte.min(byte))
-            })
-            .unwrap_or(0)
-    };
+    let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
 
     Ok(collect_lexical_completions(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+        valid_prefix_end_byte,
+    ))
+}
+
+/// Builds bounded source-only import metadata for one named source snapshot.
+///
+/// The collector applies the same source, token, nesting, canonical-profile,
+/// and vendored-parser checks as [`check_syntax_named`] but never evaluates
+/// source, loads an import, or creates a capability host. For incomplete
+/// source it retains only complete imports ending at or before the first
+/// syntax diagnostic, as recorded by [`ModuleImportReport::valid_prefix_end_byte`].
+/// A reported `use mod.<path>` declaration is not proof that the path exists
+/// or is permitted at runtime.
+pub fn module_import_report_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<ModuleImportReport, RuntimeError> {
+    let syntax = check_syntax_named(file, source, limits)?;
+    let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
+
+    Ok(collect_module_imports(
         source,
         limits.max_syntax_tokens,
         limits.max_syntax_nesting,
@@ -1224,6 +1289,24 @@ fn validate_source_length(source: &str, limits: ExecutionLimits) -> Result<(), R
         });
     }
     Ok(())
+}
+
+fn valid_prefix_end_byte(source: &str, syntax: &SyntaxReport) -> usize {
+    if syntax.valid {
+        return source.len();
+    }
+    if syntax.diagnostics.is_empty() {
+        return 0;
+    }
+
+    syntax
+        .diagnostics
+        .iter()
+        .try_fold(source.len(), |first_byte, diagnostic| {
+            source_byte_at_position(source, diagnostic.line, diagnostic.column)
+                .map(|byte| first_byte.min(byte))
+        })
+        .unwrap_or(0)
 }
 
 fn source_byte_at_position(source: &str, line: usize, column: usize) -> Option<usize> {
@@ -2646,6 +2729,87 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
         assert!(top_level_declarations("fn broken(")
             .expect("invalid source is still bounded")
             .is_empty());
+    }
+
+    #[test]
+    fn reports_complete_import_paths_with_exact_spans() {
+        let source = "use mod.tool\n\
+                      use mod.std.assert\n\
+                      fn run() {\n\
+                          use mod.custom.client\n\
+                          client\n\
+                      }";
+
+        let report = module_import_report(source).expect("source is within default limits");
+
+        assert_eq!(report.valid_prefix_end_byte, source.len());
+        assert!(!report.truncated);
+        assert_eq!(
+            report
+                .imports
+                .iter()
+                .map(|import| { import.path.iter().map(String::as_str).collect::<Vec<_>>() })
+                .collect::<Vec<_>>(),
+            [
+                vec!["mod", "tool"],
+                vec!["mod", "std", "assert"],
+                vec!["mod", "custom", "client"],
+            ]
+        );
+        for import in &report.imports {
+            assert_eq!(
+                &source[import.path_span.start_byte..import.path_span.end_byte],
+                import.path.join(".")
+            );
+            assert_eq!(
+                &source[import.binding.start_byte..import.binding.end_byte],
+                import.path.last().expect("every import has a binding")
+            );
+        }
+
+        let runtime = Runtime::default();
+        assert_eq!(runtime.module_import_report(source).unwrap(), report);
+    }
+
+    #[test]
+    fn import_reports_stop_at_the_first_syntax_diagnostic() {
+        let source = "use mod.tool\n@\nuse mod.std.assert";
+
+        let report = module_import_report(source).expect("source is within default limits");
+
+        assert_eq!(report.valid_prefix_end_byte, source.find('@').unwrap());
+        assert_eq!(report.imports.len(), 1);
+        assert_eq!(report.imports[0].path, ["mod", "tool"]);
+        assert!(!report.truncated);
+    }
+
+    #[test]
+    fn import_reports_reject_a_path_with_trailing_statement_tokens() {
+        let source = "use mod.tool unexpected";
+
+        let report = module_import_report(source).expect("source is within default limits");
+
+        assert_eq!(
+            report.valid_prefix_end_byte,
+            source.find("unexpected").unwrap()
+        );
+        assert!(report.imports.is_empty());
+        assert!(!report.truncated);
+    }
+
+    #[test]
+    fn import_reports_have_a_fixed_bound_and_truncation_signal() {
+        let mut source = String::new();
+        for index in 0..=MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+
+        let report = module_import_report(&source).expect("generated source is canonical");
+
+        assert_eq!(report.imports.len(), MAX_MODULE_IMPORTS);
+        assert!(report.truncated);
+        assert_eq!(report.imports[0].path, ["mod", "module_0"]);
+        assert_eq!(report.imports.last().unwrap().path, ["mod", "module_1023"]);
     }
 
     #[test]

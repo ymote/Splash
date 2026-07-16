@@ -32,11 +32,11 @@ use lsp_types::{
 };
 use splash_core::{
     check_syntax_named, format_source_named, is_canonical_identifier,
-    lexical_completion_report_named, lexical_symbol_report_named, top_level_declarations_named,
-    ExecutionLimits, LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind,
-    LexicalSymbolReport, SourceSpan, SyntaxDiagnostic, TopLevelDeclaration,
-    TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
-    MAX_SYNTAX_DIAGNOSTICS,
+    lexical_completion_report_named, lexical_symbol_report_named, module_import_report_named,
+    top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
+    LexicalSymbolKind, LexicalSymbolReport, ModuleImport, ModuleImportReport, SourceSpan,
+    SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -50,6 +50,7 @@ struct DocumentState {
     version: i32,
     lexical_report: OnceCell<Result<LexicalSymbolReport, String>>,
     completion_report: OnceCell<Result<LexicalCompletionReport, String>>,
+    module_import_report: OnceCell<Result<ModuleImportReport, String>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -250,14 +251,29 @@ impl SplashLanguageServer {
 
     fn completion(&self, uri: &Uri, position: Position) -> Result<CompletionList, String> {
         let (source, report) = self.lexical_completions(uri)?;
-        let is_incomplete = report.symbols_truncated || report.sites_truncated;
+        let lexical_incomplete = report.symbols_truncated || report.sites_truncated;
         let empty = || CompletionList {
-            is_incomplete,
+            is_incomplete: lexical_incomplete,
             items: Vec::new(),
         };
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(empty());
         };
+        if report.symbols_truncated {
+            return Ok(empty());
+        }
+
+        if let Some(member_site) = direct_module_member_completion_site(source, byte_offset) {
+            let imports = self.module_imports(uri)?;
+            return Ok(tool_module_member_completion(
+                source,
+                report,
+                imports,
+                member_site,
+                lexical_incomplete || imports.truncated,
+            ));
+        }
+
         let Some(site) = report.sites.iter().copied().find(|site| {
             site.start_byte <= byte_offset
                 && byte_offset <= site.end_byte
@@ -265,9 +281,6 @@ impl SplashLanguageServer {
         }) else {
             return Ok(empty());
         };
-        if report.symbols_truncated {
-            return Ok(empty());
-        }
 
         let mut visible_by_name = HashMap::<&str, &LexicalSymbol>::new();
         for symbol in &report.symbols {
@@ -303,7 +316,7 @@ impl SplashLanguageServer {
         items.sort_by(|left, right| left.label.cmp(&right.label));
 
         Ok(CompletionList {
-            is_incomplete,
+            is_incomplete: lexical_incomplete,
             items,
         })
     }
@@ -437,6 +450,24 @@ impl SplashLanguageServer {
         }
     }
 
+    fn module_imports(&self, uri: &Uri) -> Result<&ModuleImportReport, String> {
+        let state = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| "the document is not open in this Splash session".to_owned())?;
+        let source = state.source.as_deref().ok_or_else(|| {
+            format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
+        })?;
+        let report = state.module_import_report.get_or_init(|| {
+            module_import_report_named(uri.as_str(), source, ExecutionLimits::default())
+                .map_err(|error| format!("cannot inspect canonical Splash imports: {error}"))
+        });
+        match report {
+            Ok(report) => Ok(report),
+            Err(message) => Err(message.clone()),
+        }
+    }
+
     fn replace_document(
         &mut self,
         uri: Uri,
@@ -461,6 +492,7 @@ impl SplashLanguageServer {
                     version,
                     lexical_report: OnceCell::new(),
                     completion_report: OnceCell::new(),
+                    module_import_report: OnceCell::new(),
                 },
             );
             return resource_diagnostics(
@@ -481,6 +513,7 @@ impl SplashLanguageServer {
                 version,
                 lexical_report: OnceCell::new(),
                 completion_report: OnceCell::new(),
+                module_import_report: OnceCell::new(),
             },
         );
         PublishDiagnosticsParams::new(uri, diagnostics, Some(version))
@@ -564,6 +597,7 @@ fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
         document_highlight_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             resolve_provider: Some(false),
+            trigger_characters: Some(vec![".".to_owned()]),
             ..CompletionOptions::default()
         }),
         rename_provider: versioned_document_edits.then(|| {
@@ -953,6 +987,144 @@ fn completion_item_kind(kind: LexicalSymbolKind) -> CompletionItemKind {
         | LexicalSymbolKind::LoopBinding
         | LexicalSymbolKind::LambdaParameter => CompletionItemKind::VARIABLE,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemberCompletionSite {
+    receiver: SourceSpan,
+    member: SourceSpan,
+}
+
+fn direct_module_member_completion_site(
+    source: &str,
+    byte_offset: usize,
+) -> Option<MemberCompletionSite> {
+    if byte_offset > source.len() || !source.is_char_boundary(byte_offset) {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    let mut member_start = byte_offset;
+    while member_start > 0 && is_identifier_byte(bytes[member_start - 1]) {
+        member_start -= 1;
+    }
+    let mut member_end = byte_offset;
+    while member_end < bytes.len() && is_identifier_byte(bytes[member_end]) {
+        member_end += 1;
+    }
+    if member_start == 0 || bytes[member_start - 1] != b'.' {
+        return None;
+    }
+    if member_start < member_end && !is_identifier_start_byte(bytes[member_start]) {
+        return None;
+    }
+
+    let receiver_end = member_start - 1;
+    let mut receiver_start = receiver_end;
+    while receiver_start > 0 && is_identifier_byte(bytes[receiver_start - 1]) {
+        receiver_start -= 1;
+    }
+    if receiver_start == receiver_end
+        || !is_identifier_start_byte(bytes[receiver_start])
+        || (receiver_start > 0 && bytes[receiver_start - 1] == b'.')
+    {
+        return None;
+    }
+    let receiver_name = source.get(receiver_start..receiver_end)?;
+    if !is_canonical_identifier(receiver_name) {
+        return None;
+    }
+
+    Some(MemberCompletionSite {
+        receiver: SourceSpan {
+            start_byte: receiver_start,
+            end_byte: receiver_end,
+        },
+        member: SourceSpan {
+            start_byte: member_start,
+            end_byte: member_end,
+        },
+    })
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_identifier_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn tool_module_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+    {
+        return empty();
+    }
+
+    let Some(receiver_name) = source.get(site.receiver.start_byte..site.receiver.end_byte) else {
+        return empty();
+    };
+    let Some(symbol) = visible_symbol_at(lexical, receiver_name, site.receiver.start_byte) else {
+        return empty();
+    };
+    if symbol.kind != LexicalSymbolKind::Import
+        || !imports.imports.iter().any(|import| {
+            import.binding == symbol.definition && is_builtin_tool_module_import(import)
+        })
+    {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.member);
+    let items = ["call", "call_json", "start", "start_json"]
+        .into_iter()
+        .map(|method| CompletionItem {
+            label: method.to_owned(),
+            kind: Some(CompletionItemKind::METHOD),
+            detail: Some("mod.tool method; host capability required".to_owned()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                method.to_owned(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect();
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
+fn visible_symbol_at<'symbol>(
+    report: &'symbol LexicalCompletionReport,
+    name: &str,
+    byte_offset: usize,
+) -> Option<&'symbol LexicalSymbol> {
+    report
+        .symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.name == name
+                && symbol.visibility_start_byte <= byte_offset
+                && byte_offset < symbol.visibility_end_byte
+        })
+        .max_by_key(|symbol| (symbol.visibility_start_byte, symbol.definition.start_byte))
+}
+
+fn is_builtin_tool_module_import(import: &ModuleImport) -> bool {
+    import.path.iter().map(String::as_str).eq(["mod", "tool"])
 }
 
 fn require_complete_lexical_report(report: &LexicalSymbolReport) -> Result<(), String> {
@@ -1781,6 +1953,134 @@ mod tests {
     }
 
     #[test]
+    fn completes_exact_visible_mod_tool_members_with_replacement_edits() {
+        let source = "use mod.tool\nlet output = tool.";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+        let member_start = source.len();
+        let expected_empty_range = Range::new(
+            position_at_byte(source, member_start),
+            position_at_byte(source, member_start),
+        );
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, member_start))
+            .unwrap();
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["call", "call_json", "start", "start_json"]
+        );
+        assert!(completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::METHOD)
+                && item.detail.as_deref() == Some("mod.tool method; host capability required")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if *range == expected_empty_range
+                )
+        }));
+
+        let partial_source = "use mod.tool\nlet output = tool.ca";
+        let mut partial_server = SplashLanguageServer::default();
+        partial_server.open_document(document(1, partial_source));
+        let partial_start = partial_source.rfind("ca").unwrap();
+        let partial_end = partial_source.len();
+        let expected_partial_range = Range::new(
+            position_at_byte(partial_source, partial_start),
+            position_at_byte(partial_source, partial_end),
+        );
+
+        let partial = partial_server
+            .completion(&test_uri(), position_at_byte(partial_source, partial_end))
+            .unwrap();
+        assert_eq!(partial.items.len(), 4);
+        assert!(partial.items.iter().all(|item| {
+            matches!(
+                &item.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                    if *range == expected_partial_range
+            )
+        }));
+    }
+
+    #[test]
+    fn refuses_module_member_completion_for_shadowed_or_non_direct_bindings() {
+        for source in [
+            "use mod.custom.tool\nlet output = tool.",
+            "use mod.tool\nlet tool = {call: 1}\ntool.",
+            "use mod.tool\nlet object = {tool: tool}\nobject.tool.",
+            "use mod.tool\n@\ntool.",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .unwrap();
+            assert!(
+                completion.items.is_empty(),
+                "unexpected members for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalidates_cached_module_imports_on_a_full_document_change() {
+        let initial = "use mod.tool\nlet output = tool.";
+        let replacement = "use mod.custom.tool\nlet output = tool.";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, initial));
+
+        let initial_completion = server
+            .completion(&test_uri(), position_at_byte(initial, initial.len()))
+            .unwrap();
+        assert_eq!(initial_completion.items.len(), 4);
+
+        let diagnostics = server
+            .change_document(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(test_uri(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: replacement.to_owned(),
+                }],
+            })
+            .expect("a newer full document replaces the cached snapshot");
+        assert!(!diagnostics.diagnostics.is_empty());
+
+        let replacement_completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(replacement, replacement.len()),
+            )
+            .unwrap();
+        assert!(replacement_completion.items.is_empty());
+    }
+
+    #[test]
+    fn marks_tool_member_completion_incomplete_when_imports_are_truncated() {
+        let mut source = String::from("use mod.tool\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("let output = tool.");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, source.len()))
+            .unwrap();
+
+        assert!(completion.is_incomplete);
+        assert_eq!(completion.items.len(), 4);
+    }
+
+    #[test]
     fn completion_excludes_sites_after_the_first_mid_document_error() {
         let source = "let alpha = 1\nalpha\n@\nlet beta = 2\nbeta";
         let mut server = SplashLanguageServer::default();
@@ -2272,6 +2572,10 @@ mod tests {
         assert_eq!(capabilities["hoverProvider"], true);
         assert_eq!(capabilities["documentHighlightProvider"], true);
         assert_eq!(capabilities["completionProvider"]["resolveProvider"], false);
+        assert_eq!(
+            capabilities["completionProvider"]["triggerCharacters"],
+            serde_json::json!(["."])
+        );
         assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
 
         client_connection

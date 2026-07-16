@@ -4,9 +4,10 @@ use libfuzzer_sys::fuzz_target;
 use splash_core::{
     check_syntax_named, check_vm_compatibility_named, format_source_named, fuzzing,
     is_canonical_identifier, lexical_completion_report_named, lexical_symbol_report_named,
-    tool_call_hint_report_named, top_level_declarations_named, ExecutionLimits,
-    LexicalCompletionReport, LexicalSymbol, RuntimeError, ToolCallHint, TopLevelDeclaration,
-    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    module_import_report_named, tool_call_hint_report_named, top_level_declarations_named,
+    ExecutionLimits, LexicalCompletionReport, LexicalSymbol, ModuleImportReport, RuntimeError,
+    ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
+    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
     MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
@@ -34,6 +35,9 @@ fuzz_target!(|data: &[u8]| {
     let completion_report = lexical_completion_report_named("fuzz.splash", source, limits)
         .expect("the fuzz limits are always valid for bounded completion metadata");
     assert_completion_invariants(source, &completion_report);
+    let import_report = module_import_report_named("fuzz.splash", source, limits)
+        .expect("the fuzz limits are always valid for bounded import metadata");
+    assert_module_import_invariants(source, &import_report);
 
     if profile.valid {
         assert!(
@@ -78,6 +82,7 @@ fuzz_target!(|data: &[u8]| {
             lexical_report.truncated
         );
         assert_eq!(completion_report.valid_prefix_end_byte, source.len());
+        assert_eq!(import_report.valid_prefix_end_byte, source.len());
 
         match format_source_named("fuzz.splash", source, limits) {
             Ok(formatted) => {
@@ -184,6 +189,62 @@ fn assert_outline_invariants(source: &str, declarations: &[TopLevelDeclaration])
             "outline span does not begin with its declaration keyword: {declaration:?}"
         );
         previous_end_byte = declaration.declaration_end_byte;
+    }
+}
+
+fn assert_module_import_invariants(source: &str, report: &ModuleImportReport) {
+    assert!(report.imports.len() <= MAX_MODULE_IMPORTS);
+    if report.truncated {
+        assert_eq!(report.imports.len(), MAX_MODULE_IMPORTS);
+    }
+    assert!(report.valid_prefix_end_byte <= source.len());
+    assert!(source.is_char_boundary(report.valid_prefix_end_byte));
+
+    let mut previous_start_byte = 0_usize;
+    for import in &report.imports {
+        assert!(
+            import.path.len() >= 2
+                && import.path.first().is_some_and(|segment| segment == "mod"),
+            "import path is not a complete mod path: {import:?}"
+        );
+        assert!(
+            previous_start_byte <= import.path_span.start_byte
+                && import.path_span.start_byte < import.path_span.end_byte
+                && import.path_span.end_byte <= report.valid_prefix_end_byte,
+            "import path span is unordered or exceeds the safe prefix: {import:?}"
+        );
+        assert!(
+            import.path_span.start_byte <= import.binding.start_byte
+                && import.binding.start_byte < import.binding.end_byte
+                && import.binding.end_byte == import.path_span.end_byte,
+            "import binding span is not the final path segment: {import:?}"
+        );
+        for offset in [
+            import.path_span.start_byte,
+            import.path_span.end_byte,
+            import.binding.start_byte,
+            import.binding.end_byte,
+        ] {
+            assert!(
+                source.is_char_boundary(offset),
+                "import span is not a UTF-8 boundary: {import:?}"
+            );
+        }
+        assert_eq!(
+            &source[import.path_span.start_byte..import.path_span.end_byte],
+            import.path.join("."),
+            "import path span does not match its segments: {import:?}"
+        );
+        assert_eq!(
+            &source[import.binding.start_byte..import.binding.end_byte],
+            import.path.last().expect("complete import has a binding"),
+            "import binding span does not match its final segment: {import:?}"
+        );
+        assert!(
+            import.path.iter().all(|segment| is_canonical_identifier(segment)),
+            "import path contains a non-canonical identifier: {import:?}"
+        );
+        previous_start_byte = import.path_span.start_byte;
     }
 }
 
