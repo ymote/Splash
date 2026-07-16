@@ -682,6 +682,7 @@ dependencies = [
  "splash-schema",
  "splash-worker",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

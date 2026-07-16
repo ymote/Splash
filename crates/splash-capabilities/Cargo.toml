@@ -21,9 +21,10 @@ splash-sandbox = { version = "0.1.0", path = "../splash-sandbox", optional = tru
 splash-schema = { version = "0.1.0", path = "../splash-schema" }
 splash-worker = { version = "0.1.0", path = "../splash-worker", optional = true }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"], optional = true }
+zeroize = { version = "1.9.0", optional = true }
 
 [features]
 bubblewrap-watchdog = ["dep:splash-sandbox"]
 in-process-worker = ["dep:splash-worker"]
 json-line-worker = []
-http-endpoint-catalog = ["dep:ureq"]
+http-endpoint-catalog = ["dep:ureq", "dep:zeroize"]

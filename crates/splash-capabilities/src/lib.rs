@@ -1570,17 +1570,71 @@ impl CapabilityHost {
         metadata: ToolMetadata,
         catalog: http_endpoint_catalog::HttpEndpointCatalog,
     ) -> Result<(), ToolRegistrationError> {
+        if catalog.requires_secret_resolver() {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "HTTP endpoint catalog secret bindings require an explicit secret resolver",
+            ));
+        }
         catalog.validate_tool_policy(&policy)?;
+        let max_output_bytes = policy.max_output_bytes;
+        let contract = catalog.tool_contract()?;
+        self.register_http_endpoint_catalog_contract(
+            policy,
+            metadata,
+            contract,
+            catalog.into_tool_handler(max_output_bytes),
+        )
+    }
+
+    /// Registers a bounded catalog of setup-selected HTTPS endpoints whose
+    /// reviewed credential bindings resolve only at invocation time.
+    ///
+    /// Splash can still select only the catalog's opaque endpoint identifier.
+    /// It cannot choose a secret, header, URL, method, or redirect target. The
+    /// resolver is consumed with the tool and is never exposed through the
+    /// tool descriptor, audit view, or dynamic runtime API.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpEndpointCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        catalog.validate_tool_policy(&policy)?;
+        let max_output_bytes = policy.max_output_bytes;
+        let contract = catalog.tool_contract()?;
+        self.register_http_endpoint_catalog_contract(
+            policy,
+            metadata,
+            contract,
+            catalog.into_tool_handler_with_secret_resolver(max_output_bytes, secret_resolver),
+        )
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    fn register_http_endpoint_catalog_contract<F>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        contract: JsonToolContract,
+        handler: F,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
+    {
         let JsonToolContract {
             input_schema,
             output_schema,
             input,
             output,
-        } = catalog.tool_contract()?;
+        } = contract;
         let metadata = metadata
             .with_input_schema(input_schema)
             .with_output_schema(output_schema);
-        let max_output_bytes = policy.max_output_bytes;
         self.register_json_tool_with_validators(
             policy,
             metadata,
@@ -1592,7 +1646,7 @@ impl CapabilityHost {
                 output,
                 ToolError::Failed("HTTP endpoint request failed".to_owned()),
             )),
-            catalog.into_tool_handler(max_output_bytes),
+            handler,
         )
     }
 
@@ -3225,6 +3279,31 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_http_endpoint_catalog_tool(policy, metadata, catalog)
+    }
+
+    /// Registers a setup-selected HTTPS endpoint catalog with a host-owned
+    /// secret resolver. See
+    /// [`CapabilityHost::register_http_endpoint_catalog_tool_with_secret_resolver`]
+    /// for the authority and disclosure boundary.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpEndpointCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                policy,
+                metadata,
+                catalog,
+                secret_resolver,
+            )
     }
 
     /// Registers a deferred-only text capability with no in-process handler.

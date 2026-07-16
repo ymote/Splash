@@ -165,6 +165,32 @@ impl MobileWorkflowBuilder {
             .register_http_endpoint_catalog_tool(policy, metadata, catalog)
     }
 
+    /// Registers one setup-selected HTTPS endpoint catalog with a host-owned
+    /// secret resolver for the sealed workflow catalog.
+    ///
+    /// The resolver is consumed during setup. Workflow steps can select only
+    /// the reviewed opaque endpoint identifier through an approved tool grant;
+    /// they cannot select or inspect a secret, header, URL, method, or redirect.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: splash_capabilities::http_endpoint_catalog::HttpEndpointCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: splash_capabilities::http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        self.runtime
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                policy,
+                metadata,
+                catalog,
+                secret_resolver,
+            )
+    }
+
     /// Registers one reviewed JSON adapter with executable input and output
     /// contracts.
     pub fn register_json_tool<F>(
@@ -519,7 +545,8 @@ mod tests {
 
     #[cfg(feature = "http-endpoint-catalog")]
     use splash_capabilities::http_endpoint_catalog::{
-        HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod,
+        HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod, HttpEndpointSecret,
+        HttpEndpointSecretStore,
     };
     use splash_capabilities::{
         fixed_file_catalog::FixedFileCatalog, json, AuditOutcome, CapabilityLeaseGrant,
@@ -922,6 +949,50 @@ mod tests {
         assert_eq!(runtime.audit()[0].tool, "net.status");
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
         assert!(!runtime.has_suspended_execution());
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    #[test]
+    fn seals_endpoint_secret_resolvers_without_workflow_metadata_disclosure() {
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog
+            .insert(
+                HttpEndpoint::https(
+                    "status",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/v1/status?fixed=true",
+                )
+                .expect("reviewed endpoint is valid")
+                .with_bearer_secret("release.auth")
+                .expect("credential binds only to HTTPS"),
+            )
+            .expect("endpoint is retained");
+        let mut secrets = HttpEndpointSecretStore::new();
+        secrets
+            .insert(
+                "release.auth",
+                HttpEndpointSecret::new("test-only-token-42").expect("test secret is valid"),
+            )
+            .expect("secret is retained during setup");
+
+        let mut builder = MobileWorkflowBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets one reviewed service status."),
+                catalog,
+                secrets,
+            )
+            .expect("static endpoint adapter registers");
+        let runtime = builder.build();
+
+        let descriptor = runtime
+            .tool_catalog_json()
+            .expect("sealed workflow catalog serializes for the host");
+        assert!(descriptor.contains("net.status"));
+        assert!(!descriptor.contains("release.auth"));
+        assert!(!descriptor.contains("test-only-token-42"));
+        assert!(!descriptor.contains("api.example.test"));
     }
 
     #[test]

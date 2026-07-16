@@ -18,7 +18,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use serde_json::json;
-use ureq::{http::Uri, Agent};
+use ureq::{
+    http::{
+        header::{HeaderName, HeaderValue},
+        Uri,
+    },
+    Agent,
+};
+use zeroize::Zeroizing;
 
 use crate::{
     JsonToolContract, JsonToolRequest, JsonValue, ToolDataFormat, ToolError, ToolPolicy,
@@ -45,6 +52,12 @@ pub const MAX_HTTP_ENDPOINT_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HTTP_ENDPOINT_ID_BYTES: usize = 128;
 /// Maximum UTF-8 byte length of a fixed endpoint URL.
 pub const MAX_HTTP_ENDPOINT_URL_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 byte length of an opaque host-selected secret identifier.
+pub const MAX_HTTP_ENDPOINT_SECRET_ID_BYTES: usize = 128;
+/// Maximum byte length of one host-resolved HTTP secret header value.
+pub const MAX_HTTP_ENDPOINT_SECRET_BYTES: usize = 4 * 1024;
+/// Maximum number of secrets a bounded in-memory endpoint secret store retains.
+pub const MAX_HTTP_ENDPOINT_SECRET_STORE_ENTRIES: usize = 128;
 /// Default end-to-end request deadline, including DNS and response reading.
 pub const DEFAULT_HTTP_ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Absolute maximum end-to-end request deadline.
@@ -65,6 +78,258 @@ enum EndpointTransport {
     InsecureHttp,
 }
 
+/// A host-held secret value that can be injected into one fixed HTTPS endpoint.
+///
+/// Splash source cannot construct, inspect, serialize, or receive this value.
+/// Values are restricted to printable ASCII HTTP header bytes, bounded, and
+/// zeroized when this wrapper is dropped. HTTP and TLS implementation buffers
+/// can still retain copies while a request is in flight, so this is not a
+/// complete process-memory secrecy guarantee.
+pub struct HttpEndpointSecret(Zeroizing<String>);
+
+impl HttpEndpointSecret {
+    /// Creates one bounded secret suitable for an HTTP header value.
+    pub fn new(value: impl Into<String>) -> Result<Self, HttpEndpointSecretError> {
+        let value = Zeroizing::new(value.into());
+        if value.is_empty() {
+            return Err(HttpEndpointSecretError::EmptyValue);
+        }
+        if value.len() > MAX_HTTP_ENDPOINT_SECRET_BYTES {
+            return Err(HttpEndpointSecretError::ValueTooLarge {
+                maximum: MAX_HTTP_ENDPOINT_SECRET_BYTES,
+            });
+        }
+        if !value.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
+            return Err(HttpEndpointSecretError::InvalidHeaderValue);
+        }
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Clone for HttpEndpointSecret {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl fmt::Debug for HttpEndpointSecret {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HttpEndpointSecret(REDACTED)")
+    }
+}
+
+/// Host-side failures while storing or resolving endpoint-bound secrets.
+///
+/// The endpoint adapter maps every one of these cases to one generic
+/// script-facing failure. Implementations must not encode secret material in a
+/// custom error path or tool metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpEndpointSecretError {
+    InvalidIdentifier,
+    DuplicateIdentifier,
+    StoreCapacityExceeded { maximum: usize },
+    EmptyValue,
+    ValueTooLarge { maximum: usize },
+    InvalidHeaderValue,
+    NotFound,
+}
+
+impl Display for HttpEndpointSecretError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidIdentifier => {
+                formatter.write_str("invalid HTTP endpoint secret identifier")
+            }
+            Self::DuplicateIdentifier => {
+                formatter.write_str("HTTP endpoint secret identifier is already registered")
+            }
+            Self::StoreCapacityExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "HTTP endpoint secret store exceeds its maximum of {maximum} entries"
+                )
+            }
+            Self::EmptyValue => formatter.write_str("HTTP endpoint secret must not be empty"),
+            Self::ValueTooLarge { maximum } => {
+                write!(formatter, "HTTP endpoint secret exceeds {maximum} bytes")
+            }
+            Self::InvalidHeaderValue => {
+                formatter.write_str("HTTP endpoint secret is not a valid printable header value")
+            }
+            Self::NotFound => formatter.write_str("HTTP endpoint secret is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for HttpEndpointSecretError {}
+
+/// Resolves one opaque secret identifier selected by trusted endpoint setup.
+///
+/// The identifier originates only in a host-configured endpoint binding, not
+/// in Splash input. Implementors can load from a platform credential store or
+/// another reviewed Rust integration. Every resolver error is redacted before
+/// it can reach Splash source, audit records, or tool descriptors.
+pub trait HttpEndpointSecretResolver {
+    fn resolve_http_endpoint_secret(
+        &mut self,
+        identifier: &str,
+    ) -> Result<HttpEndpointSecret, HttpEndpointSecretError>;
+}
+
+impl<F> HttpEndpointSecretResolver for F
+where
+    F: for<'a> FnMut(&'a str) -> Result<HttpEndpointSecret, HttpEndpointSecretError>,
+{
+    fn resolve_http_endpoint_secret(
+        &mut self,
+        identifier: &str,
+    ) -> Result<HttpEndpointSecret, HttpEndpointSecretError> {
+        self(identifier)
+    }
+}
+
+/// A bounded in-memory resolver for setup-provisioned endpoint secrets.
+///
+/// It intentionally has no getter or iterator. Move it into
+/// `register_http_endpoint_catalog_tool_with_secret_resolver` during trusted
+/// setup, or implement [`HttpEndpointSecretResolver`] to load a secret from a
+/// platform-specific credential store for each request.
+#[derive(Default)]
+pub struct HttpEndpointSecretStore {
+    entries: BTreeMap<String, HttpEndpointSecret>,
+}
+
+impl HttpEndpointSecretStore {
+    /// Creates an empty bounded endpoint secret store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns how many opaque secret bindings this store retains.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether this store has no secret bindings.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adds one opaque secret identifier and value during trusted setup.
+    pub fn insert(
+        &mut self,
+        identifier: impl Into<String>,
+        secret: HttpEndpointSecret,
+    ) -> Result<(), HttpEndpointSecretError> {
+        let identifier = identifier.into();
+        if !is_valid_secret_identifier(&identifier) {
+            return Err(HttpEndpointSecretError::InvalidIdentifier);
+        }
+        if self.entries.contains_key(&identifier) {
+            return Err(HttpEndpointSecretError::DuplicateIdentifier);
+        }
+        if self.entries.len() >= MAX_HTTP_ENDPOINT_SECRET_STORE_ENTRIES {
+            return Err(HttpEndpointSecretError::StoreCapacityExceeded {
+                maximum: MAX_HTTP_ENDPOINT_SECRET_STORE_ENTRIES,
+            });
+        }
+        self.entries.insert(identifier, secret);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for HttpEndpointSecretStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpEndpointSecretStore")
+            .field("entry_count", &self.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpEndpointSecretResolver for HttpEndpointSecretStore {
+    fn resolve_http_endpoint_secret(
+        &mut self,
+        identifier: &str,
+    ) -> Result<HttpEndpointSecret, HttpEndpointSecretError> {
+        self.entries
+            .get(identifier)
+            .cloned()
+            .ok_or(HttpEndpointSecretError::NotFound)
+    }
+}
+
+struct NoHttpEndpointSecretResolver;
+
+impl HttpEndpointSecretResolver for NoHttpEndpointSecretResolver {
+    fn resolve_http_endpoint_secret(
+        &mut self,
+        _identifier: &str,
+    ) -> Result<HttpEndpointSecret, HttpEndpointSecretError> {
+        Err(HttpEndpointSecretError::NotFound)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HttpEndpointAuthorization {
+    None,
+    BearerSecret {
+        secret_identifier: String,
+    },
+    HeaderSecret {
+        name: HeaderName,
+        secret_identifier: String,
+    },
+}
+
+impl HttpEndpointAuthorization {
+    fn is_configured(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn resolve_header(
+        &self,
+        resolver: &mut dyn HttpEndpointSecretResolver,
+    ) -> Result<Option<(HeaderName, HeaderValue)>, HttpEndpointCatalogError> {
+        match self {
+            Self::None => Ok(None),
+            Self::BearerSecret { secret_identifier } => {
+                let secret = resolver
+                    .resolve_http_endpoint_secret(secret_identifier)
+                    .map_err(|_| HttpEndpointCatalogError::SecretUnavailable)?;
+                let value = Zeroizing::new(format!("Bearer {}", secret.as_str()));
+                Ok(Some(make_sensitive_header(
+                    HeaderName::from_static("authorization"),
+                    value.as_str(),
+                )?))
+            }
+            Self::HeaderSecret {
+                name,
+                secret_identifier,
+            } => {
+                let secret = resolver
+                    .resolve_http_endpoint_secret(secret_identifier)
+                    .map_err(|_| HttpEndpointCatalogError::SecretUnavailable)?;
+                Ok(Some(make_sensitive_header(name.clone(), secret.as_str())?))
+            }
+        }
+    }
+}
+
+fn make_sensitive_header(
+    name: HeaderName,
+    value: &str,
+) -> Result<(HeaderName, HeaderValue), HttpEndpointCatalogError> {
+    let mut value =
+        HeaderValue::from_str(value).map_err(|_| HttpEndpointCatalogError::SecretUnavailable)?;
+    value.set_sensitive(true);
+    Ok((name, value))
+}
+
 /// One host-selected URL and method in a [`HttpEndpointCatalog`].
 ///
 /// The URL has no script-facing accessor so a tool descriptor and ordinary
@@ -75,6 +340,7 @@ pub struct HttpEndpoint {
     url: String,
     method: HttpEndpointMethod,
     transport: EndpointTransport,
+    authorization: HttpEndpointAuthorization,
 }
 
 impl HttpEndpoint {
@@ -122,6 +388,44 @@ impl HttpEndpoint {
         self.method
     }
 
+    /// Binds a host-resolved bearer token to this HTTPS endpoint.
+    ///
+    /// The opaque secret identifier is never published to Splash. It is
+    /// resolved only immediately before this endpoint executes and is sent as
+    /// `Authorization: Bearer ...`. Insecure HTTP endpoints reject credential
+    /// bindings during setup.
+    pub fn with_bearer_secret(
+        self,
+        secret_identifier: impl Into<String>,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        self.with_authorization(HttpEndpointAuthorization::BearerSecret {
+            secret_identifier: validate_secret_identifier(secret_identifier.into())?,
+        })
+    }
+
+    /// Binds a host-resolved secret value to one reviewed request header on
+    /// this HTTPS endpoint.
+    ///
+    /// The header name and opaque secret identifier are fixed during setup.
+    /// Splash cannot choose either value. Transport-managed headers, cookies,
+    /// and response-shaping headers are rejected so this does not become a
+    /// general header API.
+    pub fn with_secret_header(
+        self,
+        name: impl AsRef<str>,
+        secret_identifier: impl Into<String>,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        let name = HeaderName::from_str(name.as_ref())
+            .map_err(|_| HttpEndpointCatalogError::InvalidSecretHeaderName)?;
+        if !is_allowed_secret_header(&name) {
+            return Err(HttpEndpointCatalogError::ForbiddenSecretHeaderName);
+        }
+        self.with_authorization(HttpEndpointAuthorization::HeaderSecret {
+            name,
+            secret_identifier: validate_secret_identifier(secret_identifier.into())?,
+        })
+    }
+
     fn new(
         identifier: String,
         method: HttpEndpointMethod,
@@ -137,7 +441,22 @@ impl HttpEndpoint {
             url,
             method,
             transport,
+            authorization: HttpEndpointAuthorization::None,
         })
+    }
+
+    fn with_authorization(
+        mut self,
+        authorization: HttpEndpointAuthorization,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        if self.transport != EndpointTransport::Https {
+            return Err(HttpEndpointCatalogError::SecretAuthorizationRequiresHttps);
+        }
+        if self.authorization.is_configured() {
+            return Err(HttpEndpointCatalogError::SecretAuthorizationAlreadyConfigured);
+        }
+        self.authorization = authorization;
+        Ok(self)
     }
 }
 
@@ -148,6 +467,10 @@ impl fmt::Debug for HttpEndpoint {
             .field("identifier", &self.identifier)
             .field("method", &self.method)
             .field("transport", &self.transport)
+            .field(
+                "has_secret_authorization",
+                &self.authorization.is_configured(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -249,6 +572,11 @@ pub enum HttpEndpointCatalogError {
     UrlFragmentNotAllowed,
     HttpsRequired,
     InsecureHttpRequired,
+    InvalidSecretIdentifier,
+    InvalidSecretHeaderName,
+    ForbiddenSecretHeaderName,
+    SecretAuthorizationRequiresHttps,
+    SecretAuthorizationAlreadyConfigured,
     DuplicateIdentifier,
     EntryLimitExceeded { maximum: usize },
     NotFound,
@@ -256,6 +584,7 @@ pub enum HttpEndpointCatalogError {
     MissingRequestBody,
     UnexpectedRequestBody,
     RequestTooLarge { maximum: usize },
+    SecretUnavailable,
     Transport,
     UnexpectedStatus { status: u16 },
     ResponseTooLarge { maximum: usize },
@@ -278,6 +607,20 @@ impl Display for HttpEndpointCatalogError {
             Self::InsecureHttpRequired => {
                 formatter.write_str("insecure HTTP endpoints must use the HTTP scheme")
             }
+            Self::InvalidSecretIdentifier => {
+                formatter.write_str("invalid HTTP endpoint secret identifier")
+            }
+            Self::InvalidSecretHeaderName => {
+                formatter.write_str("invalid HTTP endpoint secret header name")
+            }
+            Self::ForbiddenSecretHeaderName => formatter
+                .write_str("HTTP endpoint secret header conflicts with managed transport headers"),
+            Self::SecretAuthorizationRequiresHttps => {
+                formatter.write_str("HTTP endpoint secret authorization requires an HTTPS endpoint")
+            }
+            Self::SecretAuthorizationAlreadyConfigured => {
+                formatter.write_str("HTTP endpoint secret authorization is already configured")
+            }
             Self::DuplicateIdentifier => {
                 formatter.write_str("HTTP endpoint identifier is already registered")
             }
@@ -298,6 +641,7 @@ impl Display for HttpEndpointCatalogError {
             Self::RequestTooLarge { maximum } => {
                 write!(formatter, "HTTP endpoint request exceeds {maximum} bytes")
             }
+            Self::SecretUnavailable => formatter.write_str("HTTP endpoint secret is unavailable"),
             Self::Transport => formatter.write_str("HTTP endpoint request failed"),
             Self::UnexpectedStatus { status } => {
                 write!(
@@ -351,6 +695,12 @@ impl HttpEndpointCatalog {
     /// Returns whether the catalog contains no endpoints.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    pub(crate) fn requires_secret_resolver(&self) -> bool {
+        self.entries
+            .values()
+            .any(|endpoint| endpoint.authorization.is_configured())
     }
 
     /// Adds one already validated host-selected endpoint.
@@ -446,12 +796,30 @@ impl HttpEndpointCatalog {
         self,
         max_output_bytes: usize,
     ) -> impl FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static {
+        self.into_tool_handler_with_secret_resolver(max_output_bytes, NoHttpEndpointSecretResolver)
+    }
+
+    pub(crate) fn into_tool_handler_with_secret_resolver<R>(
+        self,
+        max_output_bytes: usize,
+        secret_resolver: R,
+    ) -> impl FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static
+    where
+        R: HttpEndpointSecretResolver + 'static,
+    {
         let agents = HttpEndpointAgents::new(self.limits);
         let max_request_bytes = self.limits.max_request_bytes;
         let max_response_bytes = self.limits.max_response_bytes.min(max_output_bytes);
+        let mut secret_resolver = secret_resolver;
         move |request| {
-            self.execute(&agents, request, max_request_bytes, max_response_bytes)
-                .map_err(HttpEndpointCatalogError::into_tool_error)
+            self.execute(
+                &agents,
+                request,
+                max_request_bytes,
+                max_response_bytes,
+                &mut secret_resolver,
+            )
+            .map_err(HttpEndpointCatalogError::into_tool_error)
         }
     }
 
@@ -461,6 +829,7 @@ impl HttpEndpointCatalog {
         request: &JsonToolRequest,
         max_request_bytes: usize,
         max_response_bytes: usize,
+        secret_resolver: &mut dyn HttpEndpointSecretResolver,
     ) -> Result<JsonValue, HttpEndpointCatalogError> {
         let object = request
             .input
@@ -505,16 +874,28 @@ impl HttpEndpointCatalog {
                 maximum: max_request_bytes,
             });
         }
+        let secret_header = endpoint.authorization.resolve_header(secret_resolver)?;
 
         let mut response = match (endpoint.method, encoded_body) {
             (HttpEndpointMethod::Get, None) => {
-                agents.for_endpoint(endpoint).get(&endpoint.url).call()
+                let request = agents.for_endpoint(endpoint).get(&endpoint.url);
+                let request = match secret_header {
+                    Some((name, value)) => request.header(name, value),
+                    None => request,
+                };
+                request.call()
             }
-            (HttpEndpointMethod::Post, Some(body)) => agents
-                .for_endpoint(endpoint)
-                .post(&endpoint.url)
-                .header("Content-Type", "application/json")
-                .send(body),
+            (HttpEndpointMethod::Post, Some(body)) => {
+                let request = agents
+                    .for_endpoint(endpoint)
+                    .post(&endpoint.url)
+                    .header("Content-Type", "application/json");
+                let request = match secret_header {
+                    Some((name, value)) => request.header(name, value),
+                    None => request,
+                };
+                request.send(body)
+            }
             _ => return Err(HttpEndpointCatalogError::InvalidRequest),
         }
         .map_err(|_| HttpEndpointCatalogError::Transport)?;
@@ -649,6 +1030,49 @@ fn is_valid_identifier(identifier: &str) -> bool {
             })
 }
 
+fn validate_secret_identifier(identifier: String) -> Result<String, HttpEndpointCatalogError> {
+    if is_valid_secret_identifier(&identifier) {
+        Ok(identifier)
+    } else {
+        Err(HttpEndpointCatalogError::InvalidSecretIdentifier)
+    }
+}
+
+fn is_valid_secret_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier.len() <= MAX_HTTP_ENDPOINT_SECRET_ID_BYTES
+        && identifier
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match byte {
+                b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' => index != 0 || byte != b'.',
+                _ => false,
+            })
+}
+
+fn is_allowed_secret_header(name: &HeaderName) -> bool {
+    !matches!(
+        name.as_str(),
+        "accept"
+            | "accept-encoding"
+            | "connection"
+            | "content-length"
+            | "content-type"
+            | "cookie"
+            | "expect"
+            | "host"
+            | "keep-alive"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "set-cookie"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "user-agent"
+    )
+}
+
 impl HttpEndpointCatalogError {
     fn into_tool_error(self) -> ToolError {
         match self {
@@ -667,8 +1091,10 @@ impl HttpEndpointCatalogError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::rc::Rc;
     use std::sync::mpsc::{self, Receiver};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -1079,5 +1505,327 @@ mod tests {
             large_error,
             ToolError::Failed("HTTP endpoint request failed".to_owned())
         );
+    }
+
+    #[test]
+    fn rejects_invalid_secret_configuration_and_bounds_secret_storage() {
+        assert!(matches!(
+            HttpEndpoint::insecure_http(
+                "local",
+                HttpEndpointMethod::Get,
+                "http://127.0.0.1/status"
+            )
+            .unwrap()
+            .with_bearer_secret("release.auth"),
+            Err(HttpEndpointCatalogError::SecretAuthorizationRequiresHttps)
+        ));
+        assert!(matches!(
+            HttpEndpoint::https(
+                "status",
+                HttpEndpointMethod::Get,
+                "https://api.example.test"
+            )
+            .unwrap()
+            .with_bearer_secret("bad/id"),
+            Err(HttpEndpointCatalogError::InvalidSecretIdentifier)
+        ));
+        assert!(matches!(
+            HttpEndpoint::https(
+                "status",
+                HttpEndpointMethod::Get,
+                "https://api.example.test"
+            )
+            .unwrap()
+            .with_secret_header("Content-Type", "release.auth"),
+            Err(HttpEndpointCatalogError::ForbiddenSecretHeaderName)
+        ));
+        assert!(matches!(
+            HttpEndpoint::https(
+                "status",
+                HttpEndpointMethod::Get,
+                "https://api.example.test"
+            )
+            .unwrap()
+            .with_secret_header("bad header", "release.auth"),
+            Err(HttpEndpointCatalogError::InvalidSecretHeaderName)
+        ));
+        assert!(matches!(
+            HttpEndpoint::https(
+                "status",
+                HttpEndpointMethod::Get,
+                "https://api.example.test"
+            )
+            .unwrap()
+            .with_bearer_secret("release.auth")
+            .unwrap()
+            .with_secret_header("x-api-key", "other.auth"),
+            Err(HttpEndpointCatalogError::SecretAuthorizationAlreadyConfigured)
+        ));
+        assert!(matches!(
+            HttpEndpointSecret::new(""),
+            Err(HttpEndpointSecretError::EmptyValue)
+        ));
+        assert!(matches!(
+            HttpEndpointSecret::new("line\r\nbreak"),
+            Err(HttpEndpointSecretError::InvalidHeaderValue)
+        ));
+        assert!(matches!(
+            HttpEndpointSecret::new("x".repeat(MAX_HTTP_ENDPOINT_SECRET_BYTES + 1)),
+            Err(HttpEndpointSecretError::ValueTooLarge { .. })
+        ));
+
+        let mut secrets = HttpEndpointSecretStore::new();
+        for index in 0..MAX_HTTP_ENDPOINT_SECRET_STORE_ENTRIES {
+            secrets
+                .insert(
+                    format!("secret-{index}"),
+                    HttpEndpointSecret::new("test-token").unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            secrets.insert("one-more", HttpEndpointSecret::new("test-token").unwrap()),
+            Err(HttpEndpointSecretError::StoreCapacityExceeded { .. })
+        ));
+        let debug = format!("{secrets:?}");
+        assert!(debug.contains("entry_count"));
+        assert!(!debug.contains("secret-0"));
+        assert!(!debug.contains("test-token"));
+        assert_eq!(
+            format!("{:?}", HttpEndpointSecret::new("test-token").unwrap()),
+            "HttpEndpointSecret(REDACTED)"
+        );
+    }
+
+    #[test]
+    fn endpoint_secret_resolver_is_opaque_and_publishes_no_credential_metadata() {
+        let endpoint = HttpEndpoint::https(
+            "status",
+            HttpEndpointMethod::Get,
+            "https://api.example.test/v1/status?reviewed=true",
+        )
+        .unwrap()
+        .with_bearer_secret("release.auth")
+        .unwrap();
+        let endpoint_debug = format!("{endpoint:?}");
+        assert!(!endpoint_debug.contains("release.auth"));
+
+        let mut missing_catalog = HttpEndpointCatalog::default();
+        missing_catalog.insert(endpoint).unwrap();
+        let error = CapabilityRuntime::default()
+            .register_http_endpoint_catalog_tool(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets reviewed service status."),
+                missing_catalog,
+            )
+            .expect_err("credentials require an explicit resolver");
+        assert_eq!(
+            error,
+            ToolRegistrationError::InvalidPolicy(
+                "HTTP endpoint catalog secret bindings require an explicit secret resolver"
+            )
+        );
+        assert!(!error.to_string().contains("release.auth"));
+
+        let endpoint = HttpEndpoint::https(
+            "status",
+            HttpEndpointMethod::Get,
+            "https://api.example.test/v1/status?reviewed=true",
+        )
+        .unwrap()
+        .with_bearer_secret("release.auth")
+        .unwrap();
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog.insert(endpoint).unwrap();
+        let mut secrets = HttpEndpointSecretStore::new();
+        secrets
+            .insert(
+                "release.auth",
+                HttpEndpointSecret::new("test-only-token-42").unwrap(),
+            )
+            .unwrap();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets reviewed service status."),
+                catalog,
+                secrets,
+            )
+            .unwrap();
+
+        let published = runtime.tool_catalog_json().unwrap();
+        assert!(!published.contains("release.auth"));
+        assert!(!published.contains("test-only-token-42"));
+        assert!(!published.contains("api.example.test"));
+        assert!(!published.contains("/v1/status"));
+    }
+
+    #[test]
+    fn secret_headers_are_fixed_sensitive_and_unavailable_secrets_are_redacted() {
+        let endpoint = HttpEndpoint::https(
+            "status",
+            HttpEndpointMethod::Get,
+            "https://api.example.test/v1/status",
+        )
+        .unwrap()
+        .with_bearer_secret("release.auth")
+        .unwrap();
+        let mut secrets = HttpEndpointSecretStore::new();
+        secrets
+            .insert(
+                "release.auth",
+                HttpEndpointSecret::new("test-only-token-42").unwrap(),
+            )
+            .unwrap();
+        let (name, value) = endpoint
+            .authorization
+            .resolve_header(&mut secrets)
+            .unwrap()
+            .expect("bearer binding produces one header");
+        assert_eq!(name.as_str(), "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer test-only-token-42");
+        assert!(value.is_sensitive());
+
+        let custom = HttpEndpoint::https(
+            "submit",
+            HttpEndpointMethod::Post,
+            "https://api.example.test/v1/submit",
+        )
+        .unwrap()
+        .with_secret_header("x-api-key", "release.api-key")
+        .unwrap();
+        let mut custom_secrets = HttpEndpointSecretStore::new();
+        custom_secrets
+            .insert(
+                "release.api-key",
+                HttpEndpointSecret::new("test-only-key").unwrap(),
+            )
+            .unwrap();
+        let (name, value) = custom
+            .authorization
+            .resolve_header(&mut custom_secrets)
+            .unwrap()
+            .expect("custom binding produces one header");
+        assert_eq!(name.as_str(), "x-api-key");
+        assert_eq!(value.to_str().unwrap(), "test-only-key");
+        assert!(value.is_sensitive());
+
+        let mut unavailable_catalog = HttpEndpointCatalog::default();
+        unavailable_catalog
+            .insert(
+                HttpEndpoint::https(
+                    "status",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/v1/status",
+                )
+                .unwrap()
+                .with_bearer_secret("release.auth")
+                .unwrap(),
+            )
+            .unwrap();
+        let mut unavailable = unavailable_catalog
+            .into_tool_handler_with_secret_resolver(64, |_: &str| {
+                Err(HttpEndpointSecretError::NotFound)
+            });
+        let error = unavailable(&JsonToolRequest {
+            name: "net.status".to_owned(),
+            input: json!({"endpoint": "status"}),
+            call_index: 1,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ToolError::Failed("HTTP endpoint request failed".to_owned())
+        );
+        assert!(!error.to_string().contains("release.auth"));
+    }
+
+    #[test]
+    fn schema_rejections_do_not_resolve_or_disclose_endpoint_secrets() {
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog
+            .insert(
+                HttpEndpoint::https(
+                    "status",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/v1/status",
+                )
+                .unwrap()
+                .with_bearer_secret("release.auth")
+                .unwrap(),
+            )
+            .unwrap();
+        let resolver_calls = Rc::new(RefCell::new(0_usize));
+        let resolver_calls_for_handler = Rc::clone(&resolver_calls);
+        let resolver = move |_: &str| {
+            *resolver_calls_for_handler.borrow_mut() += 1;
+            HttpEndpointSecret::new("test-only-token-42")
+        };
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets reviewed service status."),
+                catalog,
+                resolver,
+            )
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.tool\n\
+                 tool.call_json(\"net.status\", {endpoint: \"status\", secret: \"attempted-exfiltration\"})",
+            )
+            .unwrap();
+        assert!(!report.succeeded());
+        assert_eq!(*resolver_calls.borrow(), 0);
+        let diagnostics = format!("{:?}", report.diagnostics);
+        assert!(diagnostics.contains("HTTP endpoint access was denied"));
+        assert!(!diagnostics.contains("release.auth"));
+        assert!(!diagnostics.contains("attempted-exfiltration"));
+        assert!(!diagnostics.contains("schema"));
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn oversized_authenticated_post_bodies_do_not_resolve_a_secret() {
+        let mut catalog = HttpEndpointCatalog::new(HttpEndpointCatalogLimits {
+            max_request_bytes: 16,
+            ..HttpEndpointCatalogLimits::default()
+        })
+        .unwrap();
+        catalog
+            .insert(
+                HttpEndpoint::https(
+                    "submit",
+                    HttpEndpointMethod::Post,
+                    "https://api.example.test/v1/submit",
+                )
+                .unwrap()
+                .with_bearer_secret("release.auth")
+                .unwrap(),
+            )
+            .unwrap();
+        let resolver_calls = Rc::new(RefCell::new(0_usize));
+        let resolver_calls_for_handler = Rc::clone(&resolver_calls);
+        let resolver = move |_: &str| {
+            *resolver_calls_for_handler.borrow_mut() += 1;
+            HttpEndpointSecret::new("test-only-token-42")
+        };
+        let mut handler = catalog.into_tool_handler_with_secret_resolver(64, resolver);
+
+        let error = handler(&JsonToolRequest {
+            name: "net.submit".to_owned(),
+            input: json!({"endpoint": "submit", "body": {"value": "0123456789"}}),
+            call_index: 1,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ToolError::Denied("HTTP endpoint access was denied".to_owned())
+        );
+        assert_eq!(*resolver_calls.borrow(), 0);
     }
 }

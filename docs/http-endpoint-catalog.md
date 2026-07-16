@@ -3,8 +3,9 @@
 The optional
 splash_capabilities::http_endpoint_catalog::HttpEndpointCatalog is a narrow
 outbound JSON capability for a reviewed, finite set of host-selected HTTP
-endpoints. It is not a general HTTP client, a secret broker, a proxy, or an
-operating-system egress sandbox.
+endpoints. It can inject a host-resolved credential into one fixed HTTPS
+endpoint, but it is not a general HTTP client, a general secret-retrieval API,
+a proxy, or an operating-system egress sandbox.
 
 Enable the feature explicitly because it links an HTTP/TLS client:
 
@@ -25,12 +26,14 @@ opaque identifier:
 use splash_capabilities::{
     http_endpoint_catalog::{
         HttpEndpoint, HttpEndpointCatalog, HttpEndpointCatalogLimits, HttpEndpointMethod,
+        HttpEndpointSecret, HttpEndpointSecretStore,
     },
     CapabilityRuntime, ToolMetadata, ToolPolicy,
 };
 
 fn register_release_status(
     runtime: &mut CapabilityRuntime,
+    release_status_token: impl Into<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut catalog = HttpEndpointCatalog::new(HttpEndpointCatalogLimits {
         max_entries: 4,
@@ -41,16 +44,25 @@ fn register_release_status(
         "release.status",
         HttpEndpointMethod::Get,
         "https://api.example.com/v1/release/status?channel=stable",
-    )?)?;
+    )?.with_bearer_secret("release.status.token")?)?;
+
+    // This value comes from trusted host setup, such as an OS credential store.
+    // It is never supplied to or returned from Splash source.
+    let mut secrets = HttpEndpointSecretStore::new();
+    secrets.insert(
+        "release.status.token",
+        HttpEndpointSecret::new(release_status_token)?,
+    )?;
 
     let mut policy = ToolPolicy::json("service.request");
     policy.max_calls = 2;
     policy.max_input_bytes = 4 * 1024;
     policy.max_output_bytes = 32 * 1024;
-    runtime.register_http_endpoint_catalog_tool(
+    runtime.register_http_endpoint_catalog_tool_with_secret_resolver(
         policy,
         ToolMetadata::new("Gets the reviewed release status by opaque identifier."),
         catalog,
+        secrets,
     )?;
     Ok(())
 }
@@ -71,6 +83,13 @@ The executable request schema publishes the host-facing opaque ID enum, requires
 endpoint, and rejects additional fields before the adapter runs. It never
 publishes the URL. The runtime also independently checks the request, so direct
 adapter use cannot widen the accepted shape.
+
+The caller supplies `release_status_token` during trusted host setup, such as
+from an OS credential store; it is not a Splash function or generated-script
+input. Hosts can instead implement `HttpEndpointSecretResolver` to resolve from
+a platform credential store for every invocation. The resolver is called only
+for a credential binding selected during trusted endpoint setup; Splash cannot
+name a secret or invoke a secret resolver directly.
 
 GET requires exactly {endpoint: "..."}. POST requires
 {endpoint: "...", body: {...}} or an array body. The body remains bounded by
@@ -93,12 +112,21 @@ bounded to 4 KiB. HttpEndpoint::insecure_http is explicitly named and exists
 only for trusted local or development services; do not use it for credentials,
 private data, or a production origin policy.
 
+`HttpEndpoint::with_bearer_secret` injects one fixed `Authorization: Bearer`
+value, and `with_secret_header` injects a value into one fixed reviewed header.
+Both require an HTTPS endpoint. The latter refuses transport-managed,
+cookie, and response-shaping header names, so it cannot change the request
+method, target, body encoding, proxy behavior, or response format. The secret
+identifier and value are host configuration; neither becomes a Splash input.
+
 At execution, the catalog:
 
 - permits only the configured GET or POST;
 - disables environment proxies and redirect following;
 - exposes no script-selected URL, method, header, query, redirect target, or
   cookie API;
+- resolves an endpoint-bound secret only after request schema and input checks,
+  then marks its resulting HTTP header sensitive;
 - sends Accept: application/json, sends Content-Type: application/json for
   POST, and disables content encoding;
 - requires a 2xx response containing a JSON object or array;
@@ -120,12 +148,15 @@ Trusted setup receives detailed HttpEndpointCatalogError values. Splash
 receives only either HTTP endpoint access was denied for an invalid request or
 HTTP endpoint request failed for configuration, transport, status, size, or
 response-format failures. URLs, remote status codes, response bodies, headers,
-and transport details are not released to script diagnostics.
+secret identifiers, secret values, and transport details are not released to
+script diagnostics.
 
 The endpoint URL has no public accessor and is omitted from Debug. The
-published tool contract contains opaque IDs, not endpoint URLs. Audit entries
-retain the tool name and byte counts, not the endpoint ID, URL, headers, or
-body.
+published tool contract contains opaque endpoint IDs, not endpoint URLs or
+credential bindings. `HttpEndpointSecret` and `HttpEndpointSecretStore` redact
+their Debug output and provide no secret getter or iterator. Audit entries
+retain the tool name and byte counts, not the endpoint ID, URL, headers,
+secret identifiers, secret values, or body.
 
 ## Security boundary
 
@@ -134,17 +165,24 @@ changing the target of this one catalog tool; it does not prevent the embedding
 process or another trusted Rust adapter from opening a network connection. It
 also does not pin DNS results, enforce a firewall rule, validate the remote
 service's authorization model, protect a host-selected endpoint from later
-server-side changes, broker credentials, or contain a blocking request that is
-already running.
+server-side changes, offer general secret access, guarantee zeroization of
+HTTP/TLS implementation buffers, or contain a blocking request that is already
+running.
 
 Hosts must treat endpoint setup as trusted policy, keep secrets out of URLs and
-tool metadata, and run effects needing real egress isolation behind a
-target-specific containment or network policy backend. In particular, this
-catalog is not sufficient to run untrusted local tools with ambient process
-authority.
+tool metadata, keep the resolver's own logs and errors free of secret material,
+and run effects needing real egress isolation behind a target-specific
+containment or network policy backend. In particular, this catalog is not
+sufficient to run untrusted local tools with ambient process authority.
+The resolver runs in the local adapter before the HTTP request starts; its own
+latency and any platform credential-store behavior are host responsibility and
+are not bounded by the catalog's HTTP deadline.
 
 For mobile and embedded applications, pass the catalog to
 mobile::MobileRuntimeBuilder::register_http_endpoint_catalog_tool or
 splash_workflow::mobile::MobileWorkflowBuilder::register_http_endpoint_catalog_tool
-before build(). Each builder consumes it during setup, so dynamic source and
-workflow steps cannot modify the catalog afterward.
+before build(). Use each matching
+`register_http_endpoint_catalog_tool_with_secret_resolver` method when the
+catalog has a credential binding. Each builder consumes both catalog and
+resolver during setup, so dynamic source and workflow steps cannot modify the
+catalog or select a secret afterward.

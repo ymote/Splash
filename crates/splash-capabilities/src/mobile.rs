@@ -140,6 +140,32 @@ impl MobileRuntimeBuilder {
             .register_http_endpoint_catalog_tool(policy, metadata, catalog)
     }
 
+    /// Registers one setup-selected HTTPS endpoint catalog with a host-owned
+    /// secret resolver for the sealed profile.
+    ///
+    /// The resolver is consumed while the catalog is configured. Dynamic
+    /// Splash source can choose only the reviewed opaque endpoint identifier;
+    /// it cannot select or inspect a secret, header, URL, method, or redirect.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: crate::http_endpoint_catalog::HttpEndpointCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: crate::http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        self.runtime
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                policy,
+                metadata,
+                catalog,
+                secret_resolver,
+            )
+    }
+
     /// Registers one reviewed JSON adapter with executable input and output
     /// contracts.
     pub fn register_json_tool<F>(
@@ -288,7 +314,10 @@ mod tests {
 
     use super::*;
     #[cfg(feature = "http-endpoint-catalog")]
-    use crate::http_endpoint_catalog::{HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod};
+    use crate::http_endpoint_catalog::{
+        HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod, HttpEndpointSecret,
+        HttpEndpointSecretStore,
+    };
     use crate::{json, CapabilityCatalogLimits, ToolDataFormat, ToolDispatch};
 
     #[derive(serde::Deserialize)]
@@ -414,6 +443,50 @@ mod tests {
         let serialized = serde_json::to_string(&input_schema).expect("schema serializes");
         assert!(!serialized.contains("api.example.test"));
         assert!(!serialized.contains("/v1/status"));
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    #[test]
+    fn seals_an_endpoint_secret_resolver_without_exposing_credential_metadata() {
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog
+            .insert(
+                HttpEndpoint::https(
+                    "status",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/v1/status?fixed=true",
+                )
+                .expect("reviewed endpoint is valid")
+                .with_bearer_secret("release.auth")
+                .expect("credential binds only to HTTPS"),
+            )
+            .expect("endpoint is retained");
+        let mut secrets = HttpEndpointSecretStore::new();
+        secrets
+            .insert(
+                "release.auth",
+                HttpEndpointSecret::new("test-only-token-42").expect("test secret is valid"),
+            )
+            .expect("secret is retained during setup");
+
+        let mut builder = MobileRuntimeBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets one reviewed endpoint status."),
+                catalog,
+                secrets,
+            )
+            .expect("static endpoint adapter registers");
+        let runtime = builder.build();
+
+        let descriptor = runtime
+            .tool_catalog_json()
+            .expect("sealed catalog serializes for the host");
+        assert!(descriptor.contains("net.status"));
+        assert!(!descriptor.contains("release.auth"));
+        assert!(!descriptor.contains("test-only-token-42"));
+        assert!(!descriptor.contains("api.example.test"));
     }
 
     #[test]

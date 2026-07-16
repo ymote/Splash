@@ -61,7 +61,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - A feature-gated host-owned fixed HTTP endpoint catalog for reviewed JSON GET
   and POST calls addressed only by opaque IDs, with HTTPS by default, bounded
   request/response data, no proxy or redirect following, and no script-selected URL,
-  method, header, or query. It is API-level mediation, not egress containment.
+  method, header, query, or secret. A host can inject a resolved credential
+  only into one fixed HTTPS endpoint; this is API-level mediation, not egress
+  containment or a general secret API.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
   policies, checkpoints, and execution, including setup-only fixed-file and
@@ -477,7 +479,8 @@ define the host-managed async boundary.
 descriptor-pinned local text-file boundary.
 
 [Fixed HTTP endpoint catalogs](docs/http-endpoint-catalog.md) define the narrow
-host-selected outbound JSON boundary and its explicit non-guarantees.
+host-selected outbound JSON boundary, endpoint-bound credential injection, and
+their explicit non-guarantees.
 
 [Editor module-interface projection](docs/module-catalog.md) defines bounded
 static authoring metadata for host-defined `mod.*` interfaces.
