@@ -16,8 +16,9 @@ use std::num::NonZeroUsize;
 
 use serde::{de::DeserializeOwned, Serialize};
 use splash_capabilities::{
-    AuditLog, CapabilityCatalogLimits, CapabilityRuntime, JsonToolContract, JsonValue,
-    ToolDescriptor, ToolError, ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
+    fixed_file_catalog::FixedFileCatalog, AuditLog, CapabilityCatalogLimits, CapabilityRuntime,
+    JsonToolContract, JsonValue, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy,
+    ToolRegistrationError, ToolRequest,
 };
 use splash_core::{ExecutionLimits, RuntimeError};
 
@@ -127,6 +128,22 @@ impl MobileWorkflowBuilder {
     {
         self.runtime
             .register_tool_with_metadata(policy, metadata, handler)
+    }
+
+    /// Registers one bounded host-owned file catalog for the sealed workflow
+    /// catalog.
+    ///
+    /// The catalog is consumed during setup, so a workflow can request only
+    /// its reviewed opaque identifiers. It cannot add entries or select paths
+    /// after [`Self::build`] seals the local adapter catalog.
+    pub fn register_fixed_file_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: FixedFileCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .register_fixed_file_catalog_tool(policy, metadata, catalog)
     }
 
     /// Registers one reviewed JSON adapter with executable input and output
@@ -468,9 +485,15 @@ impl MobileWorkflowRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use splash_capabilities::{json, AuditOutcome, CapabilityLeaseGrant, ToolStreamPolicy};
+    use splash_capabilities::{
+        fixed_file_catalog::FixedFileCatalog, json, AuditOutcome, CapabilityLeaseGrant,
+        ToolStreamPolicy,
+    };
     use splash_core::DEFAULT_INSTRUCTION_LIMIT;
     use splash_schema::JsonSchema;
 
@@ -488,6 +511,34 @@ mod tests {
     #[derive(serde::Serialize)]
     struct AddOutput {
         total: i64,
+    }
+
+    static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestFile {
+        path: PathBuf,
+    }
+
+    impl TestFile {
+        fn new(label: &str, bytes: &[u8]) -> Self {
+            let sequence = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "splash-mobile-workflow-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::write(&path, bytes).expect("test file writes");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 
     fn add_contract() -> JsonToolContract {
@@ -697,6 +748,50 @@ mod tests {
             runtime.events().last(),
             Some(WorkflowEvent::Completed { plan_id }) if *plan_id == plan.id()
         ));
+    }
+
+    #[test]
+    fn seals_fixed_file_catalogs_behind_workflow_policy_approval() {
+        let file = TestFile::new("fixed-file", b"reviewed workflow data");
+        let mut catalog = FixedFileCatalog::default();
+        catalog
+            .insert_path("guide", file.path())
+            .expect("host file is registered during setup");
+
+        let mut builder = MobileWorkflowBuilder::new().expect("default limits are valid");
+        builder
+            .register_fixed_file_catalog_tool(
+                ToolPolicy::new("file.read"),
+                ToolMetadata::new("Reads one reviewed local document."),
+                catalog,
+            )
+            .expect("static fixed-file adapter registers");
+        let mut runtime = builder.build();
+        let plan = runtime
+            .plan(vec![WorkflowStep::new(
+                "read-guide",
+                "use mod.tool\n\
+                 use mod.std.assert\n\
+                 assert(tool.call(\"file.read\", \"guide\") == \"reviewed workflow data\")",
+            )])
+            .expect("trusted plan is valid");
+        let approval = runtime
+            .approve_with_step_capability_policies(
+                &plan,
+                vec![WorkflowStepCapabilityPolicy::new(
+                    "read-guide",
+                    [CapabilityLeaseGrant::new("file.read", 1)],
+                )],
+            )
+            .expect("fixed file read is explicitly approved");
+
+        runtime.execute(&plan, approval).expect("workflow succeeds");
+
+        assert_eq!(runtime.tool_catalog().len(), 1);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "file.read");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert!(!runtime.has_suspended_execution());
     }
 
     #[test]

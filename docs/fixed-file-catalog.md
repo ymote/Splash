@@ -97,7 +97,8 @@ mount policy, mediate executable paths, broker secrets, or create a network
 policy. An adapter that needs broader local effects still requires a
 platform-specific contained worker and a reviewed capability design.
 
-For mobile and embedded applications, pass the catalog to
-`mobile::MobileRuntimeBuilder::register_fixed_file_catalog_tool` before
-`build()`. The builder consumes it during setup, so dynamic source cannot
-change the catalog afterward.
+For mobile and embedded applications, pass the catalog to either
+`mobile::MobileRuntimeBuilder::register_fixed_file_catalog_tool` or
+`splash_workflow::mobile::MobileWorkflowBuilder::register_fixed_file_catalog_tool`
+before `build()`. Each builder consumes it during setup, so dynamic source or
+workflow steps cannot change the catalog afterward.

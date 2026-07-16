@@ -60,8 +60,8 @@ and keeps UI support optional rather than making UI the language boundary.
   by script-selected filesystem paths.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
-  policies, checkpoints, and execution without exposing mutable capability
-  registration.
+  policies, checkpoints, and execution, including setup-only fixed-file
+  catalog adapters, without exposing mutable capability registration.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
