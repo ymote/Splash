@@ -496,10 +496,16 @@ invoked.
 The in-process audit view retains only its configured recent entries (1,024 by
 default, 8,192 maximum) and exposes an eviction counter. It is deliberately
 bounded so a long-lived untrusted-script host cannot grow memory through
-observability alone. Hosts that need complete audit retention must export
-entries to a separate authenticated durable sink; a retained view, its
-sequence numbers, and its loss counter are not an authorization decision or
-durable record.
+observability alone. `audit_since(cursor)` exports only a contiguous retained
+range, ordered by a distinct per-record `event_sequence`; it rejects a cursor
+overtaken by eviction or `clear_audit` rather than silently returning a partial
+history. The older `sequence` field correlates one invocation and can repeat
+across retries, cancellation, or streaming, so it is not an export cursor.
+Hosts that need complete retention must export batches to a separate
+authenticated durable sink and surface an export gap. A retained view, its
+sequences, its loss counter, and a successful export are not an authorization
+decision, durable record, effect proof, or permission to resume a workflow.
+See [capability audit export](docs/capability-audits.md).
 
 `splash_workflow::durable_events::WorkflowEventStore` provides one bounded
 authenticated workflow-telemetry journal for host-owned operator/audit replay.

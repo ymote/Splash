@@ -1191,6 +1191,17 @@ pub enum AuditOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AuditEvent {
+    /// Source-local ordering sequence for this audit record.
+    ///
+    /// It begins at one for each capability runtime and never wraps. It is
+    /// distinct from [`Self::sequence`], which correlates multiple lifecycle
+    /// records for one capability invocation. This sequence is telemetry only;
+    /// it is not a capability grant, idempotency key, fencing token, or durable
+    /// operation identity.
+    pub event_sequence: u64,
+    /// Source-local sequence of the capability invocation that produced this
+    /// record. Retry, cancellation, and stream records for one invocation can
+    /// share this value.
     pub sequence: u64,
     /// Registered tool name, or a fixed-length digest label for an oversized
     /// or invalid unrecognized request name.
@@ -1201,6 +1212,105 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_class: Option<RetryClass>,
 }
+
+/// A contiguous source-local range of exported capability audit events.
+///
+/// Hosts persist a batch under a stable host-selected stream identity. The
+/// batch is telemetry only: it neither grants a capability nor proves an
+/// adapter effect, cancellation, or rollback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AuditEventBatch {
+    events: Vec<AuditEvent>,
+    next_event_sequence: u64,
+}
+
+impl AuditEventBatch {
+    /// Returns the ordered audit events in this exported range.
+    pub fn events(&self) -> &[AuditEvent] {
+        &self.events
+    }
+
+    /// Returns the first source event sequence in this batch, or the cursor
+    /// after the batch when it is empty.
+    pub fn first_event_sequence(&self) -> u64 {
+        self.events
+            .first()
+            .map(|event| event.event_sequence)
+            .unwrap_or(self.next_event_sequence)
+    }
+
+    /// Returns the source cursor immediately after this batch.
+    pub const fn next_event_sequence(&self) -> u64 {
+        self.next_event_sequence
+    }
+
+    /// Returns whether this batch contains no audit events.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn is_contiguous(&self) -> bool {
+        if self.next_event_sequence == 0 {
+            return false;
+        }
+        let Some(first) = self.events.first() else {
+            return true;
+        };
+        if first.event_sequence == 0 || first.event_sequence == u64::MAX {
+            return false;
+        }
+        let mut expected = first.event_sequence;
+        for event in &self.events {
+            if event.event_sequence != expected || event.event_sequence == u64::MAX {
+                return false;
+            }
+            let Some(next) = expected.checked_add(1) else {
+                return false;
+            };
+            expected = next;
+        }
+        expected == self.next_event_sequence
+    }
+}
+
+/// Rejection while exporting capability audit events after a host-maintained
+/// source cursor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditEventCursorError {
+    InvalidCursor,
+    Evicted {
+        requested: u64,
+        earliest_available: u64,
+    },
+    Ahead {
+        requested: u64,
+        next_available: u64,
+    },
+}
+
+impl Display for AuditEventCursorError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCursor => formatter.write_str("capability audit cursor is invalid"),
+            Self::Evicted {
+                requested,
+                earliest_available,
+            } => write!(
+                formatter,
+                "capability audit cursor {requested} was evicted; earliest available is {earliest_available}"
+            ),
+            Self::Ahead {
+                requested,
+                next_available,
+            } => write!(
+                formatter,
+                "capability audit cursor {requested} is ahead of the next available sequence {next_available}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuditEventCursorError {}
 
 /// Ordered, read-only view of the recent in-memory capability audit events.
 ///
@@ -1436,6 +1546,8 @@ pub struct CapabilityHost {
     audit: VecDeque<AuditEvent>,
     max_audit_events: NonZeroUsize,
     dropped_audit_events: u64,
+    first_audit_event_sequence: u64,
+    next_audit_event_sequence: u64,
     next_sequence: u64,
     next_pending_id: u64,
     pending: PendingTools,
@@ -1467,6 +1579,8 @@ impl CapabilityHost {
             max_audit_events: NonZeroUsize::new(DEFAULT_MAX_AUDIT_EVENTS)
                 .expect("default audit limit is nonzero"),
             dropped_audit_events: 0,
+            first_audit_event_sequence: 1,
+            next_audit_event_sequence: 1,
             next_sequence: 0,
             next_pending_id: 0,
             pending: Rc::new(RefCell::new(BTreeMap::new())),
@@ -1963,17 +2077,66 @@ impl CapabilityHost {
         }
     }
 
+    /// Exports retained capability audit telemetry after `next_event_sequence`
+    /// in source order.
+    ///
+    /// A host that persists audit telemetry should begin with cursor `1` and
+    /// retain [`AuditEventBatch::next_event_sequence`] only after its own sink
+    /// has accepted the batch. If in-memory eviction or [`Self::clear_audit`]
+    /// overtakes that cursor, this method fails rather than silently exporting
+    /// an incomplete history. Export remains observability only: it cannot
+    /// authorize a tool, recreate an external operation, or prove an effect.
+    pub fn audit_since(
+        &self,
+        next_event_sequence: u64,
+    ) -> Result<AuditEventBatch, AuditEventCursorError> {
+        if next_event_sequence == 0 {
+            return Err(AuditEventCursorError::InvalidCursor);
+        }
+        if next_event_sequence < self.first_audit_event_sequence {
+            return Err(AuditEventCursorError::Evicted {
+                requested: next_event_sequence,
+                earliest_available: self.first_audit_event_sequence,
+            });
+        }
+        if next_event_sequence > self.next_audit_event_sequence {
+            return Err(AuditEventCursorError::Ahead {
+                requested: next_event_sequence,
+                next_available: self.next_audit_event_sequence,
+            });
+        }
+
+        let skipped = usize::try_from(next_event_sequence - self.first_audit_event_sequence)
+            .map_err(|_| AuditEventCursorError::InvalidCursor)?;
+        let batch = AuditEventBatch {
+            events: self.audit.iter().skip(skipped).cloned().collect(),
+            next_event_sequence: self.next_audit_event_sequence,
+        };
+        debug_assert!(batch.is_contiguous());
+        Ok(batch)
+    }
+
     pub fn clear_audit(&mut self) {
         self.audit.clear();
         self.dropped_audit_events = 0;
+        self.first_audit_event_sequence = self.next_audit_event_sequence;
     }
 
-    fn record_audit(&mut self, event: AuditEvent) {
+    fn record_audit(&mut self, mut event: AuditEvent) {
+        // `u64::MAX` is a cursor-only sentinel. Preserve contiguous source
+        // identities by dropping later telemetry rather than wrapping.
+        if self.next_audit_event_sequence == u64::MAX {
+            self.dropped_audit_events = self.dropped_audit_events.saturating_add(1);
+            return;
+        }
+        event.event_sequence = self.next_audit_event_sequence;
         if self.audit.len() == self.max_audit_events.get() {
             self.audit.pop_front();
             self.dropped_audit_events = self.dropped_audit_events.saturating_add(1);
+            self.first_audit_event_sequence = self.first_audit_event_sequence.saturating_add(1);
         }
         self.audit.push_back(event);
+        self.next_audit_event_sequence = self.next_audit_event_sequence.saturating_add(1);
     }
 
     fn audit_tool_label(&self, name: &str) -> String {
@@ -1996,6 +2159,7 @@ impl CapabilityHost {
         while self.audit.len() > self.max_audit_events.get() {
             self.audit.pop_front();
             self.dropped_audit_events = self.dropped_audit_events.saturating_add(1);
+            self.first_audit_event_sequence = self.first_audit_event_sequence.saturating_add(1);
         }
     }
 
@@ -2333,6 +2497,7 @@ impl CapabilityHost {
             Err(ToolError::TimedOut(_)) => (0, AuditOutcome::TimedOut),
         };
         self.record_audit(AuditEvent {
+            event_sequence: 0,
             sequence: ticket.sequence,
             tool: self.audit_tool_label(&ticket.name),
             input_bytes: ticket.input_bytes,
@@ -2350,6 +2515,7 @@ impl CapabilityHost {
             ToolError::TimedOut(_) => AuditOutcome::TimedOut,
         };
         self.record_audit(AuditEvent {
+            event_sequence: 0,
             sequence,
             tool: self.audit_tool_label(name),
             input_bytes,
@@ -2361,6 +2527,7 @@ impl CapabilityHost {
 
     fn record_retry(&mut self, ticket: &ToolTicket, retry_class: RetryClass) {
         self.record_audit(AuditEvent {
+            event_sequence: 0,
             sequence: ticket.sequence,
             tool: self.audit_tool_label(&ticket.name),
             input_bytes: ticket.input_bytes,
@@ -2372,6 +2539,7 @@ impl CapabilityHost {
 
     fn record_cancellation_requested(&mut self, ticket: &ToolTicket) {
         self.record_audit(AuditEvent {
+            event_sequence: 0,
             sequence: ticket.sequence,
             tool: self.audit_tool_label(&ticket.name),
             input_bytes: ticket.input_bytes,
@@ -2389,6 +2557,7 @@ impl CapabilityHost {
         outcome: AuditOutcome,
     ) {
         self.record_audit(AuditEvent {
+            event_sequence: 0,
             sequence: ticket.sequence,
             tool: self.audit_tool_label(&ticket.name),
             input_bytes: source_bytes,
@@ -3544,6 +3713,20 @@ impl CapabilityRuntime {
         self.runtime.host().audit()
     }
 
+    /// Exports retained audit telemetry after a host-maintained source cursor.
+    ///
+    /// Start with cursor `1` and retain the returned
+    /// [`AuditEventBatch::next_event_sequence`] only after a host-owned sink
+    /// accepts the batch. A cursor overtaken by eviction fails rather than
+    /// silently returning a partial history. This does not create authority or
+    /// prove a capability effect.
+    pub fn audit_since(
+        &self,
+        next_event_sequence: u64,
+    ) -> Result<AuditEventBatch, AuditEventCursorError> {
+        self.runtime.host().audit_since(next_event_sequence)
+    }
+
     /// Returns the current in-memory audit capacity.
     pub fn max_audit_events(&self) -> usize {
         self.runtime.host().max_audit_events()
@@ -4637,6 +4820,8 @@ mod tests {
         assert_eq!(retried.idempotency_key, first.idempotency_key);
         assert!(runtime.claim_next_external_tool().is_none());
         assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].event_sequence, 1);
+        assert_eq!(runtime.audit()[0].sequence, 0);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::RetryScheduled);
         assert_eq!(runtime.audit()[0].retry_class, Some(RetryClass::Transient));
 
@@ -4647,8 +4832,29 @@ mod tests {
 
         assert!(resumed.completed(), "{:?}", resumed.diagnostics);
         assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[1].event_sequence, 2);
+        assert_eq!(runtime.audit()[1].sequence, 0);
         assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Allowed);
         assert_eq!(runtime.audit()[1].retry_class, None);
+
+        let batch = runtime.audit_since(1).unwrap();
+        assert_eq!(batch.next_event_sequence(), 3);
+        assert_eq!(
+            batch
+                .events()
+                .iter()
+                .map(|event| event.event_sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            batch
+                .events()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 0]
+        );
     }
 
     #[test]
@@ -6593,8 +6799,19 @@ mod tests {
             .set_max_audit_events(NonZeroUsize::new(1).unwrap())
             .unwrap();
         assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].event_sequence, 3);
         assert_eq!(runtime.audit()[0].sequence, 2);
         assert_eq!(runtime.dropped_audit_events(), 2);
+        assert_eq!(
+            runtime.audit_since(2).unwrap_err(),
+            AuditEventCursorError::Evicted {
+                requested: 2,
+                earliest_available: 3,
+            }
+        );
+        let batch = runtime.audit_since(3).unwrap();
+        assert_eq!(batch.events()[0].event_sequence, 3);
+        assert_eq!(batch.next_event_sequence(), 4);
 
         runtime.clear_audit();
         assert!(runtime.audit().is_empty());
@@ -6606,6 +6823,81 @@ mod tests {
                 .unwrap_err(),
             RuntimeError::InvalidLimits("max_audit_events exceeds the hard limit")
         );
+    }
+
+    #[test]
+    fn audit_export_uses_contiguous_cursors_and_rejects_evicted_history() {
+        let mut policy = ToolPolicy::new("text.echo");
+        policy.max_calls = 4;
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .set_max_audit_events(NonZeroUsize::new(2).unwrap())
+            .unwrap();
+        runtime
+            .register_tool(policy, |request| Ok(request.input.clone()))
+            .unwrap();
+
+        for input in ["one", "two", "three"] {
+            let source = format!("use mod.tool\ntool.call(\"text.echo\", \"{input}\")");
+            assert!(runtime.eval(&source).unwrap().completed());
+        }
+
+        assert_eq!(
+            runtime.audit_since(0).unwrap_err(),
+            AuditEventCursorError::InvalidCursor
+        );
+        assert_eq!(
+            runtime.audit_since(1).unwrap_err(),
+            AuditEventCursorError::Evicted {
+                requested: 1,
+                earliest_available: 2,
+            }
+        );
+        let batch = runtime.audit_since(2).unwrap();
+        assert_eq!(batch.first_event_sequence(), 2);
+        assert_eq!(batch.next_event_sequence(), 4);
+        assert_eq!(
+            batch
+                .events()
+                .iter()
+                .map(|event| event.event_sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            batch
+                .events()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(runtime.audit_since(4).unwrap().is_empty());
+        assert_eq!(
+            runtime.audit_since(5).unwrap_err(),
+            AuditEventCursorError::Ahead {
+                requested: 5,
+                next_available: 4,
+            }
+        );
+
+        runtime.clear_audit();
+        assert_eq!(
+            runtime.audit_since(3).unwrap_err(),
+            AuditEventCursorError::Evicted {
+                requested: 3,
+                earliest_available: 4,
+            }
+        );
+        assert!(runtime.audit_since(4).unwrap().is_empty());
+
+        assert!(runtime
+            .eval("use mod.tool\ntool.call(\"text.echo\", \"four\")")
+            .unwrap()
+            .completed());
+        let resumed = runtime.audit_since(4).unwrap();
+        assert_eq!(resumed.events()[0].event_sequence, 4);
+        assert_eq!(resumed.next_event_sequence(), 5);
     }
 
     #[test]

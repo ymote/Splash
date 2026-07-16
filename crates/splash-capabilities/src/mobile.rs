@@ -289,6 +289,18 @@ impl MobileRuntime {
         self.runtime.audit()
     }
 
+    /// Exports retained audit telemetry after a host-maintained source cursor.
+    ///
+    /// A cursor overtaken by the sealed runtime's bounded audit retention
+    /// returns an error instead of a partial history. Export is host-only
+    /// observability and does not alter catalog authority.
+    pub fn audit_since(
+        &self,
+        next_event_sequence: u64,
+    ) -> Result<crate::AuditEventBatch, crate::AuditEventCursorError> {
+        self.runtime.audit_since(next_event_sequence)
+    }
+
     /// Returns the fixed in-memory audit capacity selected during setup.
     pub fn max_audit_events(&self) -> usize {
         self.runtime.max_audit_events()
@@ -631,6 +643,33 @@ mod tests {
         assert_eq!(runtime.catalog_limits(), catalog_limits);
         assert_eq!(runtime.max_audit_events(), 1);
         assert_eq!(runtime.tool_catalog().len(), 1);
+    }
+
+    #[test]
+    fn exports_contiguous_audit_telemetry_after_sealing() {
+        let mut builder = MobileRuntimeBuilder::new()
+            .expect("default limits are valid")
+            .with_max_audit_events(NonZeroUsize::new(2).unwrap())
+            .expect("audit limit is valid");
+        builder
+            .register_text_tool(
+                ToolPolicy::new("text.echo"),
+                ToolMetadata::new("Returns reviewed local text."),
+                |request| Ok(request.input.clone()),
+            )
+            .expect("static adapter registers");
+        let mut runtime = builder.build();
+
+        assert!(runtime
+            .eval("use mod.tool\ntool.call(\"text.echo\", \"ready\")")
+            .expect("canonical source evaluates")
+            .completed());
+
+        let batch = runtime.audit_since(1).expect("retained audit exports");
+        assert_eq!(batch.first_event_sequence(), 1);
+        assert_eq!(batch.next_event_sequence(), 2);
+        assert_eq!(batch.events()[0].tool, "text.echo");
+        assert!(runtime.audit_since(2).unwrap().is_empty());
     }
 
     #[test]

@@ -16,9 +16,9 @@ use std::num::NonZeroUsize;
 
 use serde::{de::DeserializeOwned, Serialize};
 use splash_capabilities::{
-    fixed_file_catalog::FixedFileCatalog, AuditLog, CapabilityCatalogLimits, CapabilityRuntime,
-    JsonToolContract, JsonValue, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy,
-    ToolRegistrationError, ToolRequest,
+    fixed_file_catalog::FixedFileCatalog, AuditEventBatch, AuditEventCursorError, AuditLog,
+    CapabilityCatalogLimits, CapabilityRuntime, JsonToolContract, JsonValue, ToolDescriptor,
+    ToolError, ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
 };
 use splash_core::{ExecutionLimits, RuntimeError};
 
@@ -300,6 +300,16 @@ impl MobileWorkflowRuntime {
     /// Returns the bounded capability-audit view.
     pub fn audit(&self) -> AuditLog<'_> {
         self.engine.runtime().audit()
+    }
+
+    /// Exports retained capability audit telemetry after a host-maintained
+    /// source cursor. A retention gap fails closed for observability instead of
+    /// silently returning a partial capability history.
+    pub fn audit_since(
+        &self,
+        next_event_sequence: u64,
+    ) -> Result<AuditEventBatch, AuditEventCursorError> {
+        self.engine.runtime().audit_since(next_event_sequence)
     }
 
     /// Returns the number of capability-audit events evicted from memory.
@@ -752,6 +762,11 @@ mod tests {
             splash_capabilities::ToolDispatch::HostPump
         );
         assert_eq!(runtime.audit().len(), 1);
+        let audit = runtime.audit_since(1).expect("retained audit exports");
+        assert_eq!(audit.first_event_sequence(), 1);
+        assert_eq!(audit.next_event_sequence(), 2);
+        assert_eq!(audit.events()[0].tool, "math.add");
+        assert!(runtime.audit_since(2).unwrap().is_empty());
         assert!(matches!(
             runtime.events().last(),
             Some(WorkflowEvent::Completed { plan_id }) if *plan_id == plan.id()

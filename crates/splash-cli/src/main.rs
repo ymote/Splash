@@ -182,8 +182,13 @@ fn run_options(options: CliOptions) -> Result<(), String> {
     }
     for event in runtime.audit() {
         println!(
-            "tool sequence={} name={} outcome={:?} input_bytes={} output_bytes={}",
-            event.sequence, event.tool, event.outcome, event.input_bytes, event.output_bytes
+            "tool event_sequence={} sequence={} name={} outcome={:?} input_bytes={} output_bytes={}",
+            event.event_sequence,
+            event.sequence,
+            event.tool,
+            event.outcome,
+            event.input_bytes,
+            event.output_bytes
         );
     }
 
@@ -476,6 +481,7 @@ fn workflow_execution_output_with_input(
         .iter()
         .map(|event| {
             json!({
+                "event_sequence": event.event_sequence,
                 "sequence": event.sequence,
                 "tool": event.tool,
                 "input_bytes": event.input_bytes,
@@ -1800,6 +1806,8 @@ mod tests {
         assert_eq!(output["audit"].as_array().map(Vec::len), Some(2));
         assert_eq!(output["audit"][0]["tool"], json!("text.echo"));
         assert_eq!(output["audit"][1]["tool"], json!("math.add"));
+        assert_eq!(output["audit"][0]["event_sequence"], json!(1));
+        assert_eq!(output["audit"][1]["event_sequence"], json!(2));
         assert_eq!(output["audit"][0]["outcome"], json!("allowed"));
         assert_eq!(output["audit"][1]["outcome"], json!("allowed"));
     }

@@ -43,7 +43,7 @@
   binding, host-owned input/per-step output schema contracts, context and
   contract digest-only checkpoints, and a sealed mobile/embedded facade.
 - Deny-by-default, audited string-tool bridge with a bounded in-memory audit
-  view and explicit eviction count.
+  view, contiguous cursor-safe host export, and explicit eviction count.
 - Bounded, host-pumped deferred tool promises.
 - Bounded host-owned fixed-file catalog capability for descriptor-pinned,
   regular UTF-8 text files selected at setup and addressed only by opaque IDs;
