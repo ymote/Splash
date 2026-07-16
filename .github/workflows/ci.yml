@@ -42,11 +42,11 @@ jobs:
       - run: RUSTFLAGS='--cfg fuzzing' cargo +nightly check --locked --manifest-path fuzz/Cargo.toml
       - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none syntax --
-          -runs=128 -max_len=16384 -dict=dictionaries/syntax.dict
+          -runs=128 -max_len=16384 -dict=${{ github.workspace }}/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
       - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none execution --
-          -runs=128 -max_len=8192 -dict=dictionaries/syntax.dict
+          -runs=128 -max_len=8192 -dict=${{ github.workspace }}/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
       - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none workflow_draft --
