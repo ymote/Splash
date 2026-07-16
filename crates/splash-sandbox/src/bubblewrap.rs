@@ -5054,6 +5054,58 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires a runner that can configure Bubblewrap's isolated loopback device"]
+    fn descriptor_pinned_executables_survive_host_path_replacement_after_compile() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new();
+        let original_bwrap = fs::canonicalize("/usr/bin/bwrap").unwrap();
+        let bwrap = root.path().join("bwrap");
+        fs::copy(original_bwrap, &bwrap).unwrap();
+        let mut bwrap_permissions = fs::metadata(&bwrap).unwrap().permissions();
+        bwrap_permissions.set_mode(0o755);
+        fs::set_permissions(&bwrap, bwrap_permissions).unwrap();
+
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let worker = runtime.join("worker");
+        create_script_executable(&worker, "#!/usr/bin/python3\nprint('compiled-worker')\n");
+
+        let mut policy = BubblewrapWorkerPolicy::new(&bwrap, "/opt/splash/worker").unwrap();
+        policy.add_runtime_mount(ReadOnlyMount::new(&runtime, "/opt/splash").unwrap());
+        policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
+        add_linux_runtime_library_mounts(&mut policy);
+        policy.pin_mount_sources();
+        policy.pin_executable_sources();
+        let plan = policy.compile(&manifest([])).unwrap();
+
+        fs::rename(&bwrap, root.path().join("bwrap-retired")).unwrap();
+        create_script_executable(&bwrap, "#!/bin/sh\nexit 99\n");
+        fs::rename(&worker, runtime.join("worker-retired")).unwrap();
+        create_script_executable(&worker, "#!/usr/bin/python3\nprint('replacement-worker')\n");
+
+        let (worker, mut standard_error) = plan.spawn_capturing_stderr().unwrap();
+        let (mut child, stdin, mut stdout) = worker.into_parts();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        let mut standard_error_output = String::new();
+        standard_error
+            .read_to_string(&mut standard_error_output)
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "worker failed: {status}; stdout: {output:?}; stderr: {standard_error_output:?}"
+        );
+        assert_eq!(output, "compiled-worker\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a runner that can configure Bubblewrap's isolated loopback device"]
     fn descriptor_pinned_file_root_survives_host_path_replacement_after_compile() {
         use std::io::Read;
 
