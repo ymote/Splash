@@ -183,16 +183,22 @@ producer grammar rather than an inherited parser superset.
 
 The VM remains the execution engine, but `Runtime::eval` and
 `CapabilityRuntime::eval` now enforce this profile before evaluation. The
-explicit `Runtime::eval_vm_compatibility` escape hatch deliberately opts a
-trusted host into the inherited Makepad syntax; that method must not receive
-LLM-generated or otherwise untrusted source. A profile rejection returns before
-the inherited tokenizer or parser sees the source. The development CLI also
-performs this preflight automatically for `eval` and `run`.
+explicit `check_vm_compatibility` and `check_vm_compatibility_named` APIs let a
+trusted migration or UI host inspect inherited Makepad syntax with source and
+VM-token bounds but without evaluating it. `Runtime::eval_vm_compatibility`
+uses that same preflight before it evaluates. These compatibility APIs must not
+receive LLM-generated or otherwise untrusted source, and they do not resolve
+imports, install modules, or grant authority. They also reject Makepad
+`@(index)` host-value tokens because standalone Splash has no host value table;
+reviewed capability adapters are the Rust integration boundary. A canonical
+profile rejection returns before the inherited tokenizer or parser sees the
+source. The development CLI performs canonical preflight automatically for
+`eval` and `run`.
 
 The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
-fixture is parsed directly by the vendored Makepad parser to catch compatibility
-drift, but it remains outside this grammar and cannot run through `splash-cli`.
-It requires a Makepad UI host that supplies widget modules and `ui`; see
+fixture passes the bounded compatibility preflight to catch parser drift, but
+it remains outside this grammar and cannot run through `splash-cli`. It
+requires a Makepad UI host that supplies widget modules and `ui`; see
 [Makepad UI compatibility](makepad-ui-compatibility.md).
 
 ## Canonical Workflow Source

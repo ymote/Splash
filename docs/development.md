@@ -83,11 +83,14 @@ Splash source cap.
 
 The standalone `fuzz` package has six bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser with a 16 KiB source
-cap and a 2,048-token cap. It asserts that every source accepted by the
-canonical preflight is also accepted by the VM parser, and that successful
-canonical formatting stays accepted and idempotent. It also checks that every
-accepted source's top-level declaration outline has ordered, non-overlapping,
-UTF-8-boundary-safe spans that contain the exact declared identifier.
+cap and a 2,048-token cap. It also sends every bounded UTF-8 input through the
+broader VM-compatibility preflight, so inherited parser paths remain covered
+even when canonical validation rejects the source. It asserts that every source
+accepted by the canonical preflight is also accepted by the VM parser, and that
+successful canonical formatting stays accepted and idempotent. It also checks
+that every accepted source's top-level declaration outline has ordered,
+non-overlapping, UTF-8-boundary-safe spans that contain the exact declared
+identifier.
 The same target validates the direct tool-call hint outline: its retained count
 must not exceed the fixed cap, its spans must be ordered UTF-8 boundaries
 within the source, and any decoded literal name must correspond to a direct

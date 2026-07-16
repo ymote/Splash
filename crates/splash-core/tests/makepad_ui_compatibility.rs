@@ -1,26 +1,17 @@
-use splash_core::{
-    check_syntax,
-    vm::{self, parser::ScriptParser, tokenizer::ScriptTokenizer},
-};
+use splash_core::{check_syntax, check_vm_compatibility_named, ExecutionLimits};
 
 const MAKEPAD_UI_COUNTER: &str = include_str!("../../../examples/makepad_ui_counter.splash");
 
 #[test]
-fn makepad_ui_counter_is_accepted_by_the_vendored_vm_parser() {
-    let mut base = vm::ScriptVmBase::new();
-    let mut tokenizer = ScriptTokenizer::default();
-    tokenizer.tokenize(&format!("{MAKEPAD_UI_COUNTER}\n;"), &mut base.heap);
-
-    let mut parser = ScriptParser::default();
-    parser.set_emit_errors(false);
-    parser.parse(
-        &tokenizer,
+fn makepad_ui_counter_is_accepted_by_the_bounded_vm_compatibility_check() {
+    let report = check_vm_compatibility_named(
         "examples/makepad_ui_counter.splash",
-        (0, 0),
-        &[],
-    );
+        MAKEPAD_UI_COUNTER,
+        ExecutionLimits::default(),
+    )
+    .unwrap();
 
-    assert!(!parser.had_error, "{:?}", parser.diagnostics);
+    assert!(report.valid, "{:?}", report.diagnostics);
 }
 
 #[test]

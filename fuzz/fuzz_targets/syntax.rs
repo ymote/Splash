@@ -2,11 +2,12 @@
 
 use libfuzzer_sys::fuzz_target;
 use splash_core::{
-    check_syntax_named, format_source_named, fuzzing, is_canonical_identifier,
-    lexical_completion_report_named, lexical_symbol_report_named, tool_call_hint_report_named,
-    top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
-    RuntimeError, ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
-    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_TOOL_CALL_HINTS,
+    check_syntax_named, check_vm_compatibility_named, format_source_named, fuzzing,
+    is_canonical_identifier, lexical_completion_report_named, lexical_symbol_report_named,
+    tool_call_hint_report_named, top_level_declarations_named, ExecutionLimits,
+    LexicalCompletionReport, LexicalSymbol, RuntimeError, ToolCallHint, TopLevelDeclaration,
+    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -29,11 +30,19 @@ fuzz_target!(|data: &[u8]| {
         .expect("the fuzz limits are always valid for canonical preflight");
     let full = check_syntax_named("fuzz.splash", source, limits)
         .expect("the fuzz limits are always valid for full syntax checking");
+    let compatibility = check_vm_compatibility_named("fuzz.splash", source, limits)
+        .expect("the fuzz limits are always valid for VM compatibility checking");
+    assert!(compatibility.diagnostics.len() <= MAX_SYNTAX_DIAGNOSTICS);
     let completion_report = lexical_completion_report_named("fuzz.splash", source, limits)
         .expect("the fuzz limits are always valid for bounded completion metadata");
     assert_completion_invariants(source, &completion_report);
 
     if profile.valid {
+        assert!(
+            compatibility.valid,
+            "canonical profile accepted source that the VM compatibility preflight rejected: {source:?}\n{:?}",
+            compatibility.diagnostics
+        );
         assert!(
             full.valid,
             "canonical profile accepted source that the VM parser rejected: {source:?}\n{:?}",

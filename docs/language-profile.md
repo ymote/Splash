@@ -120,10 +120,15 @@ The draft contains no grant or approval and must still pass a separate trusted
 host policy decision; see [Workflow drafts](workflow-drafts.md).
 
 `Runtime::eval` and `CapabilityRuntime::eval` enforce the same profile before
-execution. `Runtime::eval_vm_compatibility` is an explicit trusted-host escape
-hatch for Makepad migration code; do not expose it to generated source or a
-capability host. `WorkflowEngine` preserves a preflight failure as a
-step-scoped `WorkflowError::StepRejected` with the structured syntax report.
+execution. `check_vm_compatibility` and its named variant are bounded,
+effect-free inherited-parser checks for trusted Makepad migration or UI-host
+code; they do not resolve imports, install modules, or grant authority.
+`Runtime::eval_vm_compatibility` runs that check before it evaluates, but none
+of these compatibility APIs may be exposed to generated source or a capability
+host. The standalone compatibility path rejects Makepad `@(index)` host-value
+tokens; Rust values enter Splash only through reviewed host adapters.
+`WorkflowEngine` preserves a preflight failure as a step-scoped
+`WorkflowError::StepRejected` with the structured syntax report.
 Its retained event records only the diagnostic count, truncation flag, and
 completed-prefix count so long-lived workflow telemetry does not cache source
 diagnostic text.

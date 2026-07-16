@@ -21,18 +21,21 @@ closures that update a host-provided `ui` handle.
 
 ## What This Verifies
 
-`makepad_ui_compatibility.rs` parses the fixture with the vendored
-`makepad-script` parser. It also asserts that normal `splash_core::check_syntax`
-rejects it. That is intentional: the canonical v0.2 language is the narrow,
-bounded workflow contract used by `splash-cli`, the capability runtime, and the
-language server.
+`makepad_ui_compatibility.rs` accepts the fixture through
+`splash_core::check_vm_compatibility_named`, which applies the vendored parser
+under explicit source and VM-token bounds without evaluating it. It also asserts
+that normal `splash_core::check_syntax` rejects the fixture. That is
+intentional: the canonical v0.2 language is the narrow, bounded workflow
+contract used by `splash-cli`, the capability runtime, and the language server.
 
 The fixture is not a promise that this repository implements a Makepad UI
 runtime. It does not execute through `splash-cli`, render widgets, install
 `mod.prelude.widgets`, inject `ui`, or provide Makepad event-loop semantics.
 Use it only with a Makepad UI host that supplies those bindings. The fixture
 also is not an assertion of compatibility with every upstream Splash feature;
-the vendored VM is intentionally smaller than a full Makepad checkout.
+the vendored VM is intentionally smaller than a full Makepad checkout. In
+particular, the standalone compatibility check rejects Makepad `@(index)`
+host-value tokens because it does not accept a host value table.
 
 ## Boundary
 

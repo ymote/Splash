@@ -564,6 +564,18 @@ impl<H: Any, S: Any> Runtime<H, S> {
         check_syntax_named("inline.splash", source, self.limits)
     }
 
+    /// Validates the vendored Makepad parser's broader compatibility syntax
+    /// without executing bytecode or entering a host binding.
+    ///
+    /// This accepts syntax outside the portable Splash v0.2 profile and is
+    /// intended only for trusted migration or UI-host integration code. It
+    /// applies the configured source and inherited-VM token bounds, but it
+    /// does not resolve modules, prove host bindings exist, or grant authority.
+    /// Normal generated source must use [`Self::check_syntax`].
+    pub fn check_vm_compatibility(&self, source: &str) -> Result<SyntaxReport, RuntimeError> {
+        check_vm_compatibility_named("inline.splash", source, self.limits)
+    }
+
     /// Formats canonical Splash source without evaluating it or entering any
     /// host binding.
     ///
@@ -618,17 +630,25 @@ impl<H: Any, S: Any> Runtime<H, S> {
         if !report.valid {
             return Err(RuntimeError::SyntaxRejected(report));
         }
-        self.eval_vm_compatibility(source)
+        self.eval_preflighted(source)
     }
 
     /// Evaluates the vendored Makepad parser's broader compatibility syntax.
     ///
     /// This bypasses Splash's portable grammar contract and must not receive
     /// LLM-generated or otherwise untrusted source. Prefer [`Self::eval`] for
-    /// all normal Splash execution.
+    /// all normal Splash execution. It still applies the bounded, effect-free
+    /// [`Self::check_vm_compatibility`] preflight before it evaluates code.
     pub fn eval_vm_compatibility(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
-        validate_source_length(source, self.limits)?;
+        let report = self.check_vm_compatibility(source)?;
+        if !report.valid {
+            return Err(RuntimeError::SyntaxRejected(report));
+        }
 
+        self.eval_preflighted(source)
+    }
+
+    fn eval_preflighted(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
         let limits = self.limits;
         self.with_vm(|vm| {
             if has_paused_thread(vm) {
@@ -694,6 +714,18 @@ impl<H: Any, S: Any> Runtime<H, S> {
 /// executing it.
 pub fn check_syntax(source: &str) -> Result<SyntaxReport, RuntimeError> {
     check_syntax_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Validates inherited Makepad compatibility syntax with default bounds,
+/// without executing it.
+///
+/// This is deliberately distinct from [`check_syntax`]: it accepts the
+/// broader vendored parser language, including constructs that canonical
+/// Splash rejects. It does not resolve imports or establish that a host has
+/// installed the referenced module. Use it only for trusted migration or UI
+/// host integration tooling, never as LLM-source admission.
+pub fn check_vm_compatibility(source: &str) -> Result<SyntaxReport, RuntimeError> {
+    check_vm_compatibility_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Returns whether `name` is exactly one non-reserved canonical Splash
@@ -802,18 +834,96 @@ pub fn check_syntax_named(
         return Ok(profile);
     }
 
-    let mut diagnostics = Vec::new();
-    let mut diagnostics_truncated = false;
-
     let mut base = vm::ScriptVmBase::new();
     let mut tokenizer = ScriptTokenizer::default();
     tokenizer.tokenize(&format!("{source}\n;"), &mut base.heap);
+    Ok(parse_vm_syntax(file, &tokenizer))
+}
+
+/// Validates named inherited Makepad compatibility syntax without executing
+/// bytecode or entering a host binding.
+///
+/// Unlike [`check_syntax_named`], this does not apply the canonical Splash
+/// grammar. It bounds source bytes and source tokens from the inherited VM
+/// tokenizer before handing the token stream to the vendored parser. `file`
+/// appears only in parser diagnostics. It never resolves imports, installs a
+/// module, invokes a tool, or evaluates source. Makepad `@(index)` values are
+/// rejected because this standalone API does not accept a host value table.
+///
+/// This is a trusted-host migration and UI-integration utility. It must not
+/// replace canonical syntax admission for LLM-generated or otherwise
+/// untrusted source.
+pub fn check_vm_compatibility_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<SyntaxReport, RuntimeError> {
+    let limits = limits.validate()?;
+    validate_source_length(source, limits)?;
+
+    let mut base = vm::ScriptVmBase::new();
+    let mut tokenizer = ScriptTokenizer::default();
+    if !tokenize_vm_source_bounded(
+        &mut tokenizer,
+        source,
+        &mut base.heap,
+        limits.max_syntax_tokens,
+    ) {
+        return Ok(vm_token_limit_report(&tokenizer, limits.max_syntax_tokens));
+    }
+
+    Ok(parse_vm_syntax(file, &tokenizer))
+}
+
+/// Tokenizes source with the same terminal marker that the embedded VM sees.
+/// Tokenization stops as soon as the accumulated source token stream crosses
+/// the caller's configured limit. The terminal marker is excluded from that
+/// limit, so it measures only caller-provided source.
+fn tokenize_vm_source_bounded(
+    tokenizer: &mut ScriptTokenizer,
+    source: &str,
+    heap: &mut vm::ScriptHeap,
+    maximum_source_tokens: usize,
+) -> bool {
+    for character in source.chars().chain(std::iter::once('\n')) {
+        let mut encoded = [0_u8; 4];
+        tokenizer.tokenize(character.encode_utf8(&mut encoded), heap);
+        if tokenizer.tokens.len() > maximum_source_tokens {
+            return false;
+        }
+    }
+
+    tokenizer.tokenize(";", heap);
+    true
+}
+
+fn vm_token_limit_report(
+    tokenizer: &ScriptTokenizer,
+    maximum_source_tokens: usize,
+) -> SyntaxReport {
+    let (line, column) = token_location(tokenizer, maximum_source_tokens);
+    SyntaxReport {
+        valid: false,
+        diagnostics: vec![SyntaxDiagnostic {
+            line,
+            column,
+            message: format!(
+                "VM compatibility token count exceeds the maximum of {maximum_source_tokens}"
+            ),
+        }],
+        diagnostics_truncated: false,
+    }
+}
+
+fn parse_vm_syntax(file: &str, tokenizer: &ScriptTokenizer) -> SyntaxReport {
+    let mut diagnostics = Vec::new();
+    let mut diagnostics_truncated = false;
+
     let mut parser = ScriptParser::default();
     parser.set_emit_errors(false);
-    parser.parse(&tokenizer, file, (0, 0), &[]);
+    parser.parse(tokenizer, file, (0, 0), &[]);
 
-    let (delimiter_diagnostics, delimiter_diagnostics_truncated) =
-        delimiter_diagnostics(&tokenizer);
+    let (delimiter_diagnostics, delimiter_diagnostics_truncated) = delimiter_diagnostics(tokenizer);
     for diagnostic in delimiter_diagnostics {
         push_syntax_diagnostic(&mut diagnostics, &mut diagnostics_truncated, diagnostic);
     }
@@ -831,11 +941,11 @@ pub fn check_syntax_named(
     }
     diagnostics_truncated |= parser.diagnostics_truncated;
 
-    Ok(SyntaxReport {
+    SyntaxReport {
         valid: !parser.had_error && diagnostics.is_empty(),
         diagnostics,
         diagnostics_truncated,
-    })
+    }
 }
 
 /// Lists top-level declarations in named canonical source without evaluating
@@ -2140,6 +2250,73 @@ mod tests {
 
         assert!(report.valid, "{:?}", report.diagnostics);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn checks_vm_compatibility_without_executing_source() {
+        let report = check_vm_compatibility("var value = 42\nloop {}").unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn vm_compatibility_preflight_handles_unicode_identifiers() {
+        let report = check_vm_compatibility_named(
+            "legacy.splash",
+            "var \u{540d}\u{79f0} = 42",
+            ExecutionLimits::default(),
+        )
+        .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn vm_compatibility_preflight_rejects_unavailable_rust_values() {
+        let report =
+            check_vm_compatibility_named("legacy.splash", "@(+", ExecutionLimits::default())
+                .unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("Rust value index 0 is unavailable")));
+    }
+
+    #[test]
+    fn vm_compatibility_preflight_accepts_legacy_source_at_the_exact_token_limit() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 4,
+            ..ExecutionLimits::default()
+        };
+        let report =
+            check_vm_compatibility_named("legacy.splash", "var value = 42", limits).unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn vm_compatibility_preflight_rejects_excess_tokens_before_evaluation() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 3,
+            ..ExecutionLimits::default()
+        };
+        let report =
+            check_vm_compatibility_named("legacy.splash", "var value = 42", limits).unwrap();
+
+        assert!(!report.valid);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert!(report.diagnostics[0]
+            .message
+            .contains("VM compatibility token count exceeds the maximum of 3"));
+
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+        assert!(matches!(
+            runtime.eval_vm_compatibility("var value = 42"),
+            Err(RuntimeError::SyntaxRejected(rejected))
+                if rejected == report
+        ));
     }
 
     #[test]

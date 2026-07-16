@@ -3261,7 +3261,12 @@ impl ScriptParser {
                     return 0;
                 }
                 if let Some(index) = tok.as_rust_value() {
-                    self.push_code(values[index as usize], self.index);
+                    let Some(value) = values.get(index as usize).copied() else {
+                        error!(self, tokenizer, "Rust value index {index} is unavailable");
+                        self.state.push(State::EndExpr);
+                        return 1;
+                    };
+                    self.push_code(value, self.index);
                     self.state.push(State::EndExpr);
                     return 1;
                 }

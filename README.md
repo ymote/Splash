@@ -222,7 +222,9 @@ cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.spla
 small current-style Makepad UI body retained as a parser compatibility fixture.
 It is deliberately not runnable through `splash-cli`: the standalone runtime
 does not install Makepad widget modules, an event loop, or the `ui` handle.
-The canonical workflow profile continues to reject it. See
+The canonical workflow profile continues to reject it; trusted UI hosts can
+use the bounded `splash_core::check_vm_compatibility_named` preflight before
+they install their own bindings. See
 [Makepad UI compatibility](docs/makepad-ui-compatibility.md) for the current
 upstream example distinction and the exact boundary.
 
