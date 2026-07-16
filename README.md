@@ -13,6 +13,8 @@ and keeps UI support optional rather than making UI the language boundary.
   spellings while normalizing valid Splash source for LLM and editor workflows.
 - A bounded, grammar-aware lexical symbol index for imports, functions, local
   bindings, parameters, and loop bindings without evaluating source.
+- Bounded same-document lexical completion at expression identifiers, with
+  scope-aware candidates and exact-token replacement edits.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -26,8 +28,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A host-only stdio language server that publishes canonical syntax diagnostics,
   full-document formatting edits, top-level declaration symbols, and
   same-document lexical definitions, references, binding-kind hover, and symbol
-  highlights plus version-bound guarded rename without reading files or
-  evaluating code.
+  highlights, lexical completion, and version-bound guarded rename without
+  reading files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -326,15 +328,25 @@ It accepts only client-provided open-document text, retains at most 128
 document states and no document text above the standard 256 KiB source cap,
 and provides full-sync diagnostics, whole-document formatting, and top-level
 declaration symbols plus bounded same-document lexical definition/reference
-requests, binding-kind hover, symbol highlights, and guarded rename. Rename is
-advertised only when the client supports versioned `documentChanges`; every
-edit is bound to the exact open-document version. It rejects truncated indexes,
-import path changes, invalid identifiers, and rewrites that change the complete
-indexed lexical binding report. It never reads a document URI, evaluates
-source, resolves an imported module, creates a capability host, or loads a Rust
-adapter. The lexical index is conservative: it does not infer forward
-references, types, record keys, or member fields. A truncated 4,096-occurrence
-index can still serve retained, sound definitions and hover, but exhaustive
+requests, binding-kind hover, symbol highlights, lexical completion, and
+guarded rename. Completion is offered only while the cursor is within or at the
+end of an expression-position identifier. It returns the complete retained set
+of bindings visible at that token, lets the client filter it, and supplies an
+exact replacement edit for the identifier. Invalid source is eligible only at
+a site ending before the first syntax diagnostic. Candidate occurrences and
+completion sites have independent 4,096-entry bounds; either truncation marks
+the LSP result incomplete. A truncated site list can still serve a retained
+site, but a truncated symbol set returns no candidates because an omitted inner
+definition could shadow a retained outer binding. Rename is advertised only
+when the client supports
+versioned `documentChanges`; every edit is bound to the exact open-document
+version. It rejects truncated indexes, import path changes, invalid identifiers,
+and rewrites that change the complete indexed lexical binding report. It never
+reads a document URI, evaluates source, resolves an imported module, creates a
+capability host, or loads a Rust adapter. The lexical service is conservative:
+it does not infer forward references, types, record keys, member fields,
+builtins, tool catalogs, or imported-module exports. A truncated lexical index
+can still serve retained, sound definitions and hover, but exhaustive
 reference, highlight, and rename requests fail instead of returning a partial
 set.
 
@@ -367,7 +379,8 @@ set.
 - `splash-cli`: local development CLI.
 - `splash-lsp`: host-only stdio diagnostics, canonical formatting, top-level
   declaration symbols, and bounded same-document lexical navigation, hover, and
-  highlights plus version-bound guarded rename for open editor documents.
+  highlights plus lexical completion and version-bound guarded rename for open
+  editor documents.
 - `vendor/makepad`: provenance-preserving compatibility import.
 
 See [SECURITY.md](SECURITY.md) for the current threat model and [UPSTREAM.md](UPSTREAM.md)

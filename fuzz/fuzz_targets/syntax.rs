@@ -2,10 +2,11 @@
 
 use libfuzzer_sys::fuzz_target;
 use splash_core::{
-    check_syntax_named, format_source_named, fuzzing, lexical_symbol_report_named,
-    tool_call_hint_report_named, top_level_declarations_named, ExecutionLimits, LexicalSymbol,
+    check_syntax_named, format_source_named, fuzzing, is_canonical_identifier,
+    lexical_completion_report_named, lexical_symbol_report_named, tool_call_hint_report_named,
+    top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
     RuntimeError, ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_TOOL_CALL_HINTS,
+    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -28,6 +29,9 @@ fuzz_target!(|data: &[u8]| {
         .expect("the fuzz limits are always valid for canonical preflight");
     let full = check_syntax_named("fuzz.splash", source, limits)
         .expect("the fuzz limits are always valid for full syntax checking");
+    let completion_report = lexical_completion_report_named("fuzz.splash", source, limits)
+        .expect("the fuzz limits are always valid for bounded completion metadata");
+    assert_completion_invariants(source, &completion_report);
 
     if profile.valid {
         assert!(
@@ -61,6 +65,12 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(lexical_occurrences, MAX_LEXICAL_SYMBOL_OCCURRENCES);
         }
         assert_lexical_symbol_invariants(source, &lexical_report.symbols);
+        assert_eq!(completion_report.symbols, lexical_report.symbols);
+        assert_eq!(
+            completion_report.symbols_truncated,
+            lexical_report.truncated
+        );
+        assert_eq!(completion_report.valid_prefix_end_byte, source.len());
 
         match format_source_named("fuzz.splash", source, limits) {
             Ok(formatted) => {
@@ -200,6 +210,17 @@ fn assert_lexical_symbol_invariants(source: &str, symbols: &[LexicalSymbol]) {
             "lexical definition span is unordered or out of bounds: {symbol:?}"
         );
         assert_symbol_span(source, symbol, symbol.definition);
+        assert!(
+            symbol.definition.end_byte <= symbol.visibility_start_byte
+                && symbol.visibility_start_byte <= symbol.visibility_end_byte
+                && symbol.visibility_end_byte <= source.len(),
+            "lexical visibility interval is unordered or out of bounds: {symbol:?}"
+        );
+        assert!(
+            source.is_char_boundary(symbol.visibility_start_byte)
+                && source.is_char_boundary(symbol.visibility_end_byte),
+            "lexical visibility interval is not on UTF-8 boundaries: {symbol:?}"
+        );
         all_spans.push(symbol.definition);
         let mut previous_reference_start = symbol.definition.end_byte;
         for reference in &symbol.references {
@@ -210,6 +231,11 @@ fn assert_lexical_symbol_invariants(source: &str, symbols: &[LexicalSymbol]) {
                 "lexical reference span is unordered, empty, or out of bounds: {symbol:?}"
             );
             assert_symbol_span(source, symbol, *reference);
+            assert!(
+                symbol.visibility_start_byte <= reference.start_byte
+                    && reference.end_byte <= symbol.visibility_end_byte,
+                "lexical reference falls outside its binding visibility: {symbol:?}"
+            );
             all_spans.push(*reference);
             previous_reference_start = reference.start_byte;
         }
@@ -222,6 +248,45 @@ fn assert_lexical_symbol_invariants(source: &str, symbols: &[LexicalSymbol]) {
             spans[0].end_byte <= spans[1].start_byte,
             "lexical symbol occurrences overlap: {spans:?}"
         );
+    }
+}
+
+fn assert_completion_invariants(source: &str, report: &LexicalCompletionReport) {
+    let occurrences = report.symbols.len()
+        + report
+            .symbols
+            .iter()
+            .map(|symbol| symbol.references.len())
+            .sum::<usize>();
+    assert!(occurrences <= MAX_LEXICAL_SYMBOL_OCCURRENCES);
+    if report.symbols_truncated {
+        assert_eq!(occurrences, MAX_LEXICAL_SYMBOL_OCCURRENCES);
+    }
+    assert!(report.sites.len() <= MAX_LEXICAL_COMPLETION_SITES);
+    if report.sites_truncated {
+        assert_eq!(report.sites.len(), MAX_LEXICAL_COMPLETION_SITES);
+    }
+    assert!(report.valid_prefix_end_byte <= source.len());
+    assert!(source.is_char_boundary(report.valid_prefix_end_byte));
+    assert_lexical_symbol_invariants(source, &report.symbols);
+
+    let mut previous_start_byte = 0_usize;
+    for site in &report.sites {
+        assert!(
+            previous_start_byte <= site.start_byte
+                && site.start_byte < site.end_byte
+                && site.end_byte <= source.len(),
+            "completion site is unordered, empty, or out of bounds: {site:?}"
+        );
+        assert!(
+            source.is_char_boundary(site.start_byte) && source.is_char_boundary(site.end_byte),
+            "completion site is not on UTF-8 boundaries: {site:?}"
+        );
+        assert!(
+            is_canonical_identifier(&source[site.start_byte..site.end_byte]),
+            "completion site is not a canonical identifier: {site:?}"
+        );
+        previous_start_byte = site.start_byte;
     }
 }
 

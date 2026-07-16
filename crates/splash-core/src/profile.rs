@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 
 use super::{
-    LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, SourceSpan, SyntaxDiagnostic,
-    ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration, TopLevelDeclarationKind,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, SourceSpan,
+    SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration,
+    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_CANONICAL_PROFILE_NESTING: usize = 128;
@@ -71,7 +72,33 @@ pub(super) fn collect_top_level_declarations(
 pub(super) fn collect_lexical_symbols(source: &str, max_tokens: usize) -> LexicalSymbolReport {
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
-    CanonicalParser::new(tokens).collect_symbols()
+    let collected = CanonicalParser::new(tokens).collect_symbols(source.len());
+    LexicalSymbolReport {
+        symbols: collected.symbols,
+        truncated: collected.symbols_truncated,
+    }
+}
+
+/// Builds completion metadata from the bounded canonical token stream.
+///
+/// Unlike navigation, completion may consume an invalid source prefix. The
+/// public caller supplies the first diagnostic boundary, and consumers must
+/// ignore sites beyond it.
+pub(super) fn collect_lexical_completions(
+    source: &str,
+    max_tokens: usize,
+    valid_prefix_end_byte: usize,
+) -> LexicalCompletionReport {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    let collected = CanonicalParser::new(tokens).collect_symbols(source.len());
+    LexicalCompletionReport {
+        symbols: collected.symbols,
+        sites: collected.completion_sites,
+        symbols_truncated: collected.symbols_truncated,
+        sites_truncated: collected.completion_sites_truncated,
+        valid_prefix_end_byte,
+    }
 }
 
 /// Extracts direct `mod.tool` call syntax after the public caller has already
@@ -144,32 +171,67 @@ struct Token {
 
 struct SymbolCollector {
     symbols: Vec<LexicalSymbol>,
-    scopes: Vec<HashMap<String, usize>>,
+    scopes: Vec<SymbolScope>,
+    completion_sites: Vec<SourceSpan>,
     occurrences: usize,
     truncated: bool,
+    completion_sites_truncated: bool,
+}
+
+struct SymbolScope {
+    bindings: HashMap<String, usize>,
+    defined_symbols: Vec<usize>,
+}
+
+impl SymbolScope {
+    fn new() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            defined_symbols: Vec::new(),
+        }
+    }
+}
+
+struct CollectedLexicalData {
+    symbols: Vec<LexicalSymbol>,
+    completion_sites: Vec<SourceSpan>,
+    symbols_truncated: bool,
+    completion_sites_truncated: bool,
 }
 
 impl SymbolCollector {
     fn new() -> Self {
         Self {
             symbols: Vec::new(),
-            scopes: vec![HashMap::new()],
+            scopes: vec![SymbolScope::new()],
+            completion_sites: Vec::new(),
             occurrences: 0,
             truncated: false,
+            completion_sites_truncated: false,
         }
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(SymbolScope::new());
     }
 
-    fn pop_scope(&mut self) {
+    fn pop_scope(&mut self, visibility_end_byte: usize) {
         if self.scopes.len() > 1 {
-            self.scopes.pop();
+            let scope = self
+                .scopes
+                .pop()
+                .expect("a non-root lexical scope is present");
+            self.close_scope(scope, visibility_end_byte);
         }
     }
 
-    fn define(&mut self, name: String, definition: SourceSpan, kind: LexicalSymbolKind) {
+    fn define(
+        &mut self,
+        name: String,
+        definition: SourceSpan,
+        kind: LexicalSymbolKind,
+        visibility_start_byte: usize,
+    ) {
         if !self.reserve_occurrence() {
             return;
         }
@@ -180,14 +242,21 @@ impl SymbolCollector {
             name: name.clone(),
             definition,
             references: Vec::new(),
+            visibility_start_byte,
+            visibility_end_byte: usize::MAX,
         });
-        self.scopes
+        let scope = self
+            .scopes
             .last_mut()
-            .expect("the lexical collector always has a root scope")
-            .insert(name, symbol_index);
+            .expect("the lexical collector always has a root scope");
+        if let Some(shadowed_index) = scope.bindings.insert(name, symbol_index) {
+            self.symbols[shadowed_index].visibility_end_byte = visibility_start_byte;
+        }
+        scope.defined_symbols.push(symbol_index);
     }
 
     fn reference(&mut self, name: &str, reference: SourceSpan) {
+        self.record_completion_site(reference);
         if self.truncated {
             return;
         }
@@ -195,7 +264,7 @@ impl SymbolCollector {
             .scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).copied())
+            .find_map(|scope| scope.bindings.get(name).copied())
         else {
             return;
         };
@@ -203,6 +272,17 @@ impl SymbolCollector {
             return;
         }
         self.symbols[symbol_index].references.push(reference);
+    }
+
+    fn record_completion_site(&mut self, site: SourceSpan) {
+        if self.completion_sites_truncated {
+            return;
+        }
+        if self.completion_sites.len() == MAX_LEXICAL_COMPLETION_SITES {
+            self.completion_sites_truncated = true;
+            return;
+        }
+        self.completion_sites.push(site);
     }
 
     fn reserve_occurrence(&mut self) -> bool {
@@ -217,12 +297,26 @@ impl SymbolCollector {
         true
     }
 
-    fn finish(mut self) -> LexicalSymbolReport {
+    fn close_scope(&mut self, scope: SymbolScope, visibility_end_byte: usize) {
+        for symbol_index in scope.defined_symbols {
+            let symbol = &mut self.symbols[symbol_index];
+            if symbol.visibility_end_byte == usize::MAX {
+                symbol.visibility_end_byte = visibility_end_byte;
+            }
+        }
+    }
+
+    fn finish(mut self, source_end_byte: usize) -> CollectedLexicalData {
+        while let Some(scope) = self.scopes.pop() {
+            self.close_scope(scope, source_end_byte);
+        }
         self.symbols
             .sort_by_key(|symbol| symbol.definition.start_byte);
-        LexicalSymbolReport {
+        CollectedLexicalData {
             symbols: self.symbols,
-            truncated: self.truncated,
+            completion_sites: self.completion_sites,
+            symbols_truncated: self.truncated,
+            completion_sites_truncated: self.completion_sites_truncated,
         }
     }
 }
@@ -1268,13 +1362,13 @@ impl CanonicalParser {
         }
     }
 
-    fn collect_symbols(mut self) -> LexicalSymbolReport {
+    fn collect_symbols(mut self, source_end_byte: usize) -> CollectedLexicalData {
         self.symbols = Some(SymbolCollector::new());
         self.parse_program();
         self.symbols
             .take()
             .expect("symbol collection was enabled")
-            .finish()
+            .finish(source_end_byte)
     }
 
     fn parse_program(&mut self) {
@@ -1899,8 +1993,9 @@ impl CanonicalParser {
     }
 
     fn pop_symbol_scope(&mut self) {
+        let visibility_end_byte = self.current().start_byte;
         if let Some(symbols) = &mut self.symbols {
-            symbols.pop_scope();
+            symbols.pop_scope(visibility_end_byte);
         }
     }
 
@@ -1908,8 +2003,9 @@ impl CanonicalParser {
         let Some((name, span)) = self.symbol_token(token_index) else {
             return;
         };
+        let visibility_start_byte = self.current().start_byte;
         if let Some(symbols) = &mut self.symbols {
-            symbols.define(name, span, kind);
+            symbols.define(name, span, kind, visibility_start_byte);
         }
     }
 

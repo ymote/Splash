@@ -15,22 +15,25 @@ use lsp_types::{
         Notification as LspNotification, PublishDiagnostics,
     },
     request::{
-        DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-        PrepareRenameRequest, References, Rename, Request as LspRequest,
+        Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
+        HoverRequest, PrepareRenameRequest, References, Rename, Request as LspRequest,
     },
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
-    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
+    CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentChanges, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
+    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
     OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, PrepareRenameResponse,
     PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
     ServerCapabilities, SymbolKind, TextDocumentEdit, TextDocumentItem, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use splash_core::{
-    check_syntax_named, format_source_named, is_canonical_identifier, lexical_symbol_report_named,
-    top_level_declarations_named, ExecutionLimits, LexicalSymbol, LexicalSymbolKind,
+    check_syntax_named, format_source_named, is_canonical_identifier,
+    lexical_completion_report_named, lexical_symbol_report_named, top_level_declarations_named,
+    ExecutionLimits, LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind,
     LexicalSymbolReport, SourceSpan, SyntaxDiagnostic, TopLevelDeclaration,
     TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
     MAX_SYNTAX_DIAGNOSTICS,
@@ -46,6 +49,7 @@ struct DocumentState {
     source: Option<String>,
     version: i32,
     lexical_report: OnceCell<Result<LexicalSymbolReport, String>>,
+    completion_report: OnceCell<Result<LexicalCompletionReport, String>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -244,6 +248,66 @@ impl SplashLanguageServer {
             .collect())
     }
 
+    fn completion(&self, uri: &Uri, position: Position) -> Result<CompletionList, String> {
+        let (source, report) = self.lexical_completions(uri)?;
+        let is_incomplete = report.symbols_truncated || report.sites_truncated;
+        let empty = || CompletionList {
+            is_incomplete,
+            items: Vec::new(),
+        };
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(empty());
+        };
+        let Some(site) = report.sites.iter().copied().find(|site| {
+            site.start_byte <= byte_offset
+                && byte_offset <= site.end_byte
+                && site.end_byte <= report.valid_prefix_end_byte
+        }) else {
+            return Ok(empty());
+        };
+        if report.symbols_truncated {
+            return Ok(empty());
+        }
+
+        let mut visible_by_name = HashMap::<&str, &LexicalSymbol>::new();
+        for symbol in &report.symbols {
+            if symbol.visibility_start_byte <= site.start_byte
+                && site.start_byte < symbol.visibility_end_byte
+            {
+                let replace = visible_by_name
+                    .get(symbol.name.as_str())
+                    .is_none_or(|current| {
+                        (symbol.visibility_start_byte, symbol.definition.start_byte)
+                            > (current.visibility_start_byte, current.definition.start_byte)
+                    });
+                if replace {
+                    visible_by_name.insert(symbol.name.as_str(), symbol);
+                }
+            }
+        }
+
+        let edit_range = span_range(source, site);
+        let mut items = visible_by_name
+            .into_values()
+            .map(|symbol| CompletionItem {
+                label: symbol.name.clone(),
+                kind: Some(completion_item_kind(symbol.kind)),
+                detail: Some(lexical_symbol_kind_label(symbol.kind).to_owned()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                    edit_range,
+                    symbol.name.clone(),
+                ))),
+                ..CompletionItem::default()
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.label.cmp(&right.label));
+
+        Ok(CompletionList {
+            is_incomplete,
+            items,
+        })
+    }
+
     fn prepare_rename(
         &self,
         uri: &Uri,
@@ -355,6 +419,24 @@ impl SplashLanguageServer {
         }
     }
 
+    fn lexical_completions(&self, uri: &Uri) -> Result<(&str, &LexicalCompletionReport), String> {
+        let state = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| "the document is not open in this Splash session".to_owned())?;
+        let source = state.source.as_deref().ok_or_else(|| {
+            format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
+        })?;
+        let report = state.completion_report.get_or_init(|| {
+            lexical_completion_report_named(uri.as_str(), source, ExecutionLimits::default())
+                .map_err(|error| format!("cannot complete canonical Splash source: {error}"))
+        });
+        match report {
+            Ok(report) => Ok((source, report)),
+            Err(message) => Err(message.clone()),
+        }
+    }
+
     fn replace_document(
         &mut self,
         uri: Uri,
@@ -378,6 +460,7 @@ impl SplashLanguageServer {
                     source: None,
                     version,
                     lexical_report: OnceCell::new(),
+                    completion_report: OnceCell::new(),
                 },
             );
             return resource_diagnostics(
@@ -397,6 +480,7 @@ impl SplashLanguageServer {
                 source: Some(source),
                 version,
                 lexical_report: OnceCell::new(),
+                completion_report: OnceCell::new(),
             },
         );
         PublishDiagnosticsParams::new(uri, diagnostics, Some(version))
@@ -478,6 +562,10 @@ fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
         references_provider: Some(OneOf::Left(true)),
         hover_provider: Some(true.into()),
         document_highlight_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            resolve_provider: Some(false),
+            ..CompletionOptions::default()
+        }),
         rename_provider: versioned_document_edits.then(|| {
             OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
@@ -594,6 +682,25 @@ fn handle_request(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("invalid textDocument/documentHighlight parameters: {error}"),
+            ),
+        }
+    } else if request.method == Completion::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<CompletionParams>(request.params) {
+            Ok(params) => {
+                let text_document_position = params.text_document_position;
+                match server.completion(
+                    &text_document_position.text_document.uri,
+                    text_document_position.position,
+                ) {
+                    Ok(completion) => Response::new_ok(id, CompletionResponse::List(completion)),
+                    Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+                }
+            }
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/completion parameters: {error}"),
             ),
         }
     } else if versioned_document_edits && request.method == PrepareRenameRequest::METHOD {
@@ -837,6 +944,17 @@ fn lexical_symbol_kind_label(kind: LexicalSymbolKind) -> &'static str {
     }
 }
 
+fn completion_item_kind(kind: LexicalSymbolKind) -> CompletionItemKind {
+    match kind {
+        LexicalSymbolKind::Import => CompletionItemKind::MODULE,
+        LexicalSymbolKind::Function => CompletionItemKind::FUNCTION,
+        LexicalSymbolKind::Let
+        | LexicalSymbolKind::Parameter
+        | LexicalSymbolKind::LoopBinding
+        | LexicalSymbolKind::LambdaParameter => CompletionItemKind::VARIABLE,
+    }
+}
+
 fn require_complete_lexical_report(report: &LexicalSymbolReport) -> Result<(), String> {
     if report.truncated {
         Err(format!(
@@ -970,8 +1088,52 @@ fn remap_lexical_report(
         for reference in &mut symbol.references {
             *reference = remap_source_span(*reference, replacements)?;
         }
+        symbol.visibility_start_byte =
+            remap_source_offset(symbol.visibility_start_byte, replacements)?;
+        symbol.visibility_end_byte = remap_source_offset(symbol.visibility_end_byte, replacements)?;
     }
     Ok(expected)
+}
+
+fn remap_source_offset(offset: usize, replacements: &[SpanReplacement]) -> Result<usize, String> {
+    let mut removed_before = 0_usize;
+    let mut added_before = 0_usize;
+    for replacement in replacements {
+        if offset < replacement.original.start_byte {
+            continue;
+        }
+        if offset == replacement.original.start_byte {
+            return Ok(replacement.replacement.start_byte);
+        }
+        if offset < replacement.original.end_byte {
+            return Err("a lexical visibility boundary falls inside a rename edit".to_owned());
+        }
+
+        let original_width = replacement
+            .original
+            .end_byte
+            .checked_sub(replacement.original.start_byte)
+            .ok_or_else(|| "rename offset remapping underflowed".to_owned())?;
+        let replacement_width = replacement
+            .replacement
+            .end_byte
+            .checked_sub(replacement.replacement.start_byte)
+            .ok_or_else(|| "rename offset remapping underflowed".to_owned())?;
+        removed_before = removed_before
+            .checked_add(original_width)
+            .ok_or_else(|| "rename offset remapping overflowed".to_owned())?;
+        added_before = added_before
+            .checked_add(replacement_width)
+            .ok_or_else(|| "rename offset remapping overflowed".to_owned())?;
+        if offset == replacement.original.end_byte {
+            return Ok(replacement.replacement.end_byte);
+        }
+    }
+
+    offset
+        .checked_sub(removed_before)
+        .and_then(|value| value.checked_add(added_before))
+        .ok_or_else(|| "rename offset remapping overflowed".to_owned())
 }
 
 fn remap_source_span(
@@ -1004,7 +1166,7 @@ fn remap_source_span(
             continue;
         }
         if replacement.original.start_byte >= span.end_byte {
-            break;
+            continue;
         }
         return Err("a rename edit partially overlaps another lexical occurrence".to_owned());
     }
@@ -1170,6 +1332,68 @@ mod tests {
             lexical_symbol_kind_label(LexicalSymbolKind::LambdaParameter),
             "lambda parameter"
         );
+    }
+
+    #[test]
+    fn rename_offset_remapping_handles_boundaries_eof_and_unsorted_edits() {
+        let replacements = [
+            SpanReplacement {
+                original: SourceSpan {
+                    start_byte: 10,
+                    end_byte: 12,
+                },
+                replacement: SourceSpan {
+                    start_byte: 13,
+                    end_byte: 14,
+                },
+            },
+            SpanReplacement {
+                original: SourceSpan {
+                    start_byte: 2,
+                    end_byte: 5,
+                },
+                replacement: SourceSpan {
+                    start_byte: 2,
+                    end_byte: 8,
+                },
+            },
+        ];
+
+        for (original, remapped) in [(0, 0), (2, 2), (5, 8), (10, 13), (12, 14), (20, 22)] {
+            assert_eq!(
+                remap_source_offset(original, &replacements).unwrap(),
+                remapped
+            );
+        }
+        assert!(remap_source_offset(3, &replacements).is_err());
+        assert_eq!(
+            remap_source_span(
+                SourceSpan {
+                    start_byte: 15,
+                    end_byte: 17,
+                },
+                &replacements,
+            )
+            .unwrap(),
+            SourceSpan {
+                start_byte: 17,
+                end_byte: 19,
+            }
+        );
+
+        let shorter = [SpanReplacement {
+            original: SourceSpan {
+                start_byte: 2,
+                end_byte: 7,
+            },
+            replacement: SourceSpan {
+                start_byte: 2,
+                end_byte: 3,
+            },
+        }];
+        assert_eq!(remap_source_offset(2, &shorter).unwrap(), 2);
+        assert_eq!(remap_source_offset(7, &shorter).unwrap(), 3);
+        assert_eq!(remap_source_offset(10, &shorter).unwrap(), 6);
     }
 
     #[test]
@@ -1453,6 +1677,165 @@ mod tests {
                 .expect("an identical rename succeeds"),
             None
         );
+    }
+
+    #[test]
+    fn completes_visible_lexical_bindings_with_exact_unfiltered_edits() {
+        let source = "use mod.std.assert\n\
+                      let apple = 1\n\
+                      let apricot = 2\n\
+                      fn choose(apple) {\n\
+                          let local = \"🙂\" + apple\n\
+                          ap\n\
+                      }\n\
+                      apple";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+        let site_start = source.find("\nap\n").unwrap() + 1;
+        let expected_range = Range::new(
+            position_at_byte(source, site_start),
+            position_at_byte(source, site_start + 2),
+        );
+
+        for cursor in [site_start, site_start + 2] {
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, cursor))
+                .unwrap();
+            assert!(!completion.is_incomplete);
+            assert_eq!(
+                completion
+                    .items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["apple", "apricot", "assert", "choose", "local"]
+            );
+            assert!(completion.items.iter().all(|item| {
+                matches!(
+                    item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if range == expected_range
+                )
+            }));
+        }
+
+        let assert_item = server
+            .completion(&test_uri(), position_at_byte(source, site_start + 1))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.label == "assert")
+            .unwrap();
+        assert_eq!(assert_item.kind, Some(CompletionItemKind::MODULE));
+        let choose_item = server
+            .completion(&test_uri(), position_at_byte(source, site_start + 1))
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.label == "choose")
+            .unwrap();
+        assert_eq!(choose_item.kind, Some(CompletionItemKind::FUNCTION));
+
+        let final_site = source.rfind("apple").unwrap();
+        let outside = server
+            .completion(&test_uri(), position_at_byte(source, final_site + 1))
+            .unwrap();
+        assert!(outside.items.iter().all(|item| item.label != "local"));
+        assert_eq!(
+            outside
+                .items
+                .iter()
+                .filter(|item| item.label == "apple")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn completion_handles_incomplete_source_and_rejects_invalid_utf16_positions() {
+        let source = "let marker = \"🙂\"\nlet alpha = 1\nal(";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let completion = server.completion(&test_uri(), Position::new(2, 2)).unwrap();
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "marker"]
+        );
+        assert!(!completion.is_incomplete);
+
+        let mid_surrogate = server
+            .completion(&test_uri(), Position::new(0, 15))
+            .unwrap();
+        assert!(mid_surrogate.items.is_empty());
+        assert!(!mid_surrogate.is_incomplete);
+        assert!(server
+            .completion(&test_uri(), Position::new(99, 0))
+            .unwrap()
+            .items
+            .is_empty());
+    }
+
+    #[test]
+    fn completion_excludes_sites_after_the_first_mid_document_error() {
+        let source = "let alpha = 1\nalpha\n@\nlet beta = 2\nbeta";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+        let alpha_site = source.find("\nalpha").unwrap() + 1;
+        let beta_site = source.rfind("beta").unwrap();
+
+        let before_error = server
+            .completion(&test_uri(), position_at_byte(source, alpha_site + 2))
+            .unwrap();
+        assert_eq!(before_error.items.len(), 1);
+        assert_eq!(before_error.items[0].label, "alpha");
+
+        let after_error = server
+            .completion(&test_uri(), position_at_byte(source, beta_site + 2))
+            .unwrap();
+        assert!(after_error.items.is_empty());
+        assert!(!after_error.is_incomplete);
+    }
+
+    #[test]
+    fn completion_reports_independent_truncation_to_the_client() {
+        let mut source = String::from("let value = 0\n");
+        for _ in 0..=splash_core::MAX_LEXICAL_COMPLETION_SITES {
+            source.push_str("missing\n");
+        }
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let first_site = source.find("\nmissing").unwrap() + 1;
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, first_site))
+            .unwrap();
+
+        assert!(completion.is_incomplete);
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(completion.items[0].label, "value");
+    }
+
+    #[test]
+    fn completion_returns_no_candidates_from_a_truncated_symbol_index() {
+        let mut source = String::from("let value = 0\n");
+        for _ in 0..MAX_LEXICAL_SYMBOL_OCCURRENCES {
+            source.push_str("value\n");
+        }
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+        let first_site = source.find("\nvalue").unwrap() + 1;
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, first_site))
+            .unwrap();
+
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
     }
 
     #[test]
@@ -1888,6 +2271,7 @@ mod tests {
         assert_eq!(capabilities["referencesProvider"], true);
         assert_eq!(capabilities["hoverProvider"], true);
         assert_eq!(capabilities["documentHighlightProvider"], true);
+        assert_eq!(capabilities["completionProvider"]["resolveProvider"], false);
         assert_eq!(capabilities["renameProvider"]["prepareProvider"], true);
 
         client_connection
@@ -2101,6 +2485,45 @@ mod tests {
         assert_eq!(highlights.as_array().map(Vec::len), Some(2));
         assert_eq!(highlights[0]["kind"], 1);
         assert_eq!(highlights[1]["kind"], 1);
+
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    70.into(),
+                    Completion::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 5}
+                    }),
+                )
+                .into(),
+            )
+            .expect("completion request send succeeds");
+        let completion_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("completion response arrives");
+        let Message::Response(response) = completion_response else {
+            panic!("expected completion response");
+        };
+        let completion = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("completion request failed: {}", error.message)
+            }
+        };
+        assert_eq!(completion["isIncomplete"], false);
+        assert_eq!(completion["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(completion["items"][0]["label"], "value");
+        assert_eq!(
+            completion["items"][0]["textEdit"]["range"],
+            serde_json::json!({
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 1, "character": 5}
+            })
+        );
+        assert_eq!(completion["items"][0]["textEdit"]["newText"], "value");
 
         client_connection
             .sender

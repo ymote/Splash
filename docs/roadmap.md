@@ -15,6 +15,9 @@
   reads, evaluation, type inference, or authority.
 - Binding-kind hover and neutral same-document symbol highlights over the same
   bounded lexical index.
+- Bounded scope-aware lexical completion at expression identifiers, including
+  exact-token edits, conservative invalid-prefix support, independent site
+  truncation, and no module, type, field, catalog, or authority inference.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.
@@ -168,8 +171,8 @@
 
 ## Before a stable language release
 
-- Additional semantic editor features beyond lexical navigation, including
-  completion, imported-module resolution, and type-aware field semantics.
+- Additional semantic editor features beyond lexical completion, including
+  imported-module resolution and type-aware field semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Centralized event retention/aggregation and product-specific compensation

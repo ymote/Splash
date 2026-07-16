@@ -15,8 +15,8 @@ use std::time::Duration;
 
 pub use makepad_script as vm;
 use profile::{
-    check_canonical_profile, collect_lexical_symbols, collect_tool_call_hints,
-    collect_top_level_declarations, format_canonical_source,
+    check_canonical_profile, collect_lexical_completions, collect_lexical_symbols,
+    collect_tool_call_hints, collect_top_level_declarations, format_canonical_source,
     is_canonical_identifier as profile_is_canonical_identifier, ProfileFormatError,
 };
 pub use serde_json::Value as JsonValue;
@@ -55,6 +55,11 @@ pub const MAX_TOOL_CALL_HINTS: usize = 1_024;
 /// this fixed bound. [`LexicalSymbolReport::truncated`] is set when later
 /// occurrences are omitted.
 pub const MAX_LEXICAL_SYMBOL_OCCURRENCES: usize = 4_096;
+/// Maximum expression-identifier sites retained for lexical completion.
+///
+/// This is independent of the resolved definition/reference occurrence bound:
+/// unresolved identifier prefixes remain useful completion sites.
+pub const MAX_LEXICAL_COMPLETION_SITES: usize = 4_096;
 
 /// Bounds applied to one source evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,6 +329,10 @@ pub struct LexicalSymbol {
     pub name: String,
     pub definition: SourceSpan,
     pub references: Vec<SourceSpan>,
+    /// First byte at which this binding participates in lexical resolution.
+    pub visibility_start_byte: usize,
+    /// Exclusive scope or same-scope-shadow boundary for this binding.
+    pub visibility_end_byte: usize,
 }
 
 /// Bounded, effect-free lexical symbol output for one canonical source.
@@ -334,6 +343,27 @@ pub struct LexicalSymbol {
 pub struct LexicalSymbolReport {
     pub symbols: Vec<LexicalSymbol>,
     pub truncated: bool,
+}
+
+/// Bounded, effect-free lexical completion metadata for one source snapshot.
+///
+/// `sites` contains only identifiers parsed in expression position, including
+/// unresolved names. Declarations, import paths, record keys, and member names
+/// are excluded. A site is usable only when its end is at or before
+/// `valid_prefix_end_byte`; this permits conservative completion before the
+/// first syntax error without treating the rest of an invalid document as
+/// semantically analyzed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LexicalCompletionReport {
+    pub symbols: Vec<LexicalSymbol>,
+    pub sites: Vec<SourceSpan>,
+    /// Whether later definitions or resolved references were omitted.
+    ///
+    /// Consumers must not derive candidates from a truncated symbol set: an
+    /// omitted inner definition may shadow a retained outer binding.
+    pub symbols_truncated: bool,
+    pub sites_truncated: bool,
+    pub valid_prefix_end_byte: usize,
 }
 
 /// The direct `mod.tool` method named by one source-level tool-call hint.
@@ -569,6 +599,15 @@ impl<H: Any, S: Any> Runtime<H, S> {
         lexical_symbol_report_named("inline.splash", source, self.limits)
     }
 
+    /// Builds bounded lexical completion metadata without evaluating bytecode
+    /// or entering any host binding.
+    pub fn lexical_completion_report(
+        &self,
+        source: &str,
+    ) -> Result<LexicalCompletionReport, RuntimeError> {
+        lexical_completion_report_named("inline.splash", source, self.limits)
+    }
+
     /// Evaluates source only after it passes the canonical Splash v0.2 profile.
     ///
     /// This is the normal execution entry point for generated and user-authored
@@ -684,6 +723,16 @@ pub fn top_level_declarations(source: &str) -> Result<Vec<TopLevelDeclaration>, 
 /// binding and reference semantics.
 pub fn lexical_symbol_report(source: &str) -> Result<LexicalSymbolReport, RuntimeError> {
     lexical_symbol_report_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Builds bounded lexical completion metadata without evaluating source,
+/// resolving imports, or creating a capability host.
+///
+/// Completion sites are expression identifiers. For invalid source, only
+/// sites ending before the first syntax diagnostic are usable; see
+/// [`LexicalCompletionReport::valid_prefix_end_byte`].
+pub fn lexical_completion_report(source: &str) -> Result<LexicalCompletionReport, RuntimeError> {
+    lexical_completion_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Lists direct source-level `mod.tool` call hints in valid canonical Splash
@@ -832,6 +881,41 @@ pub fn lexical_symbol_report_named(
     Ok(collect_lexical_symbols(source, limits.max_syntax_tokens))
 }
 
+/// Builds bounded lexical completion metadata for one named source snapshot.
+///
+/// The collector is effect-free and never resolves imports or runtime values.
+/// Unlike navigation, it retains expression-identifier sites from the valid
+/// prefix of incomplete source so an editor can complete the token immediately
+/// before an end-of-file diagnostic. Sites after the first diagnostic are not
+/// semantically usable.
+pub fn lexical_completion_report_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<LexicalCompletionReport, RuntimeError> {
+    let syntax = check_syntax_named(file, source, limits)?;
+    let valid_prefix_end_byte = if syntax.valid {
+        source.len()
+    } else if syntax.diagnostics.is_empty() {
+        0
+    } else {
+        syntax
+            .diagnostics
+            .iter()
+            .try_fold(source.len(), |first_byte, diagnostic| {
+                source_byte_at_position(source, diagnostic.line, diagnostic.column)
+                    .map(|byte| first_byte.min(byte))
+            })
+            .unwrap_or(0)
+    };
+
+    Ok(collect_lexical_completions(
+        source,
+        limits.max_syntax_tokens,
+        valid_prefix_end_byte,
+    ))
+}
+
 /// Lists direct source-level `mod.tool` call hints in named canonical source
 /// without evaluating it, resolving imports, or creating a capability host.
 ///
@@ -946,6 +1030,35 @@ fn validate_source_length(source: &str, limits: ExecutionLimits) -> Result<(), R
         });
     }
     Ok(())
+}
+
+fn source_byte_at_position(source: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1;
+    let mut current_column = 1;
+    let mut characters = source.char_indices().peekable();
+    while let Some((byte, character)) = characters.next() {
+        if current_line == line && current_column == column {
+            return Some(byte);
+        }
+
+        match character {
+            '\n' => {
+                current_line += 1;
+                current_column = 1;
+            }
+            '\r' if characters.peek().is_none_or(|(_, next)| *next != '\n') => {
+                current_line += 1;
+                current_column = 1;
+            }
+            _ => current_column += 1,
+        }
+    }
+
+    (current_line == line && current_column == column).then_some(source.len())
 }
 
 /// Parses JSON after enforcing raw-byte and container-depth bounds.
@@ -2360,6 +2473,186 @@ compute(outer, 2)
             .symbols
             .iter()
             .all(|symbol| symbol.references.is_empty()));
+    }
+
+    #[test]
+    fn completion_metadata_tracks_expression_sites_and_half_open_visibility() {
+        let source = "use mod.std.assert\n\
+                      let outer = 1\n\
+                      let value = outer\n\
+                      let value = value\n\
+                      fn work(param) {\n\
+                          let local = param\n\
+                          local\n\
+                      }\n\
+                      value";
+
+        let report = lexical_completion_report(source).unwrap();
+
+        assert_eq!(report.valid_prefix_end_byte, source.len());
+        assert!(!report.symbols_truncated);
+        assert!(!report.sites_truncated);
+        assert_eq!(
+            report
+                .sites
+                .iter()
+                .map(|site| &source[site.start_byte..site.end_byte])
+                .collect::<Vec<_>>(),
+            ["outer", "value", "param", "local", "value"]
+        );
+
+        let values = report
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == "value")
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        let initializer = report.sites[1];
+        let final_reference = report.sites[4];
+        assert!(values[0].visibility_start_byte <= initializer.start_byte);
+        assert_eq!(
+            values[0].visibility_end_byte,
+            values[1].visibility_start_byte
+        );
+        assert!(initializer.start_byte < values[0].visibility_end_byte);
+        assert!(values[1].visibility_start_byte <= final_reference.start_byte);
+        assert_eq!(values[1].visibility_end_byte, source.len());
+    }
+
+    #[test]
+    fn declaration_is_not_visible_in_its_own_initializer() {
+        let source = "let value = value\nvalue";
+        let report = lexical_completion_report(source).unwrap();
+        let symbol = report
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "value")
+            .unwrap();
+
+        assert_eq!(report.sites.len(), 2);
+        assert!(report.sites[0].end_byte <= symbol.visibility_start_byte);
+        assert_eq!(symbol.references, vec![report.sites[1]]);
+    }
+
+    #[test]
+    fn scoped_binding_visibility_ends_before_the_next_identifier() {
+        let source = "for item in [1] {\nitem\n}\nitem";
+        let report = lexical_completion_report(source).unwrap();
+        let item = report
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "item")
+            .unwrap();
+        let item_sites = report
+            .sites
+            .iter()
+            .copied()
+            .filter(|site| &source[site.start_byte..site.end_byte] == "item")
+            .collect::<Vec<_>>();
+
+        assert_eq!(item_sites.len(), 2);
+        assert_eq!(item.references, vec![item_sites[0]]);
+        assert!(item.visibility_end_byte <= item_sites[1].start_byte);
+        assert!(item_sites[1].start_byte >= item.visibility_end_byte);
+    }
+
+    #[test]
+    fn member_names_record_keys_and_literal_keywords_are_not_completion_sites() {
+        let source = "let record = {key: 1}\nrecord.key\ntrue\nfalse\nnil";
+        let report = lexical_completion_report(source).unwrap();
+
+        assert_eq!(
+            report
+                .sites
+                .iter()
+                .map(|site| &source[site.start_byte..site.end_byte])
+                .collect::<Vec<_>>(),
+            ["record"]
+        );
+    }
+
+    #[test]
+    fn completion_metadata_retains_only_sites_in_the_valid_prefix() {
+        let incomplete = "let marker = \"🙂\"\r\nlet alpha = 1\r\nalpha(";
+        let report = lexical_completion_report(incomplete).unwrap();
+        let alpha_site = report
+            .sites
+            .iter()
+            .copied()
+            .find(|site| &incomplete[site.start_byte..site.end_byte] == "alpha")
+            .unwrap();
+
+        assert_eq!(report.valid_prefix_end_byte, incomplete.len());
+        assert!(alpha_site.end_byte <= report.valid_prefix_end_byte);
+        assert!(incomplete.is_char_boundary(alpha_site.start_byte));
+
+        let invalid_middle = "let marker = \"🙂\"\rlet alpha = 1\ralpha\r@\ralpha";
+        let invalid_report = lexical_completion_report(invalid_middle).unwrap();
+        assert_eq!(
+            invalid_report.valid_prefix_end_byte,
+            invalid_middle.find('@').unwrap()
+        );
+        let alpha_sites = invalid_report
+            .sites
+            .iter()
+            .filter(|site| &invalid_middle[site.start_byte..site.end_byte] == "alpha")
+            .collect::<Vec<_>>();
+        assert_eq!(alpha_sites.len(), 2);
+        assert!(alpha_sites[0].end_byte <= invalid_report.valid_prefix_end_byte);
+        assert!(alpha_sites[1].end_byte > invalid_report.valid_prefix_end_byte);
+
+        let invalid_prefix_report = lexical_completion_report("@\nalpha").unwrap();
+        assert_eq!(invalid_prefix_report.valid_prefix_end_byte, 0);
+
+        let unicode_column = "let marker = \"🙂\" @";
+        assert_eq!(
+            lexical_completion_report(unicode_column)
+                .unwrap()
+                .valid_prefix_end_byte,
+            unicode_column.find('@').unwrap()
+        );
+
+        let runtime = Runtime::default();
+        assert_eq!(
+            runtime.lexical_completion_report(incomplete).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn completion_sites_have_an_independent_fixed_bound() {
+        let mut source = String::from("let value = 0\n");
+        for _ in 0..=MAX_LEXICAL_COMPLETION_SITES {
+            source.push_str("value\n");
+        }
+
+        let report = lexical_completion_report(&source).unwrap();
+
+        assert_eq!(report.sites.len(), MAX_LEXICAL_COMPLETION_SITES);
+        assert!(report.sites_truncated);
+        assert!(report.symbols_truncated);
+        assert!(report.sites.iter().all(|site| {
+            source.is_char_boundary(site.start_byte)
+                && source.is_char_boundary(site.end_byte)
+                && &source[site.start_byte..site.end_byte] == "value"
+        }));
+    }
+
+    #[test]
+    fn completion_visibility_uses_source_end_when_the_token_stream_is_capped() {
+        let source = "let value = 0\nvalue\nvalue";
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 6,
+            ..ExecutionLimits::default()
+        };
+
+        let report = lexical_completion_report_named("capped.splash", source, limits).unwrap();
+        let symbol = report.symbols.first().unwrap();
+
+        assert_eq!(report.sites.len(), 1);
+        assert_eq!(symbol.references, report.sites);
+        assert_eq!(symbol.visibility_end_byte, source.len());
+        assert_eq!(report.valid_prefix_end_byte, report.sites[0].end_byte);
     }
 
     #[test]

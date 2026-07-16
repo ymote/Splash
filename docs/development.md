@@ -34,7 +34,7 @@ separate behavioral coverage for the imported VM.
 UTF-16 positions, full document synchronization, syntax diagnostics,
 whole-document canonical formatting, top-level `fn`/`let` document symbols,
 same-document lexical definition/reference requests, binding-kind hover, and
-symbol highlights plus guarded rename for valid canonical source:
+symbol highlights, lexical completion, and guarded rename:
 
 ```sh
 cargo run -p splash-lsp
@@ -51,6 +51,21 @@ exhausted remains available for definition and hover, while reference and
 highlight requests fail instead of returning a partial set from a truncated
 index. Highlights are neutral resolved occurrences of one lexical binding
 because the index does not classify assignment reads and writes.
+
+Completion uses a separate lazily cached report. Expression-position
+identifiers, including unresolved partial names, are retained as sites; binding
+declarations, import paths, record keys, and member names are not sites. At a
+site the server returns every retained lexical binding whose half-open
+visibility interval contains the token start, deduplicated by the innermost
+binding and sorted by name. It does not filter by the current spelling, so LSP
+client caching and backspace remain correct. Every item replaces the complete
+identifier. Invalid source is considered only through the first syntax
+diagnostic, and only sites ending at or before that boundary are usable.
+Symbols and sites have independent 4,096-entry caps; either truncation sets
+`isIncomplete`. A retained site remains usable when only the site list is
+truncated. When symbols are truncated the server returns no candidates, because
+an omitted inner definition could shadow a retained outer binding.
+
 Rename is advertised only when the editor supports versioned
 `documentChanges`. It refuses import path edits and truncated reports, validates
 the new name with the canonical lexer, reparses the rewritten source, and
@@ -59,9 +74,10 @@ This prevents indexed capture and shadowing drift; it does not claim module,
 field, type, reflection, or forward-reference semantics. Returned edits carry
 the exact open-document version.
 
-Lexical reports are lazily cached per document version and discarded on a full
-change or close. The server retains at most 128 open documents and refuses to
-retain document text above the normal 256 KiB Splash source cap.
+Lexical navigation and completion reports are lazily cached per document
+version and discarded on a full change or close. The server retains at most 128
+open documents and refuses to retain document text above the normal 256 KiB
+Splash source cap.
 
 ## Syntax fuzzing
 
@@ -80,6 +96,9 @@ authorization mechanism.
 The target also validates the bounded lexical symbol index: definitions are
 ordered, every retained definition and resolved reference is an exact UTF-8
 identifier span, and the combined count never exceeds 4,096 occurrences.
+For every bounded UTF-8 input, including invalid source, it also checks lexical
+completion site ordering and identity, half-open visibility intervals, valid
+prefix boundaries, independent symbol/site caps, and truncation signals.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 4,096 instruction
 cap, one-instruction deadline sampling, and a 32 ms terminal execution

@@ -33,7 +33,12 @@ imported module, or loads an adapter. Its top-level `fn`/`let` outline and
 same-document lexical definition/reference index are derived only from valid
 client-provided canonical source and grant no tool authority. Binding-kind hover
 and neutral symbol highlights use that same index; they do not expose runtime
-values or claim read/write analysis. Guarded rename is advertised only to a
+values or claim read/write analysis. Lexical completion uses only
+expression-identifier sites and binding visibility metadata from the supplied
+snapshot. It may retain a site from incomplete source only when the site ends
+before or at the first syntax diagnostic. It never queries runtime values,
+module exports, a tool catalog, or adapter metadata, and completion candidates
+do not grant or predict authority. Guarded rename is advertised only to a
 client that supports versioned document edits. It never renames an import path,
 never operates on a truncated index, validates the replacement with the
 canonical lexer and parser, and returns edits only when the complete remapped
@@ -44,14 +49,17 @@ is bound to the source version used for analysis.
 
 The lexical index is source-local, conservative, bounded to 4,096 retained
 definitions and resolved references, and lazily cached only for the current
-document version. A definition or hover is returned only when its retained
-occurrence has an exact binding. The index is not a type checker, module
-resolver, capability analysis, or authorization decision. The server retains
-at most 128 document states and no source text larger than the canonical 256
-KiB limit, but the underlying LSP framing layer decodes an inbound message
-before that retention limit applies. Do not expose its stdio transport to a
-hostile peer or describe it as an IPC resource sandbox; place a separate bounded
-transport or operating-system boundary in front of such a peer.
+document version. Completion sites have a separate 4,096-entry bound and cache;
+either truncation is exposed to the client as `isIncomplete`. Symbol truncation
+also suppresses all completion candidates because an omitted inner definition
+could shadow a retained outer binding. A definition or hover is returned only
+when its retained occurrence has an exact binding. The index is not a type
+checker, module resolver, capability analysis, or authorization decision. The
+server retains at most 128 document states and no source text larger than the
+canonical 256 KiB limit, but the underlying LSP framing layer decodes an inbound
+message before that retention limit applies. Do not expose its stdio transport
+to a hostile peer or describe it as an IPC resource sandbox; place a separate
+bounded transport or operating-system boundary in front of such a peer.
 
 `splash-protocol` defines the portable, attenuated handoff from a policy host
 to a contained worker. It validates manifests, request uniqueness, formats,

@@ -64,6 +64,28 @@ truncated reports are not renameable. This is a fail-closed indexed lexical
 guarantee, not module, field, type, reflection, forward-reference, or runtime
 semantic analysis.
 
+For same-document completion, Rust hosts can call
+`splash_core::lexical_completion_report` or its named, limit-aware variant.
+The report retains expression-position identifier sites separately from the
+lexical symbols and gives every symbol a half-open byte interval in which the
+binding is visible. A declaration becomes visible only after its initializer,
+so `let value = value` does not resolve or complete the initializer from the
+new binding. Same-scope redeclaration closes the old interval when the new
+binding becomes visible, and leaving a function, lambda, or loop scope closes
+its bindings before the following identifier.
+
+Completion metadata is bounded independently to 4,096 sites and 4,096 retained
+definition/reference occurrences, with a truncation signal for each. On
+invalid or incomplete source, `valid_prefix_end_byte` is the first syntax
+diagnostic byte; a consumer may use only sites ending at or before that
+boundary. This permits a partial identifier immediately before an end-of-file
+diagnostic without assigning meaning to later recovery tokens. The report does
+not provide keywords, builtins, tool-catalog names, imported-module exports,
+types, record keys, or member fields, and it carries no runtime values or
+authority. Consumers must not derive candidates from a symbol-truncated report:
+an omitted inner definition may shadow a retained outer binding. The LSP
+therefore returns an incomplete empty candidate set in that case.
+
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash
 tool-calls <file>` exposes the same result as structured JSON. The report
