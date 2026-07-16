@@ -116,6 +116,10 @@ and keeps UI support optional rather than making UI the language boundary.
   host-selected worker and manifest-selected file roots; it rejects network,
   executable, and secret selectors rather than claiming unsupported policy,
   and drops every Linux capability before worker execution.
+- Optional Linux descriptor-pinned executable identity for the fixed
+  Bubblewrap, worker, and resource-limit-runner files, with no path-launch
+  fallback. It requires descriptor-pinned runtime roots and does not replace
+  immutable runtime ownership or an executable-path mediation policy.
 - A one-shot, versioned private-pipe session bootstrap for Linux Bubblewrap
   workers that is bound to the exact manifest retained by the compiled command
   and precedes JSON worker frames without exposing the key through argv or

@@ -78,6 +78,30 @@ pub enum MountSourceBinding {
     DescriptorPinned,
 }
 
+/// How the fixed host and worker executables retain their identities between
+/// policy compilation and process launch.
+///
+/// This is host-only containment configuration. It is never serialized into a
+/// Splash capability manifest or selected by generated source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ExecutableSourceBinding {
+    /// Resolve the configured executable paths during policy compilation and
+    /// execute or mount those paths at launch.
+    #[default]
+    Path,
+    /// On Linux, retain the Bubblewrap executable's descriptor at compilation,
+    /// launch it through a private `/proc/self/fd` path, and bind retained
+    /// worker and limit-runner file descriptors over their runtime paths.
+    ///
+    /// This requires [`MountSourceBinding::DescriptorPinned`] so the runtime
+    /// root has the same launch-only binding. It pins the selected executable
+    /// files after compilation, but it does not freeze dynamic libraries or
+    /// other mutable descendants of a mounted runtime tree. There is no
+    /// fallback to path-based executable launch or file binds.
+    DescriptorPinned,
+}
+
 /// User-namespace hardening selected for a Bubblewrap worker.
 ///
 /// [`Self::RequireNoFurtherUserNamespaces`] makes Bubblewrap require a new
@@ -640,8 +664,9 @@ impl PrivateTmpfs {
 /// This configuration is intentionally constructed by host Rust code. It is
 /// not serializable configuration for generated Splash source. All executable
 /// and host paths must be absolute. `compile` canonicalizes source paths and
-/// requires their contents to exist, but a host must still keep its policy
-/// paths immutable between compilation and process launch.
+/// requires their contents to exist. Path-bound sources still require immutable
+/// host ownership between compilation and launch. Descriptor-bound sources fix
+/// their selected inodes but do not freeze mutable runtime descendants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BubblewrapWorkerPolicy {
     bwrap_program: PathBuf,
@@ -650,6 +675,7 @@ pub struct BubblewrapWorkerPolicy {
     runtime_mounts: Vec<ReadOnlyMount>,
     file_roots: BTreeMap<String, RegisteredFileRoot>,
     mount_source_binding: MountSourceBinding,
+    executable_source_binding: ExecutableSourceBinding,
     private_tmpfs: PrivateTmpfs,
     bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
@@ -679,6 +705,7 @@ impl BubblewrapWorkerPolicy {
             runtime_mounts: Vec::new(),
             file_roots: BTreeMap::new(),
             mount_source_binding: MountSourceBinding::Path,
+            executable_source_binding: ExecutableSourceBinding::Path,
             private_tmpfs: PrivateTmpfs::Disabled,
             bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
@@ -728,6 +755,34 @@ impl BubblewrapWorkerPolicy {
     /// [`MountSourceBinding::DescriptorPinned`].
     pub fn pin_mount_sources(&mut self) -> &mut Self {
         self.set_mount_source_binding(MountSourceBinding::DescriptorPinned)
+    }
+
+    /// Returns how this policy retains fixed executable identities.
+    pub const fn executable_source_binding(&self) -> ExecutableSourceBinding {
+        self.executable_source_binding
+    }
+
+    /// Selects how this policy retains its fixed Bubblewrap, worker, and
+    /// optional resource-limit-runner executables.
+    ///
+    /// [`ExecutableSourceBinding::DescriptorPinned`] is an opt-in Linux
+    /// hardening mode. It requires [`MountSourceBinding::DescriptorPinned`]
+    /// and fails closed when the required descriptor-based Bubblewrap options
+    /// or `/proc/self/fd` execution are unavailable.
+    pub fn set_executable_source_binding(&mut self, binding: ExecutableSourceBinding) -> &mut Self {
+        self.executable_source_binding = binding;
+        self
+    }
+
+    /// Retains descriptor-pinned fixed executable sources after successful
+    /// compilation.
+    ///
+    /// This is shorthand for selecting
+    /// [`ExecutableSourceBinding::DescriptorPinned`]. Call
+    /// [`Self::pin_mount_sources`] as well; compilation rejects a policy that
+    /// selects this mode without descriptor-pinned runtime roots.
+    pub fn pin_executable_sources(&mut self) -> &mut Self {
+        self.set_executable_source_binding(ExecutableSourceBinding::DescriptorPinned)
     }
 
     /// Registers one opaque `file_root` selector.
@@ -914,6 +969,14 @@ impl BubblewrapWorkerPolicy {
             .validate()
             .map_err(BubblewrapPolicyError::Protocol)?;
         ensure_mount_source_binding_supported(self.mount_source_binding)?;
+        ensure_executable_source_binding_supported(self.executable_source_binding)?;
+        if self.executable_source_binding == ExecutableSourceBinding::DescriptorPinned
+            && self.mount_source_binding != MountSourceBinding::DescriptorPinned
+        {
+            return Err(
+                BubblewrapPolicyError::DescriptorPinnedExecutablesRequirePinnedMountSources,
+            );
+        }
         if self.bounded_file_root_writes_required && self.private_tmpfs == PrivateTmpfs::Unbounded {
             return Err(BubblewrapPolicyError::UnboundedPrivateTmpfsForbidden);
         }
@@ -922,8 +985,11 @@ impl BubblewrapWorkerPolicy {
         {
             return Err(BubblewrapPolicyError::BoundedFileRootWritesRequireUserNamespaceLockdown);
         }
-        let bwrap_program =
-            resolve_regular_executable_file("Bubblewrap program", &self.bwrap_program)?;
+        let bwrap_program = compile_host_executable(
+            "Bubblewrap program",
+            &self.bwrap_program,
+            self.executable_source_binding,
+        )?;
 
         let mut mounts = self
             .runtime_mounts
@@ -969,26 +1035,49 @@ impl BubblewrapWorkerPolicy {
         }
 
         validate_mount_layout(&mut mounts, self.private_tmpfs.is_enabled())?;
-        validate_runtime_program(
+        let worker_program_source = validate_runtime_program(
             &mounts,
             &self.worker_program,
             |program| BubblewrapPolicyError::WorkerProgramNotMounted { program },
             |program| BubblewrapPolicyError::WorkerProgramNotExecutable { program },
             "worker program source",
         )?;
-        if let Some(runner) = &self.resource_limit_runner {
+        let resource_limit_runner_source = if let Some(runner) = &self.resource_limit_runner {
             if runner.program == self.worker_program {
                 return Err(BubblewrapPolicyError::ResourceLimitRunnerMatchesWorker {
                     program: runner.program.clone(),
                 });
             }
-            validate_runtime_program(
+            Some(validate_runtime_program(
                 &mounts,
                 &runner.program,
                 |program| BubblewrapPolicyError::ResourceLimitRunnerNotMounted { program },
                 |program| BubblewrapPolicyError::ResourceLimitRunnerNotExecutable { program },
                 "resource limit runner source",
-            )?;
+            )?)
+        } else {
+            None
+        };
+        let mut executable_overlays = Vec::new();
+        if self.executable_source_binding == ExecutableSourceBinding::DescriptorPinned {
+            if !worker_program_source.is_descriptor_pinned_file {
+                executable_overlays.push(compile_pinned_program_overlay(
+                    "worker program source",
+                    worker_program_source.source,
+                    self.worker_program.clone(),
+                )?);
+            }
+            if let (Some(runner), Some(runner_source)) =
+                (&self.resource_limit_runner, resource_limit_runner_source)
+            {
+                if !runner_source.is_descriptor_pinned_file {
+                    executable_overlays.push(compile_pinned_program_overlay(
+                        "resource limit runner source",
+                        runner_source.source,
+                        runner.program.clone(),
+                    )?);
+                }
+            }
         }
         let seccomp_program =
             compile_seccomp_program(self.seccomp_profile, self.seccomp_allowlist.as_ref())?;
@@ -1039,14 +1128,19 @@ impl BubblewrapWorkerPolicy {
         mount_suffix_arguments.push(self.worker_program.clone().into_os_string());
         mount_suffix_arguments.extend(self.worker_arguments.iter().cloned());
 
-        let arguments =
-            display_arguments(&mount_prefix_arguments, &mounts, &mount_suffix_arguments);
+        let arguments = display_arguments(
+            &mount_prefix_arguments,
+            &mounts,
+            &executable_overlays,
+            &mount_suffix_arguments,
+        );
 
         Ok(BubblewrapCommand {
             bwrap_program,
             arguments,
             mount_prefix_arguments,
             mounts,
+            executable_overlays,
             mount_suffix_arguments,
             manifest: manifest.clone(),
             seccomp_program,
@@ -1063,10 +1157,11 @@ impl BubblewrapWorkerPolicy {
 /// trusted target-specific provisioning path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BubblewrapCommand {
-    bwrap_program: PathBuf,
+    bwrap_program: CompiledHostExecutable,
     arguments: Vec<OsString>,
     mount_prefix_arguments: Vec<OsString>,
     mounts: Vec<CompiledMount>,
+    executable_overlays: Vec<CompiledMount>,
     mount_suffix_arguments: Vec<OsString>,
     manifest: CapabilityManifest,
     seccomp_program: Option<SeccompProgram>,
@@ -1075,17 +1170,18 @@ pub struct BubblewrapCommand {
 impl BubblewrapCommand {
     /// Returns the canonical host Bubblewrap executable path.
     pub fn bwrap_program(&self) -> &Path {
-        &self.bwrap_program
+        self.bwrap_program.path()
     }
 
     /// Returns an inspectable representation of the fixed Bubblewrap arguments.
     ///
     /// A selected seccomp profile contributes a launch-only `--seccomp FD`
     /// pair that is intentionally omitted here because the anonymous descriptor
-    /// exists only during [`Self::spawn`]. Descriptor-pinned mounts appear as
-    /// `--bind-fd` or `--ro-bind-fd` with a non-numeric launch-only placeholder
-    /// rather than exposing a host source path. The representation is not an
-    /// executable command line when it contains a launch-only placeholder.
+    /// exists only during [`Self::spawn`]. Descriptor-pinned mount roots and
+    /// executable file overlays appear as `--bind-fd` or `--ro-bind-fd` with a
+    /// non-numeric launch-only placeholder rather than exposing a host source
+    /// path. The representation is not an executable command line when it
+    /// contains a launch-only placeholder.
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
@@ -1179,13 +1275,30 @@ impl BubblewrapCommand {
     ) -> Result<(SpawnedBubblewrapWorker, Option<ChildStderr>), BubblewrapSpawnError> {
         let mut mount_descriptors = Vec::new();
         let arguments = self.spawn_arguments(&mut mount_descriptors)?;
+        let (bwrap_program, bwrap_execution_descriptor) =
+            self.bwrap_program.prepare_for_execution()?;
         let seccomp_descriptor = self
             .seccomp_program
             .as_ref()
             .map(SeccompProgram::open_for_bubblewrap)
             .transpose()?;
+        let (cgroup_runner_program, cgroup_runner_descriptor) = if let Some(session) = &cgroup {
+            if self.bwrap_program.is_descriptor_pinned() {
+                let runner =
+                    pin_host_executable_for_spawn("cgroup runner", session.runner_program())?;
+                let (program, descriptor) = runner.prepare_for_execution()?;
+                (Some(program), descriptor)
+            } else {
+                (Some(session.runner_program().to_path_buf()), None)
+            }
+        } else {
+            (None, None)
+        };
         let mut command = if let Some(session) = &cgroup {
-            let mut command = Command::new(session.runner_program());
+            let runner_program = cgroup_runner_program
+                .as_ref()
+                .expect("cgroup-backed Bubblewrap spawn must select a runner program");
+            let mut command = Command::new(runner_program);
             command
                 .arg("--cgroup-procs")
                 .arg(session.cgroup_procs_path());
@@ -1199,10 +1312,15 @@ impl BubblewrapCommand {
                     .arg("--preserve-fd")
                     .arg(descriptor.as_raw_fd().to_string());
             }
-            command.arg("--").arg(&self.bwrap_program);
+            if let Some(descriptor) = &bwrap_execution_descriptor {
+                command
+                    .arg("--preserve-fd")
+                    .arg(descriptor.as_raw_fd().to_string());
+            }
+            command.arg("--").arg(&bwrap_program);
             command
         } else {
-            Command::new(&self.bwrap_program)
+            Command::new(&bwrap_program)
         };
         if let Some(descriptor) = &seccomp_descriptor {
             command
@@ -1224,6 +1342,8 @@ impl BubblewrapCommand {
         // any later host process launch can observe it.
         drop(seccomp_descriptor);
         drop(mount_descriptors);
+        drop(cgroup_runner_descriptor);
+        drop(bwrap_execution_descriptor);
         if let Some(session) = &cgroup {
             let join_timeout = cgroup_join_timeout
                 .expect("cgroup-backed Bubblewrap spawn must carry its host-selected join timeout");
@@ -1264,6 +1384,9 @@ impl BubblewrapCommand {
         let mut arguments = self.mount_prefix_arguments.clone();
         for mount in &self.mounts {
             mount.append_spawn_arguments(&mut arguments, mount_descriptors)?;
+        }
+        for executable_overlay in &self.executable_overlays {
+            executable_overlay.append_spawn_arguments(&mut arguments, mount_descriptors)?;
         }
         arguments.extend(self.mount_suffix_arguments.iter().cloned());
         Ok(arguments)
@@ -2457,6 +2580,8 @@ pub enum BubblewrapPolicyError {
     UnboundedPrivateTmpfsForbidden,
     BoundedFileRootWritesRequireUserNamespaceLockdown,
     DescriptorPinnedMountsUnsupportedPlatform,
+    DescriptorPinnedExecutablesUnsupportedPlatform,
+    DescriptorPinnedExecutablesRequirePinnedMountSources,
     EmptyResourceLimits,
     MissingSeccompAllowlist,
     MissingSeccompExecve,
@@ -2551,6 +2676,12 @@ impl Display for BubblewrapPolicyError {
             ),
             Self::DescriptorPinnedMountsUnsupportedPlatform => formatter.write_str(
                 "descriptor-pinned mount roots are supported only on Linux",
+            ),
+            Self::DescriptorPinnedExecutablesUnsupportedPlatform => formatter.write_str(
+                "descriptor-pinned executable sources are supported only on Linux",
+            ),
+            Self::DescriptorPinnedExecutablesRequirePinnedMountSources => formatter.write_str(
+                "descriptor-pinned executable sources require descriptor-pinned mount roots",
             ),
             Self::EmptyResourceLimits => {
                 formatter.write_str("resource limit runner requires at least one finite limit")
@@ -2676,6 +2807,8 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::UnboundedPrivateTmpfsForbidden
             | Self::BoundedFileRootWritesRequireUserNamespaceLockdown
             | Self::DescriptorPinnedMountsUnsupportedPlatform
+            | Self::DescriptorPinnedExecutablesUnsupportedPlatform
+            | Self::DescriptorPinnedExecutablesRequirePinnedMountSources
             | Self::EmptyResourceLimits
             | Self::MissingSeccompAllowlist
             | Self::MissingSeccompExecve
@@ -2707,6 +2840,7 @@ pub enum BubblewrapSpawnError {
     UnsupportedPlatform,
     SeccompTransport(io::Error),
     PinnedMountTransport(io::Error),
+    PinnedExecutableTransport(io::Error),
     Spawn(io::Error),
     MissingStdin,
     MissingStdout,
@@ -2873,6 +3007,10 @@ impl Display for BubblewrapSpawnError {
                     "could not prepare a descriptor-pinned Bubblewrap mount: {error}"
                 )
             }
+            Self::PinnedExecutableTransport(error) => write!(
+                formatter,
+                "could not prepare a descriptor-pinned Bubblewrap executable: {error}"
+            ),
             Self::Spawn(error) => write!(formatter, "failed to spawn Bubblewrap worker: {error}"),
             Self::MissingStdin => formatter.write_str("Bubblewrap worker did not expose stdin"),
             Self::MissingStdout => formatter.write_str("Bubblewrap worker did not expose stdout"),
@@ -2899,6 +3037,7 @@ impl std::error::Error for BubblewrapSpawnError {
         match self {
             Self::SeccompTransport(error)
             | Self::PinnedMountTransport(error)
+            | Self::PinnedExecutableTransport(error)
             | Self::Spawn(error) => Some(error),
             Self::CgroupMembership(error) => Some(error),
             Self::UnsupportedPlatform | Self::MissingStdin | Self::MissingStdout => None,
@@ -2936,29 +3075,70 @@ enum CompiledMountKind {
 }
 
 /// A canonical source path plus an optional Linux descriptor that fixes the
-/// mount root selected at compilation time.
+/// selected mount or executable file source at compilation time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CompiledBindSource {
     path: PathBuf,
     #[cfg(target_os = "linux")]
-    pinned_descriptor: Option<PinnedMountDescriptor>,
+    pinned_descriptor: Option<PinnedSourceDescriptor>,
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
-struct PinnedMountDescriptor {
+struct PinnedSourceDescriptor {
     descriptor: Arc<OwnedFd>,
 }
 
 #[cfg(target_os = "linux")]
-impl PartialEq for PinnedMountDescriptor {
+impl PartialEq for PinnedSourceDescriptor {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.descriptor, &other.descriptor)
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Eq for PinnedMountDescriptor {}
+impl Eq for PinnedSourceDescriptor {}
+
+#[cfg(target_os = "linux")]
+impl PinnedSourceDescriptor {
+    fn duplicate_for_child(&self) -> io::Result<OwnedFd> {
+        let descriptor = fcntl_dupfd_cloexec(self.descriptor.as_ref(), 3)?;
+        fcntl_setfd(&descriptor, FdFlags::empty())?;
+        Ok(descriptor)
+    }
+}
+
+/// A fixed host executable plus an optional Linux descriptor that keeps the
+/// selected executable inode alive until launch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompiledHostExecutable {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    pinned_descriptor: Option<PinnedSourceDescriptor>,
+}
+
+impl CompiledHostExecutable {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_descriptor_pinned(&self) -> bool {
+        self.pinned_descriptor.is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_for_execution(&self) -> Result<(PathBuf, Option<OwnedFd>), BubblewrapSpawnError> {
+        let Some(pinned) = &self.pinned_descriptor else {
+            return Ok((self.path.clone(), None));
+        };
+        let descriptor = pinned
+            .duplicate_for_child()
+            .map_err(BubblewrapSpawnError::PinnedExecutableTransport)?;
+        let program = PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()));
+        Ok((program, Some(descriptor)))
+    }
+}
 
 impl CompiledBindSource {
     fn path(&self) -> &Path {
@@ -2980,10 +3160,9 @@ impl CompiledBindSource {
         let Some(pinned) = &self.pinned_descriptor else {
             return Ok(None);
         };
-        let descriptor = fcntl_dupfd_cloexec(pinned.descriptor.as_ref(), 3)
-            .map_err(|source| BubblewrapSpawnError::PinnedMountTransport(source.into()))?;
-        fcntl_setfd(&descriptor, FdFlags::empty())
-            .map_err(|source| BubblewrapSpawnError::PinnedMountTransport(source.into()))?;
+        let descriptor = pinned
+            .duplicate_for_child()
+            .map_err(BubblewrapSpawnError::PinnedMountTransport)?;
         Ok(Some(descriptor))
     }
 }
@@ -3023,6 +3202,28 @@ impl CompiledMount {
                     .map(|relative| source.path().join(relative)),
             },
             CompiledMountKind::BoundedTmpfs { .. } => None,
+        }
+    }
+
+    fn is_descriptor_pinned_file_for_program(&self, program: &Path) -> bool {
+        match &self.kind {
+            CompiledMountKind::Bind {
+                source,
+                source_type: MountSourceType::File,
+                is_runtime: true,
+                ..
+            } if program == self.destination => {
+                #[cfg(target_os = "linux")]
+                {
+                    source.pinned_descriptor.is_some()
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    false
+                }
+            }
+            CompiledMountKind::Bind { .. } | CompiledMountKind::BoundedTmpfs { .. } => false,
         }
     }
 
@@ -3101,11 +3302,15 @@ impl CompiledMount {
 fn display_arguments(
     mount_prefix_arguments: &[OsString],
     mounts: &[CompiledMount],
+    executable_overlays: &[CompiledMount],
     mount_suffix_arguments: &[OsString],
 ) -> Vec<OsString> {
     let mut arguments = mount_prefix_arguments.to_vec();
     for mount in mounts {
         mount.append_display_arguments(&mut arguments);
+    }
+    for executable_overlay in executable_overlays {
+        executable_overlay.append_display_arguments(&mut arguments);
     }
     arguments.extend(mount_suffix_arguments.iter().cloned());
     arguments
@@ -3173,6 +3378,27 @@ fn resolve_regular_executable_file(
     Ok(path)
 }
 
+fn compile_host_executable(
+    field: &'static str,
+    configured_path: &Path,
+    binding: ExecutableSourceBinding,
+) -> Result<CompiledHostExecutable, BubblewrapPolicyError> {
+    let path = resolve_regular_executable_file(field, configured_path)?;
+    #[cfg(target_os = "linux")]
+    let pinned_descriptor = match binding {
+        ExecutableSourceBinding::Path => None,
+        ExecutableSourceBinding::DescriptorPinned => Some(pin_executable_source(field, &path)?),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = binding;
+
+    Ok(CompiledHostExecutable {
+        path,
+        #[cfg(target_os = "linux")]
+        pinned_descriptor,
+    })
+}
+
 fn resolve_runtime_mount(
     mount: &ReadOnlyMount,
     binding: MountSourceBinding,
@@ -3209,6 +3435,28 @@ fn resolve_file_root(
             source,
             access: binding.access,
             source_type: MountSourceType::Directory,
+            is_runtime: false,
+        },
+    })
+}
+
+fn compile_pinned_program_overlay(
+    field: &'static str,
+    source_path: PathBuf,
+    destination: PathBuf,
+) -> Result<CompiledMount, BubblewrapPolicyError> {
+    let source = compile_bind_source(
+        field,
+        source_path,
+        MountSourceType::File,
+        MountSourceBinding::DescriptorPinned,
+    )?;
+    Ok(CompiledMount {
+        destination,
+        kind: CompiledMountKind::Bind {
+            source,
+            access: FileRootAccess::ReadOnly,
+            source_type: MountSourceType::File,
             is_runtime: false,
         },
     })
@@ -3265,23 +3513,13 @@ fn pin_mount_source(
     field: &'static str,
     path: &Path,
     expected_type: MountSourceType,
-) -> Result<PinnedMountDescriptor, BubblewrapPolicyError> {
-    let descriptor = open(
-        path,
-        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|source| BubblewrapPolicyError::SourceIo {
-        field,
-        path: path.to_path_buf(),
-        source: source.into(),
-    })?;
-    let metadata = fstat(&descriptor).map_err(|source| BubblewrapPolicyError::SourceIo {
-        field,
-        path: path.to_path_buf(),
-        source: source.into(),
-    })?;
-    let file_type = FileType::from_raw_mode(metadata.st_mode);
+) -> Result<PinnedSourceDescriptor, BubblewrapPolicyError> {
+    let (descriptor, file_type, _) =
+        open_pinned_source(path).map_err(|source| BubblewrapPolicyError::SourceIo {
+            field,
+            path: path.to_path_buf(),
+            source,
+        })?;
     let expected = match expected_type {
         MountSourceType::File => file_type.is_file(),
         MountSourceType::Directory => file_type.is_dir(),
@@ -3296,9 +3534,82 @@ fn pin_mount_source(
             },
         });
     }
-    Ok(PinnedMountDescriptor {
-        descriptor: Arc::new(descriptor),
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_executable_source(
+    field: &'static str,
+    path: &Path,
+) -> Result<PinnedSourceDescriptor, BubblewrapPolicyError> {
+    let (descriptor, file_type, mode) =
+        open_pinned_source(path).map_err(|source| BubblewrapPolicyError::SourceIo {
+            field,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !file_type.is_file() {
+        return Err(BubblewrapPolicyError::InvalidSourceType {
+            field,
+            path: path.to_path_buf(),
+            expected: "regular file",
+        });
+    }
+    if !is_executable_mode(mode) {
+        return Err(BubblewrapPolicyError::SourceNotExecutable {
+            field,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(descriptor)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_host_executable_for_spawn(
+    field: &'static str,
+    path: &Path,
+) -> Result<CompiledHostExecutable, BubblewrapSpawnError> {
+    let (pinned_descriptor, file_type, mode) =
+        open_pinned_source(path).map_err(BubblewrapSpawnError::PinnedExecutableTransport)?;
+    if !file_type.is_file() || !is_executable_mode(mode) {
+        return Err(BubblewrapSpawnError::PinnedExecutableTransport(
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{field} {} is not a regular executable file",
+                    path.display()
+                ),
+            ),
+        ));
+    }
+    Ok(CompiledHostExecutable {
+        path: path.to_path_buf(),
+        pinned_descriptor: Some(pinned_descriptor),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_source(path: &Path) -> io::Result<(PinnedSourceDescriptor, FileType, u32)> {
+    let descriptor = open(
+        path,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| -> io::Error { source.into() })?;
+    let metadata = fstat(&descriptor).map_err(|source| -> io::Error { source.into() })?;
+    let file_type = FileType::from_raw_mode(metadata.st_mode);
+    Ok((
+        PinnedSourceDescriptor {
+            descriptor: Arc::new(descriptor),
+        },
+        file_type,
+        metadata.st_mode,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn is_executable_mode(mode: u32) -> bool {
+    mode & 0o111 != 0
 }
 
 fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
@@ -3314,6 +3625,23 @@ fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
 fn ensure_mount_source_binding_supported(
     _binding: MountSourceBinding,
 ) -> Result<(), BubblewrapPolicyError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_executable_source_binding_supported(
+    _binding: ExecutableSourceBinding,
+) -> Result<(), BubblewrapPolicyError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_executable_source_binding_supported(
+    binding: ExecutableSourceBinding,
+) -> Result<(), BubblewrapPolicyError> {
+    if binding == ExecutableSourceBinding::DescriptorPinned {
+        return Err(BubblewrapPolicyError::DescriptorPinnedExecutablesUnsupportedPlatform);
+    }
     Ok(())
 }
 
@@ -3393,13 +3721,19 @@ fn validate_mount_layout(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeProgramSource {
+    source: PathBuf,
+    is_descriptor_pinned_file: bool,
+}
+
 fn validate_runtime_program(
     mounts: &[CompiledMount],
     program: &Path,
     not_mounted: fn(PathBuf) -> BubblewrapPolicyError,
     not_executable: fn(PathBuf) -> BubblewrapPolicyError,
     source_field: &'static str,
-) -> Result<(), BubblewrapPolicyError> {
+) -> Result<RuntimeProgramSource, BubblewrapPolicyError> {
     let program_mount = mounts.iter().find(|mount| mount.exposes_program(program));
     let Some(program_mount) = program_mount else {
         return Err(not_mounted(program.to_path_buf()));
@@ -3417,7 +3751,10 @@ fn validate_runtime_program(
     if !metadata.file_type().is_file() || !is_executable(&metadata) {
         return Err(not_executable(program.to_path_buf()));
     }
-    Ok(())
+    Ok(RuntimeProgramSource {
+        source: program_source,
+        is_descriptor_pinned_file: program_mount.is_descriptor_pinned_file_for_program(program),
+    })
 }
 
 fn reserved_destinations(private_tmpfs: bool) -> Vec<(&'static Path, &'static str)> {
@@ -4200,6 +4537,105 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_pinned_executables_require_pinned_mount_roots() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert_eq!(
+            policy.executable_source_binding(),
+            ExecutableSourceBinding::Path
+        );
+
+        policy.pin_executable_sources();
+        assert_eq!(
+            policy.executable_source_binding(),
+            ExecutableSourceBinding::DescriptorPinned
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::DescriptorPinnedExecutablesRequirePinnedMountSources)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_pinned_executables_overlay_fixed_worker_and_limit_runner() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.pin_mount_sources();
+        policy.pin_executable_sources();
+        policy.set_resource_limit_runner(resource_limit_runner(&root));
+
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+
+        assert!(plan.bwrap_program.is_descriptor_pinned());
+        assert_eq!(plan.executable_overlays.len(), 2);
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--ro-bind-fd",
+                PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                "/opt/splash/worker",
+            ]
+        ));
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--ro-bind-fd",
+                PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                "/opt/splash/limit-runner",
+            ]
+        ));
+        let runtime_mount_index = arguments
+            .windows(3)
+            .position(|window| {
+                window.iter().map(String::as_str).eq([
+                    "--ro-bind-fd",
+                    PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                    "/opt/splash",
+                ])
+            })
+            .unwrap();
+        let worker_overlay_index = arguments
+            .windows(3)
+            .position(|window| {
+                window.iter().map(String::as_str).eq([
+                    "--ro-bind-fd",
+                    PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                    "/opt/splash/worker",
+                ])
+            })
+            .unwrap();
+        assert!(runtime_mount_index < worker_overlay_index);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_pinned_host_executable_survives_path_replacement() {
+        let root = TestDirectory::new();
+        let program = root.path().join("program");
+        create_script_executable(&program, "#!/bin/sh\nprintf 'compiled\\n'\n");
+
+        let executable = compile_host_executable(
+            "test program",
+            &program,
+            ExecutableSourceBinding::DescriptorPinned,
+        )
+        .unwrap();
+        let retired = root.path().join("program-retired");
+        fs::rename(&program, &retired).unwrap();
+        create_script_executable(&program, "#!/bin/sh\nprintf 'replacement\\n'\n");
+
+        let (command_path, descriptor) = executable.prepare_for_execution().unwrap();
+        let output = Command::new(command_path).output().unwrap();
+        drop(descriptor);
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"compiled\n");
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn descriptor_pinned_mount_roots_fail_closed_off_linux() {
@@ -4210,6 +4646,19 @@ mod tests {
         assert!(matches!(
             policy.compile(&manifest([])),
             Err(BubblewrapPolicyError::DescriptorPinnedMountsUnsupportedPlatform)
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn descriptor_pinned_executables_fail_closed_off_linux() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.pin_executable_sources();
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::DescriptorPinnedExecutablesUnsupportedPlatform)
         ));
     }
 
@@ -5708,6 +6157,16 @@ print("seccomp-active")
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_script_executable(path: &Path, source: &str) {
+        fs::write(path, source).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[cfg(unix)]

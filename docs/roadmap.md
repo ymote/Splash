@@ -120,6 +120,13 @@
   `--ro-bind-fd` or `--bind-fd` handles with no path-bind fallback, preventing
   replacement of the selected mount root. This does not freeze mutable
   descendants, runtime contents, or the Bubblewrap executable.
+- Optional Linux descriptor-pinned fixed executable identity. Together with
+  descriptor-pinned runtime roots, Bubblewrap is executed through its retained
+  launch-only descriptor; fixed worker and resource-limit-runner files are
+  retained and overlaid at their exact worker paths; and a cgroup runner is
+  pinned immediately after fresh cgroup preparation. It does not freeze an
+  interpreter, dynamic loader, shared libraries, runtime contents, or provide
+  general executable-path mediation.
 - Versioned private-pipe session bootstrap for a compiled Linux Bubblewrap
   worker. It checks the manifest session before launch and never places the
   host-generated key in command-line arguments or environment variables.
