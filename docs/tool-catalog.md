@@ -163,3 +163,8 @@ duplicate, or oversized projections as a whole, and marks the resulting tool
 completion incomplete rather than presenting a partial catalog. Runtime policy
 still checks the actual dynamic name against the active catalog and capability
 lease at reservation time.
+
+Static authoring metadata for host-defined `mod.*` interfaces is intentionally
+separate from this tool catalog. It uses
+`initializationOptions.splash.moduleCatalog`, cannot discover or approve a
+tool, and is documented in [Editor module interface projection](module-catalog.md).

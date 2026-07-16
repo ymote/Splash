@@ -39,12 +39,16 @@ snapshot. It may retain a site from incomplete source only when the site ends
 before or at the first syntax diagnostic. It never queries runtime values,
 module exports, a live tool catalog, or adapter metadata, and completion
 candidates do not grant or predict authority. A local editor integration may
-supply a bounded static catalog projection in initialization options; the LSP
+supply bounded static projections in initialization options: a tool projection
 uses only names, formats, and descriptions to complete a direct visible
-`mod.tool` literal. It never queries or authenticates that projection, presents
-no partial projection after malformed or over-limit input, and a suggested name
-remains subject to runtime catalog and lease checks. Guarded rename is advertised
-only to a client that supports versioned document edits. It never renames an
+`mod.tool` literal, while a separate module-interface projection uses canonical
+`mod.*` paths and descriptions for direct import-path or imported-module member
+spelling. The LSP never queries or authenticates either projection, loads or
+validates a referenced module, presents no partial projection after malformed or
+over-limit input, or lets module metadata replace the fixed `mod.tool` methods.
+Suggested names remain subject to runtime module binding, catalog, and lease
+checks. Guarded rename is advertised only to a client that supports versioned
+document edits. It never renames an
 import path, never operates on a truncated index, validates the replacement with
 the canonical lexer and parser, and returns edits only when the complete remapped
 lexical report is unchanged apart from the selected name and byte offsets. This
@@ -62,9 +66,11 @@ when its retained occurrence has an exact binding. The index is not a type
 checker, module resolver, capability analysis, or authorization decision. The
 server retains at most 128 document states and no source text larger than the
 canonical 256 KiB limit, but the underlying LSP framing layer decodes an inbound
-message before that retention limit applies. The optional catalog projection is
-separately bounded to 128 entries and 512 KiB of retained names/descriptions,
-but its inbound LSP message is likewise decoded first. Do not expose its stdio
+message before that retention limit applies. The optional tool projection is
+separately bounded to 128 entries and 512 KiB of retained names/descriptions;
+the optional module-interface projection is bounded to 256 entries and 512 KiB
+of retained paths/descriptions. Their inbound LSP messages are likewise decoded
+first. Do not expose its stdio
 transport to a hostile peer or describe it as an IPC resource sandbox; place a
 separate bounded transport or operating-system boundary in front of such a peer.
 

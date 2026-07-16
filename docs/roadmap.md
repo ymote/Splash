@@ -21,7 +21,10 @@
   import binding. A bounded, initialization-time advisory catalog projection
   can complete literal names in direct tool calls without a runtime/catalog
   lookup or authority inference; it performs no arbitrary module, type, or
-  field inference.
+  field inference. A separate bounded, initialization-time advisory module
+  interface projection can complete direct `use mod.*` path segments and
+  immediate children of a direct visible imported-module binding without module
+  loading, resolution, runtime export inspection, or authority inference.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.

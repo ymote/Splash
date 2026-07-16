@@ -52,6 +52,15 @@ const MAX_LSP_TOOL_CATALOG_TOOLS: usize = 128;
 const MAX_LSP_TOOL_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_LSP_TOOL_NAME_BYTES: usize = 128;
 const MAX_LSP_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum retained descriptors in the optional LSP module-interface
+/// projection. This is metadata for authoring only, never a module registry.
+const MAX_LSP_MODULE_CATALOG_ENTRIES: usize = 256;
+/// Maximum retained path and description bytes in the optional LSP
+/// module-interface projection.
+const MAX_LSP_MODULE_CATALOG_BYTES: usize = 512 * 1024;
+const MAX_LSP_MODULE_PATH_BYTES: usize = 256;
+const MAX_LSP_MODULE_PATH_SEGMENTS: usize = 16;
+const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
 
 type ServerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -110,6 +119,23 @@ struct ToolCompletionCatalog {
     unavailable: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleCatalogCompletion {
+    path: Vec<String>,
+    description: String,
+}
+
+/// A bounded, advisory projection of a host's known `mod.*` interface.
+///
+/// Like the tool projection, this stays inside the editor process and is
+/// static for the LSP session. It cannot load, resolve, install, or authorize
+/// a module.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ModuleCompletionCatalog {
+    modules: Vec<ModuleCatalogCompletion>,
+    unavailable: bool,
+}
+
 #[derive(Debug)]
 struct DocumentState {
     source: Option<String>,
@@ -149,13 +175,23 @@ struct SpanReplacement {
 struct SplashLanguageServer {
     documents: HashMap<Uri, DocumentState>,
     tool_catalog: ToolCompletionCatalog,
+    module_catalog: ModuleCompletionCatalog,
 }
 
 impl SplashLanguageServer {
+    #[cfg(test)]
     fn with_tool_catalog(tool_catalog: ToolCompletionCatalog) -> Self {
+        Self::with_completion_catalogs(tool_catalog, ModuleCompletionCatalog::default())
+    }
+
+    fn with_completion_catalogs(
+        tool_catalog: ToolCompletionCatalog,
+        module_catalog: ModuleCompletionCatalog,
+    ) -> Self {
         Self {
             documents: HashMap::new(),
             tool_catalog,
+            module_catalog,
         }
     }
 
@@ -337,6 +373,16 @@ impl SplashLanguageServer {
             return Ok(empty());
         }
 
+        if let Some(import_site) = direct_import_path_completion_site(source, byte_offset) {
+            return Ok(module_catalog_path_completion(
+                source,
+                report,
+                &self.module_catalog,
+                import_site,
+                lexical_incomplete,
+            ));
+        }
+
         if let Some(tool_name_site) = direct_tool_name_completion_site(source, byte_offset) {
             let imports = self.module_imports(uri)?;
             return Ok(tool_catalog_name_completion(
@@ -351,12 +397,23 @@ impl SplashLanguageServer {
 
         if let Some(member_site) = direct_module_member_completion_site(source, byte_offset) {
             let imports = self.module_imports(uri)?;
-            return Ok(tool_module_member_completion(
+            let is_incomplete = lexical_incomplete || imports.truncated;
+            if is_visible_builtin_tool_receiver(source, report, imports, member_site.receiver) {
+                return Ok(tool_module_member_completion(
+                    source,
+                    report,
+                    imports,
+                    member_site,
+                    is_incomplete,
+                ));
+            }
+            return Ok(module_catalog_member_completion(
                 source,
                 report,
                 imports,
+                &self.module_catalog,
                 member_site,
-                lexical_incomplete || imports.truncated,
+                is_incomplete,
             ));
         }
 
@@ -629,7 +686,8 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
     let initialize_params =
         serde_json::from_value::<InitializeParams>(initialize_value).unwrap_or_default();
     let versioned_document_edits = supports_versioned_document_edits(&initialize_params);
-    let tool_catalog = tool_completion_catalog_from_initialize_options(&initialize_params);
+    let (tool_catalog, module_catalog) =
+        completion_catalogs_from_initialize_options(&initialize_params);
     connection.initialize_finish(
         initialize_id,
         serde_json::json!({
@@ -637,7 +695,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
         }),
     )?;
 
-    let mut server = SplashLanguageServer::with_tool_catalog(tool_catalog);
+    let mut server = SplashLanguageServer::with_completion_catalogs(tool_catalog, module_catalog);
     while let Ok(message) = connection.receiver.recv() {
         match message {
             Message::Request(request) => {
@@ -672,31 +730,71 @@ fn supports_versioned_document_edits(params: &InitializeParams) -> bool {
         == Some(true)
 }
 
+fn completion_catalogs_from_initialize_options(
+    params: &InitializeParams,
+) -> (ToolCompletionCatalog, ModuleCompletionCatalog) {
+    let Some(options) = params.initialization_options.as_ref() else {
+        return (
+            ToolCompletionCatalog::default(),
+            ModuleCompletionCatalog::default(),
+        );
+    };
+    let Some(options) = options.as_object() else {
+        return (
+            ToolCompletionCatalog::default(),
+            ModuleCompletionCatalog::default(),
+        );
+    };
+    let Some(splash) = options.get("splash") else {
+        return (
+            ToolCompletionCatalog::default(),
+            ModuleCompletionCatalog::default(),
+        );
+    };
+    let Some(splash) = splash.as_object() else {
+        return (
+            unavailable_tool_completion_catalog(),
+            unavailable_module_completion_catalog(),
+        );
+    };
+
+    let tool_catalog = match splash.get("toolCatalog") {
+        Some(catalog) => parse_tool_completion_catalog(catalog)
+            .unwrap_or_else(unavailable_tool_completion_catalog),
+        None => ToolCompletionCatalog::default(),
+    };
+    let module_catalog = match splash.get("moduleCatalog") {
+        Some(catalog) => parse_module_completion_catalog(catalog)
+            .unwrap_or_else(unavailable_module_completion_catalog),
+        None => ModuleCompletionCatalog::default(),
+    };
+    (tool_catalog, module_catalog)
+}
+
+#[cfg(test)]
 fn tool_completion_catalog_from_initialize_options(
     params: &InitializeParams,
 ) -> ToolCompletionCatalog {
-    let Some(options) = params.initialization_options.as_ref() else {
-        return ToolCompletionCatalog::default();
-    };
-    let Some(options) = options.as_object() else {
-        return ToolCompletionCatalog::default();
-    };
-    let Some(splash) = options.get("splash") else {
-        return ToolCompletionCatalog::default();
-    };
-    let Some(splash) = splash.as_object() else {
-        return unavailable_tool_completion_catalog();
-    };
-    let Some(catalog) = splash.get("toolCatalog") else {
-        return ToolCompletionCatalog::default();
-    };
+    completion_catalogs_from_initialize_options(params).0
+}
 
-    parse_tool_completion_catalog(catalog).unwrap_or_else(unavailable_tool_completion_catalog)
+#[cfg(test)]
+fn module_completion_catalog_from_initialize_options(
+    params: &InitializeParams,
+) -> ModuleCompletionCatalog {
+    completion_catalogs_from_initialize_options(params).1
 }
 
 fn unavailable_tool_completion_catalog() -> ToolCompletionCatalog {
     ToolCompletionCatalog {
         tools: Vec::new(),
+        unavailable: true,
+    }
+}
+
+fn unavailable_module_completion_catalog() -> ModuleCompletionCatalog {
+    ModuleCompletionCatalog {
+        modules: Vec::new(),
         unavailable: true,
     }
 }
@@ -756,6 +854,72 @@ fn is_valid_catalog_tool_name(name: &str) -> bool {
         && name.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
         })
+}
+
+/// Reads a tiny static `mod.*` interface projection without treating it as a
+/// module registry. Each path must be canonical source spelling rooted at
+/// `mod`; unknown descriptor fields remain intentionally ignored.
+fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCompletionCatalog> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_LSP_MODULE_CATALOG_ENTRIES {
+        return None;
+    }
+
+    let mut retained_bytes = 0_usize;
+    let mut modules = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object()?;
+        let path = parse_module_catalog_path(object.get("path")?.as_str()?)?;
+        let description = match object.get("description") {
+            Some(value) => value.as_str()?,
+            None => "",
+        };
+        if description.len() > MAX_LSP_MODULE_DESCRIPTION_BYTES {
+            return None;
+        }
+        let path_bytes = path
+            .iter()
+            .try_fold(0_usize, |total, segment| total.checked_add(segment.len()))?
+            .checked_add(path.len().saturating_sub(1))?;
+        let entry_bytes = path_bytes.checked_add(description.len())?.checked_add(1)?;
+        retained_bytes = retained_bytes.checked_add(entry_bytes)?;
+        if retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES
+            || modules
+                .iter()
+                .any(|module: &ModuleCatalogCompletion| module.path == path)
+        {
+            return None;
+        }
+        modules.push(ModuleCatalogCompletion {
+            path,
+            description: description.to_owned(),
+        });
+    }
+    modules.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Some(ModuleCompletionCatalog {
+        modules,
+        unavailable: false,
+    })
+}
+
+fn parse_module_catalog_path(path: &str) -> Option<Vec<String>> {
+    if path.len() > MAX_LSP_MODULE_PATH_BYTES {
+        return None;
+    }
+    let segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+    if segments.len() < 2
+        || segments.len() > MAX_LSP_MODULE_PATH_SEGMENTS
+        || segments.first().is_none_or(|segment| segment != "mod")
+        || segments.get(1).is_some_and(|segment| segment == "tool")
+        || !segments
+            .iter()
+            .skip(1)
+            .all(|segment| is_canonical_identifier(segment))
+    {
+        return None;
+    }
+    Some(segments)
 }
 
 fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
@@ -1168,6 +1332,12 @@ struct MemberCompletionSite {
     member: SourceSpan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImportPathCompletionSite {
+    prefix: Vec<String>,
+    segment: SourceSpan,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ToolNameCompletionSite {
     receiver: SourceSpan,
@@ -1230,6 +1400,100 @@ fn direct_module_member_completion_site(
             end_byte: member_end,
         },
     })
+}
+
+/// Recognizes one direct, statement-position `use mod.<path>` segment.
+///
+/// This is deliberately lexical and only accepts a `use` following the start
+/// of source, a statement separator, or a block boundary. It does not resolve
+/// source files or module paths; its sole purpose is to replace the current
+/// path segment with bounded advisory metadata while an import is being typed.
+fn direct_import_path_completion_site(
+    source: &str,
+    byte_offset: usize,
+) -> Option<ImportPathCompletionSite> {
+    if byte_offset > source.len()
+        || !source.is_char_boundary(byte_offset)
+        || string_content_span_at(source, byte_offset).is_some()
+        || cursor_is_inside_comment(source, byte_offset)
+    {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    let mut segment_start = byte_offset;
+    while segment_start > 0 && is_identifier_byte(bytes[segment_start - 1]) {
+        segment_start -= 1;
+    }
+    let mut segment_end = byte_offset;
+    while segment_end < bytes.len() && is_identifier_byte(bytes[segment_end]) {
+        segment_end += 1;
+    }
+    if segment_start < segment_end && !is_identifier_start_byte(bytes[segment_start]) {
+        return None;
+    }
+
+    let mut before_segment = skip_ascii_whitespace_backward(source, segment_start);
+    let mut reversed_prefix = Vec::new();
+    let module_start;
+    loop {
+        if before_segment == 0 || bytes[before_segment - 1] != b'.' {
+            return None;
+        }
+        let before_dot = skip_ascii_whitespace_backward(source, before_segment - 1);
+        let previous_start = identifier_start_before(source, before_dot);
+        if previous_start == before_dot || !is_identifier_start_byte(bytes[previous_start]) {
+            return None;
+        }
+        let previous = source.get(previous_start..before_dot)?;
+        if !is_canonical_identifier(previous) {
+            return None;
+        }
+        reversed_prefix.push(previous.to_owned());
+        before_segment = skip_ascii_whitespace_backward(source, previous_start);
+        if previous == "mod" {
+            module_start = previous_start;
+            break;
+        }
+    }
+    reversed_prefix.reverse();
+    if reversed_prefix
+        .first()
+        .is_none_or(|segment| segment != "mod")
+    {
+        return None;
+    }
+
+    let use_end = before_segment;
+    let use_start = identifier_start_before(source, use_end);
+    if source.get(use_start..use_end)? != "use"
+        || module_start <= use_end
+        || !source[use_end..module_start]
+            .bytes()
+            .all(|byte| byte.is_ascii_whitespace())
+        || !is_import_statement_start(source, use_start)
+    {
+        return None;
+    }
+
+    Some(ImportPathCompletionSite {
+        prefix: reversed_prefix,
+        segment: SourceSpan {
+            start_byte: segment_start,
+            end_byte: segment_end,
+        },
+    })
+}
+
+fn is_import_statement_start(source: &str, use_start: usize) -> bool {
+    let mut cursor = use_start;
+    while cursor > 0 && source.as_bytes()[cursor - 1].is_ascii_whitespace() {
+        cursor -= 1;
+        if matches!(source.as_bytes()[cursor], b'\n' | b'\r') {
+            return true;
+        }
+    }
+    cursor == 0 || matches!(source.as_bytes()[cursor - 1], b';' | b'{')
 }
 
 /// Recognizes the first literal argument to one direct `mod.tool` call.
@@ -1491,6 +1755,132 @@ fn tool_module_member_completion(
     }
 }
 
+fn module_catalog_path_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    catalog: &ModuleCompletionCatalog,
+    site: ImportPathCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let is_incomplete = is_incomplete || catalog.unavailable;
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if site.segment.end_byte > lexical.valid_prefix_end_byte {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.segment);
+    let items = module_catalog_children(catalog, &site.prefix)
+        .into_iter()
+        .map(|child| CompletionItem {
+            label: child.name.clone(),
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some("advisory module path; host module binding required".to_owned()),
+            documentation: child.description.map(|description| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: description,
+                })
+            }),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range, child.name,
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect();
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
+fn module_catalog_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &ModuleCompletionCatalog,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+    {
+        return empty();
+    }
+    let Some(import) = visible_module_import_for_receiver(source, lexical, imports, site.receiver)
+    else {
+        return empty();
+    };
+
+    let is_incomplete = is_incomplete || catalog.unavailable;
+    let edit_range = span_range(source, site.member);
+    let items = module_catalog_children(catalog, &import.path)
+        .into_iter()
+        .map(|child| CompletionItem {
+            label: child.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(
+                "advisory imported-module member; host module binding required".to_owned(),
+            ),
+            documentation: child.description.map(|description| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: description,
+                })
+            }),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range, child.name,
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect();
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleCatalogChild {
+    name: String,
+    description: Option<String>,
+}
+
+/// Returns only immediate descriptors below one static path. Intermediate
+/// namespaces are inferred from their descendants but deliberately have no
+/// borrowed leaf description.
+fn module_catalog_children(
+    catalog: &ModuleCompletionCatalog,
+    parent: &[String],
+) -> Vec<ModuleCatalogChild> {
+    let mut children: Vec<ModuleCatalogChild> = Vec::new();
+    for module in &catalog.modules {
+        if module.path.len() <= parent.len() || !module.path.starts_with(parent) {
+            continue;
+        }
+        let name = module.path[parent.len()].clone();
+        let description = (module.path.len() == parent.len() + 1 && !module.description.is_empty())
+            .then(|| module.description.clone());
+        if let Some(existing) = children.iter_mut().find(|child| child.name == name) {
+            if existing.description.is_none() && description.is_some() {
+                existing.description = description;
+            }
+        } else {
+            children.push(ModuleCatalogChild { name, description });
+        }
+    }
+    children.sort_by(|left, right| left.name.cmp(&right.name));
+    children
+}
+
 fn tool_catalog_name_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -1546,21 +1936,31 @@ fn is_visible_builtin_tool_receiver(
     imports: &ModuleImportReport,
     receiver: SourceSpan,
 ) -> bool {
+    visible_module_import_for_receiver(source, lexical, imports, receiver)
+        .is_some_and(is_builtin_tool_module_import)
+}
+
+fn visible_module_import_for_receiver<'imports>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &'imports ModuleImportReport,
+    receiver: SourceSpan,
+) -> Option<&'imports ModuleImport> {
     if receiver.end_byte > lexical.valid_prefix_end_byte
         || receiver.end_byte > imports.valid_prefix_end_byte
     {
-        return false;
+        return None;
     }
-    let Some(receiver_name) = source.get(receiver.start_byte..receiver.end_byte) else {
-        return false;
-    };
-    let Some(symbol) = visible_symbol_at(lexical, receiver_name, receiver.start_byte) else {
-        return false;
-    };
-    symbol.kind == LexicalSymbolKind::Import
-        && imports.imports.iter().any(|import| {
-            import.binding == symbol.definition && is_builtin_tool_module_import(import)
+    let receiver_name = source.get(receiver.start_byte..receiver.end_byte)?;
+    let symbol = visible_symbol_at(lexical, receiver_name, receiver.start_byte)?;
+    (symbol.kind == LexicalSymbolKind::Import)
+        .then(|| {
+            imports
+                .imports
+                .iter()
+                .find(|import| import.binding == symbol.definition)
         })
+        .flatten()
 }
 
 fn visible_symbol_at<'symbol>(
@@ -1916,6 +2316,10 @@ mod tests {
 
     fn tool_catalog(value: serde_json::Value) -> ToolCompletionCatalog {
         parse_tool_completion_catalog(&value).expect("tool catalog projection is valid")
+    }
+
+    fn module_catalog(value: serde_json::Value) -> ModuleCompletionCatalog {
+        parse_module_completion_catalog(&value).expect("module catalog projection is valid")
     }
 
     fn apply_text_edits(source: &str, edits: &[TextEdit]) -> String {
@@ -2686,6 +3090,376 @@ mod tests {
     }
 
     #[test]
+    fn completes_bounded_advisory_module_paths_and_direct_imported_members() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.std",
+                "description": "Standard helpers.",
+                "ignored": {"nested": true}
+            },
+            {
+                "path": "mod.std.assert",
+                "description": "Stops when a condition is false."
+            },
+            {
+                "path": "mod.std.log",
+                "description": "Writes a host-defined log message."
+            },
+            {
+                "path": "mod.math.sin",
+                "description": "Computes a sine."
+            }
+        ]));
+
+        let import_source = "use mod.st";
+        let mut import_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        import_server.open_document(document(1, import_source));
+        let import_start = import_source.rfind("st").unwrap();
+        let import_completion = import_server
+            .completion(
+                &test_uri(),
+                position_at_byte(import_source, import_source.len()),
+            )
+            .expect("import-path completion succeeds");
+        assert!(!import_completion.is_incomplete);
+        assert_eq!(
+            import_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["math", "std"]
+        );
+        assert!(import_completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::MODULE)
+                && item.detail.as_deref()
+                    == Some("advisory module path; host module binding required")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if *range == Range::new(
+                            position_at_byte(import_source, import_start),
+                            position_at_byte(import_source, import_source.len()),
+                        )
+                )
+        }));
+        let std_import = import_completion
+            .items
+            .iter()
+            .find(|item| item.label == "std")
+            .expect("explicit module descriptor is present");
+        assert_eq!(
+            std_import.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Standard helpers.".to_owned(),
+            }))
+        );
+
+        let nested_import_source = "use mod.std.";
+        let mut nested_import_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        nested_import_server.open_document(document(1, nested_import_source));
+        let nested_import_completion = nested_import_server
+            .completion(
+                &test_uri(),
+                position_at_byte(nested_import_source, nested_import_source.len()),
+            )
+            .expect("nested import-path completion succeeds");
+        assert_eq!(
+            nested_import_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["assert", "log"]
+        );
+
+        let member_source = "use mod.std\nstd.";
+        let mut member_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        member_server.open_document(document(1, member_source));
+        let member_completion = member_server
+            .completion(
+                &test_uri(),
+                position_at_byte(member_source, member_source.len()),
+            )
+            .expect("imported-module member completion succeeds");
+        assert!(!member_completion.is_incomplete);
+        assert_eq!(
+            member_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["assert", "log"]
+        );
+        assert!(member_completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::FIELD)
+                && item.detail.as_deref()
+                    == Some("advisory imported-module member; host module binding required")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if *range == Range::new(
+                            position_at_byte(member_source, member_source.len()),
+                            position_at_byte(member_source, member_source.len()),
+                        )
+                )
+        }));
+        let assert_member = member_completion
+            .items
+            .iter()
+            .find(|item| item.label == "assert")
+            .expect("explicit member descriptor is present");
+        assert_eq!(
+            assert_member.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Stops when a condition is false.".to_owned(),
+            }))
+        );
+
+        let tool_source = "use mod.tool\ntool.";
+        let mut tool_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {"path": "mod.std.log", "description": "Does not affect mod.tool."}
+            ])),
+        );
+        tool_server.open_document(document(1, tool_source));
+        let tool_completion = tool_server
+            .completion(
+                &test_uri(),
+                position_at_byte(tool_source, tool_source.len()),
+            )
+            .expect("fixed tool completion succeeds");
+        assert_eq!(
+            tool_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["call", "call_json", "start", "start_json"]
+        );
+    }
+
+    #[test]
+    fn module_catalog_projection_is_bounded_and_fails_closed_when_malformed() {
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "moduleCatalog": [
+                        {"path": "mod.std.log", "description": "log"},
+                        {"path": "mod.math.sin", "description": "sine"}
+                    ]
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let catalog = module_completion_catalog_from_initialize_options(&params);
+        assert!(!catalog.unavailable);
+        assert_eq!(
+            catalog
+                .modules
+                .iter()
+                .map(|module| module.path.join("."))
+                .collect::<Vec<_>>(),
+            ["mod.math.sin", "mod.std.log"]
+        );
+
+        let invalid_params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "moduleCatalog": [
+                        {"path": "mod.std.123", "description": "invalid"}
+                    ]
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let invalid = module_completion_catalog_from_initialize_options(&invalid_params);
+        assert!(invalid.unavailable);
+        assert!(invalid.modules.is_empty());
+        let source = "use mod.";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            invalid,
+        );
+        server.open_document(document(1, source));
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("malformed module-catalog completion request succeeds");
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
+
+        let independent_params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "toolCatalog": [
+                        {"name": "TEXT.ECHO", "format": "text", "description": "invalid"}
+                    ],
+                    "moduleCatalog": [
+                        {"path": "mod.std.log", "description": "still usable"}
+                    ]
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let (invalid_tools, valid_modules) =
+            completion_catalogs_from_initialize_options(&independent_params);
+        assert!(invalid_tools.unavailable);
+        assert!(!valid_modules.unavailable);
+
+        let oversized = serde_json::Value::Array(
+            (0..=MAX_LSP_MODULE_CATALOG_ENTRIES)
+                .map(|index| {
+                    serde_json::json!({
+                        "path": format!("mod.module_{index}"),
+                        "description": "module"
+                    })
+                })
+                .collect(),
+        );
+        assert!(parse_module_completion_catalog(&oversized).is_none());
+
+        let oversized_description = serde_json::json!([{
+            "path": "mod.std.log",
+            "description": "x".repeat(MAX_LSP_MODULE_DESCRIPTION_BYTES + 1)
+        }]);
+        assert!(parse_module_completion_catalog(&oversized_description).is_none());
+
+        let oversized_retained_bytes = serde_json::Value::Array(
+            (0..MAX_LSP_MODULE_CATALOG_ENTRIES)
+                .map(|index| {
+                    serde_json::json!({
+                        "path": format!("mod.module_{index}"),
+                        "description": "x".repeat(MAX_LSP_MODULE_DESCRIPTION_BYTES)
+                    })
+                })
+                .collect(),
+        );
+        assert!(parse_module_completion_catalog(&oversized_retained_bytes).is_none());
+
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod", "description": "missing member"}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.tool.inspect", "description": "fixed surface"}
+        ]))
+        .is_none());
+        let too_many_segments = std::iter::once("mod")
+            .chain(std::iter::repeat_n("part", MAX_LSP_MODULE_PATH_SEGMENTS))
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": too_many_segments, "description": "too deep"}
+        ]))
+        .is_none());
+        let too_long_path = format!("mod.{}", "a".repeat(MAX_LSP_MODULE_PATH_BYTES));
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": too_long_path, "description": "too long"}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "description": "one"},
+            {"path": "mod.std.log", "description": "two"}
+        ]))
+        .is_none());
+
+        let valid_tool_invalid_modules = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "toolCatalog": [
+                        {"name": "text.echo", "format": "text", "description": "valid"}
+                    ],
+                    "moduleCatalog": [
+                        {"path": "mod.tool.inspect", "description": "invalid"}
+                    ]
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let (valid_tools, invalid_modules) =
+            completion_catalogs_from_initialize_options(&valid_tool_invalid_modules);
+        assert!(!valid_tools.unavailable);
+        assert!(invalid_modules.unavailable);
+    }
+
+    #[test]
+    fn refuses_advisory_module_completion_outside_direct_visible_contexts() {
+        let catalog = module_catalog(serde_json::json!([
+            {"path": "mod.std.log", "description": "log"}
+        ]));
+        for source in [
+            "let note = \"use mod.\"",
+            "// use mod.",
+            "value use mod.",
+            "fn run() {}use mod.",
+            "@\nuse mod.",
+            "use mod.other.std\nstd.",
+            "use mod.std\nlet note = \"std.\"",
+        ] {
+            let cursor = if source.ends_with("std.\"") {
+                source.rfind("std.").unwrap() + "std.".len()
+            } else if source.ends_with("std.") {
+                source.len()
+            } else if source.contains("use mod.") {
+                source.rfind("mod.").unwrap() + "mod.".len()
+            } else {
+                source.len()
+            };
+            let mut server = SplashLanguageServer::with_completion_catalogs(
+                ToolCompletionCatalog::default(),
+                catalog.clone(),
+            );
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, cursor))
+                .expect("completion request succeeds");
+            assert!(
+                completion.items.is_empty(),
+                "unexpected advisory module completion for {source:?}: {:?}",
+                completion
+                    .items
+                    .iter()
+                    .map(|item| (&item.label, &item.detail))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let shadowed_source = "use mod.std\nlet std = {log: 1}\nstd.";
+        let mut shadowed_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        shadowed_server.open_document(document(1, shadowed_source));
+        let receiver = shadowed_source.rfind("std.").unwrap();
+        let (_, lexical) = shadowed_server
+            .lexical_completions(&test_uri())
+            .expect("shadowed source has lexical completion metadata");
+        assert_eq!(
+            visible_symbol_at(lexical, "std", receiver).map(|symbol| symbol.kind),
+            Some(LexicalSymbolKind::Let)
+        );
+        let completion = shadowed_server
+            .completion(
+                &test_uri(),
+                position_at_byte(shadowed_source, shadowed_source.len()),
+            )
+            .expect("shadowed member completion request succeeds");
+        assert!(completion.items.is_empty());
+    }
+
+    #[test]
     fn refuses_module_member_completion_for_shadowed_or_non_direct_bindings() {
         for source in [
             "use mod.custom.tool\nlet output = tool.",
@@ -3256,6 +4030,12 @@ mod tests {
                                         "format": "json",
                                         "description": "Adds two integer fields."
                                     }
+                                ],
+                                "moduleCatalog": [
+                                    {
+                                        "path": "mod.app.weather",
+                                        "description": "Reads a host-defined forecast."
+                                    }
                                 ]
                             }
                         }
@@ -3682,6 +4462,63 @@ mod tests {
         assert_eq!(
             catalog_completion["items"][0]["detail"],
             "text capability name; host approval required"
+        );
+
+        let module_source = "use mod.app.";
+        client_connection
+            .sender
+            .send(
+                Notification::new(
+                    DidChangeTextDocument::METHOD.to_owned(),
+                    DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier::new(test_uri(), 3),
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: module_source.to_owned(),
+                        }],
+                    },
+                )
+                .into(),
+            )
+            .expect("module completion source change succeeds");
+        let _diagnostics = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("diagnostics arrive after module source change");
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    12.into(),
+                    Completion::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 0, "character": 12}
+                    }),
+                )
+                .into(),
+            )
+            .expect("module completion request send succeeds");
+        let module_completion_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("module completion response arrives");
+        let Message::Response(response) = module_completion_response else {
+            panic!("expected module completion response");
+        };
+        let module_completion = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("module completion request failed: {}", error.message)
+            }
+        };
+        assert_eq!(module_completion["isIncomplete"], false);
+        assert_eq!(module_completion["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(module_completion["items"][0]["label"], "weather");
+        assert_eq!(
+            module_completion["items"][0]["detail"],
+            "advisory module path; host module binding required"
         );
 
         client_connection

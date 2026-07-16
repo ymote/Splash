@@ -118,6 +118,45 @@ catalog is presented. A completion, description, or matching envelope format
 never grants a lease: runtime reservation and an active capability lease remain
 the authority boundary.
 
+An editor integration may separately provide a static advisory module-interface
+projection through `initializationOptions.splash.moduleCatalog`:
+
+```json
+{
+  "splash": {
+    "moduleCatalog": [
+      {
+        "path": "mod.app.weather",
+        "description": "Host-provided weather module."
+      },
+      {
+        "path": "mod.app.weather.current",
+        "description": "Returns current forecast data."
+      }
+    ]
+  }
+}
+```
+
+The LSP completes the current segment in a direct statement-position `use
+mod.*` path, and immediate children after a direct visible imported-module
+binding. It does not offer metadata-defined members for `mod.tool`, which keeps
+its fixed four language methods. The server neither reads a module URI or file,
+nor resolves, validates, installs, or loads a module; it also does not inspect
+runtime exports or infer general fields. This metadata is static for the LSP
+session and advisory even when an integration generated it from trusted host
+configuration.
+
+Each descriptor must use a canonical `mod.*` path with at least one following
+identifier, at most 16 path segments and 256 path bytes, plus an optional
+4 KiB description. The LSP retains at most 256 descriptors and 512 KiB of
+path/description bytes. Paths below the fixed `mod.tool` namespace are rejected.
+A duplicate path, malformed descriptor, or over-limit projection is discarded
+as a whole and marks matching completion
+`isIncomplete`; no partial interface is presented. See [Editor module interface
+projection](module-catalog.md) for the complete contract. This completion does
+not make a host binding available or authorize a capability.
+
 Rename is advertised only when the editor supports versioned
 `documentChanges`. It refuses import path edits and truncated reports, validates
 the new name with the canonical lexer, reparses the rewritten source, and

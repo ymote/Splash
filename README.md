@@ -15,8 +15,10 @@ and keeps UI support optional rather than making UI the language boundary.
   bindings, parameters, and loop bindings without evaluating source.
 - Bounded same-document lexical completion at expression identifiers, with
   scope-aware candidates, exact-token replacement edits, fixed `mod.tool`
-  member suggestions for an exact visible `use mod.tool` binding, and an
-  optional bounded advisory catalog projection for direct tool-name literals.
+  member suggestions for an exact visible `use mod.tool` binding, an optional
+  bounded advisory tool-catalog projection for direct tool-name literals, and
+  an optional static module-interface projection for direct import paths and
+  imported-module members.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -31,8 +33,8 @@ and keeps UI support optional rather than making UI the language boundary.
   full-document formatting edits, top-level declaration symbols, and
   same-document lexical definitions, references, binding-kind hover, and symbol
   highlights, lexical completion including the fixed `mod.tool` API and optional
-  advisory catalog literals, and version-bound guarded rename without reading
-  files or evaluating code.
+  advisory tool and module metadata, and version-bound guarded rename without
+  reading files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -405,9 +407,20 @@ and 4 KiB descriptions; malformed, duplicate, or oversized input is discarded
 as a whole and marks that completion result incomplete. The lexical service
 otherwise remains conservative: it does not infer forward references, types,
 record keys, arbitrary member fields, builtins, arbitrary catalog data, or
-imported-module exports. A truncated lexical index can still serve retained,
-sound definitions and hover, but exhaustive reference, highlight, and rename
-requests fail instead of returning a partial set.
+runtime-derived imported-module exports.
+
+An editor may also supply a separate static advisory module-interface
+projection through `initializationOptions.splash.moduleCatalog`. It completes
+the current segment in a direct statement-position `use mod.*` path and an
+immediate member after a direct, visible imported module binding. It does not
+load a source file, resolve a module, inspect a runtime export, or override the
+fixed `mod.tool` API. The projection is client-supplied, static for the session,
+and never authorizes source; malformed or over-limit input is discarded as a
+whole and marks matching completion incomplete. See [editor module-interface
+projection](docs/module-catalog.md) for its exact format and bounds. A truncated
+lexical index can still serve retained, sound definitions and hover, but
+exhaustive reference, highlight, and rename requests fail instead of returning
+a partial set.
 
 ## Workspace
 
@@ -448,6 +461,9 @@ defines the handoff to contained adapters. The [host tool catalog](docs/tool-cat
 defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schema-contracts.md)
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
+
+[Editor module-interface projection](docs/module-catalog.md) defines bounded
+static authoring metadata for host-defined `mod.*` interfaces.
 
 [Worker protocol v5](docs/worker-protocol.md) also defines keyed worker frames
 and the live-operation reconciliation boundary.
