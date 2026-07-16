@@ -23,6 +23,13 @@ pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 
+/// Stable identifier for the portable source contract enforced before normal
+/// Splash evaluation.
+pub const CANONICAL_PROFILE_ID: &str = "splash-v0.2";
+/// Version of the portable source grammar named by [`CANONICAL_PROFILE_ID`].
+pub const CANONICAL_PROFILE_VERSION: &str = "0.2";
+/// Repository-relative location of the normative portable grammar.
+pub const CANONICAL_PROFILE_GRAMMAR_PATH: &str = "docs/grammar.md";
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024;
 const FORMAT_OUTPUT_MULTIPLIER: usize = 4;
 /// Maximum formatted output size under the default source budget.

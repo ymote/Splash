@@ -12,7 +12,9 @@ use splash_capabilities::{
 use splash_core::{
     check_syntax_named, format_source_named, tool_call_hint_report_named,
     top_level_declarations_named, ExecutionLimits, SyntaxReport, ToolCallHint,
-    TopLevelDeclarationKind,
+    TopLevelDeclarationKind, CANONICAL_PROFILE_GRAMMAR_PATH, CANONICAL_PROFILE_ID,
+    CANONICAL_PROFILE_VERSION, DEFAULT_MAX_FORMATTED_SOURCE_BYTES, MAX_LEXICAL_COMPLETION_SITES,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 use splash_workflow::{
     mobile::{MobileWorkflowBuilder, MobileWorkflowRuntime},
@@ -26,6 +28,7 @@ const MAX_WORKFLOW_CLI_GRANTS: usize = 4_096;
 enum CliCommand {
     Evaluate(String),
     Catalog,
+    Profile,
     Check {
         file: String,
         source: String,
@@ -84,6 +87,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn run_options(options: CliOptions) -> Result<(), String> {
+    if matches!(&options.command, CliCommand::Profile) {
+        return run_profile();
+    }
     if let CliCommand::Check { file, source } = &options.command {
         return run_syntax_check(file, source);
     }
@@ -138,6 +144,9 @@ fn run_options(options: CliOptions) -> Result<(), String> {
             );
             return Ok(());
         }
+        CliCommand::Profile => {
+            unreachable!("profile returns before creating a host")
+        }
         CliCommand::Check { .. }
         | CliCommand::Outline { .. }
         | CliCommand::ToolCalls { .. }
@@ -176,6 +185,100 @@ fn run_options(options: CliOptions) -> Result<(), String> {
     } else {
         Err("script evaluation failed".to_owned())
     }
+}
+
+fn run_profile() -> Result<(), String> {
+    println!("{}", profile_output());
+    Ok(())
+}
+
+/// Versioned, host-free metadata for generated-source and workflow tooling.
+///
+/// This describes the standalone language boundary only. In particular, it
+/// never reports a host's tool catalog or conveys authority to invoke a tool.
+fn profile_output() -> JsonValue {
+    let limits = ExecutionLimits::default();
+    let soft_timeout_ms = u64::try_from(limits.soft_timeout.as_millis()).unwrap_or(u64::MAX);
+    let hard_timeout_ms = u64::try_from(limits.hard_timeout.as_millis()).unwrap_or(u64::MAX);
+
+    json!({
+        "schema_version": 1,
+        "language": "Splash",
+        "profile": {
+            "id": CANONICAL_PROFILE_ID,
+            "version": CANONICAL_PROFILE_VERSION,
+            "grammar_path": CANONICAL_PROFILE_GRAMMAR_PATH,
+            "canonical_only": true,
+        },
+        "preflight_limits": {
+            "source_bytes": limits.max_source_bytes,
+            "syntax_tokens": limits.max_syntax_tokens,
+            "syntax_nesting": limits.max_syntax_nesting,
+            "formatted_source_bytes": DEFAULT_MAX_FORMATTED_SOURCE_BYTES,
+            "syntax_diagnostics": MAX_SYNTAX_DIAGNOSTICS,
+        },
+        "tooling_limits": {
+            "tool_call_hints": MAX_TOOL_CALL_HINTS,
+            "lexical_symbol_occurrences": MAX_LEXICAL_SYMBOL_OCCURRENCES,
+            "lexical_completion_sites": MAX_LEXICAL_COMPLETION_SITES,
+        },
+        "evaluation_limits": {
+            "instruction_limit": limits.instruction_limit,
+            "soft_timeout_ms": soft_timeout_ms,
+            "hard_timeout_ms": hard_timeout_ms,
+            "budget_sample_interval": limits.budget_sample_interval,
+        },
+        "effect_free_commands": {
+            "profile": "splash profile",
+            "format": "splash format [--check] <file>",
+            "check": "splash check <file>",
+            "outline": "splash outline <file>",
+            "tool_calls": "splash tool-calls <file>",
+            "workflow_review": "splash workflow-review <draft.json>",
+        },
+        "tool_api": {
+            "import": "use mod.tool",
+            "await_method": ".await()",
+            "catalog_source": "host",
+            "calls": [
+                {
+                    "method": "tool.call",
+                    "input": "text",
+                    "returns": "text",
+                },
+                {
+                    "method": "tool.start",
+                    "input": "text",
+                    "returns": "promise",
+                    "await_result": "text",
+                },
+                {
+                    "method": "tool.call_json",
+                    "input": "record_or_array_json_envelope",
+                    "returns": "json_text",
+                    "decode_result": "parse_json",
+                },
+                {
+                    "method": "tool.start_json",
+                    "input": "record_or_array_json_envelope",
+                    "returns": "promise",
+                    "await_result": "json_text",
+                    "decode_await_result": "parse_json",
+                },
+            ],
+        },
+        "authority": {
+            "ambient_os_apis": false,
+            "ambient_rust_crate_access": false,
+            "imports_grant_authority": false,
+            "tool_registration": "host_only",
+            "tool_authorization": "runtime_host_policy",
+            "operator_approval": "optional_host_owned_capability_lease",
+            "static_tool_call_hints_authorize": false,
+            "workflow_drafts_grant_authority": false,
+            "workflow_approvals": "host_owned",
+        },
+    })
 }
 
 fn register_demo_tools(
@@ -756,7 +859,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 }
             }
             "check" | "outline" | "tool-calls" | "workflow-review" | "workflow-run" | "eval"
-            | "run" | "format" | "catalog" => positional.push(argument),
+            | "run" | "format" | "catalog" | "profile" => positional.push(argument),
             _ => positional.push(argument),
         }
     }
@@ -863,8 +966,13 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
             allow_echo,
             allow_json_add,
         }),
+        [command] if command == "profile" => Ok(CliOptions {
+            command: CliCommand::Profile,
+            allow_echo,
+            allow_json_add,
+        }),
         _ => Err(
-            "usage: splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
+            "usage: splash profile | splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
         ),
     }
 }
@@ -900,6 +1008,104 @@ mod tests {
                 allow_json_add: true,
             }
         );
+    }
+
+    #[test]
+    fn parses_a_profile_invocation() {
+        assert_eq!(
+            parse_args(vec!["profile".to_owned()]).unwrap(),
+            CliOptions {
+                command: CliCommand::Profile,
+                allow_echo: false,
+                allow_json_add: false,
+            }
+        );
+    }
+
+    #[test]
+    fn profile_output_matches_the_canonical_runtime_contract() {
+        let output = profile_output();
+        let limits = ExecutionLimits::default();
+
+        assert_eq!(output["schema_version"], json!(1));
+        assert_eq!(output["language"], json!("Splash"));
+        assert_eq!(output["profile"]["id"], json!(CANONICAL_PROFILE_ID));
+        assert_eq!(
+            output["profile"]["version"],
+            json!(CANONICAL_PROFILE_VERSION)
+        );
+        assert_eq!(
+            output["profile"]["grammar_path"],
+            json!(CANONICAL_PROFILE_GRAMMAR_PATH)
+        );
+        assert_eq!(output["profile"]["canonical_only"], json!(true));
+        assert_eq!(
+            output["preflight_limits"]["source_bytes"],
+            json!(limits.max_source_bytes)
+        );
+        assert_eq!(
+            output["preflight_limits"]["syntax_tokens"],
+            json!(limits.max_syntax_tokens)
+        );
+        assert_eq!(
+            output["preflight_limits"]["syntax_nesting"],
+            json!(limits.max_syntax_nesting)
+        );
+        assert_eq!(
+            output["preflight_limits"]["formatted_source_bytes"],
+            json!(DEFAULT_MAX_FORMATTED_SOURCE_BYTES)
+        );
+        assert_eq!(
+            output["preflight_limits"]["syntax_diagnostics"],
+            json!(MAX_SYNTAX_DIAGNOSTICS)
+        );
+        assert_eq!(
+            output["tooling_limits"]["tool_call_hints"],
+            json!(MAX_TOOL_CALL_HINTS)
+        );
+        assert_eq!(
+            output["tooling_limits"]["lexical_symbol_occurrences"],
+            json!(MAX_LEXICAL_SYMBOL_OCCURRENCES)
+        );
+        assert_eq!(
+            output["tooling_limits"]["lexical_completion_sites"],
+            json!(MAX_LEXICAL_COMPLETION_SITES)
+        );
+        assert_eq!(
+            output["evaluation_limits"]["instruction_limit"],
+            json!(limits.instruction_limit)
+        );
+        assert_eq!(
+            output["evaluation_limits"]["soft_timeout_ms"],
+            json!(u64::try_from(limits.soft_timeout.as_millis()).unwrap())
+        );
+        assert_eq!(
+            output["evaluation_limits"]["hard_timeout_ms"],
+            json!(u64::try_from(limits.hard_timeout.as_millis()).unwrap())
+        );
+        assert_eq!(
+            output["evaluation_limits"]["budget_sample_interval"],
+            json!(limits.budget_sample_interval)
+        );
+        assert_eq!(
+            output["effect_free_commands"]["profile"],
+            json!("splash profile")
+        );
+        assert_eq!(output["authority"]["ambient_os_apis"], json!(false));
+        assert_eq!(output["authority"]["imports_grant_authority"], json!(false));
+        assert_eq!(
+            output["authority"]["static_tool_call_hints_authorize"],
+            json!(false)
+        );
+        assert_eq!(
+            output["authority"]["workflow_drafts_grant_authority"],
+            json!(false)
+        );
+        assert_eq!(
+            output["tool_api"]["calls"].as_array().map(Vec::len),
+            Some(4)
+        );
+        assert_eq!(output["tool_api"]["await_method"], json!(".await()"));
     }
 
     #[test]

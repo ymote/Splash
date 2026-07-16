@@ -234,6 +234,19 @@ Inspect the exact demo-tool catalog supplied to an LLM host with:
 cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 ```
 
+Before generating source, an LLM host can query the versioned canonical
+language contract without creating a runtime or registering a tool:
+
+```sh
+cargo run -p splash-cli -- profile
+```
+
+The JSON response identifies the profile and grammar path, reports the active
+default bounds, and states the tool and workflow authority boundary. It is not
+a tool catalog, capability grant, or substitute for the normative
+[Splash Grammar v0.2](docs/grammar.md). Query the host's separate catalog
+before proposing effectful calls.
+
 Validate generated source against the canonical Splash v0.2 profile without
 creating a capability host or running any bytecode:
 

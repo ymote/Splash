@@ -12,6 +12,15 @@ compatibility features until separately specified.
 
 Provide normal Splash source. The runtime adds its own internal terminal
 marker, so generated code must not depend on Makepad widget-host framing.
+Before generating source, an LLM host may call `splash profile`. Its versioned
+JSON response identifies the canonical profile, grammar path, default bounded
+preflight and execution limits, effect-free CLI operations, and the authority
+model. It creates no capability runtime and does not read source. The response
+is metadata only: it is neither a complete grammar nor a substitute for the
+normative [Splash Grammar v0.2](grammar.md), a host tool catalog, a capability
+grant, or workflow approval. A host must supply its own current catalog
+separately before an agent can propose effectful calls.
+
 Run `splash check <file>` before execution when an LLM or editor produced the
 source. The check enforces the canonical v0.2 grammar rather than merely
 accepting the larger Makepad compatibility parser. Syntax preflight never
