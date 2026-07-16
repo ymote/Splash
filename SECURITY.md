@@ -31,6 +31,31 @@ host-selected file can still block the local handler. Hosts must select files
 with acceptable latency or use a contained worker with a deadline for broader
 or potentially blocking effects.
 
+When its explicit feature is enabled, HttpEndpointCatalog supplies a similarly
+narrow outbound JSON adapter. Trusted setup fixes each full endpoint URL,
+method, and opaque identifier. The executable request contract accepts only a
+catalog identifier and, for POST, a bounded JSON object or array body; it rejects
+URL, method, header, query, and redirect selectors before the adapter runs.
+The contract publishes opaque identifiers to the host-side catalog but not
+URLs. HTTPS is required by default; the explicitly named insecure HTTP
+constructor is for trusted local or development services only. The adapter
+disables environment proxies and redirect following, exposes no cookie or
+secret-header API, bounds script request input, response headers, bodies, and
+total request time, and requires a 2xx JSON object or array response.
+Script-facing failures are
+generic and do not disclose endpoint membership, URLs, status codes, headers,
+response bodies, or transport details. The endpoint set is not a secret broker:
+host metadata and endpoint URLs must not contain credentials, and POST body
+semantics need a separate reviewed schema or adapter when broad input is not
+safe.
+
+This endpoint catalog mediates one registered API surface only. It does not
+pin DNS, enforce a firewall or per-origin egress rule, contain a blocking
+request after it starts, reduce the embedding process's network authority, or
+restrict another trusted adapter. A fixed URL is still trusted host policy.
+Effects requiring real network isolation need a target-specific containment or
+network backend.
+
 The canonical Splash profile is an effect-free preflight in front of the
 vendored Makepad parser. A profile rejection never reaches that parser or a
 host binding; a profile acceptance is then independently parsed by the VM
@@ -192,7 +217,11 @@ choose a lower-level runtime, and every registered adapter retains the app's
 ambient authority. It must not expose an arbitrary executable, filesystem,
 network-origin, plugin, or crate selector. `collect_garbage()` is host-scheduled
 and may cost time proportional to the live VM heap; it is not a per-pump
-resource limit or containment mechanism. A `FixedFileCatalog` registered
+resource limit or containment mechanism. An HttpEndpointCatalog registered
+through the feature-gated builder is consumed before sealing, so generated
+source cannot add an endpoint or change its URL, method, headers, query, or
+redirect behavior. It remains in-process API mediation, not mobile or embedded
+operating-system containment. A `FixedFileCatalog` registered
 through the builder is consumed before sealing and has the same opaque-ID,
 descriptor-pinning, and mutable-content limitations described above.
 
@@ -726,12 +755,13 @@ correlation value, so operation payloads must contain opaque secret selectors
 rather than credential values.
 
 This baseline does not yet provide an arbitrary filesystem or network tool
-adapter, a secret broker, signed packages, full JSON Schema, mobile policy
-backends, or general-purpose process containment. The supplied fixed-file
-catalog is intentionally narrower than a filesystem adapter. The Linux
-Bubblewrap launcher is a deliberately narrow worker policy, not a substitute
-for those missing boundaries. Those features must not be inferred from the
-presence of the VM.
+adapter, dynamic origin policy, a secret broker, signed packages, full JSON
+Schema, mobile policy backends, or general-purpose process containment. The
+supplied fixed-file and feature-gated fixed-endpoint catalogs are intentionally
+narrower than general filesystem or network adapters. The Linux Bubblewrap
+launcher is a deliberately narrow worker policy, not a substitute for those
+missing boundaries. Those features must not be inferred from the presence of
+the VM.
 
 Tool descriptions and schemas are available only through the host-side
 catalog. They are not script-visible authority. Schemas registered solely as

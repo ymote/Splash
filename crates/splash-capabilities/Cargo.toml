@@ -20,8 +20,10 @@ splash-protocol = { version = "0.1.0", path = "../splash-protocol" }
 splash-sandbox = { version = "0.1.0", path = "../splash-sandbox", optional = true }
 splash-schema = { version = "0.1.0", path = "../splash-schema" }
 splash-worker = { version = "0.1.0", path = "../splash-worker", optional = true }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"], optional = true }
 
 [features]
 bubblewrap-watchdog = ["dep:splash-sandbox"]
 in-process-worker = ["dep:splash-worker"]
 json-line-worker = []
+http-endpoint-catalog = ["dep:ureq"]

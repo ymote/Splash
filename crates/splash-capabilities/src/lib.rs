@@ -44,6 +44,10 @@ pub mod bounded_worker;
 /// Bounded host-owned text files exposed only through opaque identifiers.
 pub mod fixed_file_catalog;
 
+/// Bounded host-owned HTTP endpoints exposed only through opaque identifiers.
+#[cfg(feature = "http-endpoint-catalog")]
+pub mod http_endpoint_catalog;
+
 /// Sealed static-catalog runtime profile for mobile and embedded hosts.
 ///
 /// It accepts only app-provided local adapters during setup, then exposes
@@ -1096,6 +1100,14 @@ fn schema_validator(schema: JsonSchema, direction: &'static str) -> ToolValidato
     })
 }
 
+#[cfg(feature = "http-endpoint-catalog")]
+fn redacted_schema_validator(schema: JsonSchema, error: ToolError) -> ToolValidator {
+    Box::new(move |encoded| {
+        let value = serde_json::from_str(encoded).map_err(|_| error.clone())?;
+        schema.validate(&value).map_err(|_| error.clone())
+    })
+}
+
 /// Compiles the Rust-side half of a typed JSON capability into an input
 /// validator. The JSON Schema remains the authoritative wire contract, so it
 /// is checked before Serde sees the value.
@@ -1540,6 +1552,46 @@ impl CapabilityHost {
         self.register_with_metadata(
             policy,
             metadata,
+            catalog.into_tool_handler(max_output_bytes),
+        )
+    }
+
+    /// Registers a bounded catalog of setup-selected HTTP endpoints as one
+    /// JSON capability.
+    ///
+    /// The catalog accepts only opaque endpoint identifiers and bounded JSON
+    /// request bodies. It never accepts a script-selected URL, method, header,
+    /// query, or redirect target. See [`http_endpoint_catalog::HttpEndpointCatalog`]
+    /// for the network and containment boundary.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpEndpointCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        catalog.validate_tool_policy(&policy)?;
+        let JsonToolContract {
+            input_schema,
+            output_schema,
+            input,
+            output,
+        } = catalog.tool_contract()?;
+        let metadata = metadata
+            .with_input_schema(input_schema)
+            .with_output_schema(output_schema);
+        let max_output_bytes = policy.max_output_bytes;
+        self.register_json_tool_with_validators(
+            policy,
+            metadata,
+            Some(redacted_schema_validator(
+                input,
+                ToolError::Denied("HTTP endpoint access was denied".to_owned()),
+            )),
+            Some(redacted_schema_validator(
+                output,
+                ToolError::Failed("HTTP endpoint request failed".to_owned()),
+            )),
             catalog.into_tool_handler(max_output_bytes),
         )
     }
@@ -3158,6 +3210,21 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_fixed_file_catalog_tool(policy, metadata, catalog)
+    }
+
+    /// Registers a bounded catalog of setup-selected HTTP endpoints as one
+    /// JSON capability. See [`CapabilityHost::register_http_endpoint_catalog_tool`]
+    /// for the authority and containment boundary.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpEndpointCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .host_mut()
+            .register_http_endpoint_catalog_tool(policy, metadata, catalog)
     }
 
     /// Registers a deferred-only text capability with no in-process handler.

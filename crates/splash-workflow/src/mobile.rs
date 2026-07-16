@@ -146,6 +146,25 @@ impl MobileWorkflowBuilder {
             .register_fixed_file_catalog_tool(policy, metadata, catalog)
     }
 
+    /// Registers one setup-selected HTTP endpoint catalog for the sealed
+    /// workflow catalog.
+    ///
+    /// The catalog is consumed during setup, so a workflow can request only
+    /// its reviewed opaque endpoint identifiers. It cannot select a URL,
+    /// method, header, query, or redirect target after [`Self::build`] seals
+    /// the local adapter catalog. This is API-level mediation, not OS
+    /// containment.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: splash_capabilities::http_endpoint_catalog::HttpEndpointCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .register_http_endpoint_catalog_tool(policy, metadata, catalog)
+    }
+
     /// Registers one reviewed JSON adapter with executable input and output
     /// contracts.
     pub fn register_json_tool<F>(
@@ -486,10 +505,22 @@ impl MobileWorkflowRuntime {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(feature = "http-endpoint-catalog")]
+    use std::io::{Read, Write};
+    #[cfg(feature = "http-endpoint-catalog")]
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(feature = "http-endpoint-catalog")]
+    use std::sync::mpsc::{self, Receiver};
+    #[cfg(feature = "http-endpoint-catalog")]
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
+    #[cfg(feature = "http-endpoint-catalog")]
+    use splash_capabilities::http_endpoint_catalog::{
+        HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod,
+    };
     use splash_capabilities::{
         fixed_file_catalog::FixedFileCatalog, json, AuditOutcome, CapabilityLeaseGrant,
         ToolStreamPolicy,
@@ -539,6 +570,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
         }
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    fn start_fixed_http_server() -> (String, Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let (sender, receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("workflow reaches local server");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("server read timeout is configured");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while request.len() < 4 * 1024 {
+                let read = stream.read(&mut buffer).expect("server reads request");
+                assert!(read > 0, "client closes before complete request headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            sender
+                .send(String::from_utf8(request).expect("request is UTF-8"))
+                .expect("test receives request");
+
+            let body = br#"{"available":true}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("server writes response header");
+            stream.write_all(body).expect("server writes response body");
+        });
+        (
+            format!("http://{address}/fixed/status?mode=reviewed"),
+            receiver,
+            server,
+        )
     }
 
     fn add_contract() -> JsonToolContract {
@@ -790,6 +862,64 @@ mod tests {
         assert_eq!(runtime.tool_catalog().len(), 1);
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].tool, "file.read");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert!(!runtime.has_suspended_execution());
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    #[test]
+    fn seals_fixed_http_endpoints_behind_workflow_policy_approval() {
+        let (url, received, server) = start_fixed_http_server();
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog
+            .insert(
+                HttpEndpoint::insecure_http("status", HttpEndpointMethod::Get, url)
+                    .expect("local endpoint is configured during setup"),
+            )
+            .expect("endpoint is retained");
+
+        let mut builder = MobileWorkflowBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_endpoint_catalog_tool(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets one reviewed service status."),
+                catalog,
+            )
+            .expect("static endpoint adapter registers");
+        let mut runtime = builder.build();
+        let plan = runtime
+            .plan(vec![WorkflowStep::new(
+                "check-status",
+                "use mod.tool\n\
+                 use mod.std.assert\n\
+                 let raw = tool.call_json(\"net.status\", {endpoint: \"status\"})\n\
+                 let response = raw.parse_json()\n\
+                 assert(response.available == true)",
+            )])
+            .expect("trusted plan is valid");
+        let approval = runtime
+            .approve_with_step_capability_policies(
+                &plan,
+                vec![WorkflowStepCapabilityPolicy::new(
+                    "check-status",
+                    [CapabilityLeaseGrant::new("net.status", 1)],
+                )],
+            )
+            .expect("fixed endpoint is explicitly approved");
+
+        runtime.execute(&plan, approval).expect("workflow succeeds");
+
+        let request = received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("one fixed request reaches the server");
+        server.join().expect("server completes");
+        assert!(request.starts_with("GET /fixed/status?mode=reviewed HTTP/1.1\r\n"));
+        let lower = request.to_ascii_lowercase();
+        assert!(!lower.contains("authorization:"));
+        assert!(!lower.contains("cookie:"));
+        assert_eq!(runtime.tool_catalog().len(), 1);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "net.status");
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
         assert!(!runtime.has_suspended_execution());
     }

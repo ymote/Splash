@@ -58,10 +58,15 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded host-owned fixed-file catalog adapter for reviewed regular UTF-8
   files, addressed only by opaque identifiers and pinned at setup rather than
   by script-selected filesystem paths.
+- A feature-gated host-owned fixed HTTP endpoint catalog for reviewed JSON GET
+  and POST calls addressed only by opaque IDs, with HTTPS by default, bounded
+  request/response data, no proxy or redirect following, and no script-selected URL,
+  method, header, or query. It is API-level mediation, not egress containment.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
-  policies, checkpoints, and execution, including setup-only fixed-file
-  catalog adapters, without exposing mutable capability registration.
+  policies, checkpoints, and execution, including setup-only fixed-file and
+  fixed-endpoint catalog adapters, without exposing mutable capability
+  registration.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
@@ -152,11 +157,12 @@ and keeps UI support optional rather than making UI the language boundary.
   or host termination poisons the session and remains indeterminate.
 - A small `splash` CLI for local evaluation and the workflow example.
 
-No ambient filesystem, subprocess, raw socket, HTTP server, or Makepad
-platform module is loaded by default. The optional fixed-file catalog is one
-explicit, bounded text tool rather than a general filesystem API. A capability
-check in the VM is not an OS sandbox; adapters that execute local tools must
-run in a separately contained worker before they are suitable for untrusted
+No ambient filesystem, subprocess, raw socket, HTTP client/server, or Makepad
+platform module is loaded by default. The optional fixed-file and fixed-endpoint
+catalogs are explicit, bounded tools rather than general filesystem or network
+APIs. A capability check in the VM is not an OS sandbox; adapters that execute
+local tools or need egress isolation must run behind an appropriate
+target-specific containment boundary before they are suitable for untrusted
 workloads.
 
 ## Example
@@ -432,8 +438,8 @@ a partial set.
 - `splash-core`: bounded VM wrapper and diagnostics.
 - `splash-capabilities`: explicit tool policy, bounded audit view, deferred promises,
   LLM-facing host catalog, approval-bound capability leases, JSON contracts,
-  aggregate catalog limits, safe host bridge, and a sealed static-catalog
-  mobile/embedded profile.
+  fixed-file and feature-gated fixed-endpoint catalogs, aggregate catalog
+  limits, safe host bridge, and a sealed static-catalog mobile/embedded profile.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
@@ -469,6 +475,9 @@ define the host-managed async boundary.
 
 [Fixed-file catalogs](docs/fixed-file-catalog.md) define the narrow
 descriptor-pinned local text-file boundary.
+
+[Fixed HTTP endpoint catalogs](docs/http-endpoint-catalog.md) define the narrow
+host-selected outbound JSON boundary and its explicit non-guarantees.
 
 [Editor module-interface projection](docs/module-catalog.md) defines bounded
 static authoring metadata for host-defined `mod.*` interfaces.

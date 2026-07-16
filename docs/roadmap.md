@@ -48,6 +48,12 @@
 - Bounded host-owned fixed-file catalog capability for descriptor-pinned,
   regular UTF-8 text files selected at setup and addressed only by opaque IDs;
   it is not an ambient filesystem API or operating-system containment.
+- Feature-gated bounded fixed HTTP endpoint catalog for host-selected JSON GET
+  and POST calls addressed by opaque IDs, with executable request-shape
+  validation, HTTPS by default, disabled proxies and redirects, and bounded
+  request input, headers, response bodies, and deadlines. It is API-level
+  mediation only, not a secret broker, dynamic origin policy, or
+  operating-system egress boundary.
 - Sealed static-catalog mobile and embedded profile for app-provided local
   adapters, with no post-build registration or external-dispatch API.
 - Sealed mobile and embedded workflow facade for static local adapters, with
@@ -191,8 +197,10 @@
   their per-mount `tmpfs` ceilings do not quota a persistent filesystem.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
-- A mediated origin-aware network policy, secret broker, and audited executable
-  policy; they must remain denied until each can be enforced.
+- A dynamic or origin-policy-evaluated network boundary, secret broker, and
+  audited executable policy. The fixed endpoint catalog is deliberately
+  narrower and does not enforce egress at the operating-system boundary; the
+  broader selectors must remain denied until each can be enforced.
 
 ## Before a stable language release
 

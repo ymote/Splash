@@ -122,6 +122,24 @@ impl MobileRuntimeBuilder {
             .register_fixed_file_catalog_tool(policy, metadata, catalog)
     }
 
+    /// Registers one setup-selected HTTP endpoint catalog for the sealed
+    /// profile.
+    ///
+    /// The catalog is consumed during setup, so dynamic Splash source can
+    /// request only its reviewed opaque endpoint identifiers. It cannot select
+    /// a URL, method, header, query, or redirect target after [`Self::build`]
+    /// seals the runtime. This is API-level mediation, not OS containment.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_endpoint_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: crate::http_endpoint_catalog::HttpEndpointCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .register_http_endpoint_catalog_tool(policy, metadata, catalog)
+    }
+
     /// Registers one reviewed JSON adapter with executable input and output
     /// contracts.
     pub fn register_json_tool<F>(
@@ -269,6 +287,8 @@ mod tests {
     use splash_core::{DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MAX_SOURCE_BYTES};
 
     use super::*;
+    #[cfg(feature = "http-endpoint-catalog")]
+    use crate::http_endpoint_catalog::{HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod};
     use crate::{json, CapabilityCatalogLimits, ToolDataFormat, ToolDispatch};
 
     #[derive(serde::Deserialize)]
@@ -350,6 +370,50 @@ mod tests {
         assert_eq!(runtime.tool_catalog().len(), 1);
         assert_eq!(runtime.tool_catalog()[0].format, ToolDataFormat::Json);
         assert_eq!(runtime.tool_catalog()[0].dispatch, ToolDispatch::HostPump);
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    #[test]
+    fn seals_a_fixed_http_catalog_without_exposing_endpoint_urls() {
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog
+            .insert(
+                HttpEndpoint::https(
+                    "status",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/v1/status?fixed=true",
+                )
+                .expect("reviewed endpoint is valid"),
+            )
+            .expect("endpoint is retained");
+
+        let mut builder = MobileRuntimeBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_endpoint_catalog_tool(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets one reviewed endpoint status."),
+                catalog,
+            )
+            .expect("static endpoint adapter registers");
+        let runtime = builder.build();
+
+        let descriptor = runtime
+            .tool_catalog()
+            .into_iter()
+            .next()
+            .expect("one tool is sealed");
+        assert!(descriptor.contract_enforced);
+        let input_schema = descriptor
+            .metadata
+            .input_schema
+            .expect("opaque request contract is published");
+        assert_eq!(
+            input_schema["properties"]["endpoint"]["enum"],
+            json!(["status"])
+        );
+        let serialized = serde_json::to_string(&input_schema).expect("schema serializes");
+        assert!(!serialized.contains("api.example.test"));
+        assert!(!serialized.contains("/v1/status"));
     }
 
     #[test]
