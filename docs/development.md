@@ -81,14 +81,15 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has six bounded targets. `syntax` differentially
-exercises the canonical profile and the vendored VM parser with a 16 KiB source
-cap, a 2,048-token cap, and a 64-level nesting cap. It also sends every bounded
-UTF-8 input through the broader VM-compatibility preflight, so inherited parser
-paths remain covered even when canonical validation rejects the source. It
-asserts that every source accepted by the canonical preflight is also accepted
-by the VM parser, and that successful canonical formatting stays accepted and
-idempotent. It also checks
+The standalone `fuzz` package has seven bounded targets. `syntax` differentially
+exercises the canonical profile and the vendored VM parser under a rotating set
+of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
+to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also
+sends every bounded UTF-8 input through the broader VM-compatibility preflight,
+so inherited parser paths remain covered even when canonical validation rejects
+the source. It asserts that every source accepted by the canonical preflight is
+also accepted by the VM parser, and that successful canonical formatting stays
+accepted and idempotent. It also checks
 that every accepted source's top-level declaration outline has ordered,
 non-overlapping, UTF-8-boundary-safe spans that contain the exact declared
 identifier.

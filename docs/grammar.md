@@ -240,7 +240,9 @@ creates a capability runtime, loads a module, invokes a tool, or executes
 bytecode. By default, preflight accepts at most 256 KiB of source, 32,768
 lexical tokens, and 128 nesting levels. Canonical validation applies the
 nesting limit to grammar recursion; compatibility validation applies it to
-structural delimiters before the vendored parser runs.
+structural delimiters before the vendored parser runs. Canonical source uses
+that same bounded VM preflight after grammar admission, so it does not bypass
+the VM tokenizer limits.
 
 Rust hosts can call `splash_core::check_syntax` or
 `splash_core::check_syntax_named`. These functions apply the normal source-size

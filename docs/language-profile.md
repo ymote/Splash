@@ -135,9 +135,10 @@ completed-prefix count so long-lived workflow telemetry does not cache source
 diagnostic text.
 
 The canonical checker and the vendored VM parser are separate implementations.
-Every canonical source first passes the profile, then is parsed by the VM before
-evaluation; the shipped core and capability-host fixtures exercise that path
-with real execution and tool bindings. The `syntax` fuzz target differentially
+Every canonical source first passes the profile, then uses the same bounded VM
+preflight as trusted compatibility validation before evaluation; the shipped
+core and capability-host fixtures exercise that path with real execution and
+tool bindings. The `syntax` fuzz target differentially
 checks canonical preflight, VM parsing, and formatting. The separate
 capability-free `execution` target runs accepted programs under strict source,
 token, instruction, and wall-clock bounds. This is regression coverage, not a

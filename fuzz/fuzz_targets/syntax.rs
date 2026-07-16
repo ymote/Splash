@@ -15,19 +15,15 @@ const MAX_FUZZ_SYNTAX_TOKENS: usize = 2 * 1024;
 const MAX_FUZZ_SYNTAX_NESTING: usize = 64;
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(source) = std::str::from_utf8(data) else {
+    let Ok(unbounded_source) = std::str::from_utf8(data) else {
         return;
     };
-    if source.len() > MAX_FUZZ_SOURCE_BYTES {
+    if unbounded_source.len() > MAX_FUZZ_SOURCE_BYTES {
         return;
     }
 
-    let limits = ExecutionLimits {
-        max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
-        max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
-        max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
-        ..ExecutionLimits::default()
-    };
+    let limits = fuzz_limits(data);
+    let source = bounded_prefix(unbounded_source, limits.max_source_bytes);
     let profile = fuzzing::check_canonical_profile(source, limits)
         .expect("the fuzz limits are always valid for canonical preflight");
     let full = check_syntax_named("fuzz.splash", source, limits)
@@ -109,6 +105,43 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 });
+
+fn fuzz_limits(data: &[u8]) -> ExecutionLimits {
+    match data.first().copied().unwrap_or_default() % 4 {
+        0 => ExecutionLimits {
+            max_source_bytes: 64,
+            max_syntax_tokens: 8,
+            max_syntax_nesting: 2,
+            ..ExecutionLimits::default()
+        },
+        1 => ExecutionLimits {
+            max_source_bytes: 512,
+            max_syntax_tokens: 64,
+            max_syntax_nesting: 4,
+            ..ExecutionLimits::default()
+        },
+        2 => ExecutionLimits {
+            max_source_bytes: 4 * 1024,
+            max_syntax_tokens: 512,
+            max_syntax_nesting: 16,
+            ..ExecutionLimits::default()
+        },
+        _ => ExecutionLimits {
+            max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
+            max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
+            max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
+            ..ExecutionLimits::default()
+        },
+    }
+}
+
+fn bounded_prefix(source: &str, maximum_bytes: usize) -> &str {
+    let mut end = source.len().min(maximum_bytes);
+    while end > 0 && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    &source[..end]
+}
 
 fn assert_outline_invariants(source: &str, declarations: &[TopLevelDeclaration]) {
     let mut previous_end_byte = 0_usize;

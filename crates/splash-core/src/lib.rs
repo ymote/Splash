@@ -835,23 +835,23 @@ pub mod fuzzing {
 ///
 /// This function rejects Makepad compatibility syntax outside the documented
 /// Splash v0.2 grammar. Only source accepted by that profile reaches the
-/// vendored VM parser for a compatibility check. `file` appears only in
-/// VM-parser diagnostics. It never loads a module, resolves an import, runs
-/// bytecode, or invokes a host tool.
+/// same bounded vendored-VM preflight used by
+/// [`check_vm_compatibility_named`]. `file` appears only in VM-parser
+/// diagnostics. It never loads a module, resolves an import, runs bytecode,
+/// or invokes a host tool.
 pub fn check_syntax_named(
     file: &str,
     source: &str,
     limits: ExecutionLimits,
 ) -> Result<SyntaxReport, RuntimeError> {
-    let profile = check_profile_named(source, limits)?;
+    let limits = limits.validate()?;
+    validate_source_length(source, limits)?;
+    let profile = check_profile_with_validated_limits(source, limits);
     if !profile.valid {
         return Ok(profile);
     }
 
-    let mut base = vm::ScriptVmBase::new();
-    let mut tokenizer = ScriptTokenizer::default();
-    tokenizer.tokenize(&format!("{source}\n;"), &mut base.heap);
-    Ok(parse_vm_syntax(file, &tokenizer))
+    Ok(check_vm_syntax_with_validated_limits(file, source, limits))
 }
 
 /// Validates named inherited Makepad compatibility syntax without executing
@@ -876,6 +876,14 @@ pub fn check_vm_compatibility_named(
     let limits = limits.validate()?;
     validate_source_length(source, limits)?;
 
+    Ok(check_vm_syntax_with_validated_limits(file, source, limits))
+}
+
+fn check_vm_syntax_with_validated_limits(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> SyntaxReport {
     let mut base = vm::ScriptVmBase::new();
     let mut tokenizer = ScriptTokenizer::default();
     match tokenize_vm_source_bounded(
@@ -887,18 +895,14 @@ pub fn check_vm_compatibility_named(
     ) {
         Ok(()) => {}
         Err(VmCompatibilityPreflightLimit::Tokens) => {
-            return Ok(vm_token_limit_report(&tokenizer, limits.max_syntax_tokens));
+            return vm_token_limit_report(&tokenizer, limits.max_syntax_tokens);
         }
         Err(VmCompatibilityPreflightLimit::Nesting { token_index }) => {
-            return Ok(vm_nesting_limit_report(
-                &tokenizer,
-                token_index,
-                limits.max_syntax_nesting,
-            ));
+            return vm_nesting_limit_report(&tokenizer, token_index, limits.max_syntax_nesting);
         }
     }
 
-    Ok(parse_vm_syntax(file, &tokenizer))
+    parse_vm_syntax(file, &tokenizer)
 }
 
 enum VmCompatibilityPreflightLimit {
@@ -1176,6 +1180,7 @@ fn max_formatted_source_bytes(limits: ExecutionLimits) -> usize {
         .saturating_mul(FORMAT_OUTPUT_MULTIPLIER)
 }
 
+#[cfg(fuzzing)]
 fn check_profile_named(
     source: &str,
     limits: ExecutionLimits,
@@ -1183,21 +1188,25 @@ fn check_profile_named(
     let limits = limits.validate()?;
     validate_source_length(source, limits)?;
 
+    Ok(check_profile_with_validated_limits(source, limits))
+}
+
+fn check_profile_with_validated_limits(source: &str, limits: ExecutionLimits) -> SyntaxReport {
     let profile =
         check_canonical_profile(source, limits.max_syntax_tokens, limits.max_syntax_nesting);
     if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
-        return Ok(SyntaxReport {
+        return SyntaxReport {
             valid: false,
             diagnostics: profile.diagnostics,
             diagnostics_truncated: profile.diagnostics_truncated,
-        });
+        };
     }
 
-    Ok(SyntaxReport {
+    SyntaxReport {
         valid: true,
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
-    })
+    }
 }
 
 fn validate_source_length(source: &str, limits: ExecutionLimits) -> Result<(), RuntimeError> {
@@ -2363,6 +2372,23 @@ mod tests {
 
         assert!(report.valid, "{:?}", report.diagnostics);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn canonical_preflight_shares_the_bounded_vm_validation_result() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 16,
+            max_syntax_nesting: 4,
+            ..ExecutionLimits::default()
+        };
+        let source = "let value = [1]\nvalue[0]";
+
+        let canonical = check_syntax_named("canonical.splash", source, limits).unwrap();
+        let compatibility =
+            check_vm_compatibility_named("canonical.splash", source, limits).unwrap();
+
+        assert!(canonical.valid, "{:?}", canonical.diagnostics);
+        assert_eq!(canonical, compatibility);
     }
 
     #[test]
