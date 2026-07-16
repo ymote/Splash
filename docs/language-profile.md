@@ -33,6 +33,12 @@ operation handles. Submit the resulting document to `splash workflow-review`
 for effect-free syntax and direct-call review, then let the trusted host decide
 whether to create a plan and issue any authority.
 
+`workflow-review` returns JSON even when the draft envelope itself is rejected:
+its finite `draft.error.code` is suitable for agent repair loops and omits raw
+source and invalid identifiers. A decoded envelope has `draft.valid: true`;
+the separate top-level `valid` then reports the canonical syntax status of its
+steps. Neither result grants a capability or approves a workflow.
+
 Run `splash check <file>` before execution when an LLM or editor produced the
 source. The check enforces the canonical v0.2 grammar rather than merely
 accepting the larger Makepad compatibility parser. Syntax preflight never

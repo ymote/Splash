@@ -18,9 +18,9 @@ use splash_core::{
 };
 use splash_workflow::{
     mobile::{MobileWorkflowBuilder, MobileWorkflowRuntime},
-    workflow_draft_json_schema, WorkflowData, WorkflowDraft, WorkflowEvent, WorkflowPlan,
-    WorkflowStepCapabilityPolicy, MAX_WORKFLOW_DATA_BYTES, MAX_WORKFLOW_DRAFT_BYTES,
-    MAX_WORKFLOW_STEP_ID_BYTES,
+    workflow_draft_json_schema, WorkflowData, WorkflowDraft, WorkflowDraftError, WorkflowError,
+    WorkflowEvent, WorkflowPlan, WorkflowStepCapabilityPolicy, MAX_WORKFLOW_DATA_BYTES,
+    MAX_WORKFLOW_DRAFT_BYTES, MAX_WORKFLOW_STEP_ID_BYTES,
 };
 
 const MAX_WORKFLOW_CLI_GRANTS: usize = 4_096;
@@ -424,7 +424,18 @@ fn workflow_execution_output_with_input(
     allow_echo: bool,
     allow_json_add: bool,
 ) -> Result<(JsonValue, bool), String> {
-    let draft = WorkflowDraft::from_json(source).map_err(|error| error.to_string())?;
+    let draft = match WorkflowDraft::from_json(source) {
+        Ok(draft) => draft,
+        Err(error) => {
+            return Ok((
+                json!({
+                    "status": "rejected",
+                    "review": workflow_draft_rejection_output(&error),
+                }),
+                false,
+            ));
+        }
+    };
     let (review, valid) = workflow_review_json(&draft)?;
     if !valid {
         return Ok((json!({"status": "rejected", "review": review}), false));
@@ -696,8 +707,10 @@ fn tool_calls_output(file: &str, source: &str) -> Result<(JsonValue, bool), Stri
 }
 
 fn workflow_review_output(source: &str) -> Result<(JsonValue, bool), String> {
-    let draft = WorkflowDraft::from_json(source).map_err(|error| error.to_string())?;
-    workflow_review_json(&draft)
+    match WorkflowDraft::from_json(source) {
+        Ok(draft) => workflow_review_json(&draft),
+        Err(error) => Ok((workflow_draft_rejection_output(&error), false)),
+    }
 }
 
 fn workflow_review_json(draft: &WorkflowDraft) -> Result<(JsonValue, bool), String> {
@@ -716,7 +729,71 @@ fn workflow_review_json(draft: &WorkflowDraft) -> Result<(JsonValue, bool), Stri
             })
         })
         .collect::<Vec<_>>();
-    Ok((json!({"valid": valid, "steps": steps}), valid))
+    Ok((
+        json!({
+            "valid": valid,
+            "draft": {"valid": true, "error": null},
+            "steps": steps,
+        }),
+        valid,
+    ))
+}
+
+/// Returns a finite, source-free structural rejection for an untrusted draft.
+///
+/// A review tool can expose these codes to an LLM without reflecting raw
+/// source or invalid identifiers back into a prompt or telemetry sink.
+fn workflow_draft_rejection_output(error: &WorkflowDraftError) -> JsonValue {
+    json!({
+        "valid": false,
+        "draft": {
+            "valid": false,
+            "error": workflow_draft_error_json(error),
+        },
+        "steps": [],
+    })
+}
+
+fn workflow_draft_error_json(error: &WorkflowDraftError) -> JsonValue {
+    match error {
+        WorkflowDraftError::InputTooLarge { actual, maximum } => json!({
+            "code": "input_too_large",
+            "actual_bytes": actual,
+            "maximum_bytes": maximum,
+        }),
+        WorkflowDraftError::OutputTooLarge { actual, maximum } => json!({
+            "code": "output_too_large",
+            "actual_bytes": actual,
+            "maximum_bytes": maximum,
+        }),
+        WorkflowDraftError::InvalidEncoding => json!({"code": "invalid_encoding"}),
+        WorkflowDraftError::UnsupportedFormatVersion { actual, expected } => json!({
+            "code": "unsupported_format_version",
+            "actual": actual,
+            "expected": expected,
+        }),
+        WorkflowDraftError::InvalidPlan(error) => workflow_draft_plan_error_json(error),
+        WorkflowDraftError::SerializationFailed => json!({"code": "serialization_failed"}),
+    }
+}
+
+fn workflow_draft_plan_error_json(error: &WorkflowError) -> JsonValue {
+    match error {
+        WorkflowError::EmptyPlan => json!({"code": "empty_plan"}),
+        WorkflowError::TooManySteps { maximum } => {
+            json!({"code": "too_many_steps", "maximum": maximum})
+        }
+        WorkflowError::PlanSourceTooLarge { actual, maximum } => json!({
+            "code": "aggregate_source_too_large",
+            "actual_bytes": actual,
+            "maximum_bytes": maximum,
+        }),
+        // Keep invalid identifiers out of the structured response. They are
+        // untrusted text and the caller already owns the submitted draft.
+        WorkflowError::InvalidStepId(_) => json!({"code": "invalid_step_id"}),
+        WorkflowError::DuplicateStepId(_) => json!({"code": "duplicate_step_id"}),
+        _ => json!({"code": "invalid_plan"}),
+    }
 }
 
 fn tool_call_hint_json(hint: &ToolCallHint) -> JsonValue {
@@ -1510,6 +1587,8 @@ mod tests {
 
         assert!(valid);
         assert_eq!(output["valid"], json!(true));
+        assert_eq!(output["draft"]["valid"], json!(true));
+        assert_eq!(output["draft"]["error"], json!(null));
         let steps = output["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0]["id"], json!("prepare"));
@@ -1538,12 +1617,120 @@ mod tests {
 
         assert!(!valid);
         assert_eq!(output["valid"], json!(false));
+        assert_eq!(output["draft"]["valid"], json!(true));
         assert_eq!(output["steps"][0]["id"], json!("invalid"));
         assert_eq!(output["steps"][0]["tool_calls"], json!([]));
         assert_eq!(output["steps"][0]["tool_calls_truncated"], json!(false));
         assert!(output["steps"][0]["diagnostics"]
             .as_array()
             .is_some_and(|diagnostics| !diagnostics.is_empty()));
+    }
+
+    #[test]
+    fn workflow_review_returns_structured_source_free_draft_rejections() {
+        let (malformed, malformed_valid) = workflow_review_output("{").unwrap();
+        assert!(!malformed_valid);
+        assert_eq!(malformed["valid"], json!(false));
+        assert_eq!(malformed["draft"]["valid"], json!(false));
+        assert_eq!(
+            malformed["draft"]["error"]["code"],
+            json!("invalid_encoding")
+        );
+        assert_eq!(malformed["steps"], json!([]));
+
+        let source = r#"{
+            "format_version": 1,
+            "steps": [{"id": "BAD!", "source": "let done = true"}]
+        }"#;
+        let (invalid_id, invalid_id_valid) = workflow_review_output(source).unwrap();
+        assert!(!invalid_id_valid);
+        assert_eq!(
+            invalid_id["draft"]["error"]["code"],
+            json!("invalid_step_id")
+        );
+        assert!(!invalid_id.to_string().contains("BAD!"));
+    }
+
+    #[test]
+    fn workflow_draft_error_codes_are_finite_and_source_free() {
+        let cases = [
+            (
+                WorkflowDraftError::InputTooLarge {
+                    actual: 8,
+                    maximum: 4,
+                },
+                "input_too_large",
+            ),
+            (
+                WorkflowDraftError::OutputTooLarge {
+                    actual: 8,
+                    maximum: 4,
+                },
+                "output_too_large",
+            ),
+            (WorkflowDraftError::InvalidEncoding, "invalid_encoding"),
+            (
+                WorkflowDraftError::UnsupportedFormatVersion {
+                    actual: 2,
+                    expected: 1,
+                },
+                "unsupported_format_version",
+            ),
+            (
+                WorkflowDraftError::InvalidPlan(WorkflowError::EmptyPlan),
+                "empty_plan",
+            ),
+            (
+                WorkflowDraftError::InvalidPlan(WorkflowError::TooManySteps { maximum: 4 }),
+                "too_many_steps",
+            ),
+            (
+                WorkflowDraftError::InvalidPlan(WorkflowError::PlanSourceTooLarge {
+                    actual: 8,
+                    maximum: 4,
+                }),
+                "aggregate_source_too_large",
+            ),
+            (
+                WorkflowDraftError::InvalidPlan(WorkflowError::InvalidStepId(
+                    "untrusted-id".to_owned(),
+                )),
+                "invalid_step_id",
+            ),
+            (
+                WorkflowDraftError::InvalidPlan(WorkflowError::DuplicateStepId(
+                    "untrusted-id".to_owned(),
+                )),
+                "duplicate_step_id",
+            ),
+            (
+                WorkflowDraftError::InvalidPlan(WorkflowError::ExecutionInProgress),
+                "invalid_plan",
+            ),
+            (
+                WorkflowDraftError::SerializationFailed,
+                "serialization_failed",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let output = workflow_draft_rejection_output(&error);
+            assert_eq!(output["draft"]["error"]["code"], json!(expected_code));
+            assert!(!output.to_string().contains("untrusted-id"));
+        }
+    }
+
+    #[test]
+    fn workflow_run_returns_the_same_structured_draft_rejection() {
+        let (output, completed) = workflow_execution_output("{", &[], false, false).unwrap();
+
+        assert!(!completed);
+        assert_eq!(output["status"], json!("rejected"));
+        assert_eq!(output["review"]["valid"], json!(false));
+        assert_eq!(
+            output["review"]["draft"]["error"]["code"],
+            json!("invalid_encoding")
+        );
     }
 
     #[test]

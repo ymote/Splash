@@ -198,9 +198,14 @@ cargo run -p splash-cli -- workflow-review examples/release_workflow_draft.json
 ```
 
 The command prints JSON with each step's ID, canonical syntax diagnostics,
-bounded direct tool-call hints, and `tool_calls_truncated`. It exits nonzero
-when any source step is invalid. It does not print or infer grants and never
-evaluates the draft.
+bounded direct tool-call hints, and `tool_calls_truncated`. A decoded envelope
+has `draft.valid: true` even when one of its source steps is invalid; the
+top-level `valid` field then remains false and the relevant step carries the
+bounded diagnostics. A malformed or structurally invalid envelope instead
+returns `draft.valid: false`, an empty `steps` list, and a finite error `code`
+without echoing raw source or an invalid step ID. The command exits nonzero for
+either kind of rejection. It does not print or infer grants and never evaluates
+the draft.
 
 ## CLI Demonstration Execution
 
@@ -235,6 +240,11 @@ or crate-selection adapter. It emits bounded in-memory audit and step-status
 data, not durable operation evidence. Production hosts must review a draft and
 construct `WorkflowStepCapabilityPolicy` values from trusted policy rather
 than use source hints or pass LLM-supplied grants through to execution.
+
+When its draft envelope is malformed or structurally invalid, `workflow-run`
+also returns a rejected JSON status with the same nested review rejection
+object before it creates the demo runtime. This is a structured input result,
+not an approval, capability decision, or execution record.
 
 With `--input`, the direct CLI result includes the input, completed outputs,
 and context fingerprint for local inspection. That output is intentionally
