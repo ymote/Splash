@@ -23,8 +23,9 @@ closures that update a host-provided `ui` handle.
 
 `makepad_ui_compatibility.rs` accepts the fixture through
 `splash_core::check_vm_compatibility_named`, which applies the vendored parser
-under explicit source and VM-token bounds without evaluating it. It also asserts
-that normal `splash_core::check_syntax` rejects the fixture. That is
+under explicit source, VM-token, and delimiter-nesting bounds without
+evaluating it. It also asserts that normal `splash_core::check_syntax` rejects
+the fixture. That is
 intentional: the canonical v0.2 language is the narrow, bounded workflow
 contract used by `splash-cli`, the capability runtime, and the language server.
 

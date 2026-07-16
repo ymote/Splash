@@ -13,8 +13,6 @@ use super::{
     MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
-const MAX_CANONICAL_PROFILE_NESTING: usize = 128;
-
 pub(super) struct ProfileReport {
     pub(super) diagnostics: Vec<SyntaxDiagnostic>,
     pub(super) diagnostics_truncated: bool,
@@ -25,7 +23,11 @@ pub(super) enum ProfileFormatError {
     OutputTooLarge { actual: usize, maximum: usize },
 }
 
-pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> ProfileReport {
+pub(super) fn check_canonical_profile(
+    source: &str,
+    max_tokens: usize,
+    max_nesting: usize,
+) -> ProfileReport {
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, diagnostics, diagnostics_truncated) = lexer.tokenize();
     if !diagnostics.is_empty() || diagnostics_truncated {
@@ -35,7 +37,7 @@ pub(super) fn check_canonical_profile(source: &str, max_tokens: usize) -> Profil
         };
     }
 
-    CanonicalParser::new(tokens).parse()
+    CanonicalParser::new(tokens, max_nesting).parse()
 }
 
 pub(super) fn is_canonical_identifier(name: &str) -> bool {
@@ -69,10 +71,14 @@ pub(super) fn collect_top_level_declarations(
 /// Builds a lexical index after the public caller has confirmed canonical,
 /// VM-compatible source. Parsing the already bounded token stream gives the
 /// collector exact binding contexts without evaluating source or imports.
-pub(super) fn collect_lexical_symbols(source: &str, max_tokens: usize) -> LexicalSymbolReport {
+pub(super) fn collect_lexical_symbols(
+    source: &str,
+    max_tokens: usize,
+    max_nesting: usize,
+) -> LexicalSymbolReport {
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
-    let collected = CanonicalParser::new(tokens).collect_symbols(source.len());
+    let collected = CanonicalParser::new(tokens, max_nesting).collect_symbols(source.len());
     LexicalSymbolReport {
         symbols: collected.symbols,
         truncated: collected.symbols_truncated,
@@ -87,11 +93,12 @@ pub(super) fn collect_lexical_symbols(source: &str, max_tokens: usize) -> Lexica
 pub(super) fn collect_lexical_completions(
     source: &str,
     max_tokens: usize,
+    max_nesting: usize,
     valid_prefix_end_byte: usize,
 ) -> LexicalCompletionReport {
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
-    let collected = CanonicalParser::new(tokens).collect_symbols(source.len());
+    let collected = CanonicalParser::new(tokens, max_nesting).collect_symbols(source.len());
     LexicalCompletionReport {
         symbols: collected.symbols,
         sites: collected.completion_sites,
@@ -119,6 +126,7 @@ pub(super) fn collect_tool_call_hints(source: &str, max_tokens: usize) -> ToolCa
 pub(super) fn format_canonical_source(
     source: &str,
     max_tokens: usize,
+    max_nesting: usize,
     max_output_bytes: usize,
 ) -> Result<String, ProfileFormatError> {
     let lexer = ProfileLexer::new(source, max_tokens);
@@ -130,7 +138,7 @@ pub(super) fn format_canonical_source(
         }));
     }
 
-    let profile = CanonicalParser::new(tokens.clone()).parse();
+    let profile = CanonicalParser::new(tokens.clone(), max_nesting).parse();
     if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
         return Err(ProfileFormatError::Profile(profile));
     }
@@ -1337,17 +1345,19 @@ struct CanonicalParser {
     tokens: Vec<Token>,
     index: usize,
     nesting: usize,
+    maximum_nesting: usize,
     diagnostics: Vec<SyntaxDiagnostic>,
     diagnostics_truncated: bool,
     symbols: Option<SymbolCollector>,
 }
 
 impl CanonicalParser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, maximum_nesting: usize) -> Self {
         Self {
             tokens,
             index: 0,
             nesting: 0,
+            maximum_nesting,
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             symbols: None,
@@ -2079,9 +2089,10 @@ impl CanonicalParser {
     }
 
     fn enter_nesting(&mut self) -> bool {
-        if self.nesting >= MAX_CANONICAL_PROFILE_NESTING {
+        if self.nesting >= self.maximum_nesting {
             self.report_current(format!(
-                "canonical Splash nesting exceeds the maximum of {MAX_CANONICAL_PROFILE_NESTING}"
+                "canonical Splash nesting exceeds the maximum of {}",
+                self.maximum_nesting
             ));
             false
         } else {

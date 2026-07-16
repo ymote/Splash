@@ -10,6 +10,7 @@ use splash_core::ExecutionLimits;
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 8 * 1024;
 const MAX_FUZZ_SYNTAX_TOKENS: usize = 1_024;
+const MAX_FUZZ_SYNTAX_NESTING: usize = 64;
 const FUZZ_INSTRUCTION_LIMIT: usize = 4_096;
 const FUZZ_EXECUTION_DEADLINE: Duration = Duration::from_millis(32);
 const MAX_PENDING_TOOLS: usize = 2;
@@ -26,6 +27,7 @@ fuzz_target!(|data: &[u8]| {
     let limits = ExecutionLimits {
         max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
+        max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
         instruction_limit: FUZZ_INSTRUCTION_LIMIT,
         // Equal deadlines turn an elapsed sample into a terminal failure.
         soft_timeout: FUZZ_EXECUTION_DEADLINE,

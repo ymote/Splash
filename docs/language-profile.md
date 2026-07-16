@@ -17,8 +17,9 @@ source. The check enforces the canonical v0.2 grammar rather than merely
 accepting the larger Makepad compatibility parser. Syntax preflight never
 resolves imports, creates a host, or grants a tool capability. A source that
 the canonical profile rejects never enters the inherited tokenizer or parser.
-The default preflight budget is 256 KiB of source and 32,768 lexical tokens;
-an embedded host can lower both through `ExecutionLimits`.
+The default preflight budget is 256 KiB of source, 32,768 lexical tokens, and
+128 syntax-nesting levels; an embedded host can lower all three through
+`ExecutionLimits`.
 
 `splash format <file>` applies the same profile and compatibility checks, then
 writes canonical whitespace to standard output without evaluating source or

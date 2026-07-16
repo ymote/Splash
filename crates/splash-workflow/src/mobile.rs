@@ -543,6 +543,7 @@ mod tests {
             ExecutionLimits {
                 max_source_bytes: 32 * 1024,
                 max_syntax_tokens: 4 * 1024,
+                max_syntax_nesting: 64,
                 instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
                 soft_timeout: Duration::from_millis(16),
                 hard_timeout: Duration::from_millis(32),
@@ -588,6 +589,7 @@ mod tests {
         runtime.execute(&plan, approval).expect("workflow succeeds");
 
         assert_eq!(runtime.limits().max_source_bytes, 32 * 1024);
+        assert_eq!(runtime.limits().max_syntax_nesting, 64);
         assert_eq!(runtime.max_pending_tools(), 4);
         assert_eq!(runtime.pending_tools(), 0);
         assert_eq!(runtime.tool_catalog().len(), 1);

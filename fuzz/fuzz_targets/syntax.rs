@@ -12,6 +12,7 @@ use splash_core::{
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_FUZZ_SYNTAX_TOKENS: usize = 2 * 1024;
+const MAX_FUZZ_SYNTAX_NESTING: usize = 64;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(source) = std::str::from_utf8(data) else {
@@ -24,6 +25,7 @@ fuzz_target!(|data: &[u8]| {
     let limits = ExecutionLimits {
         max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
+        max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
         ..ExecutionLimits::default()
     };
     let profile = fuzzing::check_canonical_profile(source, limits)

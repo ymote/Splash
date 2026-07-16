@@ -30,6 +30,12 @@ pub const DEFAULT_MAX_FORMATTED_SOURCE_BYTES: usize =
     DEFAULT_MAX_SOURCE_BYTES * FORMAT_OUTPUT_MULTIPLIER;
 /// Maximum canonical lexical tokens accepted by default during syntax preflight.
 pub const DEFAULT_MAX_SYNTAX_TOKENS: usize = 32 * 1024;
+/// Maximum syntactic nesting accepted by default during syntax preflight.
+///
+/// Canonical Splash applies this to grammar nesting. The trusted Makepad
+/// compatibility preflight applies it to delimiter nesting before it invokes
+/// the vendored parser.
+pub const DEFAULT_MAX_SYNTAX_NESTING: usize = 128;
 pub const DEFAULT_INSTRUCTION_LIMIT: usize = 200_000;
 pub const DEFAULT_SOFT_TIMEOUT: Duration = Duration::from_millis(32);
 pub const DEFAULT_HARD_TIMEOUT: Duration = Duration::from_millis(64);
@@ -66,6 +72,7 @@ pub const MAX_LEXICAL_COMPLETION_SITES: usize = 4_096;
 pub struct ExecutionLimits {
     pub max_source_bytes: usize,
     pub max_syntax_tokens: usize,
+    pub max_syntax_nesting: usize,
     pub instruction_limit: usize,
     pub soft_timeout: Duration,
     pub hard_timeout: Duration,
@@ -77,6 +84,7 @@ impl Default for ExecutionLimits {
         Self {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_syntax_tokens: DEFAULT_MAX_SYNTAX_TOKENS,
+            max_syntax_nesting: DEFAULT_MAX_SYNTAX_NESTING,
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
             soft_timeout: DEFAULT_SOFT_TIMEOUT,
             hard_timeout: DEFAULT_HARD_TIMEOUT,
@@ -95,6 +103,11 @@ impl ExecutionLimits {
         if self.max_syntax_tokens == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_syntax_tokens must be greater than zero",
+            ));
+        }
+        if self.max_syntax_nesting == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_syntax_nesting must be greater than zero",
             ));
         }
         if self.instruction_limit == 0 {
@@ -569,8 +582,9 @@ impl<H: Any, S: Any> Runtime<H, S> {
     ///
     /// This accepts syntax outside the portable Splash v0.2 profile and is
     /// intended only for trusted migration or UI-host integration code. It
-    /// applies the configured source and inherited-VM token bounds, but it
-    /// does not resolve modules, prove host bindings exist, or grant authority.
+    /// applies the configured source, inherited-VM token, and delimiter-nesting
+    /// bounds, but it does not resolve modules, prove host bindings exist, or
+    /// grant authority.
     /// Normal generated source must use [`Self::check_syntax`].
     pub fn check_vm_compatibility(&self, source: &str) -> Result<SyntaxReport, RuntimeError> {
         check_vm_compatibility_named("inline.splash", source, self.limits)
@@ -844,11 +858,12 @@ pub fn check_syntax_named(
 /// bytecode or entering a host binding.
 ///
 /// Unlike [`check_syntax_named`], this does not apply the canonical Splash
-/// grammar. It bounds source bytes and source tokens from the inherited VM
-/// tokenizer before handing the token stream to the vendored parser. `file`
-/// appears only in parser diagnostics. It never resolves imports, installs a
-/// module, invokes a tool, or evaluates source. Makepad `@(index)` values are
-/// rejected because this standalone API does not accept a host value table.
+/// grammar. It bounds source bytes, source tokens, and delimiter nesting from
+/// the inherited VM tokenizer before handing the token stream to the vendored
+/// parser. `file` appears only in parser diagnostics. It never resolves
+/// imports, installs a module, invokes a tool, or evaluates source. Makepad
+/// `@(index)` values are rejected because this standalone API does not accept
+/// a host value table.
 ///
 /// This is a trusted-host migration and UI-integration utility. It must not
 /// replace canonical syntax admission for LLM-generated or otherwise
@@ -863,38 +878,66 @@ pub fn check_vm_compatibility_named(
 
     let mut base = vm::ScriptVmBase::new();
     let mut tokenizer = ScriptTokenizer::default();
-    if !tokenize_vm_source_bounded(
+    match tokenize_vm_source_bounded(
         &mut tokenizer,
         source,
         &mut base.heap,
         limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
     ) {
-        return Ok(vm_token_limit_report(&tokenizer, limits.max_syntax_tokens));
+        Ok(()) => {}
+        Err(VmCompatibilityPreflightLimit::Tokens) => {
+            return Ok(vm_token_limit_report(&tokenizer, limits.max_syntax_tokens));
+        }
+        Err(VmCompatibilityPreflightLimit::Nesting { token_index }) => {
+            return Ok(vm_nesting_limit_report(
+                &tokenizer,
+                token_index,
+                limits.max_syntax_nesting,
+            ));
+        }
     }
 
     Ok(parse_vm_syntax(file, &tokenizer))
 }
 
+enum VmCompatibilityPreflightLimit {
+    Tokens,
+    Nesting { token_index: usize },
+}
+
 /// Tokenizes source with the same terminal marker that the embedded VM sees.
 /// Tokenization stops as soon as the accumulated source token stream crosses
-/// the caller's configured limit. The terminal marker is excluded from that
-/// limit, so it measures only caller-provided source.
+/// either caller-configured structural limit. The terminal marker is excluded
+/// from those limits, so they measure only caller-provided source.
 fn tokenize_vm_source_bounded(
     tokenizer: &mut ScriptTokenizer,
     source: &str,
     heap: &mut vm::ScriptHeap,
     maximum_source_tokens: usize,
-) -> bool {
+    maximum_nesting: usize,
+) -> Result<(), VmCompatibilityPreflightLimit> {
+    let mut delimiters = Vec::new();
+    let mut checked_tokens = 0_usize;
+
     for character in source.chars().chain(std::iter::once('\n')) {
         let mut encoded = [0_u8; 4];
         tokenizer.tokenize(character.encode_utf8(&mut encoded), heap);
         if tokenizer.tokens.len() > maximum_source_tokens {
-            return false;
+            return Err(VmCompatibilityPreflightLimit::Tokens);
+        }
+        if let Some(token_index) = advance_vm_compatibility_nesting(
+            tokenizer,
+            &mut checked_tokens,
+            &mut delimiters,
+            maximum_nesting,
+        ) {
+            return Err(VmCompatibilityPreflightLimit::Nesting { token_index });
         }
     }
 
     tokenizer.tokenize(";", heap);
-    true
+    Ok(())
 }
 
 fn vm_token_limit_report(
@@ -910,6 +953,23 @@ fn vm_token_limit_report(
             message: format!(
                 "VM compatibility token count exceeds the maximum of {maximum_source_tokens}"
             ),
+        }],
+        diagnostics_truncated: false,
+    }
+}
+
+fn vm_nesting_limit_report(
+    tokenizer: &ScriptTokenizer,
+    token_index: usize,
+    maximum_nesting: usize,
+) -> SyntaxReport {
+    let (line, column) = token_location(tokenizer, token_index);
+    SyntaxReport {
+        valid: false,
+        diagnostics: vec![SyntaxDiagnostic {
+            line,
+            column,
+            message: format!("VM compatibility nesting exceeds the maximum of {maximum_nesting}"),
         }],
         diagnostics_truncated: false,
     }
@@ -951,10 +1011,11 @@ fn parse_vm_syntax(file: &str, tokenizer: &ScriptTokenizer) -> SyntaxReport {
 /// Lists top-level declarations in named canonical source without evaluating
 /// it, resolving imports, or creating a capability host.
 ///
-/// This applies the same source, token, canonical-profile, and vendored
-/// parser-compatibility checks as [`check_syntax_named`]. `file` appears only
-/// in VM-parser diagnostics. Invalid source produces an empty outline; callers
-/// that need diagnostics should call [`check_syntax_named`] separately.
+/// This applies the same source, token, nesting, canonical-profile, and
+/// vendored parser-compatibility checks as [`check_syntax_named`]. `file`
+/// appears only in VM-parser diagnostics. Invalid source produces an empty
+/// outline; callers that need diagnostics should call [`check_syntax_named`]
+/// separately.
 pub fn top_level_declarations_named(
     file: &str,
     source: &str,
@@ -974,9 +1035,9 @@ pub fn top_level_declarations_named(
 /// Builds a bounded lexical symbol index for named canonical source without
 /// evaluating it, resolving document URIs, or creating a capability host.
 ///
-/// This applies the same source, token, canonical-profile, and vendored parser
-/// compatibility checks as [`check_syntax_named`]. Invalid source returns an
-/// empty report; callers that need diagnostics should call
+/// This applies the same source, token, nesting, canonical-profile, and
+/// vendored parser compatibility checks as [`check_syntax_named`]. Invalid
+/// source returns an empty report; callers that need diagnostics should call
 /// [`check_syntax_named`] separately.
 pub fn lexical_symbol_report_named(
     file: &str,
@@ -988,7 +1049,11 @@ pub fn lexical_symbol_report_named(
         return Ok(LexicalSymbolReport::default());
     }
 
-    Ok(collect_lexical_symbols(source, limits.max_syntax_tokens))
+    Ok(collect_lexical_symbols(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+    ))
 }
 
 /// Builds bounded lexical completion metadata for one named source snapshot.
@@ -1022,6 +1087,7 @@ pub fn lexical_completion_report_named(
     Ok(collect_lexical_completions(
         source,
         limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
         valid_prefix_end_byte,
     ))
 }
@@ -1029,9 +1095,9 @@ pub fn lexical_completion_report_named(
 /// Lists direct source-level `mod.tool` call hints in named canonical source
 /// without evaluating it, resolving imports, or creating a capability host.
 ///
-/// This applies the same source, token, canonical-profile, and vendored
-/// parser-compatibility checks as [`check_syntax_named`]. It reports no hints
-/// for invalid source. The result is intentionally incomplete and
+/// This applies the same source, token, nesting, canonical-profile, and
+/// vendored parser-compatibility checks as [`check_syntax_named`]. It reports
+/// no hints for invalid source. The result is intentionally incomplete and
 /// non-authoritative; use it only to present a review summary before the host
 /// issues a lease and evaluates the source. This compatibility helper returns
 /// the retained prefix only; use [`tool_call_hint_report_named`] when a host
@@ -1047,9 +1113,9 @@ pub fn tool_call_hints_named(
 /// Lists bounded direct source-level `mod.tool` call hints in named canonical
 /// source with an explicit truncation signal.
 ///
-/// This applies the same source, token, canonical-profile, and vendored
-/// parser-compatibility checks as [`check_syntax_named`]. It reports no hints
-/// for invalid source. The result is intentionally incomplete and
+/// This applies the same source, token, nesting, canonical-profile, and
+/// vendored parser-compatibility checks as [`check_syntax_named`]. It reports
+/// no hints for invalid source. The result is intentionally incomplete and
 /// non-authoritative; use it only to present a review summary before the host
 /// issues a lease and evaluates the source.
 pub fn tool_call_hint_report_named(
@@ -1087,6 +1153,7 @@ pub fn format_source_named(
     match format_canonical_source(
         source,
         limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
         max_formatted_source_bytes(limits),
     ) {
         Ok(formatted) => Ok(formatted),
@@ -1116,7 +1183,8 @@ fn check_profile_named(
     let limits = limits.validate()?;
     validate_source_length(source, limits)?;
 
-    let profile = check_canonical_profile(source, limits.max_syntax_tokens);
+    let profile =
+        check_canonical_profile(source, limits.max_syntax_tokens, limits.max_syntax_nesting);
     if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
         return Ok(SyntaxReport {
             valid: false,
@@ -1436,6 +1504,24 @@ enum Delimiter {
 }
 
 impl Delimiter {
+    fn from_opening_token(token: ScriptToken) -> Option<Self> {
+        match token {
+            ScriptToken::OpenCurly => Some(Self::Curly),
+            ScriptToken::OpenRound => Some(Self::Round),
+            ScriptToken::OpenSquare => Some(Self::Square),
+            _ => None,
+        }
+    }
+
+    fn from_closing_token(token: ScriptToken) -> Option<Self> {
+        match token {
+            ScriptToken::CloseCurly => Some(Self::Curly),
+            ScriptToken::CloseRound => Some(Self::Round),
+            ScriptToken::CloseSquare => Some(Self::Square),
+            _ => None,
+        }
+    }
+
     const fn opening(self) -> char {
         match self {
             Self::Curly => '{',
@@ -1453,41 +1539,60 @@ impl Delimiter {
     }
 }
 
+fn advance_vm_compatibility_nesting(
+    tokenizer: &ScriptTokenizer,
+    checked_tokens: &mut usize,
+    delimiters: &mut Vec<Delimiter>,
+    maximum_nesting: usize,
+) -> Option<usize> {
+    for (offset, token_position) in tokenizer.tokens[*checked_tokens..].iter().enumerate() {
+        let token_index = *checked_tokens + offset;
+        if let Some(opening) = Delimiter::from_opening_token(token_position.token) {
+            if delimiters.len() >= maximum_nesting {
+                return Some(token_index);
+            }
+            delimiters.push(opening);
+            continue;
+        }
+
+        if let Some(closing) = Delimiter::from_closing_token(token_position.token) {
+            if delimiters.last().is_some_and(|opening| *opening == closing) {
+                delimiters.pop();
+            }
+        }
+    }
+    *checked_tokens = tokenizer.tokens.len();
+    None
+}
+
 fn delimiter_diagnostics(tokenizer: &ScriptTokenizer) -> (Vec<SyntaxDiagnostic>, bool) {
     let mut diagnostics = Vec::new();
     let mut truncated = false;
     let mut openings = Vec::new();
 
     for (index, token_position) in tokenizer.tokens.iter().enumerate() {
-        let opening = match token_position.token {
-            ScriptToken::OpenCurly => Some(Delimiter::Curly),
-            ScriptToken::OpenRound => Some(Delimiter::Round),
-            ScriptToken::OpenSquare => Some(Delimiter::Square),
-            _ => None,
-        };
+        let opening = Delimiter::from_opening_token(token_position.token);
         if let Some(opening) = opening {
             openings.push((opening, index));
             continue;
         }
 
-        let closing = match token_position.token {
-            ScriptToken::CloseCurly => Some(Delimiter::Curly),
-            ScriptToken::CloseRound => Some(Delimiter::Round),
-            ScriptToken::CloseSquare => Some(Delimiter::Square),
-            ScriptToken::StringUnfinished => {
-                let (line, column) = token_location(tokenizer, index);
-                push_syntax_diagnostic(
-                    &mut diagnostics,
-                    &mut truncated,
-                    SyntaxDiagnostic {
-                        line,
-                        column,
-                        message: "unterminated string literal".to_owned(),
-                    },
-                );
-                None
-            }
-            _ => None,
+        let closing = if let Some(closing) = Delimiter::from_closing_token(token_position.token) {
+            Some(closing)
+        } else if matches!(token_position.token, ScriptToken::StringUnfinished) {
+            let (line, column) = token_location(tokenizer, index);
+            push_syntax_diagnostic(
+                &mut diagnostics,
+                &mut truncated,
+                SyntaxDiagnostic {
+                    line,
+                    column,
+                    message: "unterminated string literal".to_owned(),
+                },
+            );
+            None
+        } else {
+            None
         };
         let Some(closing) = closing else {
             continue;
@@ -2320,6 +2425,32 @@ mod tests {
     }
 
     #[test]
+    fn vm_compatibility_preflight_respects_the_configured_nesting_limit() {
+        let limits = ExecutionLimits {
+            max_syntax_nesting: 3,
+            ..ExecutionLimits::default()
+        };
+        let accepted =
+            check_vm_compatibility_named("legacy.splash", "var value = (((42)))", limits).unwrap();
+        assert!(accepted.valid, "{:?}", accepted.diagnostics);
+
+        let rejected =
+            check_vm_compatibility_named("legacy.splash", "var value = ((((42))))", limits)
+                .unwrap();
+        assert!(!rejected.valid);
+        assert_eq!(rejected.diagnostics.len(), 1);
+        assert!(rejected.diagnostics[0]
+            .message
+            .contains("VM compatibility nesting exceeds the maximum of 3"));
+
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+        assert!(matches!(
+            runtime.eval_vm_compatibility("var value = ((((42))))"),
+            Err(RuntimeError::SyntaxRejected(report)) if report == rejected
+        ));
+    }
+
+    #[test]
     fn checks_tool_syntax_without_a_capability_host() {
         let report = check_syntax("use mod.tool\ntool.call(\"text.echo\", \"hello\")").unwrap();
 
@@ -3050,7 +3181,11 @@ compute(outer, 2)
         let limits = ExecutionLimits::default();
         let mut profile_accepted = 0;
         for source in sources {
-            let profile = check_canonical_profile(&source, limits.max_syntax_tokens);
+            let profile = check_canonical_profile(
+                &source,
+                limits.max_syntax_tokens,
+                limits.max_syntax_nesting,
+            );
             if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
                 continue;
             }
@@ -3085,7 +3220,11 @@ compute(outer, 2)
 
     #[test]
     fn bounds_canonical_profile_nesting() {
-        let source = format!("let value = {}0{}", "(".repeat(129), ")".repeat(129));
+        let source = format!(
+            "let value = {}0{}",
+            "(".repeat(DEFAULT_MAX_SYNTAX_NESTING + 1),
+            ")".repeat(DEFAULT_MAX_SYNTAX_NESTING + 1)
+        );
         let report = check_syntax(&source).unwrap();
 
         assert!(!report.valid);
@@ -3093,6 +3232,24 @@ compute(outer, 2)
             diagnostic
                 .message
                 .contains("canonical Splash nesting exceeds the maximum")
+        }));
+    }
+
+    #[test]
+    fn canonical_profile_respects_the_configured_nesting_limit() {
+        let limits = ExecutionLimits {
+            max_syntax_nesting: 2,
+            ..ExecutionLimits::default()
+        };
+        let accepted = check_syntax_named("nesting.splash", "let value = (0)", limits).unwrap();
+        assert!(accepted.valid, "{:?}", accepted.diagnostics);
+
+        let rejected = check_syntax_named("nesting.splash", "let value = ((0))", limits).unwrap();
+        assert!(!rejected.valid);
+        assert!(rejected.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("canonical Splash nesting exceeds the maximum of 2")
         }));
     }
 
@@ -3295,6 +3452,19 @@ compute(outer, 2)
         assert_eq!(
             check_syntax_named("tokens.splash", "let value = 1", limits).unwrap_err(),
             RuntimeError::InvalidLimits("max_syntax_tokens must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_syntax_nesting_limit() {
+        let limits = ExecutionLimits {
+            max_syntax_nesting: 0,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("nesting.splash", "let value = 1", limits).unwrap_err(),
+            RuntimeError::InvalidLimits("max_syntax_nesting must be greater than zero")
         );
     }
 

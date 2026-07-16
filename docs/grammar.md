@@ -184,11 +184,12 @@ producer grammar rather than an inherited parser superset.
 The VM remains the execution engine, but `Runtime::eval` and
 `CapabilityRuntime::eval` now enforce this profile before evaluation. The
 explicit `check_vm_compatibility` and `check_vm_compatibility_named` APIs let a
-trusted migration or UI host inspect inherited Makepad syntax with source and
-VM-token bounds but without evaluating it. `Runtime::eval_vm_compatibility`
-uses that same preflight before it evaluates. These compatibility APIs must not
-receive LLM-generated or otherwise untrusted source, and they do not resolve
-imports, install modules, or grant authority. They also reject Makepad
+trusted migration or UI host inspect inherited Makepad syntax with source,
+VM-token, and delimiter-nesting bounds but without evaluating it.
+`Runtime::eval_vm_compatibility` uses that same preflight before it evaluates.
+These compatibility APIs must not receive LLM-generated or otherwise untrusted
+source, and they do not resolve imports, install modules, or grant authority.
+They also reject Makepad
 `@(index)` host-value tokens because standalone Splash has no host value table;
 reviewed capability adapters are the Rust integration boundary. A canonical
 profile rejection returns before the inherited tokenizer or parser sees the
@@ -236,14 +237,16 @@ The command prints one JSON object containing `valid`, a bounded
 `diagnostics_truncated`. It validates the canonical grammar first and then
 checks that accepted source is compatible with the vendored VM. It never
 creates a capability runtime, loads a module, invokes a tool, or executes
-bytecode. Canonical profile nesting is bounded to 128 levels during this
-preflight, and the default lexical-token budget is 32,768.
+bytecode. By default, preflight accepts at most 256 KiB of source, 32,768
+lexical tokens, and 128 nesting levels. Canonical validation applies the
+nesting limit to grammar recursion; compatibility validation applies it to
+structural delimiters before the vendored parser runs.
 
 Rust hosts can call `splash_core::check_syntax` or
 `splash_core::check_syntax_named`. These functions apply the normal source-size
-and syntax-token limits but not instruction or deadline execution limits
-because they do not execute source. Embedded hosts can lower either bound with
-`ExecutionLimits`.
+syntax-token, and nesting limits but not instruction or deadline execution
+limits because they do not execute source. Embedded hosts can lower any of
+those bounds with `ExecutionLimits`.
 
 Editor and generator tooling that needs an outline can call
 `splash_core::top_level_declarations` or
@@ -277,8 +280,8 @@ rewriting it into a different language contract.
 Use `splash format --check workflow.splash` to exit nonzero when formatting
 would change the source. Rust hosts can call `splash_core::format_source` or
 `splash_core::format_source_named`; both use the supplied `ExecutionLimits`
-source and syntax-token bounds, cap output at four times the source budget,
-and never evaluate code.
+source, syntax-token, and nesting bounds, cap output at four times the source
+budget, and never evaluate code.
 
 ## Editor protocol
 
