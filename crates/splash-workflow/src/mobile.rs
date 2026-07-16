@@ -548,6 +548,10 @@ mod tests {
         HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod, HttpEndpointSecret,
         HttpEndpointSecretStore,
     };
+    #[cfg(feature = "platform-keyring-secret-resolver")]
+    use splash_capabilities::platform_keyring_secret_resolver::{
+        PlatformKeyringSecretEntry, PlatformKeyringSecretResolver,
+    };
     use splash_capabilities::{
         fixed_file_catalog::FixedFileCatalog, json, AuditOutcome, CapabilityLeaseGrant,
         ToolStreamPolicy,
@@ -993,6 +997,55 @@ mod tests {
         assert!(!descriptor.contains("release.auth"));
         assert!(!descriptor.contains("test-only-token-42"));
         assert!(!descriptor.contains("api.example.test"));
+    }
+
+    #[cfg(feature = "platform-keyring-secret-resolver")]
+    #[test]
+    fn seals_native_credential_resolvers_without_workflow_metadata_disclosure() {
+        let mut catalog = HttpEndpointCatalog::default();
+        catalog
+            .insert(
+                HttpEndpoint::https(
+                    "status",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/v1/status?fixed=true",
+                )
+                .expect("reviewed endpoint is valid")
+                .with_bearer_secret("release.auth")
+                .expect("credential binds only to HTTPS"),
+            )
+            .expect("endpoint is retained");
+        let resolver = PlatformKeyringSecretResolver::new(vec![PlatformKeyringSecretEntry::new(
+            "release.auth",
+            "com.example.splash",
+            "release-user",
+        )
+        .expect("native credential locator is valid")])
+        .expect("one native credential binding is valid");
+
+        let mut builder = MobileWorkflowBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_endpoint_catalog_tool_with_secret_resolver(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets one reviewed service status."),
+                catalog,
+                resolver,
+            )
+            .expect("static endpoint adapter registers without credential lookup");
+        let runtime = builder.build();
+
+        let descriptor = runtime
+            .tool_catalog_json()
+            .expect("sealed workflow catalog serializes for the host");
+        assert!(descriptor.contains("net.status"));
+        for private_value in [
+            "release.auth",
+            "com.example.splash",
+            "release-user",
+            "api.example.test",
+        ] {
+            assert!(!descriptor.contains(private_value));
+        }
     }
 
     #[test]

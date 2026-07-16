@@ -48,8 +48,10 @@ JavaScript runtime:
 - Fixed outbound JSON calls to host-selected HTTPS endpoints, addressed only by
   opaque IDs with fixed methods, paths, and queries. This is useful for small
   mobile or edge workflows. A host-held credential can be resolved and injected
-  only into one configured HTTPS endpoint without becoming script-visible. This
-  is not arbitrary web access, a general secret API, or egress containment.
+  only into one configured HTTPS endpoint without becoming script-visible. An
+  optional explicit native resolver reads exact pre-provisioned credentials on
+  macOS, iOS, and Windows and fails closed elsewhere. This is not arbitrary web
+  access, a general secret API, or egress containment.
 - LLM-proposed tool sequences submitted as data-only drafts, reviewed by a
   host, and executed under named per-step grants with bounded initial input,
   completed-step JSON outputs, and host-selected schemas for each boundary.

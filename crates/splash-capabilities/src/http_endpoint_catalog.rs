@@ -136,6 +136,9 @@ pub enum HttpEndpointSecretError {
     ValueTooLarge { maximum: usize },
     InvalidHeaderValue,
     NotFound,
+    PlatformCredentialStoreUnavailable,
+    PlatformCredentialStoreFailure,
+    InvalidStoredValue,
 }
 
 impl Display for HttpEndpointSecretError {
@@ -161,6 +164,13 @@ impl Display for HttpEndpointSecretError {
                 formatter.write_str("HTTP endpoint secret is not a valid printable header value")
             }
             Self::NotFound => formatter.write_str("HTTP endpoint secret is unavailable"),
+            Self::PlatformCredentialStoreUnavailable => formatter
+                .write_str("native platform credential-store access is unavailable on this target"),
+            Self::PlatformCredentialStoreFailure => {
+                formatter.write_str("native platform credential-store access failed")
+            }
+            Self::InvalidStoredValue => formatter
+                .write_str("native platform credential-store value is not a valid HTTP secret"),
         }
     }
 }
@@ -1038,7 +1048,7 @@ fn validate_secret_identifier(identifier: String) -> Result<String, HttpEndpoint
     }
 }
 
-fn is_valid_secret_identifier(identifier: &str) -> bool {
+pub(crate) fn is_valid_secret_identifier(identifier: &str) -> bool {
     !identifier.is_empty()
         && identifier.len() <= MAX_HTTP_ENDPOINT_SECRET_ID_BYTES
         && identifier

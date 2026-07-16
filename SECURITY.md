@@ -52,6 +52,16 @@ This is endpoint-bound injection, not a general secret broker; host metadata and
 endpoint URLs must not contain credentials, and POST body semantics need a
 separate reviewed schema or adapter when broad input is not safe.
 
+The optional `platform-keyring-secret-resolver` feature maps only setup-selected
+opaque endpoint-secret IDs to exact service/account locations in explicit native
+macOS, iOS, or Windows credential stores. It reads existing values only at
+invocation time, never exposes those mappings through accessors or `Debug`, and
+never creates, updates, rotates, or deletes credentials. Unsupported Linux and
+embedded targets fail closed instead of using keyring-rs's in-process mock
+store. This is still not a general credential broker, rollback anchor, or OS
+network boundary; resolver latency and native-store behavior remain host
+responsibility.
+
 This endpoint catalog mediates one registered API surface only. It does not
 pin DNS, enforce a firewall or per-origin egress rule, contain a blocking
 request after it starts, reduce the embedding process's network authority, or

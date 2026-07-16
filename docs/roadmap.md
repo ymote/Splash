@@ -53,9 +53,11 @@
   validation, HTTPS by default, disabled proxies and redirects, and bounded
   request input, headers, response bodies, and deadlines. Host-held bounded
   credentials can be resolved only into one fixed HTTPS endpoint through an
-  opaque setup-selected reference. It is API-level mediation only, not a
-  general secret broker, dynamic origin policy, or operating-system egress
-  boundary.
+  opaque setup-selected reference. A separate feature-gated resolver can read
+  one exact pre-provisioned value per binding from explicit native macOS, iOS,
+  or Windows credential stores without an in-process mock fallback. It is
+  API-level mediation only, not a general secret broker, dynamic origin
+  policy, or operating-system egress boundary.
 - Sealed static-catalog mobile and embedded profile for app-provided local
   adapters, with no post-build registration or external-dispatch API.
 - Sealed mobile and embedded workflow facade for static local adapters, with

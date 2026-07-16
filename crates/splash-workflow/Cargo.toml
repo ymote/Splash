@@ -23,6 +23,10 @@ splash-storage = { version = "0.1.0", path = "../splash-storage" }
 
 [features]
 http-endpoint-catalog = ["splash-capabilities/http-endpoint-catalog"]
+platform-keyring-secret-resolver = [
+    "http-endpoint-catalog",
+    "splash-capabilities/platform-keyring-secret-resolver",
+]
 multiplexed-worker = ["splash-capabilities/json-line-worker"]
 bubblewrap-recovery = [
     "dep:getrandom",

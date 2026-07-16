@@ -17,6 +17,16 @@ splash-capabilities = { path = "../splash-capabilities", features = ["http-endpo
 For the sealed workflow facade, enable the matching
 splash-workflow/http-endpoint-catalog feature.
 
+To resolve endpoint-bound secrets at invocation time from a native credential
+store on macOS, iOS, or Windows, enable
+`platform-keyring-secret-resolver` instead. That feature includes
+`http-endpoint-catalog`; the matching workflow feature forwards it.
+
+~~~toml
+[dependencies]
+splash-capabilities = { path = "../splash-capabilities", features = ["platform-keyring-secret-resolver"] }
+~~~
+
 ## Authority model
 
 During trusted Rust setup, the host fixes each complete URL, method, and
@@ -91,6 +101,39 @@ a platform credential store for every invocation. The resolver is called only
 for a credential binding selected during trusted endpoint setup; Splash cannot
 name a secret or invoke a secret resolver directly.
 
+`platform_keyring_secret_resolver::PlatformKeyringSecretResolver` is a
+read-only implementation for pre-provisioned native credentials. Each trusted
+setup entry maps one opaque endpoint-secret ID to one fixed service/account
+locator. It exposes neither mappings nor locators through accessors or `Debug`,
+performs no lookup during configuration, and uses only the explicit macOS, iOS,
+or Windows keyring implementation. It never creates, updates, rotates, or
+deletes a credential. Unsupported Linux and embedded targets fail closed rather
+than using keyring-rs's process-local mock store. Stored values must be
+nonempty printable ASCII HTTP header values no larger than 4 KiB.
+
+For a host that provisions the credential separately, replace the in-memory
+store in the setup example with this resolver:
+
+~~~rust
+use splash_capabilities::platform_keyring_secret_resolver::{
+    PlatformKeyringSecretEntry, PlatformKeyringSecretResolver,
+};
+
+let secrets = PlatformKeyringSecretResolver::new(vec![
+    PlatformKeyringSecretEntry::new(
+        "release.status.token",
+        "com.example.splash",
+        "release-status",
+    )?,
+])?;
+runtime.register_http_endpoint_catalog_tool_with_secret_resolver(
+    policy,
+    ToolMetadata::new("Gets the reviewed release status by opaque identifier."),
+    catalog,
+    secrets,
+)?;
+~~~
+
 GET requires exactly {endpoint: "..."}. POST requires
 {endpoint: "...", body: {...}} or an array body. The body remains bounded by
 the catalog request limit, and the tool policy may lower that input budget but
@@ -157,6 +200,11 @@ credential bindings. `HttpEndpointSecret` and `HttpEndpointSecretStore` redact
 their Debug output and provide no secret getter or iterator. Audit entries
 retain the tool name and byte counts, not the endpoint ID, URL, headers,
 secret identifiers, secret values, or body.
+
+`PlatformKeyringSecretEntry` and `PlatformKeyringSecretResolver` likewise
+redact their native credential mappings and locators. Credential-store errors
+remain finite host-side categories and become the same generic failed tool
+result as other resolver failures.
 
 ## Security boundary
 

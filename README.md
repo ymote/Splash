@@ -62,8 +62,10 @@ and keeps UI support optional rather than making UI the language boundary.
   and POST calls addressed only by opaque IDs, with HTTPS by default, bounded
   request/response data, no proxy or redirect following, and no script-selected URL,
   method, header, query, or secret. A host can inject a resolved credential
-  only into one fixed HTTPS endpoint; this is API-level mediation, not egress
-  containment or a general secret API.
+  only into one fixed HTTPS endpoint. An optional native resolver performs
+  read-only exact credential lookup on macOS, iOS, and Windows without a mock
+  fallback; this is API-level mediation, not egress containment or a general
+  secret API.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
   policies, checkpoints, and execution, including setup-only fixed-file and
