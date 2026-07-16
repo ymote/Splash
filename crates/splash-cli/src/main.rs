@@ -13,8 +13,9 @@ use splash_core::{
     check_syntax_named, format_source_named, tool_call_hint_report_named,
     top_level_declarations_named, ExecutionLimits, SyntaxReport, ToolCallHint,
     TopLevelDeclarationKind, CANONICAL_PROFILE_GRAMMAR_PATH, CANONICAL_PROFILE_ID,
-    CANONICAL_PROFILE_VERSION, DEFAULT_MAX_FORMATTED_SOURCE_BYTES, MAX_LEXICAL_COMPLETION_SITES,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    CANONICAL_PROFILE_VERSION, DEFAULT_MAX_FORMATTED_SOURCE_BYTES, DEFAULT_MAX_SOURCE_BYTES,
+    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
+    MAX_TOOL_CALL_HINTS,
 };
 use splash_workflow::{
     mobile::{MobileWorkflowBuilder, MobileWorkflowRuntime},
@@ -985,15 +986,15 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
             allow_echo,
             allow_json_add,
         }),
-        [command, path] if command == "run" => fs::read_to_string(path)
-            .map(|source| CliOptions {
+        [command, path] if command == "run" => {
+            read_utf8_file_with_max_bytes(path, DEFAULT_MAX_SOURCE_BYTES).map(|source| CliOptions {
                 command: CliCommand::Evaluate(source),
                 allow_echo,
                 allow_json_add,
             })
-            .map_err(|error| format!("cannot read {path}: {error}")),
-        [command, path] if command == "check" => fs::read_to_string(path)
-            .map(|source| CliOptions {
+        }
+        [command, path] if command == "check" => {
+            read_utf8_file_with_max_bytes(path, DEFAULT_MAX_SOURCE_BYTES).map(|source| CliOptions {
                 command: CliCommand::Check {
                     file: path.clone(),
                     source,
@@ -1001,9 +1002,9 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_echo,
                 allow_json_add,
             })
-            .map_err(|error| format!("cannot read {path}: {error}")),
-        [command, path] if command == "outline" => fs::read_to_string(path)
-            .map(|source| CliOptions {
+        }
+        [command, path] if command == "outline" => {
+            read_utf8_file_with_max_bytes(path, DEFAULT_MAX_SOURCE_BYTES).map(|source| CliOptions {
                 command: CliCommand::Outline {
                     file: path.clone(),
                     source,
@@ -1011,9 +1012,9 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_echo,
                 allow_json_add,
             })
-            .map_err(|error| format!("cannot read {path}: {error}")),
-        [command, path] if command == "tool-calls" => fs::read_to_string(path)
-            .map(|source| CliOptions {
+        }
+        [command, path] if command == "tool-calls" => {
+            read_utf8_file_with_max_bytes(path, DEFAULT_MAX_SOURCE_BYTES).map(|source| CliOptions {
                 command: CliCommand::ToolCalls {
                     file: path.clone(),
                     source,
@@ -1021,7 +1022,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_echo,
                 allow_json_add,
             })
-            .map_err(|error| format!("cannot read {path}: {error}")),
+        }
         [command, path] if command == "workflow-review" => {
             read_utf8_file_with_max_bytes(path, MAX_WORKFLOW_DRAFT_BYTES)
             .map(|source| CliOptions {
@@ -1052,8 +1053,8 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 }
             })
         }
-        [command, path] if command == "format" => fs::read_to_string(path)
-            .map(|source| CliOptions {
+        [command, path] if command == "format" => {
+            read_utf8_file_with_max_bytes(path, DEFAULT_MAX_SOURCE_BYTES).map(|source| CliOptions {
                 command: CliCommand::Format {
                     file: path.clone(),
                     source,
@@ -1062,7 +1063,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 allow_echo,
                 allow_json_add,
             })
-            .map_err(|error| format!("cannot read {path}: {error}")),
+        }
         [command] if command == "catalog" => Ok(CliOptions {
             command: CliCommand::Catalog,
             allow_echo,
@@ -1259,6 +1260,32 @@ mod tests {
             error,
             format!("cannot read {display}: input exceeds 4 bytes")
         );
+    }
+
+    #[test]
+    fn source_file_commands_reject_oversized_input_during_argument_parsing() {
+        let unique = format!(
+            "splash-cli-source-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::write(&path, vec![b'x'; DEFAULT_MAX_SOURCE_BYTES + 1]).unwrap();
+        let display = path.display().to_string();
+        let expected =
+            format!("cannot read {display}: input exceeds {DEFAULT_MAX_SOURCE_BYTES} bytes");
+
+        for command in ["run", "check", "outline", "tool-calls", "format"] {
+            assert_eq!(
+                parse_args(vec![command.to_owned(), display.clone()]).unwrap_err(),
+                expected
+            );
+        }
+
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

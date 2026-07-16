@@ -52,3 +52,19 @@ checkpoint restoration, loop control-flow cleanup, and uncatchable instruction
 and hard-time limits.
 Capability and workflow tests separately verify that recovery cannot erase an
 audit, refund a call, widen a lease, or bypass a dataflow output contract.
+
+## `platform/script`: re-entrant VM and raw-pointer hardening
+
+The inherited interpreter cached a raw pointer into a body's opcode vector
+across native calls. Native handlers receive `&mut ScriptVm` and can re-enter
+evaluation, including replacing the current body's parser, which invalidates
+that pointer. Splash copies each opcode through a scoped `RefCell` borrow
+instead; the borrow ends before dispatch, so re-entrant host code remains
+supported without retaining a dangling pointer.
+
+`ScriptThreads` now validates externally selected thread indexes before it
+updates its cached raw pointer, and its accessors use release-mode assertions
+instead of debug-only null checks. Invalid host input therefore fails
+deterministically rather than forming or dereferencing an out-of-bounds
+pointer. `ScriptHandleGc` downcasts now use `Any::type_id`, so a handle
+implementation cannot forge a type match by overriding a trait method.

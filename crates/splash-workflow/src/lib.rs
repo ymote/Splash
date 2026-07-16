@@ -1806,7 +1806,7 @@ impl WorkflowOperation {
         if !is_valid_operation_token(&self.tool) {
             return Err(WorkflowOperationLedgerError::InvalidTool(self.tool.clone()));
         }
-        if !is_valid_operation_token(&self.operation_key) {
+        if !is_valid_workflow_operation_key(&self.operation_key) {
             return Err(WorkflowOperationLedgerError::InvalidOperationKey(
                 self.operation_key.clone(),
             ));
@@ -6304,6 +6304,10 @@ fn is_valid_operation_token(value: &str) -> bool {
         })
 }
 
+fn is_valid_workflow_operation_key(value: &str) -> bool {
+    is_valid_operation_token(value) && !value.starts_with("cmp-")
+}
+
 fn is_valid_compensation_key(value: &str) -> bool {
     value.starts_with("cmp-") && is_valid_operation_token(value)
 }
@@ -8757,6 +8761,22 @@ mod tests {
             .plan(vec![WorkflowStep::new("publish", "let release = true")])
             .unwrap();
         let mut ledger = engine.operation_ledger(&plan).unwrap();
+
+        assert_eq!(
+            engine
+                .record_operation(
+                    &plan,
+                    &mut ledger,
+                    "publish",
+                    "release.publish",
+                    "cmp-reserved",
+                    b"request",
+                )
+                .unwrap_err(),
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::InvalidOperationKey(
+                "cmp-reserved".to_owned()
+            ))
+        );
 
         assert_eq!(
             engine

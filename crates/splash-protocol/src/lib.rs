@@ -17,7 +17,10 @@ use zeroize::Zeroize;
 
 pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_WIRE_FRAME_BYTES: usize = 1_048_576;
+/// Byte length of a BLAKE3 authentication tag.
 pub const AUTH_TAG_BYTES: usize = blake3::OUT_LEN;
+/// Byte length of a host-provisioned BLAKE3 session key.
+pub const SESSION_KEY_BYTES: usize = blake3::KEY_LEN;
 /// Current format version for a private host-to-worker session bootstrap.
 ///
 /// This format is not a worker frame. It is a one-shot preamble that must be
@@ -1620,10 +1623,10 @@ impl SessionRole {
 /// and store it through a platform-specific trusted channel, not in a Splash
 /// script or worker manifest.
 #[derive(Clone)]
-pub struct SessionKey([u8; AUTH_TAG_BYTES]);
+pub struct SessionKey([u8; SESSION_KEY_BYTES]);
 
 impl SessionKey {
-    pub fn from_bytes(bytes: [u8; AUTH_TAG_BYTES]) -> Result<Self, ProtocolError> {
+    pub fn from_bytes(bytes: [u8; SESSION_KEY_BYTES]) -> Result<Self, ProtocolError> {
         if bytes.iter().all(|byte| *byte == 0) {
             return Err(ProtocolError::WeakSessionKey);
         }
@@ -1631,13 +1634,13 @@ impl SessionKey {
     }
 
     pub fn from_slice(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        if bytes.len() != AUTH_TAG_BYTES {
+        if bytes.len() != SESSION_KEY_BYTES {
             return Err(ProtocolError::InvalidSessionKeyLength {
                 actual: bytes.len(),
-                expected: AUTH_TAG_BYTES,
+                expected: SESSION_KEY_BYTES,
             });
         }
-        let mut key = [0; AUTH_TAG_BYTES];
+        let mut key = [0; SESSION_KEY_BYTES];
         key.copy_from_slice(bytes);
         Self::from_bytes(key)
     }
@@ -1762,7 +1765,7 @@ impl PrivatePipeWorkerBootstrap {
         validate_token("session id", &session_id)
             .map_err(PrivatePipeWorkerBootstrapError::Protocol)?;
 
-        let mut key = [0; AUTH_TAG_BYTES];
+        let mut key = [0; SESSION_KEY_BYTES];
         reader
             .read_exact(&mut key)
             .map_err(PrivatePipeWorkerBootstrapError::Io)?;
@@ -4440,7 +4443,7 @@ mod tests {
     }
 
     fn session_key(byte: u8) -> SessionKey {
-        SessionKey::from_bytes([byte; AUTH_TAG_BYTES]).unwrap()
+        SessionKey::from_bytes([byte; SESSION_KEY_BYTES]).unwrap()
     }
 
     #[test]
@@ -4451,7 +4454,7 @@ mod tests {
         bootstrap.write_to(&mut encoded).unwrap();
         assert_eq!(
             encoded.len(),
-            PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 2 + "session-1".len() + AUTH_TAG_BYTES
+            PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC.len() + 2 + "session-1".len() + SESSION_KEY_BYTES
         );
         let bootstrap_len = encoded.len();
         encoded.extend_from_slice(b"next-json-frame");
@@ -4701,14 +4704,14 @@ mod tests {
         );
         assert!(correct_worker.open(frame).is_ok());
         assert_eq!(
-            SessionKey::from_bytes([0; AUTH_TAG_BYTES]).unwrap_err(),
+            SessionKey::from_bytes([0; SESSION_KEY_BYTES]).unwrap_err(),
             ProtocolError::WeakSessionKey
         );
         assert_eq!(
-            SessionKey::from_slice(&[7; AUTH_TAG_BYTES - 1]).unwrap_err(),
+            SessionKey::from_slice(&[7; SESSION_KEY_BYTES - 1]).unwrap_err(),
             ProtocolError::InvalidSessionKeyLength {
-                actual: AUTH_TAG_BYTES - 1,
-                expected: AUTH_TAG_BYTES,
+                actual: SESSION_KEY_BYTES - 1,
+                expected: SESSION_KEY_BYTES,
             }
         );
     }

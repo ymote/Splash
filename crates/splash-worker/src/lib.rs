@@ -716,6 +716,14 @@ impl WorkerAdapterRegistry {
         )
     }
 
+    pub(crate) fn has_declared_cancellable_invocation_safety(&self, tool: &str) -> bool {
+        matches!(
+            self.adapters.get(tool),
+            Some(WorkerAdapterEntry::Cancellable(adapter))
+                if adapter.invocation_safety().is_some()
+        )
+    }
+
     fn adapter_mut(&mut self, tool: &str) -> Option<&mut (dyn WorkerAdapter + '_)> {
         match self.adapters.get_mut(tool)? {
             WorkerAdapterEntry::Standard(adapter) => Some(adapter.as_mut()),

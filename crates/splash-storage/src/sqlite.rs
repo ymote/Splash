@@ -65,6 +65,11 @@ pub struct AnchoredSqliteRecoveryFence {
     fencing_token: u64,
 }
 
+enum PersistCandidateOutcome {
+    Stored,
+    AnchorChanged(RollbackAnchorState),
+}
+
 impl fmt::Debug for AnchoredSqliteRecoveryFence {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
@@ -263,12 +268,22 @@ where
         current: RollbackAnchorState,
         replacement: &StoredRecord,
         commitment: [u8; ROLLBACK_ANCHOR_COMMITMENT_BYTES],
-    ) -> Result<(), AnchoredSqliteStoreError<A::Error>> {
+    ) -> Result<PersistCandidateOutcome, AnchoredSqliteStoreError<A::Error>> {
         let revision_bytes = replacement.revision().to_be_bytes();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(AnchoredSqliteStoreError::Sqlite)?;
+        // Recovery advances the anchor before acquiring this SQLite write
+        // lock. Recheck while the lock is held so a superseded writer cannot
+        // insert a new orphan after recovery has discarded old candidates.
+        let actual = self
+            .anchor
+            .load(key)
+            .map_err(AnchoredSqliteStoreError::Anchor)?;
+        if actual != current {
+            return Ok(PersistCandidateOutcome::AnchorChanged(actual));
+        }
         prune_history(&transaction, key, current).map_err(AnchoredSqliteStoreError::Sqlite)?;
         let existing = transaction
             .query_row(
@@ -293,7 +308,7 @@ where
             transaction
                 .commit()
                 .map_err(AnchoredSqliteStoreError::Sqlite)?;
-            return Ok(());
+            return Ok(PersistCandidateOutcome::Stored);
         }
         let current_revision = current.revision_floor().to_be_bytes();
         let pending: i64 = transaction
@@ -324,7 +339,8 @@ where
             .map_err(AnchoredSqliteStoreError::Sqlite)?;
         transaction
             .commit()
-            .map_err(AnchoredSqliteStoreError::Sqlite)
+            .map_err(AnchoredSqliteStoreError::Sqlite)?;
+        Ok(PersistCandidateOutcome::Stored)
     }
 
     fn advance_anchor(
@@ -420,7 +436,26 @@ where
         }
         Self::validate_replacement(current, &replacement)?;
         let commitment = record_commitment(key, &replacement);
-        self.persist_candidate(key, current, &replacement, commitment)?;
+        match self.persist_candidate(key, current, &replacement, commitment)? {
+            PersistCandidateOutcome::Stored => {}
+            PersistCandidateOutcome::AnchorChanged(actual) => {
+                self.record_at_anchor(key, actual)?;
+                match fencing_token {
+                    Some(fencing_token) if fencing_token != actual.fencing_token() => {
+                        return Err(AnchoredSqliteStoreError::FencingTokenRejected {
+                            current: actual.fencing_token(),
+                            supplied: fencing_token,
+                        });
+                    }
+                    None if actual.fencing_token() != 0 => {
+                        return Err(AnchoredSqliteStoreError::FencingRequired {
+                            current: actual.fencing_token(),
+                        });
+                    }
+                    _ => return Ok(Self::conflict(actual)),
+                }
+            }
+        }
         let next = current
             .with_record_commitment(replacement.revision(), commitment)
             .map_err(AnchoredSqliteStoreError::InvalidAnchorState)?;
@@ -983,6 +1018,42 @@ mod tests {
                 revision_floor: 0,
             }
         );
+    }
+
+    #[test]
+    fn stale_writer_cannot_repopulate_candidates_after_recovery() {
+        let mut store =
+            AnchoredSqliteStore::open_in_memory(RejectRecordAdvanceAnchor::default()).unwrap();
+        let key = key();
+        let first_fence = store.reserve_fence(&key).unwrap();
+        let stale_state = store.checked_anchor_state(&key).unwrap();
+        assert_eq!(stale_state.fencing_token(), first_fence);
+
+        let recovery = store.reserve_recovery_fence(&key).unwrap();
+        assert_eq!(store.discard_unanchored_candidates(recovery).unwrap(), 0);
+
+        let replacement = record(1, b"stale candidate");
+        assert!(matches!(
+            store
+                .persist_candidate(
+                    &key,
+                    stale_state,
+                    &replacement,
+                    record_commitment(&key, &replacement),
+                )
+                .unwrap(),
+            PersistCandidateOutcome::AnchorChanged(actual)
+                if actual.fencing_token() == first_fence + 1
+        ));
+        let candidates: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM splash_storage_versions WHERE namespace = ?1 AND name = ?2",
+                params![key.namespace(), key.name()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidates, 0);
     }
 
     #[test]

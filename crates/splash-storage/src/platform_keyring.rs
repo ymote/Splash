@@ -276,7 +276,9 @@ fn storage_key_from_secret(
     let mut bytes = [0; STORAGE_KEY_BYTES];
     bytes.copy_from_slice(&secret);
     secret.zeroize();
-    Ok(StorageKey::from_bytes(bytes))
+    let key = StorageKey::from_bytes(bytes);
+    bytes.zeroize();
+    Ok(key)
 }
 
 #[cfg(test)]

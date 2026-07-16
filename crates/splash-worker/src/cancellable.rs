@@ -51,6 +51,16 @@ impl<R, W> CancellableWorkerSessionDriver<R, W> {
                     grant.tool.clone(),
                 ));
             }
+            if !session
+                .adapters()
+                .has_declared_cancellable_invocation_safety(&grant.tool)
+            {
+                return Err(
+                    CancellableWorkerSessionInitError::InvocationSafetyNotDeclared(
+                        grant.tool.clone(),
+                    ),
+                );
+            }
         }
         Ok(Self {
             session,
@@ -102,6 +112,16 @@ where
                                 return Err(CancellableWorkerSessionError::AdapterNotCancellable(
                                     tool,
                                 ));
+                            }
+                            if !session
+                                .adapters
+                                .has_declared_cancellable_invocation_safety(&tool)
+                            {
+                                return Err(
+                                    CancellableWorkerSessionError::InvocationSafetyNotDeclared(
+                                        tool,
+                                    ),
+                                );
                             }
                             let authorized = session
                                 .authorizer
@@ -470,6 +490,7 @@ fn message_kind(message: &WorkerMessage) -> &'static str {
 pub enum CancellableWorkerSessionInitError {
     SessionPoisoned,
     AdapterNotCancellable(String),
+    InvocationSafetyNotDeclared(String),
 }
 
 impl Display for CancellableWorkerSessionInitError {
@@ -479,6 +500,10 @@ impl Display for CancellableWorkerSessionInitError {
             Self::AdapterNotCancellable(tool) => {
                 write!(formatter, "worker adapter is not cancellable: {tool}")
             }
+            Self::InvocationSafetyNotDeclared(tool) => write!(
+                formatter,
+                "worker adapter did not declare non-durable invocation safety: {tool}"
+            ),
         }
     }
 }
@@ -495,6 +520,7 @@ pub enum CancellableWorkerSessionError {
     ReaderPanicked,
     AdapterPanicked,
     AdapterNotCancellable(String),
+    InvocationSafetyNotDeclared(String),
     Adapter {
         tool: String,
         error: WorkerAdapterError,
@@ -524,6 +550,10 @@ impl Display for CancellableWorkerSessionError {
             Self::AdapterNotCancellable(tool) => {
                 write!(formatter, "worker adapter is not cancellable: {tool}")
             }
+            Self::InvocationSafetyNotDeclared(tool) => write!(
+                formatter,
+                "worker adapter did not declare non-durable invocation safety: {tool}"
+            ),
             Self::Adapter { tool, .. } => write!(formatter, "worker adapter failed: {tool}"),
             Self::Registry(error) => write!(formatter, "worker adapter registry failed: {error}"),
             Self::CancellationWithoutTarget => {
@@ -559,6 +589,7 @@ impl std::error::Error for CancellableWorkerSessionError {
             Self::ReaderPanicked
             | Self::AdapterPanicked
             | Self::AdapterNotCancellable(_)
+            | Self::InvocationSafetyNotDeclared(_)
             | Self::CancellationWithoutTarget
             | Self::UnrequestedAcknowledgement
             | Self::CloseWhileInvocationActive
@@ -683,6 +714,23 @@ mod tests {
             _grant: &CapabilityGrant,
         ) -> Result<ToolPayload, WorkerAdapterError> {
             Ok(ToolPayload::Text("done".to_owned()))
+        }
+    }
+
+    struct UndeclaredCancellableAdapter;
+
+    impl WorkerAdapter for UndeclaredCancellableAdapter {}
+
+    impl CancellableWorkerAdapter for UndeclaredCancellableAdapter {
+        fn invoke_cancellable(
+            &mut self,
+            _request: &ToolInvocation,
+            _grant: &CapabilityGrant,
+            _cancellation: &WorkerCancellationToken,
+        ) -> Result<CancellableWorkerInvocationResult, WorkerAdapterError> {
+            Ok(CancellableWorkerInvocationResult::Completed(
+                ToolPayload::Text("done".to_owned()),
+            ))
         }
     }
 
@@ -926,6 +974,25 @@ mod tests {
                 Vec::<u8>::new()
             ),
             Err(CancellableWorkerSessionInitError::AdapterNotCancellable(tool))
+                if tool == "work.run"
+        ));
+    }
+
+    #[test]
+    fn driver_refuses_a_cancellable_adapter_without_an_invocation_safety_contract() {
+        let mut registry = WorkerAdapterRegistry::default();
+        registry
+            .register_cancellable("work.run", UndeclaredCancellableAdapter)
+            .unwrap();
+        let (worker, _, _) = open_worker(registry);
+
+        assert!(matches!(
+            CancellableWorkerSessionDriver::new(
+                worker,
+                Cursor::new(Vec::<u8>::new()),
+                Vec::<u8>::new()
+            ),
+            Err(CancellableWorkerSessionInitError::InvocationSafetyNotDeclared(tool))
                 if tool == "work.run"
         ));
     }

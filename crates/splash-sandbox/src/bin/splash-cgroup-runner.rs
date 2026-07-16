@@ -54,6 +54,10 @@ mod linux {
                         return Err(RunnerError::MissingCommand);
                     };
                     let cgroup_procs = cgroup_procs.ok_or(RunnerError::MissingCgroupProcs)?;
+                    // `close_fds` can fall back for unsorted input, but a
+                    // sorted list enables its close-range fast path and keeps
+                    // the pre-exec descriptor policy deterministic.
+                    preserve_fds.sort_unstable();
                     return Ok(Self {
                         cgroup_procs,
                         preserve_fds,
@@ -223,6 +227,11 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+        use std::fs::File;
+        use std::os::fd::AsRawFd;
+
+        const CLOEXEC_HELPER_ENV: &str = "SPLASH_CGROUP_RUNNER_CLOEXEC_HELPER";
 
         fn arguments(values: &[&str]) -> Vec<OsString> {
             values.iter().map(OsString::from).collect()
@@ -250,6 +259,63 @@ mod linux {
             assert_eq!(configuration.preserve_fds, vec![9, 11]);
             assert_eq!(configuration.command, OsString::from("/usr/bin/bwrap"));
             assert_eq!(configuration.arguments, arguments(&["--unshare-all"]));
+        }
+
+        #[test]
+        fn sorts_preserved_descriptors_for_close_range() {
+            let configuration = RunnerConfiguration::parse(arguments(&[
+                "--cgroup-procs",
+                "/sys/fs/cgroup/splash-1/cgroup.procs",
+                "--preserve-fd",
+                "11",
+                "--preserve-fd",
+                "9",
+                "--",
+                "/usr/bin/bwrap",
+            ]))
+            .unwrap();
+
+            assert_eq!(configuration.preserve_fds, vec![9, 11]);
+        }
+
+        #[test]
+        fn preserves_only_requested_nonstandard_descriptors() {
+            if std::env::var_os(CLOEXEC_HELPER_ENV).is_some() {
+                assert_cloexec_policy();
+                return;
+            }
+
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("linux::tests::preserves_only_requested_nonstandard_descriptors")
+                .arg("--nocapture")
+                .env(CLOEXEC_HELPER_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        fn assert_cloexec_policy() {
+            let preserved_low = File::open("/dev/null").unwrap();
+            let discarded = File::open("/dev/null").unwrap();
+            let preserved_high = File::open("/dev/null").unwrap();
+            for descriptor in [&preserved_low, &discarded, &preserved_high] {
+                assert!(descriptor.as_raw_fd() >= 3);
+                fcntl_setfd(descriptor, FdFlags::empty()).unwrap();
+            }
+
+            mark_extra_file_descriptors_close_on_exec(&[
+                preserved_high.as_raw_fd(),
+                preserved_low.as_raw_fd(),
+            ]);
+
+            assert!(!fcntl_getfd(&preserved_low)
+                .unwrap()
+                .contains(FdFlags::CLOEXEC));
+            assert!(fcntl_getfd(&discarded).unwrap().contains(FdFlags::CLOEXEC));
+            assert!(!fcntl_getfd(&preserved_high)
+                .unwrap()
+                .contains(FdFlags::CLOEXEC));
         }
 
         #[test]

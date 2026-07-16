@@ -21,7 +21,7 @@ use splash_capabilities::json_line_worker::{
 use splash_protocol::{
     CapabilityManifest, OperationReconcileRequest, OperationReconcileResult,
     PrivatePipeWorkerBootstrap, ProtocolError, SessionAuthenticator, SessionKey, SessionRole,
-    WorkerMessage, AUTH_TAG_BYTES,
+    WorkerMessage, SESSION_KEY_BYTES,
 };
 use splash_sandbox::bubblewrap::{
     BubblewrapBootstrapError, BubblewrapCgroupBootstrapError, BubblewrapCommand,
@@ -77,8 +77,11 @@ impl FreshBubblewrapRecoverySession {
             .validate()
             .map_err(FreshBubblewrapRecoverySessionError::Protocol)?;
         let session_id = command.session_id().to_owned();
-        let mut entropy = [0_u8; AUTH_TAG_BYTES];
-        getrandom::fill(&mut entropy).map_err(FreshBubblewrapRecoverySessionError::Entropy)?;
+        let mut entropy = [0_u8; SESSION_KEY_BYTES];
+        if let Err(error) = getrandom::fill(&mut entropy) {
+            entropy.fill(0);
+            return Err(FreshBubblewrapRecoverySessionError::Entropy(error));
+        }
         let key =
             SessionKey::from_bytes(entropy).map_err(FreshBubblewrapRecoverySessionError::Protocol);
         entropy.fill(0);
