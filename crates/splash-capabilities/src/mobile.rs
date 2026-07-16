@@ -20,8 +20,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use splash_core::{Evaluation, ExecutionLimits, RuntimeError};
 
 use crate::{
-    CapabilityCatalogLimits, CapabilityRuntime, JsonToolContract, JsonValue, PumpReport, ToolError,
-    ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
+    fixed_file_catalog::FixedFileCatalog, CapabilityCatalogLimits, CapabilityRuntime,
+    JsonToolContract, JsonValue, PumpReport, ToolError, ToolMetadata, ToolPolicy,
+    ToolRegistrationError, ToolRequest,
 };
 
 /// Setup-only builder for a static mobile or embedded capability catalog.
@@ -104,6 +105,21 @@ impl MobileRuntimeBuilder {
     {
         self.runtime
             .register_tool_with_metadata(policy, metadata, handler)
+    }
+
+    /// Registers one bounded host-owned file catalog for the sealed profile.
+    ///
+    /// The catalog is consumed at setup, so dynamic Splash source can request
+    /// only its reviewed opaque identifiers and cannot add files or select
+    /// paths after [`Self::build`] seals the runtime.
+    pub fn register_fixed_file_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: FixedFileCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .register_fixed_file_catalog_tool(policy, metadata, catalog)
     }
 
     /// Registers one reviewed JSON adapter with executable input and output

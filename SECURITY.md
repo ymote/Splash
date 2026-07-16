@@ -11,6 +11,26 @@ untrusted. The runtime has two separate security boundaries:
    filesystem policy; other desktop, mobile, and embedded targets still need
    their own platform-specific containment backend.
 
+`fixed_file_catalog::FixedFileCatalog` is the supplied narrow local-file
+adapter. During trusted setup, a host registers a bounded set of already-opened
+regular files under canonical opaque identifiers. A script can request only an
+identifier through an explicitly registered text tool; it cannot provide a
+path, enumerate the catalog, traverse directories, or write a file. The
+catalog retains a descriptor rather than a path, so a later path replacement
+does not redirect that entry. Reads remain bounded by both the catalog and tool
+policy, require UTF-8, and convert all adapter errors to generic script-facing
+messages. File identity is pinned, not file content: a host must either select
+immutable files or treat mutable content as untrusted data. This adapter is not
+a general filesystem API, symlink policy, or OS containment boundary. A grant
+to one catalog tool covers every entry in that catalog; hosts needing a narrower
+file scope must use separate tools/catalogs or an input-aware authorization
+hook. A successful read necessarily reveals that its requested identifier was
+granted, so opaque identifiers should be unguessable when that matters.
+The adapter's byte bound is not a wall-clock I/O bound; a slow or remote
+host-selected file can still block the local handler. Hosts must select files
+with acceptable latency or use a contained worker with a deadline for broader
+or potentially blocking effects.
+
 The canonical Splash profile is an effect-free preflight in front of the
 vendored Makepad parser. A profile rejection never reaches that parser or a
 host binding; a profile acceptance is then independently parsed by the VM
@@ -172,7 +192,9 @@ choose a lower-level runtime, and every registered adapter retains the app's
 ambient authority. It must not expose an arbitrary executable, filesystem,
 network-origin, plugin, or crate selector. `collect_garbage()` is host-scheduled
 and may cost time proportional to the live VM heap; it is not a per-pump
-resource limit or containment mechanism.
+resource limit or containment mechanism. A `FixedFileCatalog` registered
+through the builder is consumed before sealing and has the same opaque-ID,
+descriptor-pinning, and mutable-content limitations described above.
 
 `splash_workflow::mobile::MobileWorkflowBuilder` applies the same static local
 adapter rule to host-owned workflow execution. Its sealed result can create
@@ -703,11 +725,13 @@ in addition to authentication. The canonical-input digest is an unkeyed
 correlation value, so operation payloads must contain opaque secret selectors
 rather than credential values.
 
-This baseline does not yet provide filesystem or network tool adapters, a
-secret broker, signed packages, full JSON Schema, mobile policy backends, or
-general-purpose process containment. The Linux Bubblewrap launcher is a
-deliberately narrow worker policy, not a substitute for those missing
-boundaries. Those features must not be inferred from the presence of the VM.
+This baseline does not yet provide an arbitrary filesystem or network tool
+adapter, a secret broker, signed packages, full JSON Schema, mobile policy
+backends, or general-purpose process containment. The supplied fixed-file
+catalog is intentionally narrower than a filesystem adapter. The Linux
+Bubblewrap launcher is a deliberately narrow worker policy, not a substitute
+for those missing boundaries. Those features must not be inferred from the
+presence of the VM.
 
 Tool descriptions and schemas are available only through the host-side
 catalog. They are not script-visible authority. Schemas registered solely as

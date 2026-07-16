@@ -55,6 +55,9 @@ and keeps UI support optional rather than making UI the language boundary.
   embedded event loops.
 - A sealed static-catalog mobile and embedded profile for reviewed local Rust
   adapters, with executable JSON contracts for structured script-visible data.
+- A bounded host-owned fixed-file catalog adapter for reviewed regular UTF-8
+  files, addressed only by opaque identifiers and pinned at setup rather than
+  by script-selected filesystem paths.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
   policies, checkpoints, and execution without exposing mutable capability
@@ -149,10 +152,12 @@ and keeps UI support optional rather than making UI the language boundary.
   or host termination poisons the session and remains indeterminate.
 - A small `splash` CLI for local evaluation and the workflow example.
 
-No filesystem, subprocess, raw socket, HTTP server, or Makepad platform
-module is loaded by default. A capability check in the VM is not an OS
-sandbox; adapters that execute local tools must run in a separately contained
-worker before they are suitable for untrusted workloads.
+No ambient filesystem, subprocess, raw socket, HTTP server, or Makepad
+platform module is loaded by default. The optional fixed-file catalog is one
+explicit, bounded text tool rather than a general filesystem API. A capability
+check in the VM is not an OS sandbox; adapters that execute local tools must
+run in a separately contained worker before they are suitable for untrusted
+workloads.
 
 ## Example
 
@@ -461,6 +466,9 @@ defines the handoff to contained adapters. The [host tool catalog](docs/tool-cat
 defines safe discovery for an LLM orchestrator. [JSON tool contracts](docs/schema-contracts.md)
 define the executable structured-data boundary. [External tools](docs/external-tools.md)
 define the host-managed async boundary.
+
+[Fixed-file catalogs](docs/fixed-file-catalog.md) define the narrow
+descriptor-pinned local text-file boundary.
 
 [Editor module-interface projection](docs/module-catalog.md) defines bounded
 static authoring metadata for host-defined `mod.*` interfaces.

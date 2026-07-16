@@ -45,6 +45,9 @@
 - Deny-by-default, audited string-tool bridge with a bounded in-memory audit
   view and explicit eviction count.
 - Bounded, host-pumped deferred tool promises.
+- Bounded host-owned fixed-file catalog capability for descriptor-pinned,
+  regular UTF-8 text files selected at setup and addressed only by opaque IDs;
+  it is not an ambient filesystem API or operating-system containment.
 - Sealed static-catalog mobile and embedded profile for app-provided local
   adapters, with no post-build registration or external-dispatch API.
 - Sealed mobile and embedded workflow facade for static local adapters, with

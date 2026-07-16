@@ -41,6 +41,9 @@ pub use splash_schema::{JsonSchema, SchemaError};
 /// supply their own lifecycle supervisor.
 pub mod bounded_worker;
 
+/// Bounded host-owned text files exposed only through opaque identifiers.
+pub mod fixed_file_catalog;
+
 /// Sealed static-catalog runtime profile for mobile and embedded hosts.
 ///
 /// It accepts only app-provided local adapters during setup, then exposes
@@ -1516,6 +1519,28 @@ impl CapabilityHost {
             None,
             ToolDispatch::HostPump,
             ToolImplementation::HostPump(Box::new(handler)),
+        )
+    }
+
+    /// Registers a bounded catalog of descriptor-pinned regular files as one
+    /// text capability.
+    ///
+    /// The catalog accepts only host-selected opaque identifiers. It exposes
+    /// no script-selected paths, directory traversal, file enumeration, or
+    /// write access. The returned text is bounded by both the catalog and the
+    /// tool policy. This is not operating-system containment.
+    pub fn register_fixed_file_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: fixed_file_catalog::FixedFileCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        catalog.validate_tool_policy(&policy)?;
+        let max_output_bytes = policy.max_output_bytes;
+        self.register_with_metadata(
+            policy,
+            metadata,
+            catalog.into_tool_handler(max_output_bytes),
         )
     }
 
@@ -3119,6 +3144,20 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_with_metadata(policy, metadata, handler)
+    }
+
+    /// Registers a bounded catalog of descriptor-pinned regular files as one
+    /// text capability. See [`CapabilityHost::register_fixed_file_catalog_tool`]
+    /// for the authority and containment boundary.
+    pub fn register_fixed_file_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: fixed_file_catalog::FixedFileCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .host_mut()
+            .register_fixed_file_catalog_tool(policy, metadata, catalog)
     }
 
     /// Registers a deferred-only text capability with no in-process handler.
