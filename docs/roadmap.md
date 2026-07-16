@@ -110,6 +110,11 @@
   executable, and secret selectors, and does not fall back to unrestricted
   process launch. It unconditionally drops every Linux capability before the
   worker executes, including when the host invokes Bubblewrap as root.
+- Optional Linux descriptor-pinned Bubblewrap mount roots. After successful
+  compilation, runtime and host-backed file-root bindings use launch-only
+  `--ro-bind-fd` or `--bind-fd` handles with no path-bind fallback, preventing
+  replacement of the selected mount root. This does not freeze mutable
+  descendants, runtime contents, or the Bubblewrap executable.
 - Versioned private-pipe session bootstrap for a compiled Linux Bubblewrap
   worker. It checks the manifest session before launch and never places the
   host-generated key in command-line arguments or environment variables.

@@ -36,7 +36,7 @@ mod linux {
 
     struct RunnerConfiguration {
         cgroup_procs: PathBuf,
-        preserve_fd: Option<i32>,
+        preserve_fds: Vec<i32>,
         command: OsString,
         arguments: Vec<OsString>,
     }
@@ -45,7 +45,7 @@ mod linux {
         fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, RunnerError> {
             let arguments = arguments.into_iter().collect::<Vec<_>>();
             let mut cgroup_procs = None;
-            let mut preserve_fd = None;
+            let mut preserve_fds = Vec::new();
             let mut index = 0;
 
             while let Some(argument) = arguments.get(index) {
@@ -56,7 +56,7 @@ mod linux {
                     let cgroup_procs = cgroup_procs.ok_or(RunnerError::MissingCgroupProcs)?;
                     return Ok(Self {
                         cgroup_procs,
-                        preserve_fd,
+                        preserve_fds,
                         command: command.clone(),
                         arguments: arguments[index + 2..].to_vec(),
                     });
@@ -75,9 +75,10 @@ mod linux {
                     }
                     "--preserve-fd" => {
                         let descriptor = parse_preserved_descriptor(value)?;
-                        if preserve_fd.replace(descriptor).is_some() {
-                            return Err(RunnerError::DuplicateOption(option.to_owned()));
+                        if preserve_fds.contains(&descriptor) {
+                            return Err(RunnerError::DuplicatePreservedDescriptor(descriptor));
                         }
+                        preserve_fds.push(descriptor);
                     }
                     _ => return Err(RunnerError::UnknownOption(option.to_owned())),
                 }
@@ -98,7 +99,7 @@ mod linux {
             path: configuration.cgroup_procs.clone(),
             source,
         })?;
-        mark_extra_file_descriptors_close_on_exec(configuration.preserve_fd);
+        mark_extra_file_descriptors_close_on_exec(&configuration.preserve_fds);
         let error = Command::new(configuration.command)
             .args(configuration.arguments)
             .exec();
@@ -130,12 +131,11 @@ mod linux {
         Ok(descriptor)
     }
 
-    fn mark_extra_file_descriptors_close_on_exec(preserve_fd: Option<i32>) {
-        let preserved = preserve_fd.into_iter().collect::<Vec<_>>();
+    fn mark_extra_file_descriptors_close_on_exec(preserved: &[i32]) {
         // The runner has joined the cgroup and will perform no further file
         // descriptor operations before exec. Keep the optional seccomp program
-        // descriptor for Bubblewrap and close every other nonstandard handle.
-        close_fds::set_fds_cloexec(3, &preserved);
+        // descriptors for Bubblewrap and close every other nonstandard handle.
+        close_fds::set_fds_cloexec(3, preserved);
     }
 
     #[derive(Debug)]
@@ -144,6 +144,7 @@ mod linux {
         UnknownOption(String),
         MissingValue(String),
         DuplicateOption(String),
+        DuplicatePreservedDescriptor(i32),
         MissingCgroupProcs,
         InvalidCgroupProcsPath,
         InvalidPreservedDescriptor,
@@ -159,6 +160,7 @@ mod linux {
                 | Self::UnknownOption(_)
                 | Self::MissingValue(_)
                 | Self::DuplicateOption(_)
+                | Self::DuplicatePreservedDescriptor(_)
                 | Self::MissingCgroupProcs
                 | Self::InvalidCgroupProcsPath
                 | Self::InvalidPreservedDescriptor
@@ -176,6 +178,9 @@ mod linux {
                 Self::UnknownOption(option) => write!(formatter, "unknown option {option}"),
                 Self::MissingValue(option) => write!(formatter, "missing value for {option}"),
                 Self::DuplicateOption(option) => write!(formatter, "duplicate option {option}"),
+                Self::DuplicatePreservedDescriptor(descriptor) => {
+                    write!(formatter, "duplicate preserved descriptor {descriptor}")
+                }
                 Self::MissingCgroupProcs => {
                     formatter.write_str("--cgroup-procs is required before the -- separator")
                 }
@@ -206,6 +211,7 @@ mod linux {
                 | Self::UnknownOption(_)
                 | Self::MissingValue(_)
                 | Self::DuplicateOption(_)
+                | Self::DuplicatePreservedDescriptor(_)
                 | Self::MissingCgroupProcs
                 | Self::InvalidCgroupProcsPath
                 | Self::InvalidPreservedDescriptor
@@ -223,12 +229,14 @@ mod linux {
         }
 
         #[test]
-        fn parses_a_fixed_bubblewrap_command_with_a_preserved_descriptor() {
+        fn parses_a_fixed_bubblewrap_command_with_preserved_descriptors() {
             let configuration = RunnerConfiguration::parse(arguments(&[
                 "--cgroup-procs",
                 "/sys/fs/cgroup/splash-1/cgroup.procs",
                 "--preserve-fd",
                 "9",
+                "--preserve-fd",
+                "11",
                 "--",
                 "/usr/bin/bwrap",
                 "--unshare-all",
@@ -239,7 +247,7 @@ mod linux {
                 configuration.cgroup_procs,
                 std::path::Path::new("/sys/fs/cgroup/splash-1/cgroup.procs")
             );
-            assert_eq!(configuration.preserve_fd, Some(9));
+            assert_eq!(configuration.preserve_fds, vec![9, 11]);
             assert_eq!(configuration.command, OsString::from("/usr/bin/bwrap"));
             assert_eq!(configuration.arguments, arguments(&["--unshare-all"]));
         }
@@ -265,6 +273,16 @@ mod linux {
                     "/sys/fs/cgroup/a/cgroup.procs",
                     "--preserve-fd",
                     "2",
+                    "--",
+                    "/usr/bin/bwrap",
+                ]),
+                arguments(&[
+                    "--cgroup-procs",
+                    "/sys/fs/cgroup/a/cgroup.procs",
+                    "--preserve-fd",
+                    "9",
+                    "--preserve-fd",
+                    "9",
                     "--",
                     "/usr/bin/bwrap",
                 ]),

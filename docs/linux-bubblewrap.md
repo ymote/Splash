@@ -19,7 +19,7 @@ provide it.
 ```rust
 use splash_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, EphemeralFileRoot, FileRootAccess, FileRootBinding,
-    ReadOnlyMount, ResourceLimitRunner, WorkerResourceLimits,
+    MountSourceBinding, ReadOnlyMount, ResourceLimitRunner, WorkerResourceLimits,
     WorkerSeccompProfile,
 };
 use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
@@ -48,6 +48,7 @@ policy.add_ephemeral_file_root(
 )?;
 policy.require_bounded_file_root_writes();
 policy.require_no_further_user_namespaces();
+policy.set_mount_source_binding(MountSourceBinding::DescriptorPinned);
 policy.set_seccomp_profile(WorkerSeccompProfile::DenyKnownEscapeSurface);
 policy.enable_private_tmpfs_with_maximum_bytes(64 * 1024 * 1024)?;
 
@@ -75,6 +76,18 @@ let bootstrap = PrivatePipeWorkerBootstrap::new(
 let worker = command.spawn_with_bootstrap(&bootstrap)?;
 let (lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
 ```
+
+`MountSourceBinding::DescriptorPinned` is optional Linux hardening for host
+paths selected by this policy. At `compile`, Splash opens each selected runtime
+and host-backed file-root source, retains that root descriptor in the immutable
+command, and passes a fresh launch-only duplicate to Bubblewrap through
+`--ro-bind-fd` or `--bind-fd`. After compilation, replacing the configured
+source path cannot substitute a different mount root. A Bubblewrap build that
+lacks those options fails the worker launch; Splash never retries with a
+path-based bind. This mode does not freeze mutable descendants of a pinned
+directory, the contents of a runtime tree, the Bubblewrap executable selected
+by the host, or an already-open writable file. Those still require immutable
+host ownership or a target-specific design.
 
 `spawn_with_bootstrap` binds the bootstrap session ID to the manifest used at
 `compile` before it launches Bubblewrap. It then writes and flushes a versioned,
@@ -142,9 +155,9 @@ The fixed runner writes its own PID to the fresh child's `cgroup.procs` before
 it `exec`s Bubblewrap. Bubblewrap and every later descendant therefore inherit
 the cgroup without a post-spawn migration race. Before it executes Bubblewrap,
 the runner marks every inherited descriptor from 3 onward close-on-exec,
-preserving only the optional launch-only seccomp descriptor. The cgroup path is
-not present in the Bubblewrap command line, environment, Splash source, or
-worker protocol.
+preserving only selected launch-only seccomp and descriptor-pinned mount
+descriptors. The cgroup path is not present in the Bubblewrap command line,
+environment, Splash source, or worker protocol.
 
 Before `spawn_in_cgroup` or `spawn_with_bootstrap_in_cgroup` returns a worker
 handle, Splash observes the direct child PID in the fresh `cgroup.procs`. The
@@ -529,7 +542,8 @@ The resulting command uses:
 - `--chdir /`, so worker startup does not inherit the host process's current
   directory;
 - explicit `--ro-bind` runtime and read-only file roots, or explicit `--bind`
-  read-write file roots; and
+  read-write file roots. With `DescriptorPinned`, the corresponding launch
+  instead uses `--ro-bind-fd` or `--bind-fd` with a host-held descriptor; and
 - optional `--size BYTES` immediately before a private `--tmpfs /tmp`, limiting
   only allocations in that mount; and
 - manifest-selected `--size BYTES --tmpfs DESTINATION` pairs for bounded
@@ -617,11 +631,11 @@ It does not yet provide:
   coordinator automates a narrow reconciliation-only post-stop sequence but
   does not supply durable worker journal storage, retry effects, select
   compensation, or resume a workflow; and
-- protection from a trusted host changing a policy source path between plan
-  compilation and worker exit. Policy sources and their contents, including
-  executable and symlink targets, must be owned and immutable to untrusted
-  actors for that whole interval, or a future descriptor-based launcher must be
-  used.
+- protection from changes to files inside a mounted directory, a runtime tree,
+  the Bubblewrap executable, or the behavior of a writable host-backed root.
+  `DescriptorPinned` prevents replacement of the selected mount-root path only;
+  policy sources and runtime contents still need immutable host ownership when
+  that is part of the product security model.
 
 The default user-namespace policy retains Bubblewrap's best-effort
 `--unshare-all` behavior. Hosts requiring prevention of further user namespace

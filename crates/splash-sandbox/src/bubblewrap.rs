@@ -32,7 +32,10 @@ use std::os::unix::net::UnixStream;
 use std::process::{ChildStderr, Command, Stdio};
 
 #[cfg(target_os = "linux")]
-use rustix::io::{fcntl_dupfd_cloexec, fcntl_setfd, FdFlags};
+use rustix::{
+    fs::{fstat, open, FileType, Mode, OFlags},
+    io::{fcntl_dupfd_cloexec, fcntl_setfd, FdFlags},
+};
 use splash_protocol::{
     CapabilityManifest, PrivatePipeWorkerBootstrap, PrivatePipeWorkerBootstrapError, ProtocolError,
     ResourceKind, ResourceSelector,
@@ -53,6 +56,26 @@ pub const MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS: usize = 512;
 pub enum FileRootAccess {
     ReadOnly,
     ReadWrite,
+}
+
+/// How Bubblewrap receives trusted host mount roots at launch.
+///
+/// This is host-only containment configuration. It is never serialized into a
+/// Splash capability manifest or selected by generated source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MountSourceBinding {
+    /// Pass canonicalized host paths to Bubblewrap at launch.
+    #[default]
+    Path,
+    /// Retain each selected mount-root descriptor after compilation and pass a
+    /// launch-only duplicate to Bubblewrap's `--bind-fd` or `--ro-bind-fd`.
+    ///
+    /// This is available only on Linux and requires a Bubblewrap build with
+    /// those options. There is no fallback to path-based binds. It pins the
+    /// mounted root's identity after compilation, but it does not freeze
+    /// mutable descendants inside a mounted directory.
+    DescriptorPinned,
 }
 
 /// User-namespace hardening selected for a Bubblewrap worker.
@@ -626,6 +649,7 @@ pub struct BubblewrapWorkerPolicy {
     worker_arguments: Vec<OsString>,
     runtime_mounts: Vec<ReadOnlyMount>,
     file_roots: BTreeMap<String, RegisteredFileRoot>,
+    mount_source_binding: MountSourceBinding,
     private_tmpfs: PrivateTmpfs,
     bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
@@ -654,6 +678,7 @@ impl BubblewrapWorkerPolicy {
             worker_arguments: Vec::new(),
             runtime_mounts: Vec::new(),
             file_roots: BTreeMap::new(),
+            mount_source_binding: MountSourceBinding::Path,
             private_tmpfs: PrivateTmpfs::Disabled,
             bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
@@ -680,6 +705,29 @@ impl BubblewrapWorkerPolicy {
     pub fn add_runtime_mount(&mut self, mount: ReadOnlyMount) -> &mut Self {
         self.runtime_mounts.push(mount);
         self
+    }
+
+    /// Returns how this policy passes selected mount roots to Bubblewrap.
+    pub const fn mount_source_binding(&self) -> MountSourceBinding {
+        self.mount_source_binding
+    }
+
+    /// Selects how this policy passes selected mount roots to Bubblewrap.
+    ///
+    /// [`MountSourceBinding::DescriptorPinned`] is an opt-in Linux hardening
+    /// mode. Compilation rejects it on other platforms, and launch never
+    /// falls back to a path bind when Bubblewrap rejects a descriptor bind.
+    pub fn set_mount_source_binding(&mut self, binding: MountSourceBinding) -> &mut Self {
+        self.mount_source_binding = binding;
+        self
+    }
+
+    /// Retains descriptor-pinned mount roots after a successful compilation.
+    ///
+    /// This is shorthand for selecting
+    /// [`MountSourceBinding::DescriptorPinned`].
+    pub fn pin_mount_sources(&mut self) -> &mut Self {
+        self.set_mount_source_binding(MountSourceBinding::DescriptorPinned)
     }
 
     /// Registers one opaque `file_root` selector.
@@ -865,6 +913,7 @@ impl BubblewrapWorkerPolicy {
         manifest
             .validate()
             .map_err(BubblewrapPolicyError::Protocol)?;
+        ensure_mount_source_binding_supported(self.mount_source_binding)?;
         if self.bounded_file_root_writes_required && self.private_tmpfs == PrivateTmpfs::Unbounded {
             return Err(BubblewrapPolicyError::UnboundedPrivateTmpfsForbidden);
         }
@@ -879,7 +928,7 @@ impl BubblewrapWorkerPolicy {
         let mut mounts = self
             .runtime_mounts
             .iter()
-            .map(resolve_runtime_mount)
+            .map(|mount| resolve_runtime_mount(mount, self.mount_source_binding))
             .collect::<Result<Vec<_>, _>>()?;
 
         let resources = manifest
@@ -906,7 +955,7 @@ impl BubblewrapWorkerPolicy {
                                     },
                                 );
                             }
-                            mounts.push(resolve_file_root(binding)?);
+                            mounts.push(resolve_file_root(binding, self.mount_source_binding)?);
                         }
                         RegisteredFileRoot::Ephemeral(root) => {
                             mounts.push(resolve_ephemeral_file_root(root));
@@ -944,16 +993,16 @@ impl BubblewrapWorkerPolicy {
         let seccomp_program =
             compile_seccomp_program(self.seccomp_profile, self.seccomp_allowlist.as_ref())?;
 
-        let mut arguments = vec![
+        let mut mount_prefix_arguments = vec![
             OsString::from("--die-with-parent"),
             OsString::from("--new-session"),
             OsString::from("--unshare-all"),
         ];
         if self.user_namespace_policy == UserNamespacePolicy::RequireNoFurtherUserNamespaces {
-            arguments.push(OsString::from("--unshare-user"));
-            arguments.push(OsString::from("--disable-userns"));
+            mount_prefix_arguments.push(OsString::from("--unshare-user"));
+            mount_prefix_arguments.push(OsString::from("--disable-userns"));
         }
-        arguments.extend([
+        mount_prefix_arguments.extend([
             OsString::from("--clearenv"),
             OsString::from("--proc"),
             OsString::from("/proc"),
@@ -962,37 +1011,43 @@ impl BubblewrapWorkerPolicy {
             OsString::from("--chdir"),
             OsString::from("/"),
         ]);
-        arguments.push(OsString::from("--cap-drop"));
-        arguments.push(OsString::from("ALL"));
+        mount_prefix_arguments.push(OsString::from("--cap-drop"));
+        mount_prefix_arguments.push(OsString::from("ALL"));
         if let Some(maximum_bytes) = self.private_tmpfs.maximum_bytes() {
-            arguments.push(OsString::from("--size"));
-            arguments.push(OsString::from(maximum_bytes.get().to_string()));
+            mount_prefix_arguments.push(OsString::from("--size"));
+            mount_prefix_arguments.push(OsString::from(maximum_bytes.get().to_string()));
         }
         if self.private_tmpfs.is_enabled() {
-            arguments.push(OsString::from("--tmpfs"));
-            arguments.push(OsString::from("/tmp"));
+            mount_prefix_arguments.push(OsString::from("--tmpfs"));
+            mount_prefix_arguments.push(OsString::from("/tmp"));
         }
-        for mount in &mounts {
-            mount.append_arguments(&mut arguments);
-        }
+        let mut mount_suffix_arguments = Vec::new();
         if self.bounded_file_root_writes_required {
             for destination in ["/proc", "/dev", "/"] {
-                arguments.push(OsString::from("--remount-ro"));
-                arguments.push(OsString::from(destination));
+                mount_suffix_arguments.push(OsString::from("--remount-ro"));
+                mount_suffix_arguments.push(OsString::from(destination));
             }
         }
-        arguments.push(OsString::from("--"));
+        mount_suffix_arguments.push(OsString::from("--"));
         if let Some(runner) = &self.resource_limit_runner {
-            arguments.push(runner.program.clone().into_os_string());
-            runner.limits.append_runner_arguments(&mut arguments);
-            arguments.push(OsString::from("--"));
+            mount_suffix_arguments.push(runner.program.clone().into_os_string());
+            runner
+                .limits
+                .append_runner_arguments(&mut mount_suffix_arguments);
+            mount_suffix_arguments.push(OsString::from("--"));
         }
-        arguments.push(self.worker_program.clone().into_os_string());
-        arguments.extend(self.worker_arguments.iter().cloned());
+        mount_suffix_arguments.push(self.worker_program.clone().into_os_string());
+        mount_suffix_arguments.extend(self.worker_arguments.iter().cloned());
+
+        let arguments =
+            display_arguments(&mount_prefix_arguments, &mounts, &mount_suffix_arguments);
 
         Ok(BubblewrapCommand {
             bwrap_program,
             arguments,
+            mount_prefix_arguments,
+            mounts,
+            mount_suffix_arguments,
             manifest: manifest.clone(),
             seccomp_program,
         })
@@ -1010,6 +1065,9 @@ impl BubblewrapWorkerPolicy {
 pub struct BubblewrapCommand {
     bwrap_program: PathBuf,
     arguments: Vec<OsString>,
+    mount_prefix_arguments: Vec<OsString>,
+    mounts: Vec<CompiledMount>,
+    mount_suffix_arguments: Vec<OsString>,
     manifest: CapabilityManifest,
     seccomp_program: Option<SeccompProgram>,
 }
@@ -1020,11 +1078,14 @@ impl BubblewrapCommand {
         &self.bwrap_program
     }
 
-    /// Returns the fixed command-line arguments supplied to Bubblewrap.
+    /// Returns an inspectable representation of the fixed Bubblewrap arguments.
     ///
     /// A selected seccomp profile contributes a launch-only `--seccomp FD`
     /// pair that is intentionally omitted here because the anonymous descriptor
-    /// exists only during [`Self::spawn`].
+    /// exists only during [`Self::spawn`]. Descriptor-pinned mounts appear as
+    /// `--bind-fd` or `--ro-bind-fd` with a non-numeric launch-only placeholder
+    /// rather than exposing a host source path. The representation is not an
+    /// executable command line when it contains a launch-only placeholder.
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
@@ -1116,6 +1177,8 @@ impl BubblewrapCommand {
         cgroup: Option<CgroupV2Session>,
         cgroup_join_timeout: Option<Duration>,
     ) -> Result<(SpawnedBubblewrapWorker, Option<ChildStderr>), BubblewrapSpawnError> {
+        let mut mount_descriptors = Vec::new();
+        let arguments = self.spawn_arguments(&mut mount_descriptors)?;
         let seccomp_descriptor = self
             .seccomp_program
             .as_ref()
@@ -1126,6 +1189,11 @@ impl BubblewrapCommand {
             command
                 .arg("--cgroup-procs")
                 .arg(session.cgroup_procs_path());
+            for descriptor in &mount_descriptors {
+                command
+                    .arg("--preserve-fd")
+                    .arg(descriptor.as_raw_fd().to_string());
+            }
             if let Some(descriptor) = &seccomp_descriptor {
                 command
                     .arg("--preserve-fd")
@@ -1142,7 +1210,7 @@ impl BubblewrapCommand {
                 .arg(descriptor.as_raw_fd().to_string());
         }
         command
-            .args(&self.arguments)
+            .args(arguments)
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1155,6 +1223,7 @@ impl BubblewrapCommand {
         // reads the program. Close our deliberately inherited copy before
         // any later host process launch can observe it.
         drop(seccomp_descriptor);
+        drop(mount_descriptors);
         if let Some(session) = &cgroup {
             let join_timeout = cgroup_join_timeout
                 .expect("cgroup-backed Bubblewrap spawn must carry its host-selected join timeout");
@@ -1185,6 +1254,19 @@ impl BubblewrapCommand {
             },
             stderr,
         ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_arguments(
+        &self,
+        mount_descriptors: &mut Vec<OwnedFd>,
+    ) -> Result<Vec<OsString>, BubblewrapSpawnError> {
+        let mut arguments = self.mount_prefix_arguments.clone();
+        for mount in &self.mounts {
+            mount.append_spawn_arguments(&mut arguments, mount_descriptors)?;
+        }
+        arguments.extend(self.mount_suffix_arguments.iter().cloned());
+        Ok(arguments)
     }
 
     #[cfg(all(target_os = "linux", test))]
@@ -2374,6 +2456,7 @@ pub enum BubblewrapPolicyError {
     },
     UnboundedPrivateTmpfsForbidden,
     BoundedFileRootWritesRequireUserNamespaceLockdown,
+    DescriptorPinnedMountsUnsupportedPlatform,
     EmptyResourceLimits,
     MissingSeccompAllowlist,
     MissingSeccompExecve,
@@ -2465,6 +2548,9 @@ impl Display for BubblewrapPolicyError {
             ),
             Self::BoundedFileRootWritesRequireUserNamespaceLockdown => formatter.write_str(
                 "bounded file-root writes require mandatory further-user-namespace lockdown",
+            ),
+            Self::DescriptorPinnedMountsUnsupportedPlatform => formatter.write_str(
+                "descriptor-pinned mount roots are supported only on Linux",
             ),
             Self::EmptyResourceLimits => {
                 formatter.write_str("resource limit runner requires at least one finite limit")
@@ -2589,6 +2675,7 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::UnboundedFileRootWriteForbidden { .. }
             | Self::UnboundedPrivateTmpfsForbidden
             | Self::BoundedFileRootWritesRequireUserNamespaceLockdown
+            | Self::DescriptorPinnedMountsUnsupportedPlatform
             | Self::EmptyResourceLimits
             | Self::MissingSeccompAllowlist
             | Self::MissingSeccompExecve
@@ -2619,6 +2706,7 @@ impl std::error::Error for BubblewrapPolicyError {
 pub enum BubblewrapSpawnError {
     UnsupportedPlatform,
     SeccompTransport(io::Error),
+    PinnedMountTransport(io::Error),
     Spawn(io::Error),
     MissingStdin,
     MissingStdout,
@@ -2779,6 +2867,12 @@ impl Display for BubblewrapSpawnError {
                     "could not prepare Bubblewrap seccomp program: {error}"
                 )
             }
+            Self::PinnedMountTransport(error) => {
+                write!(
+                    formatter,
+                    "could not prepare a descriptor-pinned Bubblewrap mount: {error}"
+                )
+            }
             Self::Spawn(error) => write!(formatter, "failed to spawn Bubblewrap worker: {error}"),
             Self::MissingStdin => formatter.write_str("Bubblewrap worker did not expose stdin"),
             Self::MissingStdout => formatter.write_str("Bubblewrap worker did not expose stdout"),
@@ -2803,7 +2897,9 @@ impl Display for BubblewrapSpawnError {
 impl std::error::Error for BubblewrapSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SeccompTransport(error) | Self::Spawn(error) => Some(error),
+            Self::SeccompTransport(error)
+            | Self::PinnedMountTransport(error)
+            | Self::Spawn(error) => Some(error),
             Self::CgroupMembership(error) => Some(error),
             Self::UnsupportedPlatform | Self::MissingStdin | Self::MissingStdout => None,
             Self::CgroupJoinTimeout(_) | Self::CgroupRunnerExited(_) => None,
@@ -2817,16 +2913,19 @@ enum MountSourceType {
     Directory,
 }
 
-#[derive(Clone, Debug)]
+#[cfg(target_os = "linux")]
+const PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER: &str = "<pinned-mount-source>";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CompiledMount {
     destination: PathBuf,
     kind: CompiledMountKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CompiledMountKind {
     Bind {
-        source: PathBuf,
+        source: CompiledBindSource,
         access: FileRootAccess,
         source_type: MountSourceType,
         is_runtime: bool,
@@ -2834,6 +2933,59 @@ enum CompiledMountKind {
     BoundedTmpfs {
         maximum_bytes: NonZeroUsize,
     },
+}
+
+/// A canonical source path plus an optional Linux descriptor that fixes the
+/// mount root selected at compilation time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompiledBindSource {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    pinned_descriptor: Option<PinnedMountDescriptor>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct PinnedMountDescriptor {
+    descriptor: Arc<OwnedFd>,
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for PinnedMountDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.descriptor, &other.descriptor)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for PinnedMountDescriptor {}
+
+impl CompiledBindSource {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn append_display_argument(&self, arguments: &mut Vec<OsString>) {
+        #[cfg(target_os = "linux")]
+        if self.pinned_descriptor.is_some() {
+            arguments.push(OsString::from(PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER));
+            return;
+        }
+
+        arguments.push(self.path.clone().into_os_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn duplicate_for_bubblewrap(&self) -> Result<Option<OwnedFd>, BubblewrapSpawnError> {
+        let Some(pinned) = &self.pinned_descriptor else {
+            return Ok(None);
+        };
+        let descriptor = fcntl_dupfd_cloexec(pinned.descriptor.as_ref(), 3)
+            .map_err(|source| BubblewrapSpawnError::PinnedMountTransport(source.into()))?;
+        fcntl_setfd(&descriptor, FdFlags::empty())
+            .map_err(|source| BubblewrapSpawnError::PinnedMountTransport(source.into()))?;
+        Ok(Some(descriptor))
+    }
 }
 
 impl CompiledMount {
@@ -2864,24 +3016,42 @@ impl CompiledMount {
                 source_type,
                 ..
             } => match source_type {
-                MountSourceType::File => Some(source.clone()),
+                MountSourceType::File => Some(source.path.clone()),
                 MountSourceType::Directory => program
                     .strip_prefix(&self.destination)
                     .ok()
-                    .map(|relative| source.join(relative)),
+                    .map(|relative| source.path().join(relative)),
             },
             CompiledMountKind::BoundedTmpfs { .. } => None,
         }
     }
 
-    fn append_arguments(&self, arguments: &mut Vec<OsString>) {
+    fn append_display_arguments(&self, arguments: &mut Vec<OsString>) {
         match &self.kind {
             CompiledMountKind::Bind { source, access, .. } => {
-                arguments.push(OsString::from(match access {
-                    FileRootAccess::ReadOnly => "--ro-bind",
-                    FileRootAccess::ReadWrite => "--bind",
+                arguments.push(OsString::from(match *access {
+                    FileRootAccess::ReadOnly => {
+                        #[cfg(target_os = "linux")]
+                        if source.pinned_descriptor.is_some() {
+                            "--ro-bind-fd"
+                        } else {
+                            "--ro-bind"
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        "--ro-bind"
+                    }
+                    FileRootAccess::ReadWrite => {
+                        #[cfg(target_os = "linux")]
+                        if source.pinned_descriptor.is_some() {
+                            "--bind-fd"
+                        } else {
+                            "--bind"
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        "--bind"
+                    }
                 }));
-                arguments.push(source.clone().into_os_string());
+                source.append_display_argument(arguments);
                 arguments.push(self.destination.clone().into_os_string());
             }
             CompiledMountKind::BoundedTmpfs { maximum_bytes } => {
@@ -2892,6 +3062,53 @@ impl CompiledMount {
             }
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn append_spawn_arguments(
+        &self,
+        arguments: &mut Vec<OsString>,
+        mount_descriptors: &mut Vec<OwnedFd>,
+    ) -> Result<(), BubblewrapSpawnError> {
+        match &self.kind {
+            CompiledMountKind::Bind { source, access, .. } => {
+                let descriptor = source.duplicate_for_bubblewrap()?;
+                let option = match (access, descriptor.is_some()) {
+                    (FileRootAccess::ReadOnly, true) => "--ro-bind-fd",
+                    (FileRootAccess::ReadWrite, true) => "--bind-fd",
+                    (FileRootAccess::ReadOnly, false) => "--ro-bind",
+                    (FileRootAccess::ReadWrite, false) => "--bind",
+                };
+                arguments.push(OsString::from(option));
+                if let Some(descriptor) = descriptor {
+                    arguments.push(OsString::from(descriptor.as_raw_fd().to_string()));
+                    mount_descriptors.push(descriptor);
+                } else {
+                    arguments.push(source.path.clone().into_os_string());
+                }
+                arguments.push(self.destination.clone().into_os_string());
+            }
+            CompiledMountKind::BoundedTmpfs { maximum_bytes } => {
+                arguments.push(OsString::from("--size"));
+                arguments.push(OsString::from(maximum_bytes.get().to_string()));
+                arguments.push(OsString::from("--tmpfs"));
+                arguments.push(self.destination.clone().into_os_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn display_arguments(
+    mount_prefix_arguments: &[OsString],
+    mounts: &[CompiledMount],
+    mount_suffix_arguments: &[OsString],
+) -> Vec<OsString> {
+    let mut arguments = mount_prefix_arguments.to_vec();
+    for mount in mounts {
+        mount.append_display_arguments(&mut arguments);
+    }
+    arguments.extend(mount_suffix_arguments.iter().cloned());
+    arguments
 }
 
 fn validate_host_path(field: &'static str, path: &Path) -> Result<(), BubblewrapPolicyError> {
@@ -2956,15 +3173,12 @@ fn resolve_regular_executable_file(
     Ok(path)
 }
 
-fn resolve_runtime_mount(mount: &ReadOnlyMount) -> Result<CompiledMount, BubblewrapPolicyError> {
-    let source = canonical_existing_path("runtime mount source", &mount.source)?;
-    let metadata =
-        fs::metadata(&source).map_err(|source_error| BubblewrapPolicyError::SourceIo {
-            field: "runtime mount source",
-            path: source.clone(),
-            source: source_error,
-        })?;
-    let source_type = source_type("runtime mount source", source.clone(), &metadata)?;
+fn resolve_runtime_mount(
+    mount: &ReadOnlyMount,
+    binding: MountSourceBinding,
+) -> Result<CompiledMount, BubblewrapPolicyError> {
+    let (source, source_type) =
+        resolve_bind_source("runtime mount source", &mount.source, binding)?;
     Ok(CompiledMount {
         destination: mount.destination.clone(),
         kind: CompiledMountKind::Bind {
@@ -2976,18 +3190,16 @@ fn resolve_runtime_mount(mount: &ReadOnlyMount) -> Result<CompiledMount, Bubblew
     })
 }
 
-fn resolve_file_root(binding: &FileRootBinding) -> Result<CompiledMount, BubblewrapPolicyError> {
-    let source = canonical_existing_path("file-root source", &binding.source)?;
-    let metadata =
-        fs::metadata(&source).map_err(|source_error| BubblewrapPolicyError::SourceIo {
-            field: "file-root source",
-            path: source.clone(),
-            source: source_error,
-        })?;
-    if !metadata.is_dir() {
+fn resolve_file_root(
+    binding: &FileRootBinding,
+    mount_source_binding: MountSourceBinding,
+) -> Result<CompiledMount, BubblewrapPolicyError> {
+    let (source, source_type) =
+        resolve_bind_source("file-root source", &binding.source, mount_source_binding)?;
+    if source_type != MountSourceType::Directory {
         return Err(BubblewrapPolicyError::InvalidSourceType {
             field: "file-root source",
-            path: source,
+            path: source.path.clone(),
             expected: "directory",
         });
     }
@@ -3002,6 +3214,93 @@ fn resolve_file_root(binding: &FileRootBinding) -> Result<CompiledMount, Bubblew
     })
 }
 
+fn resolve_bind_source(
+    field: &'static str,
+    configured_path: &Path,
+    binding: MountSourceBinding,
+) -> Result<(CompiledBindSource, MountSourceType), BubblewrapPolicyError> {
+    let path = canonical_existing_path(field, configured_path)?;
+    let metadata = fs::metadata(&path).map_err(|source| BubblewrapPolicyError::SourceIo {
+        field,
+        path: path.clone(),
+        source,
+    })?;
+    let source_type = source_type(field, path.clone(), &metadata)?;
+    let source = compile_bind_source(field, path, source_type, binding)?;
+    Ok((source, source_type))
+}
+
+#[cfg(target_os = "linux")]
+fn compile_bind_source(
+    field: &'static str,
+    path: PathBuf,
+    source_type: MountSourceType,
+    binding: MountSourceBinding,
+) -> Result<CompiledBindSource, BubblewrapPolicyError> {
+    let pinned_descriptor = match binding {
+        MountSourceBinding::Path => None,
+        MountSourceBinding::DescriptorPinned => Some(pin_mount_source(field, &path, source_type)?),
+    };
+    Ok(CompiledBindSource {
+        path,
+        pinned_descriptor,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn compile_bind_source(
+    _field: &'static str,
+    path: PathBuf,
+    _source_type: MountSourceType,
+    binding: MountSourceBinding,
+) -> Result<CompiledBindSource, BubblewrapPolicyError> {
+    if binding == MountSourceBinding::DescriptorPinned {
+        return Err(BubblewrapPolicyError::DescriptorPinnedMountsUnsupportedPlatform);
+    }
+    Ok(CompiledBindSource { path })
+}
+
+#[cfg(target_os = "linux")]
+fn pin_mount_source(
+    field: &'static str,
+    path: &Path,
+    expected_type: MountSourceType,
+) -> Result<PinnedMountDescriptor, BubblewrapPolicyError> {
+    let descriptor = open(
+        path,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| BubblewrapPolicyError::SourceIo {
+        field,
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    let metadata = fstat(&descriptor).map_err(|source| BubblewrapPolicyError::SourceIo {
+        field,
+        path: path.to_path_buf(),
+        source: source.into(),
+    })?;
+    let file_type = FileType::from_raw_mode(metadata.st_mode);
+    let expected = match expected_type {
+        MountSourceType::File => file_type.is_file(),
+        MountSourceType::Directory => file_type.is_dir(),
+    };
+    if !expected {
+        return Err(BubblewrapPolicyError::InvalidSourceType {
+            field,
+            path: path.to_path_buf(),
+            expected: match expected_type {
+                MountSourceType::File => "regular file",
+                MountSourceType::Directory => "directory",
+            },
+        });
+    }
+    Ok(PinnedMountDescriptor {
+        descriptor: Arc::new(descriptor),
+    })
+}
+
 fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
     CompiledMount {
         destination: root.destination.clone(),
@@ -3009,6 +3308,23 @@ fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
             maximum_bytes: root.maximum_bytes,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_mount_source_binding_supported(
+    _binding: MountSourceBinding,
+) -> Result<(), BubblewrapPolicyError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_mount_source_binding_supported(
+    binding: MountSourceBinding,
+) -> Result<(), BubblewrapPolicyError> {
+    if binding == MountSourceBinding::DescriptorPinned {
+        return Err(BubblewrapPolicyError::DescriptorPinnedMountsUnsupportedPlatform);
+    }
+    Ok(())
 }
 
 fn canonical_existing_path(
@@ -3804,6 +4120,99 @@ mod tests {
         assert!(!arguments.iter().any(|argument| argument == "session-1"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_pinned_mount_roots_render_launch_only_fd_binds() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.pin_mount_sources();
+        policy
+            .add_file_root(
+                "input",
+                binding(&root, "input", "/workspace/input", FileRootAccess::ReadOnly),
+            )
+            .unwrap();
+        policy
+            .add_file_root(
+                "output",
+                binding(
+                    &root,
+                    "output",
+                    "/workspace/output",
+                    FileRootAccess::ReadWrite,
+                ),
+            )
+            .unwrap();
+
+        let plan = policy
+            .compile(&manifest([
+                selector(ResourceKind::FileRoot, "input"),
+                selector(ResourceKind::FileRoot, "output"),
+            ]))
+            .unwrap();
+        let arguments = argument_strings(&plan);
+        let runtime = fs::canonicalize(root.path().join("runtime"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let input = fs::canonicalize(root.path().join("input"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let output = fs::canonicalize(root.path().join("output"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            policy.mount_source_binding(),
+            MountSourceBinding::DescriptorPinned
+        );
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--ro-bind-fd",
+                PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                "/opt/splash",
+            ]
+        ));
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--ro-bind-fd",
+                PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                "/workspace/input",
+            ]
+        ));
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--bind-fd",
+                PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                "/workspace/output",
+            ]
+        ));
+        for source in [runtime, input, output] {
+            assert!(
+                !arguments.iter().any(|argument| argument == &source),
+                "descriptor-pinned source leaked into display arguments: {source}"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn descriptor_pinned_mount_roots_fail_closed_off_linux() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.pin_mount_sources();
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::DescriptorPinnedMountsUnsupportedPlatform)
+        ));
+    }
+
     #[test]
     fn further_user_namespace_lockdown_is_opt_in_and_requires_bubblewrap_flags() {
         let root = TestDirectory::new();
@@ -4191,6 +4600,84 @@ mod tests {
                 if termination.was_killed()
         ));
         assert!(watchdog.close().unwrap().was_killed());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a runner that can configure Bubblewrap's isolated loopback device"]
+    fn descriptor_pinned_file_root_survives_host_path_replacement_after_compile() {
+        use std::io::Read;
+
+        let root = TestDirectory::new();
+        let source = root.path().join("input");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("marker"), "compiled-root\n").unwrap();
+        let secret = root.path().join("secret");
+        fs::create_dir(&secret).unwrap();
+        fs::write(secret.join("marker"), "host-only\n").unwrap();
+
+        let python = fs::canonicalize("/usr/bin/python3").unwrap();
+        let mut policy = BubblewrapWorkerPolicy::new("/usr/bin/bwrap", python)
+            .unwrap()
+            .with_worker_arguments([
+                "-B",
+                "-c",
+                r#"
+import os
+from pathlib import Path
+
+for raw_descriptor in os.listdir('/proc/self/fd'):
+    descriptor = int(raw_descriptor)
+    if descriptor <= 2:
+        continue
+    try:
+        leaked = os.open('../secret/marker', os.O_RDONLY, dir_fd=descriptor)
+    except OSError:
+        continue
+    else:
+        os.close(leaked)
+        raise RuntimeError('Bubblewrap retained a host mount descriptor')
+
+print(Path('/workspace/input/marker').read_text(), end='')
+"#,
+            ]);
+        policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
+        add_linux_runtime_library_mounts(&mut policy);
+        policy
+            .add_file_root(
+                "input",
+                FileRootBinding::new(&source, "/workspace/input", FileRootAccess::ReadOnly)
+                    .unwrap(),
+            )
+            .unwrap();
+        policy.pin_mount_sources();
+
+        let plan = policy
+            .compile(&manifest([selector(ResourceKind::FileRoot, "input")]))
+            .unwrap();
+
+        let retired = root.path().join("input-retired");
+        fs::rename(&source, &retired).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("marker"), "replacement-root\n").unwrap();
+
+        let (worker, mut standard_error) = plan.spawn_capturing_stderr().unwrap();
+        let (mut child, stdin, mut stdout) = worker.into_parts();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        let mut standard_error_output = String::new();
+        standard_error
+            .read_to_string(&mut standard_error_output)
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "worker failed: {status}; stdout: {output:?}; stderr: {standard_error_output:?}"
+        );
+        assert_eq!(output, "compiled-root\n");
     }
 
     #[cfg(target_os = "linux")]
