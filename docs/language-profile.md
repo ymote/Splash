@@ -124,10 +124,16 @@ or authority. The LSP uses the separate import report only to recognize an
 exact visible `use mod.tool` binding and suggest the four fixed language
 methods `call`, `call_json`, `start`, and `start_json`. It never reads the host
 catalog for those suggestions, and their presence is neither module resolution
-nor a capability grant. Consumers must not derive candidates from a
-symbol-truncated report: an omitted inner definition may shadow a retained
-outer binding. The LSP therefore returns an incomplete empty candidate set in
-that case.
+nor a capability grant. An editor integration may separately provide a
+bounded, initialization-time advisory projection through
+`initializationOptions.splash.toolCatalog`. That LSP-only metadata can complete
+the first literal name of a direct visible `tool.call`/`tool.start` from `text`
+entries, or `tool.call_json`/`tool.start_json` from `json` entries. It is not
+part of the core report, never causes a runtime/catalog lookup, and cannot make
+a tool current, installed, approved, or callable. Consumers must not derive
+candidates from a symbol-truncated report: an omitted inner definition may
+shadow a retained outer binding. The LSP therefore returns an incomplete empty
+candidate set in that case.
 
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash

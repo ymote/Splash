@@ -2,9 +2,10 @@
 
 //! Stdio language server for the canonical Splash v0.2 source profile.
 //!
-//! The server only receives client-provided text and calls effect-free syntax,
-//! formatting, outline, and lexical symbol helpers. It never reads document
-//! URIs, evaluates Splash code, creates a capability host, or loads an adapter.
+//! The server receives client-provided document text plus optional bounded,
+//! advisory initialization metadata and calls effect-free syntax, formatting,
+//! outline, and lexical symbol helpers. It never reads document URIs, evaluates
+//! Splash code, creates a capability host, or loads an adapter.
 
 use std::{cell::OnceCell, collections::HashMap, error::Error, io, process::ExitCode};
 
@@ -23,7 +24,7 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentChanges, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
     DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
     OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, PrepareRenameResponse,
     PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
@@ -41,8 +42,73 @@ use splash_core::{
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
 const DIAGNOSTIC_SOURCE: &str = "splash";
+/// Maximum retained metadata entries in the optional LSP tool-catalog projection.
+///
+/// This intentionally matches the default host catalog count but remains local
+/// to the editor process. The projection is never a capability grant.
+const MAX_LSP_TOOL_CATALOG_TOOLS: usize = 128;
+/// Maximum retained name and description bytes in the optional LSP tool-catalog
+/// projection.
+const MAX_LSP_TOOL_CATALOG_BYTES: usize = 512 * 1024;
+const MAX_LSP_TOOL_NAME_BYTES: usize = 128;
+const MAX_LSP_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
 
 type ServerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolCatalogFormat {
+    Text,
+    Json,
+}
+
+impl ToolCatalogFormat {
+    fn from_catalog_value(value: &str) -> Option<Self> {
+        match value {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+
+    const fn accepts_call_format(self, call_format: ToolCallFormat) -> bool {
+        matches!(
+            (self, call_format),
+            (Self::Text, ToolCallFormat::Text) | (Self::Json, ToolCallFormat::Json)
+        )
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "JSON",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolCallFormat {
+    Text,
+    Json,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolCatalogCompletion {
+    name: String,
+    format: ToolCatalogFormat,
+    description: String,
+}
+
+/// A bounded, advisory projection of the host's current tool catalog.
+///
+/// The server receives this only once through LSP initialization options. It
+/// does not connect to a runtime, read a catalog from disk, or use catalog
+/// metadata to authorize source. A malformed or oversized projection is
+/// discarded in full so the editor cannot present an arbitrary partial set.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ToolCompletionCatalog {
+    tools: Vec<ToolCatalogCompletion>,
+    unavailable: bool,
+}
 
 #[derive(Debug)]
 struct DocumentState {
@@ -82,9 +148,17 @@ struct SpanReplacement {
 #[derive(Default)]
 struct SplashLanguageServer {
     documents: HashMap<Uri, DocumentState>,
+    tool_catalog: ToolCompletionCatalog,
 }
 
 impl SplashLanguageServer {
+    fn with_tool_catalog(tool_catalog: ToolCompletionCatalog) -> Self {
+        Self {
+            documents: HashMap::new(),
+            tool_catalog,
+        }
+    }
+
     fn open_document(&mut self, item: TextDocumentItem) -> PublishDiagnosticsParams {
         self.replace_document(item.uri, item.version, item.text)
     }
@@ -261,6 +335,18 @@ impl SplashLanguageServer {
         };
         if report.symbols_truncated {
             return Ok(empty());
+        }
+
+        if let Some(tool_name_site) = direct_tool_name_completion_site(source, byte_offset) {
+            let imports = self.module_imports(uri)?;
+            return Ok(tool_catalog_name_completion(
+                source,
+                report,
+                imports,
+                &self.tool_catalog,
+                tool_name_site,
+                lexical_incomplete || imports.truncated,
+            ));
         }
 
         if let Some(member_site) = direct_module_member_completion_site(source, byte_offset) {
@@ -543,6 +629,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
     let initialize_params =
         serde_json::from_value::<InitializeParams>(initialize_value).unwrap_or_default();
     let versioned_document_edits = supports_versioned_document_edits(&initialize_params);
+    let tool_catalog = tool_completion_catalog_from_initialize_options(&initialize_params);
     connection.initialize_finish(
         initialize_id,
         serde_json::json!({
@@ -550,7 +637,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
         }),
     )?;
 
-    let mut server = SplashLanguageServer::default();
+    let mut server = SplashLanguageServer::with_tool_catalog(tool_catalog);
     while let Ok(message) = connection.receiver.recv() {
         match message {
             Message::Request(request) => {
@@ -583,6 +670,92 @@ fn supports_versioned_document_edits(params: &InitializeParams) -> bool {
         .and_then(|workspace| workspace.workspace_edit.as_ref())
         .and_then(|workspace_edit| workspace_edit.document_changes)
         == Some(true)
+}
+
+fn tool_completion_catalog_from_initialize_options(
+    params: &InitializeParams,
+) -> ToolCompletionCatalog {
+    let Some(options) = params.initialization_options.as_ref() else {
+        return ToolCompletionCatalog::default();
+    };
+    let Some(options) = options.as_object() else {
+        return ToolCompletionCatalog::default();
+    };
+    let Some(splash) = options.get("splash") else {
+        return ToolCompletionCatalog::default();
+    };
+    let Some(splash) = splash.as_object() else {
+        return unavailable_tool_completion_catalog();
+    };
+    let Some(catalog) = splash.get("toolCatalog") else {
+        return ToolCompletionCatalog::default();
+    };
+
+    parse_tool_completion_catalog(catalog).unwrap_or_else(unavailable_tool_completion_catalog)
+}
+
+fn unavailable_tool_completion_catalog() -> ToolCompletionCatalog {
+    ToolCompletionCatalog {
+        tools: Vec::new(),
+        unavailable: true,
+    }
+}
+
+/// Reads the name, format, and description fields from a serialized
+/// `CapabilityRuntime::tool_catalog()` response without taking a dependency on
+/// the effectful capability crate. Unknown descriptor fields are intentionally
+/// ignored; the retained projection remains bounded and non-authoritative.
+fn parse_tool_completion_catalog(value: &serde_json::Value) -> Option<ToolCompletionCatalog> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_LSP_TOOL_CATALOG_TOOLS {
+        return None;
+    }
+
+    let mut retained_bytes = 0_usize;
+    let mut tools = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let object = entry.as_object()?;
+        let name = object.get("name")?.as_str()?;
+        if !is_valid_catalog_tool_name(name) {
+            return None;
+        }
+        let format = ToolCatalogFormat::from_catalog_value(object.get("format")?.as_str()?)?;
+        let description = match object.get("description") {
+            Some(value) => value.as_str()?,
+            None => "",
+        };
+        if description.len() > MAX_LSP_TOOL_DESCRIPTION_BYTES {
+            return None;
+        }
+        let entry_bytes = name.len().checked_add(description.len())?.checked_add(1)?;
+        retained_bytes = retained_bytes.checked_add(entry_bytes)?;
+        if retained_bytes > MAX_LSP_TOOL_CATALOG_BYTES
+            || tools
+                .iter()
+                .any(|tool: &ToolCatalogCompletion| tool.name == name)
+        {
+            return None;
+        }
+        tools.push(ToolCatalogCompletion {
+            name: name.to_owned(),
+            format,
+            description: description.to_owned(),
+        });
+    }
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Some(ToolCompletionCatalog {
+        tools,
+        unavailable: false,
+    })
+}
+
+fn is_valid_catalog_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_LSP_TOOL_NAME_BYTES
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
 }
 
 fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
@@ -995,11 +1168,23 @@ struct MemberCompletionSite {
     member: SourceSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ToolNameCompletionSite {
+    receiver: SourceSpan,
+    name: SourceSpan,
+    call_format: ToolCallFormat,
+}
+
 fn direct_module_member_completion_site(
     source: &str,
     byte_offset: usize,
 ) -> Option<MemberCompletionSite> {
     if byte_offset > source.len() || !source.is_char_boundary(byte_offset) {
+        return None;
+    }
+    if string_content_span_at(source, byte_offset).is_some()
+        || cursor_is_inside_comment(source, byte_offset)
+    {
         return None;
     }
 
@@ -1047,6 +1232,216 @@ fn direct_module_member_completion_site(
     })
 }
 
+/// Recognizes the first literal argument to one direct `mod.tool` call.
+///
+/// This is intentionally a small lexical recognizer rather than a general
+/// expression parser. It accepts only `tool.call("...")`,
+/// `tool.start("...")`, and their JSON variants, with ordinary whitespace
+/// before the opening parenthesis or literal. The caller still proves that the
+/// receiver is the visible `use mod.tool` binding before exposing metadata.
+fn direct_tool_name_completion_site(
+    source: &str,
+    byte_offset: usize,
+) -> Option<ToolNameCompletionSite> {
+    let name = string_content_span_at(source, byte_offset)?;
+    let opening_quote = name.start_byte.checked_sub(1)?;
+    let open_paren_end = skip_ascii_whitespace_backward(source, opening_quote);
+    if open_paren_end == 0 || source.as_bytes()[open_paren_end - 1] != b'(' {
+        return None;
+    }
+
+    let method_end = skip_ascii_whitespace_backward(source, open_paren_end - 1);
+    let method_start = identifier_start_before(source, method_end);
+    if method_start == method_end
+        || method_start == 0
+        || source.as_bytes()[method_start - 1] != b'.'
+    {
+        return None;
+    }
+    let call_format = match source.get(method_start..method_end)? {
+        "call" | "start" => ToolCallFormat::Text,
+        "call_json" | "start_json" => ToolCallFormat::Json,
+        _ => return None,
+    };
+
+    let receiver_end = method_start - 1;
+    let receiver_start = identifier_start_before(source, receiver_end);
+    if receiver_start == receiver_end
+        || !is_identifier_start_byte(source.as_bytes()[receiver_start])
+        || (receiver_start > 0 && source.as_bytes()[receiver_start - 1] == b'.')
+    {
+        return None;
+    }
+    let receiver_name = source.get(receiver_start..receiver_end)?;
+    if !is_canonical_identifier(receiver_name) {
+        return None;
+    }
+
+    Some(ToolNameCompletionSite {
+        receiver: SourceSpan {
+            start_byte: receiver_start,
+            end_byte: receiver_end,
+        },
+        name,
+        call_format,
+    })
+}
+
+/// Returns the raw contents of the string literal under a cursor. An
+/// unterminated current-line string remains eligible through end-of-file so an
+/// editor can complete while the user is typing. Comments and strings after an
+/// unterminated block comment are never scanned as code.
+fn string_content_span_at(source: &str, byte_offset: usize) -> Option<SourceSpan> {
+    if byte_offset > source.len() || !source.is_char_boundary(byte_offset) {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index < bytes.len()
+                    && !(bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/'))
+                {
+                    index = advance_utf8_character(source, index);
+                }
+                if index == bytes.len() {
+                    return None;
+                }
+                index += 2;
+            }
+            b'"' => {
+                let start_byte = index + 1;
+                index = start_byte;
+                let mut terminated = false;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'"' => {
+                            terminated = true;
+                            break;
+                        }
+                        b'\\' => {
+                            index = advance_utf8_character(source, index);
+                            if index < bytes.len() {
+                                index = advance_utf8_character(source, index);
+                            }
+                        }
+                        b'\n' | b'\r' => break,
+                        _ => index = advance_utf8_character(source, index),
+                    }
+                }
+                let end_byte = index;
+                let cursor_in_string = start_byte <= byte_offset
+                    && if terminated {
+                        byte_offset <= end_byte
+                    } else {
+                        byte_offset < end_byte || end_byte == source.len()
+                    };
+                if cursor_in_string {
+                    return Some(SourceSpan {
+                        start_byte,
+                        end_byte,
+                    });
+                }
+                if terminated {
+                    index += 1;
+                }
+            }
+            _ => index = advance_utf8_character(source, index),
+        }
+    }
+    None
+}
+
+fn cursor_is_inside_comment(source: &str, byte_offset: usize) -> bool {
+    if byte_offset > source.len() || !source.is_char_boundary(byte_offset) {
+        return false;
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => index = skip_string_literal(source, index),
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                let start_byte = index;
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+                if start_byte <= byte_offset && byte_offset <= index {
+                    return true;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let start_byte = index;
+                index += 2;
+                while index < bytes.len()
+                    && !(bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/'))
+                {
+                    index = advance_utf8_character(source, index);
+                }
+                if index < bytes.len() {
+                    index += 2;
+                }
+                if start_byte <= byte_offset && byte_offset <= index {
+                    return true;
+                }
+            }
+            _ => index = advance_utf8_character(source, index),
+        }
+    }
+    false
+}
+
+fn skip_string_literal(source: &str, mut index: usize) -> usize {
+    let bytes = source.as_bytes();
+    index += 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return index + 1,
+            b'\\' => {
+                index = advance_utf8_character(source, index);
+                if index < bytes.len() {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            b'\n' | b'\r' => return index,
+            _ => index = advance_utf8_character(source, index),
+        }
+    }
+    index
+}
+
+fn advance_utf8_character(source: &str, index: usize) -> usize {
+    source[index..]
+        .chars()
+        .next()
+        .map_or(source.len(), |character| index + character.len_utf8())
+}
+
+fn skip_ascii_whitespace_backward(source: &str, mut end_byte: usize) -> usize {
+    while end_byte > 0 && source.as_bytes()[end_byte - 1].is_ascii_whitespace() {
+        end_byte -= 1;
+    }
+    end_byte
+}
+
+fn identifier_start_before(source: &str, mut end_byte: usize) -> usize {
+    while end_byte > 0 && is_identifier_byte(source.as_bytes()[end_byte - 1]) {
+        end_byte -= 1;
+    }
+    end_byte
+}
+
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -1071,18 +1466,7 @@ fn tool_module_member_completion(
     {
         return empty();
     }
-
-    let Some(receiver_name) = source.get(site.receiver.start_byte..site.receiver.end_byte) else {
-        return empty();
-    };
-    let Some(symbol) = visible_symbol_at(lexical, receiver_name, site.receiver.start_byte) else {
-        return empty();
-    };
-    if symbol.kind != LexicalSymbolKind::Import
-        || !imports.imports.iter().any(|import| {
-            import.binding == symbol.definition && is_builtin_tool_module_import(import)
-        })
-    {
+    if !is_visible_builtin_tool_receiver(source, lexical, imports, site.receiver) {
         return empty();
     }
 
@@ -1105,6 +1489,78 @@ fn tool_module_member_completion(
         is_incomplete,
         items,
     }
+}
+
+fn tool_catalog_name_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &ToolCompletionCatalog,
+    site: ToolNameCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let is_incomplete = is_incomplete || catalog.unavailable;
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if !is_visible_builtin_tool_receiver(source, lexical, imports, site.receiver) {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.name);
+    let items = catalog
+        .tools
+        .iter()
+        .filter(|tool| tool.format.accepts_call_format(site.call_format))
+        .map(|tool| CompletionItem {
+            label: tool.name.clone(),
+            kind: Some(CompletionItemKind::VALUE),
+            detail: Some(format!(
+                "{} capability name; host approval required",
+                tool.format.label()
+            )),
+            documentation: (!tool.description.is_empty()).then(|| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: tool.description.clone(),
+                })
+            }),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                tool.name.clone(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect();
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
+fn is_visible_builtin_tool_receiver(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    receiver: SourceSpan,
+) -> bool {
+    if receiver.end_byte > lexical.valid_prefix_end_byte
+        || receiver.end_byte > imports.valid_prefix_end_byte
+    {
+        return false;
+    }
+    let Some(receiver_name) = source.get(receiver.start_byte..receiver.end_byte) else {
+        return false;
+    };
+    let Some(symbol) = visible_symbol_at(lexical, receiver_name, receiver.start_byte) else {
+        return false;
+    };
+    symbol.kind == LexicalSymbolKind::Import
+        && imports.imports.iter().any(|import| {
+            import.binding == symbol.definition && is_builtin_tool_module_import(import)
+        })
 }
 
 fn visible_symbol_at<'symbol>(
@@ -1456,6 +1912,10 @@ mod tests {
 
     fn document(version: i32, text: &str) -> TextDocumentItem {
         TextDocumentItem::new(test_uri(), "splash".to_owned(), version, text.to_owned())
+    }
+
+    fn tool_catalog(value: serde_json::Value) -> ToolCompletionCatalog {
+        parse_tool_completion_catalog(&value).expect("tool catalog projection is valid")
     }
 
     fn apply_text_edits(source: &str, edits: &[TextEdit]) -> String {
@@ -2009,6 +2469,223 @@ mod tests {
     }
 
     #[test]
+    fn completes_bounded_catalog_names_for_direct_visible_tool_calls() {
+        let catalog = tool_catalog(serde_json::json!([
+            {
+                "name": "text.echo",
+                "format": "text",
+                "description": "Returns text unchanged.",
+                "ignored": {"nested": true}
+            },
+            {
+                "name": "math.add",
+                "format": "json",
+                "description": "Adds two integer fields."
+            },
+            {
+                "name": "text.hidden",
+                "format": "text",
+                "description": "Another text tool."
+            }
+        ]));
+        let source = "use mod.tool\n\
+                      let text_result = tool.call(\"text.\")\n\
+                      let json_result = tool.call_json(\"math.\", {})";
+        let mut server = SplashLanguageServer::with_tool_catalog(catalog);
+        server.open_document(document(1, source));
+
+        let text_start = source.find("text.\"").unwrap();
+        let text_completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, text_start + "text.".len()),
+            )
+            .expect("text tool completion succeeds");
+        assert!(!text_completion.is_incomplete);
+        assert_eq!(
+            text_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["text.echo", "text.hidden"]
+        );
+        assert!(text_completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::VALUE)
+                && item.detail.as_deref() == Some("text capability name; host approval required")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if *range == Range::new(
+                            position_at_byte(source, text_start),
+                            position_at_byte(source, text_start + "text.".len()),
+                        )
+                )
+        }));
+        assert_eq!(
+            text_completion.items[0].documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Returns text unchanged.".to_owned(),
+            }))
+        );
+
+        let json_start = source.rfind("math.\"").unwrap();
+        let json_completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, json_start + "math.".len()),
+            )
+            .expect("JSON tool completion succeeds");
+        assert!(!json_completion.is_incomplete);
+        assert_eq!(
+            json_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["math.add"]
+        );
+        assert_eq!(
+            json_completion.items[0].detail.as_deref(),
+            Some("JSON capability name; host approval required")
+        );
+    }
+
+    #[test]
+    fn completes_catalog_names_while_a_direct_tool_literal_is_unterminated() {
+        let catalog = tool_catalog(serde_json::json!([
+            {"name": "text.echo", "format": "text", "description": "text"}
+        ]));
+        let source = "use mod.tool\nlet result = tool.call(\"tex";
+        let mut server = SplashLanguageServer::with_tool_catalog(catalog);
+        server.open_document(document(1, source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("unterminated literal remains a completion site");
+        assert!(!completion.is_incomplete);
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(completion.items[0].label, "text.echo");
+        assert!(matches!(
+            &completion.items[0].text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                if *range == Range::new(
+                    position_at_byte(source, source.rfind("tex").unwrap()),
+                    position_at_byte(source, source.len()),
+                )
+        ));
+    }
+
+    #[test]
+    fn refuses_catalog_names_outside_a_direct_visible_tool_literal() {
+        let catalog = tool_catalog(serde_json::json!([
+            {"name": "text.echo", "format": "text", "description": "text"}
+        ]));
+        for source in [
+            "use mod.custom.tool\nlet result = tool.call(\"text.\")",
+            "use mod.tool\nlet tool = {call: 1}\ntool.call(\"text.\")",
+            "use mod.tool\nlet result = tool.call(prefix, \"text.\")",
+            "use mod.tool\n// tool.call(\"text.\")",
+            "use mod.tool\nlet note = \"tool.call(\\\"text.\\\")\"",
+        ] {
+            let cursor = source.rfind("text.").unwrap() + "text.".len();
+            let mut server = SplashLanguageServer::with_tool_catalog(catalog.clone());
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, cursor))
+                .expect("completion request succeeds");
+            assert!(
+                completion.items.is_empty(),
+                "unexpected catalog completion for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_projection_is_bounded_and_fails_closed_when_malformed() {
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "toolCatalog": [
+                        {"name": "text.z", "format": "text", "description": "z"},
+                        {"name": "math.a", "format": "json", "description": "a"}
+                    ]
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let catalog = tool_completion_catalog_from_initialize_options(&params);
+        assert!(!catalog.unavailable);
+        assert_eq!(
+            catalog
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["math.a", "text.z"]
+        );
+
+        let invalid_params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "toolCatalog": [
+                        {"name": "TEXT.ECHO", "format": "text", "description": "invalid"}
+                    ]
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let invalid = tool_completion_catalog_from_initialize_options(&invalid_params);
+        assert!(invalid.unavailable);
+        assert!(invalid.tools.is_empty());
+        let source = "use mod.tool\nlet result = tool.call(\"text.\")";
+        let mut server = SplashLanguageServer::with_tool_catalog(invalid);
+        server.open_document(document(1, source));
+        let completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, source.rfind("text.").unwrap() + "text.".len()),
+            )
+            .expect("malformed catalog completion request succeeds");
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
+
+        let oversized = serde_json::Value::Array(
+            (0..=MAX_LSP_TOOL_CATALOG_TOOLS)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": format!("text.{index}"),
+                        "format": "text",
+                        "description": "text"
+                    })
+                })
+                .collect(),
+        );
+        assert!(parse_tool_completion_catalog(&oversized).is_none());
+
+        let oversized_description = serde_json::json!([{
+            "name": "text.echo",
+            "format": "text",
+            "description": "x".repeat(MAX_LSP_TOOL_DESCRIPTION_BYTES + 1)
+        }]);
+        assert!(parse_tool_completion_catalog(&oversized_description).is_none());
+
+        let oversized_retained_bytes = serde_json::Value::Array(
+            (0..MAX_LSP_TOOL_CATALOG_TOOLS)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": format!("text.{index}"),
+                        "format": "text",
+                        "description": "x".repeat(MAX_LSP_TOOL_DESCRIPTION_BYTES)
+                    })
+                })
+                .collect(),
+        );
+        assert!(parse_tool_completion_catalog(&oversized_retained_bytes).is_none());
+    }
+
+    #[test]
     fn refuses_module_member_completion_for_shadowed_or_non_direct_bindings() {
         for source in [
             "use mod.custom.tool\nlet output = tool.",
@@ -2025,6 +2702,27 @@ mod tests {
             assert!(
                 completion.items.is_empty(),
                 "unexpected members for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_tool_member_completion_inside_strings_and_comments() {
+        for source in [
+            "use mod.tool\nlet note = \"tool.\"",
+            "use mod.tool\n// tool.",
+            "use mod.tool\n/* tool. */",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+            let cursor = source.find("tool.").unwrap() + "tool.".len();
+
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, cursor))
+                .expect("completion request succeeds");
+            assert!(
+                completion.items.is_empty(),
+                "unexpected module completion for {source:?}"
             );
         }
     }
@@ -2544,6 +3242,22 @@ mod tests {
                             "workspace": {
                                 "workspaceEdit": {"documentChanges": true}
                             }
+                        },
+                        "initializationOptions": {
+                            "splash": {
+                                "toolCatalog": [
+                                    {
+                                        "name": "text.echo",
+                                        "format": "text",
+                                        "description": "Returns text unchanged."
+                                    },
+                                    {
+                                        "name": "math.add",
+                                        "format": "json",
+                                        "description": "Adds two integer fields."
+                                    }
+                                ]
+                            }
                         }
                     }),
                 )
@@ -2908,6 +3622,66 @@ mod tests {
         assert_eq!(
             rename["documentChanges"][0]["edits"][0]["newText"],
             "renamed"
+        );
+
+        let tool_source = "use mod.tool\nlet result = tool.call(\"text.\")";
+        client_connection
+            .sender
+            .send(
+                Notification::new(
+                    DidChangeTextDocument::METHOD.to_owned(),
+                    DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier::new(test_uri(), 2),
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: tool_source.to_owned(),
+                        }],
+                    },
+                )
+                .into(),
+            )
+            .expect("tool completion source change succeeds");
+        let _diagnostics = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("diagnostics arrive after tool source change");
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    11.into(),
+                    Completion::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 29}
+                    }),
+                )
+                .into(),
+            )
+            .expect("catalog completion request send succeeds");
+        let catalog_completion_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("catalog completion response arrives");
+        let Message::Response(response) = catalog_completion_response else {
+            panic!("expected catalog completion response");
+        };
+        let catalog_completion = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("catalog completion request failed: {}", error.message)
+            }
+        };
+        assert_eq!(catalog_completion["isIncomplete"], false);
+        assert_eq!(
+            catalog_completion["items"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(catalog_completion["items"][0]["label"], "text.echo");
+        assert_eq!(
+            catalog_completion["items"][0]["detail"],
+            "text capability name; host approval required"
         );
 
         client_connection

@@ -319,6 +319,18 @@ candidates because an omitted inner definition could shadow a retained outer
 binding. In invalid source, a site is eligible only when it ends at or before
 the first syntax diagnostic.
 
+The server separately recognizes an exact visible `use mod.tool` binding. At a
+direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
+`start_json` methods. An editor integration may also provide a static advisory
+tool-catalog projection at `initializationOptions.splash.toolCatalog`. The LSP
+retains only bounded `name`, `format`, and `description` metadata and uses it
+only for the first literal argument of direct visible `tool.call`/`tool.start`
+(matching `text`) or `tool.call_json`/`tool.start_json` (matching `json`). It
+never reads a host runtime, URI, file, adapter, or environment to obtain that
+projection, and a suggestion does not make a capability installed, approved,
+or callable. Malformed, duplicate, or over-limit input is discarded as a whole
+rather than presented partially.
+
 Rename does not edit the final segment of a `use` path. For another indexed
 binding it accepts exactly one non-reserved canonical identifier, rewrites the
 definition and resolved references in memory, validates the resulting canonical
@@ -331,7 +343,9 @@ remain outside the claim.
 
 The lexical service does not load or resolve imported modules, infer forward
 references or types, treat record keys or member fields as variables, enumerate
-builtins or a host tool catalog, or grant tool authority. The server does not
-open the URI supplied by the client or run source; all diagnostics, edits,
-symbols, definitions, references, hovers, highlights, completions, and rename
-validation derive from the client-provided document text.
+builtins, discover a host tool catalog, or grant tool authority. The optional
+initialization-time catalog projection is advisory client metadata, not a
+catalog lookup. The server does not open the URI supplied by the client or run
+source; all diagnostics, edits, symbols, definitions, references, hovers,
+highlights, completions, and rename validation derive from client-provided
+document text and optional initialization metadata.

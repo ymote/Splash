@@ -14,8 +14,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded, grammar-aware lexical symbol index for imports, functions, local
   bindings, parameters, and loop bindings without evaluating source.
 - Bounded same-document lexical completion at expression identifiers, with
-  scope-aware candidates, exact-token replacement edits, and fixed `mod.tool`
-  member suggestions only for an exact visible `use mod.tool` binding.
+  scope-aware candidates, exact-token replacement edits, fixed `mod.tool`
+  member suggestions for an exact visible `use mod.tool` binding, and an
+  optional bounded advisory catalog projection for direct tool-name literals.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -29,8 +30,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - A host-only stdio language server that publishes canonical syntax diagnostics,
   full-document formatting edits, top-level declaration symbols, and
   same-document lexical definitions, references, binding-kind hover, and symbol
-  highlights, lexical completion including the fixed `mod.tool` API, and
-  version-bound guarded rename without reading files or evaluating code.
+  highlights, lexical completion including the fixed `mod.tool` API and optional
+  advisory catalog literals, and version-bound guarded rename without reading
+  files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
@@ -367,21 +369,21 @@ Run the language server from an LSP-compatible editor with:
 cargo run -p splash-lsp
 ```
 
-It accepts only client-provided open-document text, retains at most 128
-document states and no document text above the standard 256 KiB source cap,
-and provides full-sync diagnostics, whole-document formatting, and top-level
-declaration symbols plus bounded same-document lexical definition/reference
-requests, binding-kind hover, symbol highlights, lexical completion, and
-guarded rename. Completion is offered only while the cursor is within or at the
-end of an expression-position identifier. It returns the complete retained set
-of bindings visible at that token, lets the client filter it, and supplies an
-exact replacement edit for the identifier. Invalid source is eligible only at
-a site ending before the first syntax diagnostic. Candidate occurrences and
-completion sites have independent 4,096-entry bounds; either truncation marks
-the LSP result incomplete. A truncated site list can still serve a retained
-site, but a truncated symbol set returns no candidates because an omitted inner
-definition could shadow a retained outer binding. Rename is advertised only
-when the client supports
+It accepts client-provided open-document text and optional bounded advisory
+initialization metadata, retains at most 128 document states and no document
+text above the standard 256 KiB source cap, and provides full-sync diagnostics,
+whole-document formatting, and top-level declaration symbols plus bounded
+same-document lexical definition/reference requests, binding-kind hover, symbol
+highlights, lexical completion, and guarded rename. Ordinary lexical completion
+is offered only while the cursor is within or at the end of an expression-position
+identifier. It returns the complete retained set of bindings visible at that
+token, lets the client filter it, and supplies an exact replacement edit for the
+identifier. Invalid source is eligible only at a site ending before the first
+syntax diagnostic. Candidate occurrences and completion sites have independent
+4,096-entry bounds; either truncation marks the LSP result incomplete. A
+truncated site list can still serve a retained site, but a truncated symbol set
+returns no candidates because an omitted inner definition could shadow a
+retained outer binding. Rename is advertised only when the client supports
 versioned `documentChanges`; every edit is bound to the exact open-document
 version. It rejects truncated indexes, import path changes, invalid identifiers,
 and rewrites that change the complete indexed lexical binding report. It never
@@ -390,12 +392,22 @@ modules, creates a capability host, or loads a Rust adapter. For an exact,
 lexically visible `use mod.tool` binding, it additionally suggests only the
 fixed `call`, `call_json`, `start`, and `start_json` methods at a direct
 `tool.` member site. Those suggestions use no tool-catalog or adapter lookup
-and do not imply a capability grant. The lexical service otherwise remains
-conservative: it does not infer forward references, types, record keys,
-arbitrary member fields, builtins, tool catalogs, or imported-module exports. A
-truncated lexical index can still serve retained, sound definitions and hover,
-but exhaustive reference, highlight, and rename requests fail instead of
-returning a partial set.
+and do not imply a capability grant. An integration may additionally supply a
+static, advisory tool-catalog projection once through
+`initializationOptions.splash.toolCatalog`; it accepts the `name`, `format`,
+and `description` fields from the host catalog JSON. For an exact visible
+`mod.tool` binding, the LSP completes the first string literal in direct
+`call`/`start` calls from text entries and direct `call_json`/`start_json`
+calls from JSON entries. It never connects to a capability runtime, reads a
+catalog file, or derives a grant from this metadata. The projection is bounded
+to 128 entries, 512 KiB of retained names and descriptions, 128-byte names,
+and 4 KiB descriptions; malformed, duplicate, or oversized input is discarded
+as a whole and marks that completion result incomplete. The lexical service
+otherwise remains conservative: it does not infer forward references, types,
+record keys, arbitrary member fields, builtins, arbitrary catalog data, or
+imported-module exports. A truncated lexical index can still serve retained,
+sound definitions and hover, but exhaustive reference, highlight, and rename
+requests fail instead of returning a partial set.
 
 ## Workspace
 

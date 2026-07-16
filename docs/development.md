@@ -40,18 +40,18 @@ symbol highlights, lexical completion, and guarded rename:
 cargo run -p splash-lsp
 ```
 
-It receives document text through LSP notifications only. It does not read the
-document URI, evaluate Splash code, construct a capability host, resolve
-arbitrary imported modules, or load a Rust adapter. The grammar-aware lexical
-index covers the final binding introduced by `use`, named functions, `let`,
-function and lambda parameters, and `for` bindings already introduced in a
-visible runtime scope. It does not infer forward references, types, record
-keys, or arbitrary member fields. A definition retained before the fixed
-4,096-occurrence budget is exhausted remains available for definition and
-hover, while reference and highlight requests fail instead of returning a
-partial set from a truncated index. Highlights are neutral resolved occurrences
-of one lexical binding because the index does not classify assignment reads and
-writes.
+It receives document text through LSP notifications plus optional bounded
+initialization metadata. It does not read the document URI, evaluate Splash
+code, construct a capability host, resolve arbitrary imported modules, or load
+a Rust adapter. The grammar-aware lexical index covers the final binding
+introduced by `use`, named functions, `let`, function and lambda parameters,
+and `for` bindings already introduced in a visible runtime scope. It does not
+infer forward references, types, record keys, or arbitrary member fields. A
+definition retained before the fixed 4,096-occurrence budget is exhausted
+remains available for definition and hover, while reference and highlight
+requests fail instead of returning a partial set from a truncated index.
+Highlights are neutral resolved occurrences of one lexical binding because the
+index does not classify assignment reads and writes.
 
 Completion uses a separate lazily cached report. Expression-position
 identifiers, including unresolved partial names, are retained as sites; binding
@@ -74,6 +74,49 @@ replacement edit. It does not offer those members for a shadowed `tool`, a
 different import path, chained property access, or source after the first
 diagnostic. This uses no catalog or adapter lookup, and a suggestion never
 implies a capability grant.
+
+An editor integration may provide a static advisory projection of the host's
+current tool catalog once during LSP initialization. The server reads only
+`initializationOptions.splash.toolCatalog`; this is an array compatible with
+the `name`, `format`, and `description` fields emitted by
+`CapabilityRuntime::tool_catalog()` or `splash catalog`:
+
+```json
+{
+  "splash": {
+    "toolCatalog": [
+      {
+        "name": "text.echo",
+        "format": "text",
+        "description": "Returns text unchanged."
+      },
+      {
+        "name": "math.add",
+        "format": "json",
+        "description": "Adds two integer fields."
+      }
+    ]
+  }
+}
+```
+
+For an exact visible `use mod.tool` binding, the LSP completes the first string
+literal argument of direct `tool.call` and `tool.start` from `text` entries,
+and direct `tool.call_json` and `tool.start_json` from `json` entries. It
+replaces only the literal contents. A current-line unterminated literal can
+receive this completion while it is being typed, but comments, ordinary
+strings, later arguments, shadowed bindings, and other import paths do not.
+
+This metadata is retained only for the LSP session; the server never reads a
+catalog from a URI, file, environment, adapter, or capability runtime. It
+treats initialization options as advisory client input, not as a current or
+trusted policy snapshot. It retains at most 128 entries, 512 KiB of names and
+descriptions, 128-byte lowercase tool names, and 4 KiB descriptions. An
+invalid format, duplicate name, malformed entry, or over-limit projection is
+discarded in full and marks catalog completion `isIncomplete`; no partial
+catalog is presented. A completion, description, or matching envelope format
+never grants a lease: runtime reservation and an active capability lease remain
+the authority boundary.
 
 Rename is advertised only when the editor supports versioned
 `documentChanges`. It refuses import path edits and truncated reports, validates

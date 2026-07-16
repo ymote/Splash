@@ -18,8 +18,10 @@
 - Bounded scope-aware lexical completion at expression identifiers, including
   exact-token edits, conservative invalid-prefix support, independent site
   truncation, and fixed `mod.tool` method suggestions only for an exact visible
-  import binding. It performs no arbitrary module, type, field, catalog, or
-  authority inference.
+  import binding. A bounded, initialization-time advisory catalog projection
+  can complete literal names in direct tool calls without a runtime/catalog
+  lookup or authority inference; it performs no arbitrary module, type, or
+  field inference.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.

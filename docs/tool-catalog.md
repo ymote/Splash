@@ -145,3 +145,21 @@ The development CLI exposes the same host catalog as JSON:
 ```sh
 cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 ```
+
+## Editor projection
+
+An editor integration may pass that JSON array through
+`initializationOptions.splash.toolCatalog` when it starts `splash-lsp`. The
+LSP consumes only each descriptor's `name`, `format`, and `description`; it
+ignores dispatch, limits, schemas, and every other field. This lets the editor
+complete a direct visible tool-name literal with the correct text or JSON call
+form without making the LSP a capability client.
+
+The editor projection is static for one LSP session and is advisory even when
+the integration supplied it from a current host catalog. It is not a runtime
+query, a catalog fingerprint check, a lease, or an approval. The LSP retains at
+most 128 entries and 512 KiB of names/descriptions, rejects malformed,
+duplicate, or oversized projections as a whole, and marks the resulting tool
+completion incomplete rather than presenting a partial catalog. Runtime policy
+still checks the actual dynamic name against the active catalog and capability
+lease at reservation time.
