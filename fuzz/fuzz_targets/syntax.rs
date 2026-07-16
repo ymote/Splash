@@ -6,9 +6,9 @@ use splash_core::{
     is_canonical_identifier, lexical_completion_report_named, lexical_symbol_report_named,
     module_import_report_named, tool_call_hint_report_named, top_level_declarations_named,
     ExecutionLimits, LexicalCompletionReport, LexicalSymbol, ModuleImportReport, RuntimeError,
-    ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
-    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
-    MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_SYNTAX_DIAGNOSTICS,
+    MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -203,8 +203,7 @@ fn assert_module_import_invariants(source: &str, report: &ModuleImportReport) {
     let mut previous_start_byte = 0_usize;
     for import in &report.imports {
         assert!(
-            import.path.len() >= 2
-                && import.path.first().is_some_and(|segment| segment == "mod"),
+            import.path.len() >= 2 && import.path.first().is_some_and(|segment| segment == "mod"),
             "import path is not a complete mod path: {import:?}"
         );
         assert!(
@@ -241,7 +240,10 @@ fn assert_module_import_invariants(source: &str, report: &ModuleImportReport) {
             "import binding span does not match its final segment: {import:?}"
         );
         assert!(
-            import.path.iter().all(|segment| is_canonical_identifier(segment)),
+            import
+                .path
+                .iter()
+                .all(|segment| is_canonical_identifier(segment)),
             "import path contains a non-canonical identifier: {import:?}"
         );
         previous_start_byte = import.path_span.start_byte;
