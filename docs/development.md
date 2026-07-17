@@ -230,7 +230,7 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has nine bounded targets. `syntax` differentially
+The standalone `fuzz` package has ten bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser under a rotating set
 of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
 to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also
@@ -322,13 +322,20 @@ capacity exercises the decoder's bounded-retention rejection path. It never
 creates a capability runtime, runs an adapter, or treats telemetry as execution
 authority. Its tracked JSON seeds cover a valid allowed audit event and an
 inconsistent retention boundary.
+`cross_stream_telemetry` constructs bounded capability-audit and workflow-event
+batches under byte-derived source cursors and aggregate capacities. It checks
+source-family isolation, explicit non-one segment registration, exact replay
+and gap rejection, aggregate eviction cursors, and source continuity after an
+aggregate clear. It runs only a fixed local `text.echo` adapter to construct
+audit telemetry; fuzz input never becomes Splash source, a tool name, or a
+tool payload.
 `json_line_worker` feeds bounded arbitrary bytes through small, variable
 `BufReader` capacities, optionally appends a line terminator, and attempts two
 successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all nine targets and performs a short 128-run coverage-only smoke pass
+CI compiles all ten targets and performs a short 128-run coverage-only smoke pass
 with `--sanitizer none`. Run the longer local commands below with the default
 sanitizer whenever the platform supports it.
 
@@ -345,6 +352,7 @@ cargo +nightly fuzz run capability_lease -- -max_total_time=60 -max_len=8192
 cargo +nightly fuzz run workflow_external_operation -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run workflow_event_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run capability_audit_journal -- -max_total_time=60 -max_len=196608
+cargo +nightly fuzz run cross_stream_telemetry -- -max_total_time=60 -max_len=4096
 cargo +nightly fuzz run json_line_worker -- -max_total_time=60 -max_len=1048578
 ```
 
@@ -362,6 +370,7 @@ cargo +nightly fuzz run --sanitizer none capability_lease -- -max_total_time=60 
 cargo +nightly fuzz run --sanitizer none workflow_external_operation -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run --sanitizer none workflow_event_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run --sanitizer none capability_audit_journal -- -max_total_time=60 -max_len=196608
+cargo +nightly fuzz run --sanitizer none cross_stream_telemetry -- -max_total_time=60 -max_len=4096
 cargo +nightly fuzz run --sanitizer none json_line_worker -- -max_total_time=60 -max_len=1048578
 ```
 
@@ -376,5 +385,6 @@ cargo +nightly fuzz run capability_lease artifacts/capability_lease/<artifact>
 cargo +nightly fuzz run workflow_external_operation artifacts/workflow_external_operation/<artifact>
 cargo +nightly fuzz run workflow_event_journal artifacts/workflow_event_journal/<artifact>
 cargo +nightly fuzz run capability_audit_journal artifacts/capability_audit_journal/<artifact>
+cargo +nightly fuzz run cross_stream_telemetry artifacts/cross_stream_telemetry/<artifact>
 cargo +nightly fuzz run json_line_worker artifacts/json_line_worker/<artifact>
 ```
