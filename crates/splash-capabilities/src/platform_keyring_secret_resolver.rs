@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
 use zeroize::Zeroize;
 
 use crate::http_endpoint_catalog::{
@@ -375,14 +376,14 @@ mod tests {
         )])
         .expect("configuration does not access the native store");
         assert!(!PlatformKeyringSecretResolver::is_supported_target());
-        assert_eq!(
+        assert!(matches!(
             resolver.resolve_http_endpoint_secret("release.auth"),
             Err(HttpEndpointSecretError::PlatformCredentialStoreUnavailable)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             resolver.resolve_http_endpoint_secret("missing.auth"),
             Err(HttpEndpointSecretError::NotFound)
-        );
+        ));
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
