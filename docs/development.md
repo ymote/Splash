@@ -33,9 +33,10 @@ separate behavioral coverage for the imported VM.
 Pull-request CI runs short 128-input smoke campaigns for every fuzz target.
 The separate `Sustained Fuzzing` workflow runs daily and can be started
 manually from GitHub Actions. It gives the differential `syntax` target and
-the bounded `execution` target ten minutes each, then gives the variable-limit
-`execution_limits` target three minutes, all with per-input timeout and RSS
-ceilings. A failure uploads its ignored `fuzz/artifacts` directory for 14 days.
+the bounded `execution` target ten minutes each, the source-only
+`lsp_document` target two minutes, and the variable-limit `execution_limits`
+target three minutes, all with per-input timeout and RSS ceilings. A failure
+uploads its ignored `fuzz/artifacts` directory for 14 days.
 
 Triage a downloaded crash before adding it to the repository:
 
@@ -253,7 +254,7 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has eleven bounded targets. `syntax` differentially
+The standalone `fuzz` package has twelve bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser under a rotating set
 of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
 to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also
@@ -283,6 +284,15 @@ explicit at the fixed import cap. It also validates direct literal-record root
 and exact child shape spans, unique field names, direct alias binding and target
 spans, safe-prefix boundaries, and the separate shape, aggregate root-and-child
 field, and alias caps.
+`lsp_document` feeds bounded UTF-8 source through the production language
+server's document lifecycle. It opens one fixed local URI, requests formatting,
+outlining, completion, hover, definition, references, highlights, and guarded
+rename across at most 33 UTF-8-boundary positions plus an invalid UTF-16
+position, replaces the whole document to invalidate lazy reports, repeats the
+requests, and closes the document. It accepts at most 16 KiB of fuzzer source
+and has a reviewed baseline `.splash` seed. The server uses its empty advisory
+catalogs only: the target never starts stdio, reads the URI, resolves modules,
+evaluates Splash, creates a capability host, or invokes an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 4,096 instruction cap, one-instruction deadline sampling, and a 32 ms
@@ -365,9 +375,10 @@ successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all eleven targets and performs a short 128-run coverage-only smoke pass
-with `--sanitizer none`. Run the longer local commands below with the default
-sanitizer whenever the platform supports it.
+CI compiles all twelve targets and performs a short 128-run coverage-only smoke
+pass with `--sanitizer none`, plus a separate short AddressSanitizer campaign
+for the LSP document lifecycle. Run the longer local commands below with the
+default sanitizer whenever the platform supports it.
 
 Install `cargo-fuzz` once, then run the target with nightly Rust:
 
@@ -375,6 +386,7 @@ Install `cargo-fuzz` once, then run the target with nightly Rust:
 cargo install cargo-fuzz
 cd fuzz
 cargo +nightly fuzz run syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run workflow_draft -- -max_total_time=60 -max_len=65536
@@ -394,6 +406,7 @@ instrumentation:
 
 ```sh
 cargo +nightly fuzz run --sanitizer none syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none workflow_draft -- -max_total_time=60 -max_len=65536
@@ -410,6 +423,7 @@ Reproduce a saved failure from the same directory with:
 
 ```sh
 cargo +nightly fuzz run syntax artifacts/syntax/<artifact>
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document artifacts/lsp_document/<artifact>
 cargo +nightly fuzz run execution artifacts/execution/<artifact>
 cargo +nightly fuzz run execution_limits artifacts/execution_limits/<artifact>
 cargo +nightly fuzz run workflow_draft artifacts/workflow_draft/<artifact>

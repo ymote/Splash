@@ -246,6 +246,6 @@
   catalog-backed chained lookup from a visible imported-module binding, and
   direct advisory workflow-data fields. General module resolution and broader
   type-aware field semantics remain open.
-- Sustained parser/VM differential fuzzing, expanded resource-exhaustion
-  coverage, and corpus triage.
+- Sustained parser/VM differential fuzzing, LSP document lifecycle fuzzing,
+  expanded resource-exhaustion coverage, and corpus triage.
 - Independent security review of effectful adapters.

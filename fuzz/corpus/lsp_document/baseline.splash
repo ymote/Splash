@@ -1,0 +1,3 @@
+let record = {title: "hello", input: {count: 1}}
+let alias = record
+let title = alias.title

@@ -5,6 +5,9 @@ vendor/makepad/target/
 !/fuzz/corpus/syntax/
 /fuzz/corpus/syntax/*
 !/fuzz/corpus/syntax/*.splash
+!/fuzz/corpus/lsp_document/
+/fuzz/corpus/lsp_document/*
+!/fuzz/corpus/lsp_document/*.splash
 !/fuzz/corpus/execution/
 /fuzz/corpus/execution/*
 !/fuzz/corpus/execution/*.splash

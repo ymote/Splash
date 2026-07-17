@@ -1005,6 +1005,100 @@ impl SplashLanguageServer {
     }
 }
 
+/// Maximum input bytes accepted by the LSP libFuzzer exercise hook.
+///
+/// This stays well below the editor's ordinary source limit so each generated
+/// case can issue several semantic requests with a predictable cost.
+#[cfg(fuzzing)]
+const MAX_FUZZ_LSP_SOURCE_BYTES: usize = 16 * 1024;
+/// Number of evenly spaced source positions sampled by the LSP fuzz hook.
+///
+/// The inclusive sampling range produces at most 33 UTF-8 boundary positions.
+#[cfg(fuzzing)]
+const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
+
+/// Exercises the source-only LSP document lifecycle for libFuzzer.
+///
+/// This hook creates a fixed local URI, opens and replaces one bounded source
+/// document, calls the effect-free semantic requests, then closes the
+/// document. It does not start stdio, read a URI, resolve modules, evaluate
+/// Splash, or construct a capability host.
+#[cfg(fuzzing)]
+pub fn fuzz_exercise_document(source: &str) {
+    use std::str::FromStr;
+
+    if source.len() > MAX_FUZZ_LSP_SOURCE_BYTES {
+        return;
+    }
+    let Ok(uri) = Uri::from_str("file:///splash-fuzz/document.splash") else {
+        return;
+    };
+
+    let mut server = SplashLanguageServer::default();
+    let _ = server.open_document(TextDocumentItem::new(
+        uri.clone(),
+        "splash".to_owned(),
+        1,
+        source.to_owned(),
+    ));
+    fuzz_exercise_semantic_requests(&server, &uri, source);
+
+    // A distinct full-document replacement invalidates every lazy semantic
+    // report before the second request pass.
+    let mut replacement = source.to_owned();
+    replacement.push('\n');
+    let _ = server.replace_document(uri.clone(), 2, replacement.clone());
+    fuzz_exercise_semantic_requests(&server, &uri, &replacement);
+
+    let _ = server.close_document(DidCloseTextDocumentParams {
+        text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
+    });
+    let _ = server.completion(&uri, Position::new(u32::MAX, u32::MAX));
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_semantic_requests(server: &SplashLanguageServer, uri: &Uri, source: &str) {
+    let _ = server.format_document(uri);
+    let _ = server.document_symbols(uri);
+
+    let mut attempted_rename = false;
+    for byte_offset in bounded_fuzz_document_offsets(source) {
+        let position = position_at_byte(source, byte_offset);
+        let _ = server.completion(uri, position);
+        let _ = server.hover(uri, position);
+        let _ = server.definition(uri, position);
+        let _ = server.references(uri, position, true);
+        let _ = server.document_highlights(uri, position);
+        if !attempted_rename && matches!(server.prepare_rename(uri, position), Ok(Some(_))) {
+            let _ = server.rename(uri, position, "fuzz_renamed");
+            attempted_rename = true;
+        }
+    }
+
+    let invalid_position = Position::new(u32::MAX, u32::MAX);
+    let _ = server.completion(uri, invalid_position);
+    let _ = server.hover(uri, invalid_position);
+    let _ = server.definition(uri, invalid_position);
+    let _ = server.references(uri, invalid_position, true);
+    let _ = server.document_highlights(uri, invalid_position);
+    let _ = server.prepare_rename(uri, invalid_position);
+}
+
+#[cfg(fuzzing)]
+fn bounded_fuzz_document_offsets(source: &str) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(MAX_FUZZ_LSP_POSITION_SAMPLES + 1);
+    for sample in 0..=MAX_FUZZ_LSP_POSITION_SAMPLES {
+        let mut offset = source.len() * sample / MAX_FUZZ_LSP_POSITION_SAMPLES;
+        while offset > 0 && !source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offsets.push(offset);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
 fn main() -> ExitCode {
     match run_stdio() {
         Ok(()) => ExitCode::SUCCESS,

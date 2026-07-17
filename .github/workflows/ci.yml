@@ -45,6 +45,10 @@ jobs:
           -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
       - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none lsp_document --
+          -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
+      - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none execution --
           -runs=128 -max_len=8192 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
@@ -95,6 +99,11 @@ jobs:
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run execution --
           -runs=128 -max_len=8192 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
+      - name: AddressSanitizer LSP document fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document --
+          -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
       - name: AddressSanitizer variable-limit evaluator fuzzing
         run: >

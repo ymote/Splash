@@ -7,8 +7,13 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [dependencies]
 libfuzzer-sys = "0.4"
+lsp-server = "0.9.0"
+lsp-types = "0.97.0"
 serde_json = "1.0.150"
 splash-capabilities = { version = "0.1.0", path = "../crates/splash-capabilities", features = ["durable-audit-journal", "json-line-worker"] }
 splash-core = { path = "../crates/splash-core" }
@@ -20,6 +25,12 @@ members = ["."]
 [[bin]]
 name = "syntax"
 path = "fuzz_targets/syntax.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "lsp_document"
+path = "fuzz_targets/lsp_document.rs"
 test = false
 doc = false
 
