@@ -111,11 +111,12 @@ different import path, chained property access, or source after the first
 diagnostic. This uses no catalog or adapter lookup, and a suggestion never
 implies a capability grant.
 
-An editor integration may provide a static advisory projection of the host's
-current tool catalog once during LSP initialization. The server reads only
-`initializationOptions.splash.toolCatalog`; this is an array compatible with
-the `name`, `format`, and `description` fields emitted by
-`CapabilityRuntime::tool_catalog()` or `splash catalog`:
+An editor integration may provide an advisory projection of the host's current
+tool catalog during LSP initialization or later through
+`workspace/didChangeConfiguration`. The server reads only
+`initializationOptions.splash.toolCatalog` or `settings.splash.toolCatalog`;
+this is an array compatible with the `name`, `format`, and `description` fields
+emitted by `CapabilityRuntime::tool_catalog()` or `splash catalog`:
 
 ```json
 {
@@ -143,19 +144,22 @@ replaces only the literal contents. A current-line unterminated literal can
 receive this completion while it is being typed, but comments, ordinary
 strings, later arguments, shadowed bindings, and other import paths do not.
 
-This metadata is retained only for the LSP session; the server never reads a
-catalog from a URI, file, environment, adapter, or capability runtime. It
-treats initialization options as advisory client input, not as a current or
-trusted policy snapshot. It retains at most 128 entries, 512 KiB of names and
-descriptions, 128-byte lowercase tool names, and 4 KiB descriptions. An
-invalid format, duplicate name, malformed entry, or over-limit projection is
-discarded in full and marks catalog completion `isIncomplete`; no partial
-catalog is presented. A completion, description, or matching envelope format
-never grants a lease: runtime reservation and an active capability lease remain
-the authority boundary.
+This metadata is retained only by the LSP; the server never reads a catalog
+from a URI, file, environment, adapter, or capability runtime. It treats both
+initialization options and configuration updates as advisory client input, not
+as a current or trusted policy snapshot. An omitted `toolCatalog` configuration
+key retains its prior projection, JSON `null` explicitly clears it, and an
+invalid format, duplicate name, malformed entry, or over-limit replacement
+discards only the tool catalog and marks matching completion `isIncomplete`; no
+partial catalog is presented. A valid empty array is a complete empty catalog.
+It retains at most 128 entries, 512 KiB of names and descriptions, 128-byte
+lowercase tool names, and 4 KiB descriptions. A completion, description, or
+matching envelope format never grants a lease: runtime reservation and an
+active capability lease remain the authority boundary.
 
-An editor integration may separately provide a static advisory module-interface
-projection through `initializationOptions.splash.moduleCatalog`:
+An editor integration may separately provide an advisory module-interface
+projection through `initializationOptions.splash.moduleCatalog` or a later
+`settings.splash.moduleCatalog` configuration update:
 
 ```json
 {
@@ -179,9 +183,12 @@ mod.*` path, and bounded catalog paths below a direct visible imported-module
 binding. It does not offer metadata-defined members for `mod.tool`, which keeps
 its fixed four language methods. The server neither reads a module URI or file,
 nor resolves, validates, installs, or loads a module; it also does not inspect
-runtime exports or infer general fields. This metadata is static for the LSP
-session and advisory even when an integration generated it from trusted host
-configuration.
+runtime exports or infer general fields. An omitted `moduleCatalog` key retains
+its prior projection, JSON `null` explicitly clears it, and a malformed update
+makes only module completion unavailable. Tool and module updates are
+independent of each other and of the atomic workflow-data pair. A malformed
+`settings` value or non-object `settings.splash` invalidates all advisory
+catalogs so the server cannot retain stale metadata.
 
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional

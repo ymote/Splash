@@ -18,13 +18,14 @@
 - Bounded scope-aware lexical completion at expression identifiers, including
   exact-token edits, conservative invalid-prefix support, independent site
   truncation, and fixed `mod.tool` method suggestions only for an exact visible
-  import binding. A bounded, initialization-time advisory catalog projection
-  can complete literal names in direct tool calls without a runtime/catalog
-  lookup or authority inference; it performs no arbitrary module, type, or
-  field inference. A separate bounded, initialization-time advisory module
-  interface projection can complete direct `use mod.*` path segments and
-  bounded catalog paths below a direct visible imported-module binding without
-  module loading, resolution, runtime export inspection, or authority inference.
+  import binding. A bounded, initialization-time or configuration-refresh
+  advisory catalog projection can complete literal names in direct tool calls
+  without a runtime/catalog lookup or authority inference; it performs no
+  arbitrary module, type, or field inference. A separate bounded,
+  initialization-time or configuration-refresh advisory module interface
+  projection can complete direct `use mod.*` path segments and bounded catalog
+  paths below a direct visible imported-module binding without module loading,
+  resolution, runtime export inspection, or authority inference.
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context

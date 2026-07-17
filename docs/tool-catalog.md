@@ -149,22 +149,46 @@ cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
 ## Editor projection
 
 An editor integration may pass that JSON array through
-`initializationOptions.splash.toolCatalog` when it starts `splash-lsp`. The
-LSP consumes only each descriptor's `name`, `format`, and `description`; it
-ignores dispatch, limits, schemas, and every other field. This lets the editor
-complete a direct visible tool-name literal with the correct text or JSON call
-form without making the LSP a capability client.
+`initializationOptions.splash.toolCatalog` when it starts `splash-lsp`, or
+replace it later through `workspace/didChangeConfiguration`. The LSP consumes
+only each descriptor's `name`, `format`, and `description`; it ignores dispatch,
+limits, schemas, and every other field. This lets the editor complete a direct
+visible tool-name literal with the correct text or JSON call form without
+making the LSP a capability client.
 
-The editor projection is static for one LSP session and is advisory even when
-the integration supplied it from a current host catalog. It is not a runtime
-query, a catalog fingerprint check, a lease, or an approval. The LSP retains at
-most 128 entries and 512 KiB of names/descriptions, rejects malformed,
-duplicate, or oversized projections as a whole, and marks the resulting tool
-completion incomplete rather than presenting a partial catalog. Runtime policy
-still checks the actual dynamic name against the active catalog and capability
-lease at reservation time.
+For a refresh, send a complete replacement under `settings.splash.toolCatalog`:
 
-Static authoring metadata for host-defined `mod.*` interfaces is intentionally
-separate from this tool catalog. It uses
-`initializationOptions.splash.moduleCatalog`, cannot discover or approve a
-tool, and is documented in [Editor module interface projection](module-catalog.md).
+```json
+{
+  "settings": {
+    "splash": {
+      "toolCatalog": [
+        {
+          "name": "text.echo",
+          "format": "text",
+          "description": "Returns text unchanged."
+        }
+      ]
+    }
+  }
+}
+```
+
+The editor projection is advisory even when the integration supplied it from a
+current host catalog. It is not a runtime query, a catalog fingerprint check, a
+lease, or an approval. An omitted `toolCatalog` key keeps the prior projection;
+JSON `null` explicitly clears it. A malformed, duplicate, or oversized
+replacement discards only the tool projection and makes matching completion
+incomplete rather than presenting a partial catalog. A valid empty array is a
+complete empty catalog. Tool refreshes do not alter `moduleCatalog` or the
+atomic workflow-data pair. A malformed `settings` value or non-object
+`settings.splash` clears all advisory catalogs. The LSP retains at most 128
+entries and 512 KiB of names/descriptions. Runtime policy still checks the
+actual dynamic name against the active catalog and capability lease at
+reservation time.
+
+Refreshable authoring metadata for host-defined `mod.*` interfaces is
+intentionally separate from this tool catalog. It uses
+`initializationOptions.splash.moduleCatalog` or a configuration refresh, cannot
+discover or approve a tool, and is documented in [Editor module interface
+projection](module-catalog.md).

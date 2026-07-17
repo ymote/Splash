@@ -1,11 +1,12 @@
 # Editor Module Interface Projection
 
-`splash-lsp` can receive a small, static description of host-defined
-`mod.*` paths when an editor starts it. This is authoring metadata only. It
-does not make Splash a package loader, create a Rust adapter, or prove that a
-module exists in the runtime selected for a document.
+`splash-lsp` can receive a small description of host-defined `mod.*` paths
+when an editor starts it or through a later configuration refresh. This is
+authoring metadata only. It does not make Splash a package loader, create a
+Rust adapter, or prove that a module exists in the runtime selected for a
+document.
 
-## Initialization format
+## Initialization and refresh format
 
 Pass `initializationOptions.splash.moduleCatalog` as an array of full module
 paths. Each descriptor accepts only `path` and an optional `description`;
@@ -39,6 +40,32 @@ The fixed `mod.tool` namespace is excluded from this metadata format. A path
 whose first segment after `mod` is `tool` is rejected rather than treated as a
 host-defined interface descriptor.
 
+A host can replace the complete projection later through
+`workspace/didChangeConfiguration` using the same array under
+`settings.splash.moduleCatalog`:
+
+```json
+{
+  "settings": {
+    "splash": {
+      "moduleCatalog": [
+        {
+          "path": "mod.app.weather",
+          "description": "Host-provided weather module."
+        }
+      ]
+    }
+  }
+}
+```
+
+An omitted `moduleCatalog` key preserves the prior projection; JSON `null`
+explicitly clears it. A malformed, duplicate, or over-limit replacement makes
+only module completion unavailable rather than retaining stale paths. A valid
+empty array is a complete empty projection. Module refreshes do not alter
+`toolCatalog` or the atomic workflow-data pair. A malformed `settings` value or
+non-object `settings.splash` clears all advisory catalogs.
+
 ## Completion behavior
 
 The LSP can complete the current segment in a direct statement-position import
@@ -70,9 +97,9 @@ This bounded catalog lookup is not general imported-module resolution or type
 inference. The LSP does not read module files, URIs, the environment, a Rust
 registry, a capability runtime, or a live catalog. It does not validate an
 imported path, load a module, inspect exports, infer record fields, or authorize
-a tool. The metadata is static for one LSP session, client-supplied,
-potentially stale, and advisory even when an integration generated it from
-trusted host configuration.
+a tool. The metadata is client-supplied, potentially stale, and advisory even
+when an integration generated it from trusted host configuration. Configuration
+refresh only replaces editor metadata; it never validates a live runtime.
 
 Runtime module binding and all capability decisions remain host-owned. In
 particular, a suggested `mod.tool` call target is still checked against the

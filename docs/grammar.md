@@ -352,15 +352,17 @@ truncated, because an omitted earlier reference could be a mutation.
 
 The server separately recognizes an exact visible `use mod.tool` binding. At a
 direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
-`start_json` methods. An editor integration may also provide a static advisory
-tool-catalog projection at `initializationOptions.splash.toolCatalog`. The LSP
-retains only bounded `name`, `format`, and `description` metadata and uses it
-only for the first literal argument of direct visible `tool.call`/`tool.start`
+`start_json` methods. An editor integration may also provide a bounded advisory
+tool-catalog projection at `initializationOptions.splash.toolCatalog` or a
+later `settings.splash.toolCatalog` configuration update. The LSP retains only
+bounded `name`, `format`, and `description` metadata and uses it only for the
+first literal argument of direct visible `tool.call`/`tool.start`
 (matching `text`) or `tool.call_json`/`tool.start_json` (matching `json`). It
 never reads a host runtime, URI, file, adapter, or environment to obtain that
 projection, and a suggestion does not make a capability installed, approved,
-or callable. Malformed, duplicate, or over-limit input is discarded as a whole
-rather than presented partially.
+or callable. An omitted key retains prior metadata, JSON `null` explicitly
+clears it, and malformed, duplicate, or over-limit input is discarded as a
+whole rather than presented partially.
 
 For host-managed dataflow authoring, an editor may separately provide the
 bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP
@@ -395,8 +397,11 @@ references or general types, follow aliases or mutations, treat record keys or
 general member fields as variables, enumerate builtins, discover a host tool
 catalog, or grant tool authority. The direct literal-record metadata above is
 advisory and remains separate from those lexical bindings. The optional
-initialization-time catalog projection is advisory client metadata, not a
-catalog lookup. The server does not open the URI supplied by the client or run
-source; all diagnostics, edits, symbols, definitions, references, hovers,
-highlights, completions, and rename validation derive from client-provided
-document text and optional initialization metadata.
+initialization-time or configuration-refresh catalog projection is advisory
+client metadata, not a catalog lookup. Tool and module keys refresh
+independently; neither affects the atomic workflow-data pair. The server does
+not open the URI supplied by the client or run source. A malformed `settings`
+value or non-object `settings.splash` clears all advisory catalogs. All
+diagnostics, edits, symbols, definitions, references, hovers, highlights,
+completions, and rename validation derive from client-provided document text
+and optional advisory metadata.

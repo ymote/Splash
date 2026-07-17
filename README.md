@@ -17,10 +17,11 @@ and keeps UI support optional rather than making UI the language boundary.
 - Bounded same-document lexical completion at expression identifiers, with
   scope-aware candidates, exact-token replacement edits, fixed `mod.tool`
   member suggestions for an exact visible `use mod.tool` binding, an optional
-  bounded advisory tool-catalog projection for direct tool-name literals, and
-  an optional static module-interface projection for direct import paths and
-  bounded chained imported-module members, plus bounded direct-literal
-  record-field completion, hover, and definition without runtime type inference.
+  bounded refreshable advisory tool-catalog projection for direct tool-name
+  literals, and an optional refreshable module-interface projection for direct
+  import paths and bounded chained imported-module members, plus bounded
+  direct-literal record-field completion, hover, and definition without runtime
+  type inference.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -394,9 +395,10 @@ Run the language server from an LSP-compatible editor with:
 cargo run -p splash-lsp
 ```
 
-It accepts client-provided open-document text and optional bounded advisory
-initialization metadata, retains at most 128 document states and no document
-text above the standard 256 KiB source cap, and provides full-sync diagnostics,
+It accepts client-provided open-document text plus optional bounded advisory
+initialization metadata and configuration refreshes, retains at most 128
+document states and no document text above the standard 256 KiB source cap,
+and provides full-sync diagnostics,
 whole-document formatting, and top-level declaration symbols plus bounded
 same-document lexical definition/reference requests, binding-kind hover, symbol
 highlights, lexical completion, and guarded rename. Ordinary lexical completion
@@ -418,8 +420,9 @@ lexically visible `use mod.tool` binding, it additionally suggests only the
 fixed `call`, `call_json`, `start`, and `start_json` methods at a direct
 `tool.` member site. Those suggestions use no tool-catalog or adapter lookup
 and do not imply a capability grant. An integration may additionally supply a
-static, advisory tool-catalog projection once through
-`initializationOptions.splash.toolCatalog`; it accepts the `name`, `format`,
+advisory tool-catalog projection through
+`initializationOptions.splash.toolCatalog` or a later
+`workspace/didChangeConfiguration` update; it accepts the `name`, `format`,
 and `description` fields from the host catalog JSON. For an exact visible
 `mod.tool` binding, the LSP completes the first string literal in direct
 `call`/`start` calls from text entries and direct `call_json`/`start_json`
@@ -438,18 +441,20 @@ conservative: it does not infer
 forward references, general types, arbitrary record fields, builtins, arbitrary
 catalog data, or runtime-derived imported-module exports.
 
-An editor may also supply a separate static advisory module-interface
-projection through `initializationOptions.splash.moduleCatalog`. It completes
-the current segment in a direct statement-position `use mod.*` path and bounded
-catalog paths after a direct, visible imported module binding. It does not load
-a source file, resolve a module, inspect a runtime export, or override the fixed
-`mod.tool` API. The projection is client-supplied, static for the session, and
-never authorizes source; malformed or over-limit input is discarded as a whole
-and marks matching completion incomplete. See [editor module-interface
-projection](docs/module-catalog.md) for its exact format and bounds. A truncated
-lexical index can still serve retained, sound definitions and hover, but
-exhaustive reference, highlight, and rename requests fail instead of returning
-a partial set.
+An editor may also supply a separate advisory module-interface projection
+through `initializationOptions.splash.moduleCatalog` or a later
+`workspace/didChangeConfiguration` update. It completes the current segment in
+a direct statement-position `use mod.*` path and bounded catalog paths after a
+direct, visible imported module binding. It does not load a source file,
+resolve a module, inspect a runtime export, or override the fixed `mod.tool`
+API. Tool and module catalog keys refresh independently: an omitted key keeps
+its prior value, JSON `null` explicitly clears it, and a malformed or over-limit
+key value makes only that catalog unavailable. A malformed `settings` value or
+non-object `settings.splash` clears all advisory catalogs. Neither projection
+authorizes source. See [editor module-interface projection](docs/module-catalog.md)
+for its exact format and bounds. A truncated lexical index can still serve
+retained, sound definitions and hover, but exhaustive reference, highlight, and
+rename requests fail instead of returning a partial set.
 
 For a host-managed dataflow authoring session, an editor can also supply a
 separate `initializationOptions.splash.workflowDataCatalog` projection. It
@@ -518,7 +523,7 @@ host-selected outbound JSON boundary, endpoint-bound credential injection, and
 their explicit non-guarantees.
 
 [Editor module-interface projection](docs/module-catalog.md) defines bounded
-static authoring metadata for host-defined `mod.*` interfaces.
+refreshable authoring metadata for host-defined `mod.*` interfaces.
 
 [Worker protocol v5](docs/worker-protocol.md) also defines keyed worker frames
 and the live-operation reconciliation boundary.

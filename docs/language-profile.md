@@ -125,8 +125,9 @@ exact visible `use mod.tool` binding and suggest the four fixed language
 methods `call`, `call_json`, `start`, and `start_json`. It never reads the host
 catalog for those suggestions, and their presence is neither module resolution
 nor a capability grant. An editor integration may separately provide a
-bounded, initialization-time advisory projection through
-`initializationOptions.splash.toolCatalog`. That LSP-only metadata can complete
+bounded advisory projection through `initializationOptions.splash.toolCatalog`
+or a later `settings.splash.toolCatalog` configuration update. That LSP-only
+metadata can complete
 the first literal name of a direct visible `tool.call`/`tool.start` from `text`
 entries, or `tool.call_json`/`tool.start_json` from `json` entries. It is not
 part of the core report, never causes a runtime/catalog lookup, and cannot make
@@ -135,18 +136,21 @@ candidates from a symbol-truncated report: an omitted inner definition may
 shadow a retained outer binding. The LSP therefore returns an incomplete empty
 candidate set in that case.
 
-An editor may separately supply
-`initializationOptions.splash.moduleCatalog`: a bounded, static list of
-canonical `mod.*` paths plus optional plain-text descriptions. This LSP-only
+An editor may separately supply `initializationOptions.splash.moduleCatalog`
+or a later `settings.splash.moduleCatalog` update: a bounded list of canonical
+`mod.*` paths plus optional plain-text descriptions. This LSP-only
 projection can complete the current segment of a direct statement-position
 `use mod.*` path, or bounded catalog paths below a direct visible imported-module
 binding. It is not part of the core report and does not load a source file,
 resolve or validate a module, inspect runtime exports, infer arbitrary fields,
 or make a Rust adapter current or callable. `mod.tool` remains a fixed language
 surface and never receives metadata-defined members. The client-supplied
-projection is static for the session, advisory, potentially stale, and never
-authority; malformed, duplicate, or over-limit input is discarded as a whole
-and makes matching completion incomplete. See [Editor module interface
+projection is advisory, potentially stale, and never authority; an omitted key
+retains the prior projection, JSON `null` explicitly clears it, and malformed,
+duplicate, or over-limit input is discarded as a whole and makes matching
+completion incomplete. Tool and module updates are independent of each other
+and of the atomic workflow-data pair. A malformed `settings` value or non-object
+`settings.splash` clears all advisory catalogs. See [Editor module interface
 projection](module-catalog.md) for the exact wire shape and limits.
 
 For dataflow authoring, an editor may instead supply the separate bounded

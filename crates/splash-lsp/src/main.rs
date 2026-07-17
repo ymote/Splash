@@ -121,10 +121,11 @@ struct ToolCatalogCompletion {
 
 /// A bounded, advisory projection of the host's current tool catalog.
 ///
-/// The server receives this only once through LSP initialization options. It
-/// does not connect to a runtime, read a catalog from disk, or use catalog
-/// metadata to authorize source. A malformed or oversized projection is
-/// discarded in full so the editor cannot present an arbitrary partial set.
+/// The server receives this through LSP initialization options or a later
+/// configuration refresh. It does not connect to a runtime, read a catalog
+/// from disk, or use catalog metadata to authorize source. A malformed or
+/// oversized projection is discarded in full so the editor cannot present an
+/// arbitrary partial set.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ToolCompletionCatalog {
     tools: Vec<ToolCatalogCompletion>,
@@ -139,9 +140,9 @@ struct ModuleCatalogCompletion {
 
 /// A bounded, advisory projection of a host's known `mod.*` interface.
 ///
-/// Like the tool projection, this stays inside the editor process and is
-/// static for the LSP session. It cannot load, resolve, install, or authorize
-/// a module.
+/// Like the tool projection, this stays inside the editor process and can only
+/// be replaced by host configuration. It cannot load, resolve, install, or
+/// authorize a module.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ModuleCompletionCatalog {
     modules: Vec<ModuleCatalogCompletion>,
@@ -241,6 +242,16 @@ enum WorkflowDataConfigurationUpdate {
         catalog: WorkflowDataCompletionCatalog,
         step_context: WorkflowDataStepContext,
     },
+}
+
+/// One independent tool or module catalog transition received through
+/// `workspace/didChangeConfiguration`. `null` is an explicit clear; malformed
+/// metadata also clears that advisory catalog rather than retaining stale
+/// suggestions.
+enum AdvisoryCatalogConfigurationUpdate<Catalog> {
+    Keep,
+    Clear,
+    Replace(Catalog),
 }
 
 #[derive(Debug)]
@@ -345,6 +356,43 @@ impl SplashLanguageServer {
         }
     }
 
+    /// Refreshes all advisory editor metadata after a host configuration
+    /// update. Each catalog has an independent replacement boundary; the
+    /// workflow catalog/context pair remains atomic.
+    fn refresh_advisory_configuration(&mut self, settings: &serde_json::Value) {
+        self.refresh_tool_catalog_configuration(settings);
+        self.refresh_module_catalog_configuration(settings);
+        self.refresh_workflow_data_configuration(settings);
+    }
+
+    /// Refreshes the advisory tool catalog without consulting a capability
+    /// runtime or granting source authority.
+    fn refresh_tool_catalog_configuration(&mut self, settings: &serde_json::Value) {
+        match tool_catalog_configuration_update_from_settings(settings) {
+            AdvisoryCatalogConfigurationUpdate::Keep => {}
+            AdvisoryCatalogConfigurationUpdate::Clear => {
+                self.tool_catalog = unavailable_tool_completion_catalog();
+            }
+            AdvisoryCatalogConfigurationUpdate::Replace(catalog) => {
+                self.tool_catalog = catalog;
+            }
+        }
+    }
+
+    /// Refreshes the advisory module catalog without loading or resolving a
+    /// module.
+    fn refresh_module_catalog_configuration(&mut self, settings: &serde_json::Value) {
+        match module_catalog_configuration_update_from_settings(settings) {
+            AdvisoryCatalogConfigurationUpdate::Keep => {}
+            AdvisoryCatalogConfigurationUpdate::Clear => {
+                self.module_catalog = unavailable_module_completion_catalog();
+            }
+            AdvisoryCatalogConfigurationUpdate::Replace(catalog) => {
+                self.module_catalog = catalog;
+            }
+        }
+    }
+
     /// Refreshes workflow-only editor metadata after a host configuration
     /// update. The parsed value is fully validated before either field changes,
     /// so a reader never observes a mixed catalog/context pair.
@@ -367,6 +415,14 @@ impl SplashLanguageServer {
     fn invalidate_workflow_data_configuration(&mut self) {
         self.workflow_data_catalog = unavailable_workflow_data_completion_catalog();
         self.workflow_data_step_context = unavailable_workflow_data_step_context();
+    }
+
+    /// A malformed configuration notification must not leave potentially stale
+    /// advisory metadata available to the editor.
+    fn invalidate_advisory_configuration(&mut self) {
+        self.tool_catalog = unavailable_tool_completion_catalog();
+        self.module_catalog = unavailable_module_completion_catalog();
+        self.invalidate_workflow_data_configuration();
     }
 
     fn open_document(&mut self, item: TextDocumentItem) -> PublishDiagnosticsParams {
@@ -1361,6 +1417,65 @@ fn parse_workflow_data_step_context(
     })
 }
 
+/// Extracts the optional `settings.splash` object from a standard LSP
+/// configuration notification. An absent object leaves existing metadata
+/// alone; malformed configuration invalidates the affected advisory catalog.
+fn splash_settings_from_configuration(
+    settings: &serde_json::Value,
+) -> Result<Option<&serde_json::Map<String, serde_json::Value>>, ()> {
+    let Some(settings) = settings.as_object() else {
+        return Err(());
+    };
+    let Some(splash) = settings.get("splash") else {
+        return Ok(None);
+    };
+    splash.as_object().map(Some).ok_or(())
+}
+
+/// Parses one independent advisory catalog configuration value. A host may
+/// omit the key to retain a prior projection, send `null` to clear it, or send
+/// one complete replacement. A malformed configuration fails closed.
+fn advisory_catalog_configuration_update_from_settings<Catalog>(
+    settings: &serde_json::Value,
+    key: &str,
+    parse: impl FnOnce(&serde_json::Value) -> Option<Catalog>,
+) -> AdvisoryCatalogConfigurationUpdate<Catalog> {
+    let splash = match splash_settings_from_configuration(settings) {
+        Ok(Some(splash)) => splash,
+        Ok(None) => return AdvisoryCatalogConfigurationUpdate::Keep,
+        Err(()) => return AdvisoryCatalogConfigurationUpdate::Clear,
+    };
+    let Some(value) = splash.get(key) else {
+        return AdvisoryCatalogConfigurationUpdate::Keep;
+    };
+    if value.is_null() {
+        return AdvisoryCatalogConfigurationUpdate::Clear;
+    }
+    parse(value)
+        .map(AdvisoryCatalogConfigurationUpdate::Replace)
+        .unwrap_or(AdvisoryCatalogConfigurationUpdate::Clear)
+}
+
+fn tool_catalog_configuration_update_from_settings(
+    settings: &serde_json::Value,
+) -> AdvisoryCatalogConfigurationUpdate<ToolCompletionCatalog> {
+    advisory_catalog_configuration_update_from_settings(
+        settings,
+        "toolCatalog",
+        parse_tool_completion_catalog,
+    )
+}
+
+fn module_catalog_configuration_update_from_settings(
+    settings: &serde_json::Value,
+) -> AdvisoryCatalogConfigurationUpdate<ModuleCompletionCatalog> {
+    advisory_catalog_configuration_update_from_settings(
+        settings,
+        "moduleCatalog",
+        parse_module_completion_catalog,
+    )
+}
+
 /// Parses the workflow-specific portion of a standard LSP configuration
 /// update. The update deliberately requires both catalog and context: merging
 /// a new position into an old schema, or retaining an old position after a
@@ -1368,14 +1483,10 @@ fn parse_workflow_data_step_context(
 fn workflow_data_configuration_update_from_settings(
     settings: &serde_json::Value,
 ) -> WorkflowDataConfigurationUpdate {
-    let Some(settings) = settings.as_object() else {
-        return unavailable_workflow_data_configuration_update();
-    };
-    let Some(splash) = settings.get("splash") else {
-        return WorkflowDataConfigurationUpdate::Keep;
-    };
-    let Some(splash) = splash.as_object() else {
-        return unavailable_workflow_data_configuration_update();
+    let splash = match splash_settings_from_configuration(settings) {
+        Ok(Some(splash)) => splash,
+        Ok(None) => return WorkflowDataConfigurationUpdate::Keep,
+        Err(()) => return unavailable_workflow_data_configuration_update(),
     };
     let (Some(catalog), Some(context)) = (
         splash.get("workflowDataCatalog"),
@@ -1673,8 +1784,8 @@ fn handle_notification(
     let diagnostics = match notification.method.as_str() {
         DidChangeConfiguration::METHOD => {
             match serde_json::from_value::<DidChangeConfigurationParams>(notification.params) {
-                Ok(params) => server.refresh_workflow_data_configuration(&params.settings),
-                Err(_) => server.invalidate_workflow_data_configuration(),
+                Ok(params) => server.refresh_advisory_configuration(&params.settings),
+                Err(_) => server.invalidate_advisory_configuration(),
             }
             None
         }
@@ -4703,7 +4814,13 @@ mod tests {
             &replacement_catalog,
         );
         let mut malformed_params_server =
-            SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            SplashLanguageServer::with_completion_catalogs_and_workflow_data(
+                tool_catalog(serde_json::json!([
+                    {"name": "text.echo", "format": "text"}
+                ])),
+                module_catalog(serde_json::json!([
+                    {"path": "mod.app.inspect"}
+                ])),
                 replacement_catalog,
                 replacement_context,
             );
@@ -4717,6 +4834,8 @@ mod tests {
             ),
         )
         .expect("malformed configuration notification is handled");
+        assert!(malformed_params_server.tool_catalog.unavailable);
+        assert!(malformed_params_server.module_catalog.unavailable);
         assert!(malformed_params_server.workflow_data_catalog.unavailable);
         assert!(
             malformed_params_server
@@ -5187,6 +5306,240 @@ mod tests {
                 .collect(),
         );
         assert!(parse_tool_completion_catalog(&oversized_retained_bytes).is_none());
+    }
+
+    #[test]
+    fn refreshes_tool_and_module_catalogs_independently_and_fails_closed() {
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            tool_catalog(serde_json::json!([
+                {"name": "text.old", "format": "text", "description": "old tool"}
+            ])),
+            module_catalog(serde_json::json!([
+                {"path": "mod.app.old", "description": "old module"}
+            ])),
+        );
+        let tool_source = "use mod.tool\nlet result = tool.call(\"text.";
+        server.open_document(document(1, tool_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(tool_source, tool_source.len())
+                )
+                .expect("initial tool completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["text.old"]
+        );
+
+        let module_source = "use mod.app\napp.";
+        server.open_document(document(2, module_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(module_source, module_source.len()),
+                )
+                .expect("initial module completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+
+        let (server_connection, _client_connection) = Connection::memory();
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {
+                            "toolCatalog": [
+                                {"name": "text.next", "format": "text", "description": "next tool"}
+                            ],
+                            "moduleCatalog": [
+                                {"path": "mod.app.next", "description": "next module"}
+                            ]
+                        }
+                    }),
+                },
+            ),
+        )
+        .expect("complete tool and module replacement is handled");
+
+        server.open_document(document(3, tool_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(tool_source, tool_source.len())
+                )
+                .expect("refreshed tool completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["text.next"]
+        );
+        server.open_document(document(4, module_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(module_source, module_source.len()),
+                )
+                .expect("refreshed module completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["next"]
+        );
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {"moduleCatalog": null}
+                    }),
+                },
+            ),
+        )
+        .expect("explicit module clear is handled");
+        assert!(server.module_catalog.unavailable);
+        server.open_document(document(5, module_source));
+        let cleared_module_completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(module_source, module_source.len()),
+            )
+            .expect("cleared module completion succeeds");
+        assert!(cleared_module_completion.is_incomplete);
+        assert!(cleared_module_completion.items.is_empty());
+        server.open_document(document(6, tool_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(tool_source, tool_source.len())
+                )
+                .expect("module clear retains tool catalog")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["text.next"]
+        );
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {
+                            "toolCatalog": {},
+                            "moduleCatalog": [
+                                {"path": "mod.app.final", "description": "final module"}
+                            ]
+                        }
+                    }),
+                },
+            ),
+        )
+        .expect("malformed tool projection and valid module replacement are handled");
+        assert!(server.tool_catalog.unavailable);
+        assert!(!server.workflow_data_catalog.unavailable);
+        assert!(!server.workflow_data_step_context.unavailable);
+        server.open_document(document(7, tool_source));
+        let unavailable_tool_completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(tool_source, tool_source.len()),
+            )
+            .expect("unavailable tool completion succeeds");
+        assert!(unavailable_tool_completion.is_incomplete);
+        assert!(unavailable_tool_completion.items.is_empty());
+        server.open_document(document(8, module_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(module_source, module_source.len()),
+                )
+                .expect("independent module recovery succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["final"]
+        );
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {
+                            "toolCatalog": [
+                                {"name": "text.recovered", "format": "text", "description": "recovered tool"}
+                            ]
+                        }
+                    }),
+                },
+            ),
+        )
+        .expect("tool recovery is handled");
+        server.open_document(document(9, tool_source));
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(tool_source, tool_source.len())
+                )
+                .expect("recovered tool completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["text.recovered"]
+        );
+        assert_eq!(
+            server
+                .module_catalog
+                .modules
+                .iter()
+                .map(|module| module.path.join("."))
+                .collect::<Vec<_>>(),
+            ["mod.app.final"]
+        );
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({"splash": []}),
+                },
+            ),
+        )
+        .expect("malformed splash configuration is handled");
+        assert!(server.tool_catalog.unavailable);
+        assert!(server.module_catalog.unavailable);
+        assert!(server.workflow_data_catalog.unavailable);
+        assert!(server.workflow_data_step_context.unavailable);
     }
 
     #[test]
