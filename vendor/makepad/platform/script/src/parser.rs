@@ -3766,6 +3766,9 @@ impl ScriptParser {
 
                                 // Patch remaining FIELD to PROTO_FIELD
                                 for pair in self.opcodes.rchunks_mut(2) {
+                                    if pair.len() != 2 {
+                                        break;
+                                    }
                                     if pair[0].is_id() && pair[1] == Opcode::FIELD.into() {
                                         pair[1] = Opcode::PROTO_FIELD.into()
                                     } else if pair[1].is_id() && pair[0] == Opcode::FIELD.into() {

@@ -28,6 +28,29 @@ cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
 This keeps failures in source owned by Splash actionable while preserving
 separate behavioral coverage for the imported VM.
 
+## Sustained fuzzing
+
+Pull-request CI runs short 128-input smoke campaigns for every fuzz target.
+The separate `Sustained Fuzzing` workflow runs daily and can be started
+manually from GitHub Actions. It gives the differential `syntax` target and
+the bounded `execution` target ten minutes each, with per-input timeout and
+RSS ceilings. A failure uploads its ignored `fuzz/artifacts` directory for 14
+days.
+
+Triage a downloaded crash before adding it to the repository:
+
+```sh
+cd fuzz
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none syntax artifacts/syntax/crash-<sha>
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz tmin --sanitizer none syntax artifacts/syntax/crash-<sha>
+```
+
+Then add a focused unit or integration regression and, when it improves the
+campaign, a reviewed text or JSON seed under `fuzz/corpus`. Do not commit raw
+generated corpus entries or `fuzz/artifacts`; they can include unreviewed
+input and are intentionally ignored. Keep vendor parser fixes documented in
+`vendor/makepad/PATCHES.md`.
+
 ## Language server
 
 `splash-lsp` is a host-only stdio server for editor clients. It advertises

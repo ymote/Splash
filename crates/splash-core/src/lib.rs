@@ -2506,6 +2506,16 @@ mod tests {
     }
 
     #[test]
+    fn vm_compatibility_preflight_rejects_a_partial_field_assignment_without_panicking() {
+        let report =
+            check_vm_compatibility_named("legacy.splash", "@.b-=", ExecutionLimits::default())
+                .unwrap();
+
+        assert!(!report.valid);
+        assert!(!report.diagnostics.is_empty());
+    }
+
+    #[test]
     fn vm_compatibility_preflight_accepts_legacy_source_at_the_exact_token_limit() {
         let limits = ExecutionLimits {
             max_syntax_tokens: 4,
@@ -3091,7 +3101,7 @@ compute(outer, 2)
         assert!(alpha_site.end_byte <= report.valid_prefix_end_byte);
         assert!(incomplete.is_char_boundary(alpha_site.start_byte));
 
-        let invalid_middle = "let marker = \"🙂\"\rlet alpha = 1\ralpha\r@\ralpha";
+        let invalid_middle = "let marker = \"🙂\"\r\nlet alpha = 1\r\nalpha\r\n@\r\nalpha";
         let invalid_report = lexical_completion_report(invalid_middle).unwrap();
         assert_eq!(
             invalid_report.valid_prefix_end_byte,
@@ -3213,6 +3223,24 @@ compute(outer, 2)
             format_source(source).unwrap(),
             "let values = [1, 2]\nlet transform = |value| value * 2\nlet first = values[0]\n"
         );
+    }
+
+    #[test]
+    fn canonical_profile_rejects_bare_carriage_returns_before_vm_preflight() {
+        let source = "true\r[]";
+
+        let canonical =
+            check_syntax_named("line-endings.splash", source, ExecutionLimits::default()).unwrap();
+        assert!(!canonical.valid);
+        assert_eq!(canonical.diagnostics.len(), 1);
+        assert!(canonical.diagnostics[0]
+            .message
+            .contains("bare carriage returns are not supported"));
+
+        let compatibility =
+            check_vm_compatibility_named("line-endings.splash", source, ExecutionLimits::default())
+                .unwrap();
+        assert!(!compatibility.valid);
     }
 
     #[test]

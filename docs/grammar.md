@@ -279,6 +279,10 @@ line endings, and trailing whitespace. It is idempotent. It rejects invalid
 source and Makepad-only compatibility syntax instead of applying recovery or
 rewriting it into a different language contract.
 
+Canonical source accepts LF and CRLF line endings. A bare carriage return is
+rejected because the vendored VM does not treat it as a statement separator;
+formatted output uses LF.
+
 Use `splash format --check workflow.splash` to exit nonzero when formatting
 would change the source. Rust hosts can call `splash_core::format_source` or
 `splash_core::format_source_named`; both use the supplied `ExecutionLimits`

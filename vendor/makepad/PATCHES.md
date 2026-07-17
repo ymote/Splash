@@ -68,3 +68,15 @@ instead of debug-only null checks. Invalid host input therefore fails
 deterministically rather than forming or dereferencing an out-of-bounds
 pointer. `ScriptHandleGc` downcasts now use `Any::type_id`, so a handle
 implementation cannot forge a type match by overriding a trait method.
+
+## `platform/script`: malformed field-assignment parser bounds
+
+The inherited assignment rewrite walks the emitted opcode stream in reverse
+pairs. A malformed partial field assignment can leave a trailing one-opcode
+chunk, but the loop indexed both pair elements unconditionally. Splash stops
+at that incomplete chunk so the normal parser error path rejects the source
+instead of panicking during compatibility preflight.
+
+Upstream-sync note: this local safety patch is carried against the pinned
+`makepad/makepad dev` import and must be reapplied or retired when that import
+is next synchronized.

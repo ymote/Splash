@@ -2,7 +2,7 @@
 //!
 //! The adapter executes on one owned thread while this driver retains the
 //! authenticated frame loop. Only an explicitly registered
-//! [`CancellableWorkerAdapter`](crate::CancellableWorkerAdapter) can use this
+//! [`CancellableWorkerAdapter`] can use this
 //! path. Durable operations remain on the journaled single-exchange path and
 //! must use reconciliation after an ambiguous process stop.
 

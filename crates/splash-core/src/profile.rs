@@ -794,14 +794,18 @@ impl<'source> ProfileLexer<'source> {
 
     fn emit_carriage_return_newline(&mut self) {
         let (line, column) = self.location();
+        if self.peek() != Some('\n') {
+            self.report(
+                line,
+                column,
+                "bare carriage returns are not supported; use `\\n` or `\\r\\n` line endings",
+            );
+            self.advance();
+            return;
+        }
         let start_index = self.index;
         self.advance();
-        if self.current() == Some('\n') {
-            self.advance();
-        } else {
-            self.line += 1;
-            self.column = 1;
-        }
+        self.advance();
         self.emit(TokenKind::Newline, line, column, start_index, self.index);
     }
 
