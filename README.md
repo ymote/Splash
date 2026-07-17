@@ -496,9 +496,9 @@ both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-
 - `splash-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
   payload adapter that requires a platform trust anchor.
-- `splash-protocol`: portable worker messages, capability attenuation,
-  keyed session framing, strict ordinary-call cancellation, and host-side
-  invocation/result validation.
+- `splash-protocol`: portable worker messages, capability attenuation, a fixed
+  128-grant session-manifest bound, keyed session framing, strict ordinary-call
+  cancellation, and host-side invocation/result validation.
 - `splash-worker`: worker-side session runtime, explicit Rust adapter registry,
   cancellable ordinary-invocation driver, and authenticated journal-store
   bridge; it is not an OS sandbox or platform storage backend.

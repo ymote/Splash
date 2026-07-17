@@ -27,6 +27,15 @@ grant defines:
 - a separate maximum for explicitly host-approved compensation effects; and
 - opaque resource selectors.
 
+A manifest contains at most 128 distinct grants, and each grant contains at
+most 64 resource selectors. These fixed structural limits bound manifest
+validation, authorization state, and worker policy planning independently of
+the 1 MiB authenticated-frame limit. A host that needs fewer capabilities must
+attenuate the manifest before opening the worker session; a zero-grant manifest
+remains valid and grants no tool authority. A host that needs more must split
+work across separately approved worker sessions rather than expand one session
+manifest.
+
 Resource selectors have a kind (`file_root`, `executable`, `network_origin`,
 or `secret`) plus an opaque identifier. They are not paths, command lines, DNS
 names, or secret values. The policy host maps each selector to a real resource

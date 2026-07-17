@@ -36,6 +36,11 @@ pub const MAX_WORKER_OPERATION_JOURNAL_BYTES: usize = 256 * 1024;
 pub const MAX_WORKER_OPERATION_RECORDS: usize = 64;
 /// Current serialized worker operation journal format version.
 pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 2;
+/// Maximum distinct capability grants carried by one worker session manifest.
+///
+/// This keeps manifest validation, authorization state, and contained-worker
+/// launch planning bounded independently of the wire-frame byte ceiling.
+pub const MAX_CAPABILITY_GRANTS_PER_MANIFEST: usize = 128;
 const MAX_RESOURCES_PER_GRANT: usize = 64;
 const MAX_TOKEN_BYTES: usize = 128;
 const PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC: [u8; 8] = *b"SPLPBOOT";
@@ -248,6 +253,11 @@ impl CapabilityManifest {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion {
                 actual: self.protocol_version,
+            });
+        }
+        if self.grants.len() > MAX_CAPABILITY_GRANTS_PER_MANIFEST {
+            return Err(ProtocolError::TooManyGrants {
+                maximum: MAX_CAPABILITY_GRANTS_PER_MANIFEST,
             });
         }
         validate_token("session id", &self.session_id)?;
@@ -2748,6 +2758,9 @@ pub enum ProtocolError {
     },
     DuplicateGrant(String),
     InvalidGrant(&'static str),
+    TooManyGrants {
+        maximum: usize,
+    },
     TooManyResources {
         maximum: usize,
     },
@@ -2871,6 +2884,9 @@ impl Display for ProtocolError {
             }
             Self::DuplicateGrant(tool) => write!(formatter, "duplicate capability grant: {tool}"),
             Self::InvalidGrant(message) => formatter.write_str(message),
+            Self::TooManyGrants { maximum } => {
+                write!(formatter, "capability manifest exceeds {maximum} grants")
+            }
             Self::TooManyResources { maximum } => {
                 write!(
                     formatter,
@@ -3281,12 +3297,68 @@ mod tests {
         CapabilityManifest::new("session-1", vec![json_grant()]).unwrap()
     }
 
+    fn grants(count: usize) -> Vec<CapabilityGrant> {
+        (0..count)
+            .map(|index| CapabilityGrant::text(format!("tool-{index}")))
+            .collect()
+    }
+
     #[test]
     fn rejects_duplicate_capability_grants() {
         let error =
             CapabilityManifest::new("session-1", vec![json_grant(), json_grant()]).unwrap_err();
 
         assert_eq!(error, ProtocolError::DuplicateGrant("math.add".to_owned()));
+    }
+
+    #[test]
+    fn capability_manifest_grant_count_is_bounded_across_protocol_entry_points() {
+        let exact =
+            CapabilityManifest::new("session-1", grants(MAX_CAPABILITY_GRANTS_PER_MANIFEST))
+                .expect("the exact manifest grant maximum is accepted");
+        assert_eq!(exact.grants.len(), MAX_CAPABILITY_GRANTS_PER_MANIFEST);
+
+        let oversized = CapabilityManifest {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: "session-1".to_owned(),
+            grants: grants(MAX_CAPABILITY_GRANTS_PER_MANIFEST + 1),
+        };
+        let expected = ProtocolError::TooManyGrants {
+            maximum: MAX_CAPABILITY_GRANTS_PER_MANIFEST,
+        };
+        assert_eq!(oversized.validate().unwrap_err(), expected);
+        assert_eq!(
+            CapabilityManifest::new("session-1", oversized.grants.clone()).unwrap_err(),
+            expected
+        );
+        assert!(matches!(
+            SessionAuthorizer::new(oversized.clone()),
+            Err(ProtocolError::TooManyGrants { maximum })
+                if maximum == MAX_CAPABILITY_GRANTS_PER_MANIFEST
+        ));
+
+        let raw_frame = AuthenticatedWorkerMessage {
+            sequence: 1,
+            message: WorkerMessage::OpenSession {
+                manifest: oversized.clone(),
+            },
+            auth_tag: "00".repeat(AUTH_TAG_BYTES),
+        };
+        let raw_json = serde_json::to_string(&raw_frame).unwrap();
+        assert_eq!(
+            AuthenticatedWorkerMessage::from_json_line(&raw_json).unwrap_err(),
+            expected
+        );
+
+        let key = SessionKey::from_bytes([7; AUTH_TAG_BYTES]).unwrap();
+        let mut host = SessionAuthenticator::new("session-1", key, SessionRole::Host).unwrap();
+        assert_eq!(
+            host.seal(WorkerMessage::OpenSession {
+                manifest: oversized,
+            })
+            .unwrap_err(),
+            expected
+        );
     }
 
     #[test]
