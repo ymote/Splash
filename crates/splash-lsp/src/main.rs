@@ -34,8 +34,9 @@ use lsp_types::{
 use splash_core::{
     check_syntax_named, format_source_named, is_canonical_identifier,
     lexical_completion_report_named, lexical_symbol_report_named, module_import_report_named,
-    top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
-    LexicalSymbolKind, LexicalSymbolReport, ModuleImport, ModuleImportReport, SourceSpan,
+    static_record_shape_report_named, top_level_declarations_named, ExecutionLimits,
+    LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
+    ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordShape, StaticRecordShapeReport,
     SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
     MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
 };
@@ -143,6 +144,7 @@ struct DocumentState {
     lexical_report: OnceCell<Result<LexicalSymbolReport, String>>,
     completion_report: OnceCell<Result<LexicalCompletionReport, String>>,
     module_import_report: OnceCell<Result<ModuleImportReport, String>>,
+    static_record_shape_report: OnceCell<Result<StaticRecordShapeReport, String>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -269,6 +271,20 @@ impl SplashLanguageServer {
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(None);
         };
+        let shapes = self.static_record_shapes(uri)?;
+        if !report.truncated {
+            if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
+                if let Some(field) = static_record_field_for_member(
+                    source,
+                    &report.symbols,
+                    source.len(),
+                    shapes,
+                    site,
+                ) {
+                    return Ok(Some(symbol_location(uri, source, field.definition)));
+                }
+            }
+        }
         let Some(symbol) = symbol_at_byte(report, byte_offset) else {
             return Ok(None);
         };
@@ -281,6 +297,26 @@ impl SplashLanguageServer {
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(None);
         };
+        let shapes = self.static_record_shapes(uri)?;
+        if !report.truncated {
+            if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
+                if let Some(field) = static_record_field_for_member(
+                    source,
+                    &report.symbols,
+                    source.len(),
+                    shapes,
+                    site,
+                ) {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!("**static record field** `{}`", field.name),
+                        }),
+                        range: Some(span_range(source, site.member)),
+                    }));
+                }
+            }
+        }
         let Some((symbol, occurrence)) = symbol_occurrence_at_byte(report, byte_offset) else {
             return Ok(None);
         };
@@ -405,6 +441,23 @@ impl SplashLanguageServer {
                     imports,
                     member_site,
                     is_incomplete,
+                ));
+            }
+            let shapes = self.static_record_shapes(uri)?;
+            if let Some(shape) = visible_static_record_shape(
+                source,
+                &report.symbols,
+                report.valid_prefix_end_byte,
+                shapes,
+                member_site.receiver,
+            ) {
+                return Ok(static_record_member_completion(
+                    source,
+                    report,
+                    shapes,
+                    shape,
+                    member_site,
+                    lexical_incomplete || shapes.truncated,
                 ));
             }
             return Ok(module_catalog_member_completion(
@@ -611,6 +664,24 @@ impl SplashLanguageServer {
         }
     }
 
+    fn static_record_shapes(&self, uri: &Uri) -> Result<&StaticRecordShapeReport, String> {
+        let state = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| "the document is not open in this Splash session".to_owned())?;
+        let source = state.source.as_deref().ok_or_else(|| {
+            format!("the document exceeds Splash's {DEFAULT_MAX_SOURCE_BYTES}-byte source limit")
+        })?;
+        let report = state.static_record_shape_report.get_or_init(|| {
+            static_record_shape_report_named(uri.as_str(), source, ExecutionLimits::default())
+                .map_err(|error| format!("cannot inspect static record shapes: {error}"))
+        });
+        match report {
+            Ok(report) => Ok(report),
+            Err(message) => Err(message.clone()),
+        }
+    }
+
     fn replace_document(
         &mut self,
         uri: Uri,
@@ -636,6 +707,7 @@ impl SplashLanguageServer {
                     lexical_report: OnceCell::new(),
                     completion_report: OnceCell::new(),
                     module_import_report: OnceCell::new(),
+                    static_record_shape_report: OnceCell::new(),
                 },
             );
             return resource_diagnostics(
@@ -657,6 +729,7 @@ impl SplashLanguageServer {
                 lexical_report: OnceCell::new(),
                 completion_report: OnceCell::new(),
                 module_import_report: OnceCell::new(),
+                static_record_shape_report: OnceCell::new(),
             },
         );
         PublishDiagnosticsParams::new(uri, diagnostics, Some(version))
@@ -1755,6 +1828,48 @@ fn tool_module_member_completion(
     }
 }
 
+fn static_record_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    shapes: &StaticRecordShapeReport,
+    shape: &StaticRecordShape,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let is_incomplete = is_incomplete || shapes.truncated;
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > shapes.valid_prefix_end_byte
+    {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.member);
+    let mut items = shape
+        .fields
+        .iter()
+        .map(|field| CompletionItem {
+            label: field.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some("static record field; direct literal only".to_owned()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                field.name.clone(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
 fn module_catalog_path_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -1968,8 +2083,15 @@ fn visible_symbol_at<'symbol>(
     name: &str,
     byte_offset: usize,
 ) -> Option<&'symbol LexicalSymbol> {
-    report
-        .symbols
+    visible_symbol_in(&report.symbols, name, byte_offset)
+}
+
+fn visible_symbol_in<'symbol>(
+    symbols: &'symbol [LexicalSymbol],
+    name: &str,
+    byte_offset: usize,
+) -> Option<&'symbol LexicalSymbol> {
+    symbols
         .iter()
         .filter(|symbol| {
             symbol.name == name
@@ -1977,6 +2099,153 @@ fn visible_symbol_at<'symbol>(
                 && byte_offset < symbol.visibility_end_byte
         })
         .max_by_key(|symbol| (symbol.visibility_start_byte, symbol.definition.start_byte))
+}
+
+fn visible_static_record_shape<'shape>(
+    source: &str,
+    symbols: &[LexicalSymbol],
+    valid_prefix_end_byte: usize,
+    shapes: &'shape StaticRecordShapeReport,
+    receiver: SourceSpan,
+) -> Option<&'shape StaticRecordShape> {
+    if receiver.end_byte > valid_prefix_end_byte || receiver.end_byte > shapes.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let receiver_name = source.get(receiver.start_byte..receiver.end_byte)?;
+    let symbol = visible_symbol_in(symbols, receiver_name, receiver.start_byte)?;
+    if symbol.kind != LexicalSymbolKind::Let {
+        return None;
+    }
+    if !static_record_binding_is_stable_at(source, symbol, receiver.start_byte) {
+        return None;
+    }
+    shapes
+        .shapes
+        .iter()
+        .find(|shape| shape.binding == symbol.definition)
+}
+
+fn static_record_binding_is_stable_at(
+    source: &str,
+    symbol: &LexicalSymbol,
+    site_start_byte: usize,
+) -> bool {
+    symbol
+        .references
+        .iter()
+        .copied()
+        .filter(|reference| reference.start_byte < site_start_byte)
+        .all(|reference| !reference_may_mutate_static_record(source, reference))
+}
+
+/// Detects writes to a binding or one of its direct member paths. Indexing and
+/// calls fail closed because this lightweight advisory feature does not model
+/// their possible mutation or escape behavior.
+fn reference_may_mutate_static_record(source: &str, reference: SourceSpan) -> bool {
+    let bytes = source.as_bytes();
+    let Some(mut index) = skip_splash_trivia(source, reference.end_byte) else {
+        return true;
+    };
+
+    loop {
+        if is_assignment_operator_at(bytes, index) {
+            return true;
+        }
+        if bytes.get(index) != Some(&b'.') {
+            return matches!(bytes.get(index), Some(b'[' | b'('));
+        }
+
+        index += 1;
+        let Some(next) = skip_splash_trivia(source, index) else {
+            return true;
+        };
+        if !bytes
+            .get(next)
+            .is_some_and(|byte| is_identifier_start_byte(*byte))
+        {
+            return true;
+        }
+        index = next + 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        let Some(next) = skip_splash_trivia(source, index) else {
+            return true;
+        };
+        index = next;
+    }
+}
+
+fn skip_splash_trivia(source: &str, mut index: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    loop {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'/') {
+            return Some(index);
+        }
+        match bytes.get(index + 1) {
+            Some(b'/') => {
+                index += 2;
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            Some(b'*') => {
+                index += 2;
+                while !(bytes.get(index) == Some(&b'*') && bytes.get(index + 1) == Some(&b'/')) {
+                    if index == bytes.len() {
+                        return None;
+                    }
+                    index = advance_utf8_character(source, index);
+                }
+                index += 2;
+            }
+            _ => return Some(index),
+        }
+    }
+}
+
+fn is_assignment_operator_at(bytes: &[u8], index: usize) -> bool {
+    match bytes.get(index) {
+        Some(b'=') => bytes.get(index + 1) != Some(&b'='),
+        Some(b'+' | b'-' | b'*' | b'/' | b'%') => bytes.get(index + 1) == Some(&b'='),
+        _ => false,
+    }
+}
+
+fn static_record_field_for_member<'field>(
+    source: &str,
+    symbols: &[LexicalSymbol],
+    valid_prefix_end_byte: usize,
+    shapes: &'field StaticRecordShapeReport,
+    site: MemberCompletionSite,
+) -> Option<&'field StaticRecordField> {
+    if site.member.end_byte > valid_prefix_end_byte
+        || site.member.end_byte > shapes.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let member_name = source.get(site.member.start_byte..site.member.end_byte)?;
+    let shape = visible_static_record_shape(
+        source,
+        symbols,
+        valid_prefix_end_byte,
+        shapes,
+        site.receiver,
+    )?;
+    shape.fields.iter().find(|field| field.name == member_name)
 }
 
 fn is_builtin_tool_module_import(import: &ModuleImport) -> bool {
@@ -2873,6 +3142,153 @@ mod tests {
     }
 
     #[test]
+    fn completes_and_navigates_direct_static_record_fields() {
+        let source = "let profile = {name: \"Ada\", active: true}\nprofile.name";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let member_start = source.rfind("name").unwrap();
+        let completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, member_start + "name".len()),
+            )
+            .expect("static record completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "name"]
+        );
+        assert!(completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::FIELD)
+                && item.detail.as_deref() == Some("static record field; direct literal only")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if *range == Range::new(
+                            position_at_byte(source, member_start),
+                            position_at_byte(source, member_start + "name".len()),
+                        )
+                )
+        }));
+
+        let field_definition = source.find("name:").unwrap();
+        let definition = server
+            .definition(&test_uri(), position_at_byte(source, member_start + 1))
+            .expect("static record definition succeeds")
+            .expect("known static field has a definition");
+        assert_eq!(
+            definition.range,
+            Range::new(
+                position_at_byte(source, field_definition),
+                position_at_byte(source, field_definition + "name".len()),
+            )
+        );
+
+        let hover = server
+            .hover(&test_uri(), position_at_byte(source, member_start + 1))
+            .expect("static record hover succeeds")
+            .expect("known static field has hover information");
+        assert_eq!(
+            hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "**static record field** `name`".to_owned(),
+            })
+        );
+        assert_eq!(
+            hover.range,
+            Some(Range::new(
+                position_at_byte(source, member_start),
+                position_at_byte(source, member_start + "name".len()),
+            ))
+        );
+
+        let alias_source = "let profile = {name: \"Ada\"}\nlet alias = profile\nalias.name";
+        let mut alias_server = SplashLanguageServer::default();
+        alias_server.open_document(document(1, alias_source));
+        assert!(alias_server
+            .completion(
+                &test_uri(),
+                position_at_byte(alias_source, alias_source.len())
+            )
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(alias_server
+            .definition(
+                &test_uri(),
+                position_at_byte(alias_source, alias_source.rfind("name").unwrap()),
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn suppresses_static_record_fields_after_a_mutation_but_not_a_read() {
+        let read_source =
+            "let profile = {name: \"Ada\"}\nlet label = profile.name == \"Ada\"\nprofile.";
+        let mut read_server = SplashLanguageServer::default();
+        read_server.open_document(document(1, read_source));
+        assert_eq!(
+            read_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(read_source, read_source.len())
+                )
+                .unwrap()
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["name"]
+        );
+
+        for source in [
+            "let profile = {name: \"Ada\"}\nprofile = {active: true}\nprofile.",
+            "let profile = {name: \"Ada\"}\nprofile /* write */ = {active: true}\nprofile.",
+            "let profile = {name: \"Ada\"}\nprofile.name = \"Grace\"\nprofile.",
+            "let profile = {name: \"Ada\"}\nprofile[\"name\"]\nprofile.",
+            "let profile = {name: \"Ada\"}\nprofile.refresh()\nprofile.",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .unwrap();
+            assert!(
+                completion.items.is_empty(),
+                "static record fields must be suppressed after a potentially mutating path: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_static_record_navigation_from_a_truncated_lexical_index() {
+        let mut source = String::from("let profile = {name: \"Ada\"}\n");
+        for _ in 0..MAX_LEXICAL_SYMBOL_OCCURRENCES {
+            source.push_str("profile\n");
+        }
+        source.push_str("profile.name");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let member = source.rfind("name").unwrap();
+        assert!(server
+            .definition(&test_uri(), position_at_byte(&source, member))
+            .unwrap()
+            .is_none());
+        assert!(server
+            .hover(&test_uri(), position_at_byte(&source, member))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn completes_bounded_catalog_names_for_direct_visible_tool_calls() {
         let catalog = tool_catalog(serde_json::json!([
             {
@@ -3436,7 +3852,7 @@ mod tests {
             );
         }
 
-        let shadowed_source = "use mod.std\nlet std = {log: 1}\nstd.";
+        let shadowed_source = "use mod.std\nlet std = 1\nstd.";
         let mut shadowed_server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
             catalog,
@@ -3463,7 +3879,7 @@ mod tests {
     fn refuses_module_member_completion_for_shadowed_or_non_direct_bindings() {
         for source in [
             "use mod.custom.tool\nlet output = tool.",
-            "use mod.tool\nlet tool = {call: 1}\ntool.",
+            "use mod.tool\nlet tool = 1\ntool.",
             "use mod.tool\nlet object = {tool: tool}\nobject.tool.",
             "use mod.tool\n@\ntool.",
         ] {
@@ -3532,6 +3948,53 @@ mod tests {
             )
             .unwrap();
         assert!(replacement_completion.items.is_empty());
+    }
+
+    #[test]
+    fn invalidates_cached_static_record_shapes_on_a_full_document_change() {
+        let initial = "let profile = {name: \"Ada\"}\nprofile.";
+        let replacement = "let profile = {active: true}\nprofile.";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, initial));
+
+        let initial_completion = server
+            .completion(&test_uri(), position_at_byte(initial, initial.len()))
+            .expect("the initial static record shape is cached");
+        assert_eq!(
+            initial_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["name"]
+        );
+
+        let diagnostics = server
+            .change_document(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(test_uri(), 2),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: replacement.to_owned(),
+                }],
+            })
+            .expect("a newer full document replaces the cached static record shape");
+        assert!(!diagnostics.diagnostics.is_empty());
+
+        let replacement_completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(replacement, replacement.len()),
+            )
+            .expect("the replacement static record shape is fresh");
+        assert_eq!(
+            replacement_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["active"]
+        );
     }
 
     #[test]

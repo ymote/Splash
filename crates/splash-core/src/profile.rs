@@ -4,13 +4,14 @@
 //! language. This module accepts only the portable grammar documented by
 //! Splash, without producing bytecode or evaluating source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{
     LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
-    ModuleImportReport, SourceSpan, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport,
-    ToolCallKind, TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_SYNTAX_DIAGNOSTICS,
+    ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordShape, StaticRecordShapeReport,
+    SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration,
+    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
     MAX_TOOL_CALL_HINTS,
 };
 
@@ -122,6 +123,21 @@ pub(super) fn collect_module_imports(
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
     CanonicalParser::new(tokens, max_nesting).collect_module_imports(valid_prefix_end_byte)
+}
+
+/// Collects exact direct literal-record initializers after the public caller
+/// has bounded and syntax-checked the source. The parser still runs for an
+/// incomplete editor snapshot, but the collector keeps only complete shapes
+/// ending before the supplied safe-prefix boundary.
+pub(super) fn collect_static_record_shapes(
+    source: &str,
+    max_tokens: usize,
+    max_nesting: usize,
+    valid_prefix_end_byte: usize,
+) -> StaticRecordShapeReport {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    CanonicalParser::new(tokens, max_nesting).collect_static_record_shapes(valid_prefix_end_byte)
 }
 
 /// Extracts direct `mod.tool` call syntax after the public caller has already
@@ -256,6 +272,55 @@ impl ModuleImportCollector {
     fn finish(self) -> ModuleImportReport {
         ModuleImportReport {
             imports: self.imports,
+            truncated: self.truncated,
+            valid_prefix_end_byte: self.valid_prefix_end_byte,
+        }
+    }
+}
+
+struct StaticRecordShapeCollector {
+    shapes: Vec<StaticRecordShape>,
+    retained_fields: usize,
+    truncated: bool,
+    valid_prefix_end_byte: usize,
+}
+
+struct DirectRecordShape {
+    fields: Vec<StaticRecordField>,
+    end_byte: usize,
+}
+
+impl StaticRecordShapeCollector {
+    fn new(valid_prefix_end_byte: usize) -> Self {
+        Self {
+            shapes: Vec::new(),
+            retained_fields: 0,
+            truncated: false,
+            valid_prefix_end_byte,
+        }
+    }
+
+    fn record(&mut self, binding: SourceSpan, shape: DirectRecordShape) {
+        if shape.end_byte > self.valid_prefix_end_byte {
+            return;
+        }
+        if self.shapes.len() == MAX_STATIC_RECORD_SHAPES
+            || self.retained_fields.saturating_add(shape.fields.len()) > MAX_STATIC_RECORD_FIELDS
+        {
+            self.truncated = true;
+            return;
+        }
+
+        self.retained_fields += shape.fields.len();
+        self.shapes.push(StaticRecordShape {
+            binding,
+            fields: shape.fields,
+        });
+    }
+
+    fn finish(self) -> StaticRecordShapeReport {
+        StaticRecordShapeReport {
+            shapes: self.shapes,
             truncated: self.truncated,
             valid_prefix_end_byte: self.valid_prefix_end_byte,
         }
@@ -1400,6 +1465,102 @@ fn is_control_keyword(token: &TokenKind) -> bool {
     matches!(token, TokenKind::Identifier(identifier) if matches!(identifier.as_str(), "if" | "elif" | "while"))
 }
 
+fn direct_record_shape_from_tokens(
+    tokens: &[Token],
+    opening_index: usize,
+) -> Option<DirectRecordShape> {
+    if !matches!(&tokens.get(opening_index)?.kind, TokenKind::OpenCurly) {
+        return None;
+    }
+
+    let (fields, closing_index) = direct_record_fields(tokens, opening_index)?;
+    if !matches!(
+        &tokens.get(closing_index + 1)?.kind,
+        TokenKind::Newline | TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::End
+    ) {
+        return None;
+    }
+
+    Some(DirectRecordShape {
+        fields,
+        end_byte: tokens.get(closing_index)?.end_byte,
+    })
+}
+
+fn direct_record_fields(
+    tokens: &[Token],
+    opening_index: usize,
+) -> Option<(Vec<StaticRecordField>, usize)> {
+    let mut fields = Vec::new();
+    let mut field_names = HashSet::<&str>::new();
+    let mut index = opening_index.checked_add(1)?;
+
+    loop {
+        while matches!(&tokens.get(index)?.kind, TokenKind::Newline) {
+            index += 1;
+        }
+        if matches!(&tokens.get(index)?.kind, TokenKind::CloseCurly) {
+            return Some((fields, index));
+        }
+
+        let field = tokens.get(index)?;
+        let TokenKind::Identifier(name) = &field.kind else {
+            return None;
+        };
+        if is_reserved_identifier(name) {
+            return None;
+        }
+        index += 1;
+        if !matches!(&tokens.get(index)?.kind, TokenKind::Operator(operator) if operator == ":") {
+            return None;
+        }
+        index += 1;
+        if matches!(
+            &tokens.get(index)?.kind,
+            TokenKind::Newline | TokenKind::Comma | TokenKind::CloseCurly | TokenKind::End
+        ) {
+            return None;
+        }
+
+        if field_names.insert(name.as_str()) {
+            fields.push(StaticRecordField {
+                name: name.clone(),
+                definition: SourceSpan {
+                    start_byte: field.start_byte,
+                    end_byte: field.end_byte,
+                },
+            });
+        }
+
+        let mut round_depth = 0_usize;
+        let mut square_depth = 0_usize;
+        let mut curly_depth = 0_usize;
+        loop {
+            let token = tokens.get(index)?;
+            match &token.kind {
+                TokenKind::OpenRound => round_depth += 1,
+                TokenKind::OpenSquare => square_depth += 1,
+                TokenKind::OpenCurly => curly_depth += 1,
+                TokenKind::CloseRound if round_depth == 0 => return None,
+                TokenKind::CloseRound => round_depth -= 1,
+                TokenKind::CloseSquare if square_depth == 0 => return None,
+                TokenKind::CloseSquare => square_depth -= 1,
+                TokenKind::CloseCurly if curly_depth > 0 => curly_depth -= 1,
+                TokenKind::CloseCurly => return Some((fields, index)),
+                TokenKind::Comma | TokenKind::Newline
+                    if round_depth == 0 && square_depth == 0 && curly_depth == 0 =>
+                {
+                    index += 1;
+                    break;
+                }
+                TokenKind::End => return None,
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+}
+
 struct CanonicalParser {
     tokens: Vec<Token>,
     index: usize,
@@ -1409,6 +1570,7 @@ struct CanonicalParser {
     diagnostics_truncated: bool,
     symbols: Option<SymbolCollector>,
     imports: Option<ModuleImportCollector>,
+    static_record_shapes: Option<StaticRecordShapeCollector>,
 }
 
 impl CanonicalParser {
@@ -1422,6 +1584,7 @@ impl CanonicalParser {
             diagnostics_truncated: false,
             symbols: None,
             imports: None,
+            static_record_shapes: None,
         }
     }
 
@@ -1448,6 +1611,18 @@ impl CanonicalParser {
         self.imports
             .take()
             .expect("module import collection was enabled")
+            .finish()
+    }
+
+    fn collect_static_record_shapes(
+        mut self,
+        valid_prefix_end_byte: usize,
+    ) -> StaticRecordShapeReport {
+        self.static_record_shapes = Some(StaticRecordShapeCollector::new(valid_prefix_end_byte));
+        self.parse_program();
+        self.static_record_shapes
+            .take()
+            .expect("static record-shape collection was enabled")
             .finish()
     }
 
@@ -1563,14 +1738,26 @@ impl CanonicalParser {
 
     fn parse_declaration(&mut self) {
         let binding = self.take_plain_identifier("expected an identifier after `let`");
-        if self.take_operator("=") {
+        let direct_record_shape = if self.take_operator("=") {
+            let shape = self.direct_record_shape();
             self.parse_expression();
+            shape
         } else if !self.at_statement_boundary() {
             self.report_current("expected `=` or a statement end after a `let` declaration");
-        }
+            None
+        } else {
+            None
+        };
         if let Some(binding) = binding {
+            if let Some(shape) = direct_record_shape {
+                self.record_static_record_shape(binding, shape);
+            }
             self.define_symbol(binding, LexicalSymbolKind::Let);
         }
+    }
+
+    fn direct_record_shape(&self) -> Option<DirectRecordShape> {
+        direct_record_shape_from_tokens(&self.tokens, self.index)
     }
 
     fn parse_function_declaration(&mut self) {
@@ -2124,6 +2311,15 @@ impl CanonicalParser {
     fn record_import(&mut self, path: Vec<String>, path_span: SourceSpan, binding: SourceSpan) {
         if let Some(imports) = &mut self.imports {
             imports.record(path, path_span, binding);
+        }
+    }
+
+    fn record_static_record_shape(&mut self, binding: usize, shape: DirectRecordShape) {
+        let Some((_, binding_span)) = self.symbol_token(binding) else {
+            return;
+        };
+        if let Some(shapes) = &mut self.static_record_shapes {
+            shapes.record(binding_span, shape);
         }
     }
 

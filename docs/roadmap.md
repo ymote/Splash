@@ -25,6 +25,11 @@
   interface projection can complete direct `use mod.*` path segments and
   immediate children of a direct visible imported-module binding without module
   loading, resolution, runtime export inspection, or authority inference.
+- Bounded direct literal-record field metadata for exact visible
+  `let binding = { ... }` initializers, with same-document completion, hover,
+  and definition. It is advisory and does not infer aliases, mutation, control
+  flow, imported values, function returns, or runtime types; an earlier direct
+  write or potentially mutating member, index, or call path suppresses it.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.
@@ -209,9 +214,9 @@
 
 ## Before a stable language release
 
-- Additional semantic editor features beyond lexical completion and the fixed
-  `mod.tool` surface, including general imported-module resolution and
-  type-aware field semantics.
+- Additional semantic editor features beyond lexical completion, fixed
+  `mod.tool`, and direct literal-record fields, including general
+  imported-module resolution and broader type-aware field semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Cross-stream event retention/aggregation and product-specific compensation

@@ -304,7 +304,7 @@ only top-level `fn` and `let` declarations after canonical syntax succeeds. The
 other semantic requests use a grammar-aware same-document lexical index for the
 final binding introduced by `use`, named functions, `let`, function and lambda
 parameters, and `for` bindings already introduced in a visible runtime scope.
-Hover reports only that lexical binding kind, and highlights use the neutral
+Lexical hover reports only that binding kind, and highlights use the neutral
 text kind rather than claiming read/write analysis. The index is bounded to
 4,096 retained definition/reference occurrences. Retained definition and hover
 results remain sound after truncation, but exhaustive reference, highlight, and
@@ -322,6 +322,18 @@ served after site-list truncation, but symbol-index truncation returns no
 candidates because an omitted inner definition could shadow a retained outer
 binding. In invalid source, a site is eligible only when it ends at or before
 the first syntax diagnostic.
+
+Separately, the server recognizes an exact visible direct initializer of the
+form `let binding = { ... }`. At a direct `binding.field` member site it offers
+the literal's retained field names, hovers a known field, and defines it at the
+literal key. This is bounded source metadata, not general type inference: it
+does not follow aliases, assignments, control flow, function returns, imports,
+or runtime values. It retains at most 1,024 shapes and 4,096 fields; a
+truncated shape report marks its completion incomplete and never exposes a
+partial field list for a binding. The LSP stops using a shape after an earlier
+direct write or a potentially mutating member, index, or call path. Static
+field hover and definition also fail closed when the lexical index is
+truncated, because an omitted earlier reference could be a mutation.
 
 The server separately recognizes an exact visible `use mod.tool` binding. At a
 direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
@@ -346,8 +358,10 @@ forward references, modules, fields, types, and name-coupled runtime behavior
 remain outside the claim.
 
 The lexical service does not load or resolve imported modules, infer forward
-references or types, treat record keys or member fields as variables, enumerate
-builtins, discover a host tool catalog, or grant tool authority. The optional
+references or general types, follow aliases or mutations, treat record keys or
+general member fields as variables, enumerate builtins, discover a host tool
+catalog, or grant tool authority. The direct literal-record metadata above is
+advisory and remains separate from those lexical bindings. The optional
 initialization-time catalog projection is advisory client metadata, not a
 catalog lookup. The server does not open the URI supplied by the client or run
 source; all diagnostics, edits, symbols, definitions, references, hovers,

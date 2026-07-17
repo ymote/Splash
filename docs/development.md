@@ -69,7 +69,8 @@ code, construct a capability host, resolve arbitrary imported modules, or load
 a Rust adapter. The grammar-aware lexical index covers the final binding
 introduced by `use`, named functions, `let`, function and lambda parameters,
 and `for` bindings already introduced in a visible runtime scope. It does not
-infer forward references, types, record keys, or arbitrary member fields. A
+infer forward references, general types, aliases, mutations, record keys, or
+arbitrary member fields. A
 definition retained before the fixed 4,096-occurrence budget is exhausted
 remains available for definition and hover, while reference and highlight
 requests fail instead of returning a partial set from a truncated index.
@@ -89,6 +90,18 @@ Symbols and sites have independent 4,096-entry caps; either truncation sets
 `isIncomplete`. A retained site remains usable when only the site list is
 truncated. When symbols are truncated the server returns no candidates, because
 an omitted inner definition could shadow a retained outer binding.
+
+For an exact visible `let binding = { ... }` initializer, the server separately
+retains a bounded static record shape. At a direct `binding.field` site it can
+complete the literal's field names, hover a known field, and navigate to that
+field key. This is source-only advisory metadata, not runtime type inference:
+it does not follow aliases, assignments, function returns, imported values, or
+runtime data. The LSP stops using a shape after an earlier direct write or a
+potentially mutating member, index, or call path. The report retains at most
+1,024 shapes and 4,096 fields; a truncated shape report marks a retained member
+completion `isIncomplete` rather than returning a partial field list for a
+binding. Static field hover and definition also fail closed when the lexical
+index is truncated, because an omitted earlier reference could be a mutation.
 
 The server separately recognizes a complete, lexically visible `use mod.tool`
 binding before the safe syntax boundary. At a direct `tool.` member site it
@@ -221,7 +234,9 @@ prefix boundaries, independent symbol/site caps, and truncation signals. The
 same invalid-source coverage validates bounded source-only import reports:
 every retained `mod.<path>` spelling and final binding span is ordered,
 UTF-8-safe, within the safe prefix, and structurally consistent; truncation is
-explicit at the fixed import cap.
+explicit at the fixed import cap. It also validates direct literal-record shape
+spans, unique field names, safe-prefix boundaries, and the separate shape and
+aggregate-field caps.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 4,096 instruction cap, one-instruction deadline sampling, and a 32 ms

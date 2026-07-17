@@ -4,10 +4,11 @@ use libfuzzer_sys::fuzz_target;
 use splash_core::{
     check_syntax_named, check_vm_compatibility_named, format_source_named, fuzzing,
     is_canonical_identifier, lexical_completion_report_named, lexical_symbol_report_named,
-    module_import_report_named, tool_call_hint_report_named, top_level_declarations_named,
-    ExecutionLimits, LexicalCompletionReport, LexicalSymbol, ModuleImportReport, RuntimeError,
-    ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_SYNTAX_DIAGNOSTICS,
+    module_import_report_named, static_record_shape_report_named, tool_call_hint_report_named,
+    top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
+    ModuleImportReport, RuntimeError, StaticRecordShapeReport, ToolCallHint, TopLevelDeclaration,
+    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
     MAX_TOOL_CALL_HINTS,
 };
 
@@ -38,6 +39,10 @@ fuzz_target!(|data: &[u8]| {
     let import_report = module_import_report_named("fuzz.splash", source, limits)
         .expect("the fuzz limits are always valid for bounded import metadata");
     assert_module_import_invariants(source, &import_report);
+    let static_record_shape_report =
+        static_record_shape_report_named("fuzz.splash", source, limits)
+            .expect("the fuzz limits are always valid for bounded static record metadata");
+    assert_static_record_shape_invariants(source, &static_record_shape_report);
 
     if profile.valid {
         assert!(
@@ -83,6 +88,10 @@ fuzz_target!(|data: &[u8]| {
         );
         assert_eq!(completion_report.valid_prefix_end_byte, source.len());
         assert_eq!(import_report.valid_prefix_end_byte, source.len());
+        assert_eq!(
+            static_record_shape_report.valid_prefix_end_byte,
+            source.len()
+        );
 
         match format_source_named("fuzz.splash", source, limits) {
             Ok(formatted) => {
@@ -230,9 +239,7 @@ fn assert_module_import_invariants(source: &str, report: &ModuleImportReport) {
             );
         }
         assert_eq!(
-            normalized_import_path(
-                &source[import.path_span.start_byte..import.path_span.end_byte]
-            ),
+            normalized_import_path(&source[import.path_span.start_byte..import.path_span.end_byte]),
             import.path.join("."),
             "import path span does not normalize to its segments: {import:?}"
         );
@@ -282,6 +289,65 @@ fn normalized_import_path(source: &str) -> String {
     }
 
     normalized
+}
+
+fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShapeReport) {
+    assert!(report.shapes.len() <= MAX_STATIC_RECORD_SHAPES);
+    assert!(report.valid_prefix_end_byte <= source.len());
+    assert!(source.is_char_boundary(report.valid_prefix_end_byte));
+
+    let mut retained_fields = 0_usize;
+    let mut previous_binding_start = 0_usize;
+    for shape in &report.shapes {
+        assert!(
+            previous_binding_start <= shape.binding.start_byte
+                && shape.binding.start_byte < shape.binding.end_byte
+                && shape.binding.end_byte <= report.valid_prefix_end_byte,
+            "static record binding span is unordered or exceeds the safe prefix: {shape:?}"
+        );
+        assert!(
+            source.is_char_boundary(shape.binding.start_byte)
+                && source.is_char_boundary(shape.binding.end_byte),
+            "static record binding span is not a UTF-8 boundary: {shape:?}"
+        );
+        assert!(
+            is_canonical_identifier(&source[shape.binding.start_byte..shape.binding.end_byte]),
+            "static record binding is not a canonical identifier: {shape:?}"
+        );
+
+        let mut previous_field_start = shape.binding.end_byte;
+        let mut field_names = std::collections::BTreeSet::new();
+        for field in &shape.fields {
+            assert!(
+                previous_field_start <= field.definition.start_byte
+                    && field.definition.start_byte < field.definition.end_byte
+                    && field.definition.end_byte <= report.valid_prefix_end_byte,
+                "static record field span is unordered or exceeds the safe prefix: {shape:?}"
+            );
+            assert!(
+                source.is_char_boundary(field.definition.start_byte)
+                    && source.is_char_boundary(field.definition.end_byte),
+                "static record field span is not a UTF-8 boundary: {shape:?}"
+            );
+            assert_eq!(
+                &source[field.definition.start_byte..field.definition.end_byte],
+                field.name,
+                "static record field span does not match its name: {shape:?}"
+            );
+            assert!(
+                is_canonical_identifier(&field.name),
+                "static record field is not a canonical identifier: {shape:?}"
+            );
+            assert!(
+                field_names.insert(field.name.as_str()),
+                "static record fields are not deduplicated: {shape:?}"
+            );
+            previous_field_start = field.definition.end_byte;
+            retained_fields += 1;
+        }
+        previous_binding_start = shape.binding.start_byte;
+    }
+    assert!(retained_fields <= MAX_STATIC_RECORD_FIELDS);
 }
 
 fn assert_tool_call_hint_invariants(source: &str, hints: &[ToolCallHint]) {

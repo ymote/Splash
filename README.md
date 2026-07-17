@@ -18,7 +18,8 @@ and keeps UI support optional rather than making UI the language boundary.
   member suggestions for an exact visible `use mod.tool` binding, an optional
   bounded advisory tool-catalog projection for direct tool-name literals, and
   an optional static module-interface projection for direct import paths and
-  imported-module members.
+  imported-module members, plus bounded direct-literal record-field completion,
+  hover, and definition without runtime type inference.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -421,9 +422,15 @@ catalog file, or derives a grant from this metadata. The projection is bounded
 to 128 entries, 512 KiB of retained names and descriptions, 128-byte names,
 and 4 KiB descriptions; malformed, duplicate, or oversized input is discarded
 as a whole and marks that completion result incomplete. The lexical service
-otherwise remains conservative: it does not infer forward references, types,
-record keys, arbitrary member fields, builtins, arbitrary catalog data, or
-runtime-derived imported-module exports.
+also recognizes an exact visible direct `let binding = { ... }` initializer:
+at `binding.field` it offers the literal field names and supports hover and
+definition to the field key. That metadata has 1,024-shape and 4,096-field
+bounds and never follows aliases, assignments, function returns, imported
+values, or runtime data. The LSP suppresses the shape after an earlier direct
+write or potentially mutating member, index, or call path. It otherwise remains
+conservative: it does not infer
+forward references, general types, arbitrary record fields, builtins, arbitrary
+catalog data, or runtime-derived imported-module exports.
 
 An editor may also supply a separate static advisory module-interface
 projection through `initializationOptions.splash.moduleCatalog`. It completes

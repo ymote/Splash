@@ -16,9 +16,9 @@ use std::time::Duration;
 pub use makepad_script as vm;
 use profile::{
     check_canonical_profile, collect_lexical_completions, collect_lexical_symbols,
-    collect_module_imports, collect_tool_call_hints, collect_top_level_declarations,
-    format_canonical_source, is_canonical_identifier as profile_is_canonical_identifier,
-    ProfileFormatError,
+    collect_module_imports, collect_static_record_shapes, collect_tool_call_hints,
+    collect_top_level_declarations, format_canonical_source,
+    is_canonical_identifier as profile_is_canonical_identifier, ProfileFormatError,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -80,6 +80,17 @@ pub const MAX_LEXICAL_SYMBOL_OCCURRENCES: usize = 4_096;
 /// This is independent of the resolved definition/reference occurrence bound:
 /// unresolved identifier prefixes remain useful completion sites.
 pub const MAX_LEXICAL_COMPLETION_SITES: usize = 4_096;
+/// Maximum direct literal-record bindings retained for one source snapshot.
+///
+/// This is independent of lexical symbol and completion-site bounds. It keeps
+/// static editor metadata bounded even for generated documents with many
+/// records.
+pub const MAX_STATIC_RECORD_SHAPES: usize = 1_024;
+/// Maximum direct literal-record fields retained across one source snapshot.
+///
+/// When this aggregate cap is reached, later complete record shapes are
+/// omitted instead of returning a partial field list for a binding.
+pub const MAX_STATIC_RECORD_FIELDS: usize = 4_096;
 
 /// Bounds applied to one source evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,6 +379,43 @@ pub struct ModuleImport {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModuleImportReport {
     pub imports: Vec<ModuleImport>,
+    pub truncated: bool,
+    pub valid_prefix_end_byte: usize,
+}
+
+/// One field declared directly by a statically recognized record literal.
+///
+/// This is advisory editor metadata only. It does not establish a runtime
+/// field type, evaluate its value, or prove that a later mutation preserves
+/// the field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaticRecordField {
+    pub name: String,
+    pub definition: SourceSpan,
+}
+
+/// One direct `let name = { ... }` literal-record shape.
+///
+/// `binding` is the exact declaration identifier span. Shapes are collected
+/// only for a whole direct literal initializer, never aliases, expressions,
+/// function returns, imported values, or runtime results.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaticRecordShape {
+    pub binding: SourceSpan,
+    pub fields: Vec<StaticRecordField>,
+}
+
+/// Bounded static literal-record metadata for one source snapshot.
+///
+/// The report is intentionally not general type inference. It retains only
+/// completed direct record literals ending at or before
+/// `valid_prefix_end_byte`, allowing editor features to remain useful before a
+/// trailing syntax diagnostic without assigning meaning to later recovery
+/// tokens. `truncated` means one or more complete shapes were omitted at the
+/// fixed shape or aggregate-field bound.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StaticRecordShapeReport {
+    pub shapes: Vec<StaticRecordShape>,
     pub truncated: bool,
     pub valid_prefix_end_byte: usize,
 }
@@ -669,6 +717,19 @@ impl<H: Any, S: Any> Runtime<H, S> {
         module_import_report_named("inline.splash", source, self.limits)
     }
 
+    /// Builds bounded direct literal-record metadata without evaluating bytecode,
+    /// resolving imports, or entering any host binding.
+    ///
+    /// This is advisory editor metadata only. It reports exact direct
+    /// `let binding = { ... }` initializers and never infers aliases, mutation,
+    /// types, or runtime values.
+    pub fn static_record_shape_report(
+        &self,
+        source: &str,
+    ) -> Result<StaticRecordShapeReport, RuntimeError> {
+        static_record_shape_report_named("inline.splash", source, self.limits)
+    }
+
     /// Builds a bounded lexical symbol index without evaluating bytecode or
     /// entering any host binding.
     pub fn lexical_symbol_report(&self, source: &str) -> Result<LexicalSymbolReport, RuntimeError> {
@@ -840,6 +901,17 @@ pub fn lexical_completion_report(source: &str) -> Result<LexicalCompletionReport
 /// capability, or Rust adapter exists.
 pub fn module_import_report(source: &str) -> Result<ModuleImportReport, RuntimeError> {
     module_import_report_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Builds bounded advisory shapes for direct literal-record bindings without
+/// evaluating source, resolving imports, or creating a capability host.
+///
+/// Only a complete `let name = { ... }` initializer is retained. This is not
+/// general type inference and never follows aliases, assignments, function
+/// returns, imported values, or runtime data. For invalid source, only shapes
+/// ending before the first syntax diagnostic are retained.
+pub fn static_record_shape_report(source: &str) -> Result<StaticRecordShapeReport, RuntimeError> {
+    static_record_shape_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Lists direct source-level `mod.tool` call hints in valid canonical Splash
@@ -1162,6 +1234,30 @@ pub fn module_import_report_named(
     let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
 
     Ok(collect_module_imports(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+        valid_prefix_end_byte,
+    ))
+}
+
+/// Builds bounded static metadata for complete direct literal-record bindings
+/// in named canonical source without evaluating it, resolving document URIs,
+/// or loading an import.
+///
+/// A retained shape proves only that the source directly initialized that
+/// binding with a record literal before `valid_prefix_end_byte`. It does not
+/// infer an alias, field value type, mutation, function return, or runtime
+/// value, and cannot authorize an effect or module access.
+pub fn static_record_shape_report_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<StaticRecordShapeReport, RuntimeError> {
+    let syntax = check_syntax_named(file, source, limits)?;
+    let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
+
+    Ok(collect_static_record_shapes(
         source,
         limits.max_syntax_tokens,
         limits.max_syntax_nesting,
@@ -2798,6 +2894,86 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
             &source[import.binding.start_byte..import.binding.end_byte],
             "worker"
         );
+    }
+
+    #[test]
+    fn static_record_shapes_retain_only_direct_literal_initializers() {
+        let source = "let settings = {\n\
+                      title: \"Splash\",\n\
+                      nested: {enabled: true},\n\
+                      items: [1, 2]\n\
+                      }\n\
+                      let alias = settings\n\
+                      let selected = {value: 1}.value\n\
+                      settings.";
+        let report = static_record_shape_report(source).expect("source is within default limits");
+
+        assert_eq!(report.valid_prefix_end_byte, source.len());
+        assert!(!report.truncated);
+        assert_eq!(report.shapes.len(), 1);
+        let shape = &report.shapes[0];
+        assert_eq!(
+            &source[shape.binding.start_byte..shape.binding.end_byte],
+            "settings"
+        );
+        assert_eq!(
+            shape
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["title", "nested", "items"]
+        );
+        for field in &shape.fields {
+            assert_eq!(
+                &source[field.definition.start_byte..field.definition.end_byte],
+                field.name
+            );
+        }
+
+        let runtime = Runtime::default();
+        assert_eq!(runtime.static_record_shape_report(source).unwrap(), report);
+    }
+
+    #[test]
+    fn static_record_shapes_stop_before_a_syntax_diagnostic_and_signal_bounds() {
+        let invalid = "let before = {value: 1}\n@\nlet after = {value: 2}";
+        let invalid_report = static_record_shape_report(invalid).unwrap();
+        assert_eq!(
+            invalid_report.valid_prefix_end_byte,
+            invalid.find('@').unwrap()
+        );
+        assert_eq!(invalid_report.shapes.len(), 1);
+        assert_eq!(
+            &invalid[invalid_report.shapes[0].binding.start_byte
+                ..invalid_report.shapes[0].binding.end_byte],
+            "before"
+        );
+
+        let mut bounded = String::new();
+        for index in 0..=MAX_STATIC_RECORD_SHAPES {
+            bounded.push_str(&format!("let record_{index} = {{field: {index}}}\n"));
+        }
+        let bounded_report = static_record_shape_report(&bounded).unwrap();
+        assert_eq!(bounded_report.shapes.len(), MAX_STATIC_RECORD_SHAPES);
+        assert!(bounded_report.truncated);
+        assert_eq!(bounded_report.shapes[0].fields.len(), 1);
+        assert_eq!(
+            bounded_report.shapes.last().unwrap().fields[0].name,
+            "field"
+        );
+
+        let mut too_many_fields = String::from("let oversized = {");
+        for index in 0..=MAX_STATIC_RECORD_FIELDS {
+            if index > 0 {
+                too_many_fields.push_str(", ");
+            }
+            too_many_fields.push_str(&format!("field_{index}: {index}"));
+        }
+        too_many_fields.push('}');
+        let field_bounded_report = static_record_shape_report(&too_many_fields).unwrap();
+        assert!(field_bounded_report.shapes.is_empty());
+        assert!(field_bounded_report.truncated);
     }
 
     #[test]

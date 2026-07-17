@@ -1,0 +1,6 @@
+let profile = {
+    name: "Ada",
+    active: true,
+    nested: {level: 1}
+}
+profile.name
