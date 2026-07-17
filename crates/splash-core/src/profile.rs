@@ -8,10 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
-    ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordShape, StaticRecordShapeReport,
-    SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind, TopLevelDeclaration,
-    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
-    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
+    ModuleImportReport, SourceSpan, StaticRecordAlias, StaticRecordField, StaticRecordShape,
+    StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind,
+    TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES,
+    MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
     MAX_TOOL_CALL_HINTS,
 };
 
@@ -170,10 +171,10 @@ pub(super) fn collect_module_imports(
     CanonicalParser::new(tokens, max_nesting).collect_module_imports(valid_prefix_end_byte)
 }
 
-/// Collects exact direct literal-record initializers after the public caller
-/// has bounded and syntax-checked the source. The parser still runs for an
-/// incomplete editor snapshot, but the collector keeps only complete shapes
-/// ending before the supplied safe-prefix boundary.
+/// Collects exact direct literal-record initializers and direct alias edges
+/// after the public caller has bounded and syntax-checked the source. The
+/// parser still runs for an incomplete editor snapshot, but the collector keeps
+/// only complete metadata ending before the supplied safe-prefix boundary.
 pub(super) fn collect_static_record_shapes(
     source: &str,
     max_tokens: usize,
@@ -325,8 +326,10 @@ impl ModuleImportCollector {
 
 struct StaticRecordShapeCollector {
     shapes: Vec<StaticRecordShape>,
+    aliases: Vec<StaticRecordAlias>,
     retained_fields: usize,
     truncated: bool,
+    aliases_truncated: bool,
     valid_prefix_end_byte: usize,
 }
 
@@ -335,12 +338,19 @@ struct DirectRecordShape {
     end_byte: usize,
 }
 
+struct DirectRecordAlias {
+    target: SourceSpan,
+    end_byte: usize,
+}
+
 impl StaticRecordShapeCollector {
     fn new(valid_prefix_end_byte: usize) -> Self {
         Self {
             shapes: Vec::new(),
+            aliases: Vec::new(),
             retained_fields: 0,
             truncated: false,
+            aliases_truncated: false,
             valid_prefix_end_byte,
         }
     }
@@ -363,10 +373,27 @@ impl StaticRecordShapeCollector {
         });
     }
 
+    fn record_alias(&mut self, binding: SourceSpan, alias: DirectRecordAlias) {
+        if alias.end_byte > self.valid_prefix_end_byte {
+            return;
+        }
+        if self.aliases.len() == MAX_STATIC_RECORD_ALIASES {
+            self.aliases_truncated = true;
+            return;
+        }
+
+        self.aliases.push(StaticRecordAlias {
+            binding,
+            target: alias.target,
+        });
+    }
+
     fn finish(self) -> StaticRecordShapeReport {
         StaticRecordShapeReport {
             shapes: self.shapes,
+            aliases: self.aliases,
             truncated: self.truncated,
+            aliases_truncated: self.aliases_truncated,
             valid_prefix_end_byte: self.valid_prefix_end_byte,
         }
     }
@@ -1564,6 +1591,32 @@ fn direct_record_shape_from_tokens(
     })
 }
 
+fn direct_record_alias_from_tokens(
+    tokens: &[Token],
+    target_index: usize,
+) -> Option<DirectRecordAlias> {
+    let target = tokens.get(target_index)?;
+    let TokenKind::Identifier(name) = &target.kind else {
+        return None;
+    };
+    if is_reserved_identifier(name)
+        || !matches!(
+            &tokens.get(target_index + 1)?.kind,
+            TokenKind::Newline | TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::End
+        )
+    {
+        return None;
+    }
+
+    Some(DirectRecordAlias {
+        target: SourceSpan {
+            start_byte: target.start_byte,
+            end_byte: target.end_byte,
+        },
+        end_byte: target.end_byte,
+    })
+}
+
 fn direct_record_fields(
     tokens: &[Token],
     opening_index: usize,
@@ -1858,19 +1911,23 @@ impl CanonicalParser {
 
     fn parse_declaration(&mut self) {
         let binding = self.take_plain_identifier("expected an identifier after `let`");
-        let direct_record_shape = if self.take_operator("=") {
+        let (direct_record_shape, direct_record_alias) = if self.take_operator("=") {
             let shape = self.direct_record_shape();
+            let alias = self.direct_record_alias();
             self.parse_expression();
-            shape
+            (shape, alias)
         } else if !self.at_statement_boundary() {
             self.report_current("expected `=` or a statement end after a `let` declaration");
-            None
+            (None, None)
         } else {
-            None
+            (None, None)
         };
         if let Some(binding) = binding {
             if let Some(shape) = direct_record_shape {
                 self.record_static_record_shape(binding, shape);
+            }
+            if let Some(alias) = direct_record_alias {
+                self.record_static_record_alias(binding, alias);
             }
             self.define_symbol(binding, LexicalSymbolKind::Let);
         }
@@ -1878,6 +1935,10 @@ impl CanonicalParser {
 
     fn direct_record_shape(&self) -> Option<DirectRecordShape> {
         direct_record_shape_from_tokens(&self.tokens, self.index)
+    }
+
+    fn direct_record_alias(&self) -> Option<DirectRecordAlias> {
+        direct_record_alias_from_tokens(&self.tokens, self.index)
     }
 
     fn parse_function_declaration(&mut self) {
@@ -2522,6 +2583,15 @@ impl CanonicalParser {
         };
         if let Some(shapes) = &mut self.static_record_shapes {
             shapes.record(binding_span, shape);
+        }
+    }
+
+    fn record_static_record_alias(&mut self, binding: usize, alias: DirectRecordAlias) {
+        let Some((_, binding_span)) = self.symbol_token(binding) else {
+            return;
+        };
+        if let Some(shapes) = &mut self.static_record_shapes {
+            shapes.record_alias(binding_span, alias);
         }
     }
 

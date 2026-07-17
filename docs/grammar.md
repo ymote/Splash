@@ -339,16 +339,22 @@ binding. In invalid source, a site is eligible only when it ends at or before
 the first syntax diagnostic.
 
 Separately, the server recognizes an exact visible direct initializer of the
-form `let binding = { ... }`. At a direct `binding.field` member site it offers
-the literal's retained field names, hovers a known field, and defines it at the
-literal key. This is bounded source metadata, not general type inference: it
-does not follow aliases, assignments, control flow, function returns, imports,
-or runtime values. It retains at most 1,024 shapes and 4,096 fields; a
-truncated shape report marks its completion incomplete and never exposes a
-partial field list for a binding. The LSP stops using a shape after an earlier
-direct write or a potentially mutating member, index, or call path. Static
-field hover and definition also fail closed when the lexical index is
-truncated, because an omitted earlier reference could be a mutation.
+form `let binding = { ... }` and exact `let alias = binding` source edges. At a
+direct `binding.field` member site, including a lexical direct-alias chain of
+at most 16 hops, it offers the literal's retained field names, hovers a known
+field, and defines it at the literal key. Alias targets resolve at their source
+position, preserving lexical shadowing. This is bounded source metadata, not
+general type inference: it does not follow parenthesized or computed aliases,
+assignments, control flow, function returns, imports, or runtime values. It
+retains at most 1,024 shapes, 4,096 fields, and 1,024 alias edges. A truncated
+shape report marks its completion incomplete and never exposes a partial field
+list for a binding. A truncated alias report returns no static field items,
+marks completion incomplete, and disables static field hover and definition.
+The LSP stops using a shape after an earlier direct write or a potentially
+mutating member, index, call, or escape path through the root or any retained
+direct alias that resolves to it. Static field hover and definition also fail closed
+when the lexical index is truncated, because an omitted earlier reference could
+be a mutation.
 
 The server separately recognizes an exact visible `use mod.tool` binding. At a
 direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
@@ -393,10 +399,11 @@ forward references, modules, fields, types, and name-coupled runtime behavior
 remain outside the claim.
 
 The lexical service does not load or resolve imported modules, infer forward
-references or general types, follow aliases or mutations, treat record keys or
-general member fields as variables, enumerate builtins, discover a host tool
-catalog, or grant tool authority. The direct literal-record metadata above is
-advisory and remains separate from those lexical bindings. The optional
+references or general types, follow arbitrary aliases or mutations, treat
+record keys or general member fields as variables, enumerate builtins, discover
+a host tool catalog, or grant tool authority. The bounded direct literal-record
+and direct-alias metadata above is advisory and remains separate from those
+lexical bindings. The optional
 initialization-time or configuration-refresh catalog projection is advisory
 client metadata, not a catalog lookup. Tool and module keys refresh
 independently; neither affects the atomic workflow-data pair. The server does

@@ -7,7 +7,13 @@
 //! outline, and lexical symbol helpers. It never reads document URIs, evaluates
 //! Splash code, creates a capability host, or loads an adapter.
 
-use std::{cell::OnceCell, collections::HashMap, error::Error, io, process::ExitCode};
+use std::{
+    cell::OnceCell,
+    collections::{HashMap, HashSet},
+    error::Error,
+    io,
+    process::ExitCode,
+};
 
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
@@ -43,6 +49,11 @@ use splash_core::{
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
 const DIAGNOSTIC_SOURCE: &str = "splash";
+/// Maximum direct source alias hops considered for static record editor metadata.
+///
+/// This is intentionally much smaller than the independently capped alias
+/// report, so one member request has a fixed traversal bound.
+const MAX_STATIC_RECORD_ALIAS_DEPTH: usize = 16;
 /// Maximum retained metadata entries in the optional LSP tool-catalog projection.
 ///
 /// This intentionally matches the default host catalog count but remains local
@@ -720,7 +731,7 @@ impl SplashLanguageServer {
                         shapes,
                         shape,
                         member_site,
-                        lexical_incomplete || shapes.truncated,
+                        lexical_incomplete,
                     ));
                 }
             }
@@ -2451,11 +2462,14 @@ fn static_record_member_completion(
     site: MemberCompletionSite,
     is_incomplete: bool,
 ) -> CompletionList {
-    let is_incomplete = is_incomplete || shapes.truncated;
+    let is_incomplete = is_incomplete || shapes.truncated || shapes.aliases_truncated;
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
     };
+    if shapes.aliases_truncated {
+        return empty();
+    }
     if site.member.end_byte > lexical.valid_prefix_end_byte
         || site.member.end_byte > shapes.valid_prefix_end_byte
     {
@@ -2469,7 +2483,7 @@ fn static_record_member_completion(
         .map(|field| CompletionItem {
             label: field.name.clone(),
             kind: Some(CompletionItemKind::FIELD),
-            detail: Some("static record field; direct literal only".to_owned()),
+            detail: Some("static record field; direct literal or alias".to_owned()),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                 edit_range,
                 field.name.clone(),
@@ -2941,6 +2955,99 @@ fn visible_symbol_in<'symbol>(
         .max_by_key(|symbol| (symbol.visibility_start_byte, symbol.definition.start_byte))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticRecordAliasTarget {
+    Let(usize),
+    NotStatic,
+    Uncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticRecordRoot {
+    Found(SourceSpan),
+    NotStatic,
+    Uncertain,
+}
+
+struct StaticRecordAliasIndex<'symbol> {
+    symbols_by_definition: HashMap<usize, &'symbol LexicalSymbol>,
+    alias_targets: HashMap<usize, StaticRecordAliasTarget>,
+    static_shape_bindings: HashSet<usize>,
+}
+
+impl<'symbol> StaticRecordAliasIndex<'symbol> {
+    fn new(
+        source: &str,
+        symbols: &'symbol [LexicalSymbol],
+        shapes: &StaticRecordShapeReport,
+    ) -> Self {
+        let symbols_by_definition = symbols
+            .iter()
+            .map(|symbol| (symbol.definition.start_byte, symbol))
+            .collect();
+        let static_shape_bindings = shapes
+            .shapes
+            .iter()
+            .map(|shape| shape.binding.start_byte)
+            .collect();
+        let mut alias_targets = HashMap::with_capacity(shapes.aliases.len());
+        for alias in &shapes.aliases {
+            let target = match source.get(alias.target.start_byte..alias.target.end_byte) {
+                Some(name) => match visible_symbol_in(symbols, name, alias.target.start_byte) {
+                    Some(symbol) if symbol.kind == LexicalSymbolKind::Let => {
+                        StaticRecordAliasTarget::Let(symbol.definition.start_byte)
+                    }
+                    _ => StaticRecordAliasTarget::NotStatic,
+                },
+                None => StaticRecordAliasTarget::Uncertain,
+            };
+            alias_targets.insert(alias.binding.start_byte, target);
+        }
+
+        Self {
+            symbols_by_definition,
+            alias_targets,
+            static_shape_bindings,
+        }
+    }
+
+    fn root_for(&self, initial: &'symbol LexicalSymbol) -> StaticRecordRoot {
+        if initial.kind != LexicalSymbolKind::Let {
+            return StaticRecordRoot::NotStatic;
+        }
+
+        let mut current = initial;
+        let mut visited = Vec::with_capacity(MAX_STATIC_RECORD_ALIAS_DEPTH + 1);
+        for depth in 0..=MAX_STATIC_RECORD_ALIAS_DEPTH {
+            let binding_start_byte = current.definition.start_byte;
+            if self.static_shape_bindings.contains(&binding_start_byte) {
+                return StaticRecordRoot::Found(current.definition);
+            }
+            if visited.contains(&binding_start_byte) || depth == MAX_STATIC_RECORD_ALIAS_DEPTH {
+                return StaticRecordRoot::Uncertain;
+            }
+            visited.push(binding_start_byte);
+
+            let target_start_byte = match self.alias_targets.get(&binding_start_byte).copied() {
+                Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
+                Some(StaticRecordAliasTarget::NotStatic) | None => {
+                    return StaticRecordRoot::NotStatic
+                }
+                Some(StaticRecordAliasTarget::Uncertain) => return StaticRecordRoot::Uncertain,
+            };
+            let Some(target) = self.symbols_by_definition.get(&target_start_byte).copied() else {
+                return StaticRecordRoot::Uncertain;
+            };
+            if target.kind != LexicalSymbolKind::Let {
+                return StaticRecordRoot::Uncertain;
+            }
+            current = target;
+        }
+
+        StaticRecordRoot::Uncertain
+    }
+}
+
 fn visible_static_record_shape<'shape>(
     source: &str,
     symbols: &[LexicalSymbol],
@@ -2957,13 +3064,71 @@ fn visible_static_record_shape<'shape>(
     if symbol.kind != LexicalSymbolKind::Let {
         return None;
     }
-    if !static_record_binding_is_stable_at(source, symbol, receiver.start_byte) {
+    let aliases = StaticRecordAliasIndex::new(source, symbols, shapes);
+    let StaticRecordRoot::Found(root_binding) = aliases.root_for(symbol) else {
+        return None;
+    };
+    if !shapes.aliases_truncated
+        && !static_record_alias_group_is_stable(
+            source,
+            shapes,
+            &aliases,
+            root_binding,
+            receiver.start_byte,
+        )
+    {
         return None;
     }
     shapes
         .shapes
         .iter()
-        .find(|shape| shape.binding == symbol.definition)
+        .find(|shape| shape.binding == root_binding)
+}
+
+fn static_record_alias_group_is_stable(
+    source: &str,
+    shapes: &StaticRecordShapeReport,
+    aliases: &StaticRecordAliasIndex<'_>,
+    root_binding: SourceSpan,
+    site_start_byte: usize,
+) -> bool {
+    let Some(root) = aliases
+        .symbols_by_definition
+        .get(&root_binding.start_byte)
+        .copied()
+    else {
+        return false;
+    };
+    if root.definition != root_binding
+        || !static_record_binding_is_stable_at(source, root, site_start_byte)
+    {
+        return false;
+    }
+
+    for alias in shapes
+        .aliases
+        .iter()
+        .filter(|alias| alias.binding.start_byte < site_start_byte)
+    {
+        let Some(alias_symbol) = aliases
+            .symbols_by_definition
+            .get(&alias.binding.start_byte)
+            .copied()
+        else {
+            return false;
+        };
+        match aliases.root_for(alias_symbol) {
+            StaticRecordRoot::Found(alias_root) if alias_root == root_binding => {
+                if !static_record_binding_is_stable_at(source, alias_symbol, site_start_byte) {
+                    return false;
+                }
+            }
+            StaticRecordRoot::Found(_) | StaticRecordRoot::NotStatic => {}
+            StaticRecordRoot::Uncertain => return false,
+        }
+    }
+
+    true
 }
 
 fn static_record_binding_is_stable_at(
@@ -2979,9 +3144,9 @@ fn static_record_binding_is_stable_at(
         .all(|reference| !reference_may_mutate_static_record(source, reference))
 }
 
-/// Detects writes to a binding or one of its direct member paths. Indexing and
-/// calls fail closed because this lightweight advisory feature does not model
-/// their possible mutation or escape behavior.
+/// Detects writes to a binding or one of its direct member paths. Indexing,
+/// calls, and delimiter-terminated values fail closed because this lightweight
+/// advisory feature does not model their possible mutation or escape behavior.
 fn reference_may_mutate_static_record(source: &str, reference: SourceSpan) -> bool {
     let bytes = source.as_bytes();
     let Some(mut index) = skip_splash_trivia(source, reference.end_byte) else {
@@ -2993,7 +3158,10 @@ fn reference_may_mutate_static_record(source: &str, reference: SourceSpan) -> bo
             return true;
         }
         if bytes.get(index) != Some(&b'.') {
-            return matches!(bytes.get(index), Some(b'[' | b'('));
+            return matches!(
+                bytes.get(index),
+                Some(b'[' | b'(' | b',' | b')' | b']' | b'}')
+            );
         }
 
         index += 1;
@@ -3072,7 +3240,8 @@ fn static_record_field_for_member<'field>(
     shapes: &'field StaticRecordShapeReport,
     site: MemberCompletionSite,
 ) -> Option<&'field StaticRecordField> {
-    if site.member.end_byte > valid_prefix_end_byte
+    if shapes.aliases_truncated
+        || site.member.end_byte > valid_prefix_end_byte
         || site.member.end_byte > shapes.valid_prefix_end_byte
     {
         return None;
@@ -3413,6 +3582,7 @@ mod tests {
         DidChangeConfigurationParams, FormattingOptions, TextDocumentContentChangeEvent,
         VersionedTextDocumentIdentifier,
     };
+    use splash_core::MAX_STATIC_RECORD_ALIASES;
 
     use super::*;
 
@@ -4019,7 +4189,7 @@ mod tests {
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
-                && item.detail.as_deref() == Some("static record field; direct literal only")
+                && item.detail.as_deref() == Some("static record field; direct literal or alias")
                 && matches!(
                     &item.text_edit,
                     Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
@@ -4065,21 +4235,148 @@ mod tests {
         let alias_source = "let profile = {name: \"Ada\"}\nlet alias = profile\nalias.name";
         let mut alias_server = SplashLanguageServer::default();
         alias_server.open_document(document(1, alias_source));
-        assert!(alias_server
+        let alias_completion = alias_server
             .completion(
                 &test_uri(),
-                position_at_byte(alias_source, alias_source.len())
+                position_at_byte(alias_source, alias_source.len()),
+            )
+            .unwrap();
+        assert_eq!(
+            alias_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["name"]
+        );
+        let alias_member = alias_source.rfind("name").unwrap();
+        let alias_definition = alias_server
+            .definition(
+                &test_uri(),
+                position_at_byte(alias_source, alias_member + 1),
+            )
+            .unwrap()
+            .expect("alias static record field has a definition");
+        assert_eq!(
+            alias_definition.range,
+            Range::new(
+                position_at_byte(alias_source, alias_source.find("name:").unwrap()),
+                position_at_byte(
+                    alias_source,
+                    alias_source.find("name:").unwrap() + "name".len()
+                ),
+            )
+        );
+        assert!(alias_server
+            .hover(
+                &test_uri(),
+                position_at_byte(alias_source, alias_member + 1),
+            )
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn follows_bounded_direct_static_record_alias_chains_with_lexical_shadowing() {
+        let transitive_source = "let profile = {name: \"Ada\"}\n\
+                                 let first = profile\n\
+                                 let second = first\n\
+                                 second.name";
+        let mut transitive_server = SplashLanguageServer::default();
+        transitive_server.open_document(document(1, transitive_source));
+        let transitive_completion = transitive_server
+            .completion(
+                &test_uri(),
+                position_at_byte(transitive_source, transitive_source.len()),
+            )
+            .unwrap();
+        assert_eq!(
+            transitive_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["name"]
+        );
+
+        let shadowed_source = "let profile = {outer: true}\n\
+                               fn inspect() {\n\
+                                   let profile = {inner: true}\n\
+                                   let alias = profile\n\
+                                   alias.inner\n\
+                               }";
+        let mut shadowed_server = SplashLanguageServer::default();
+        shadowed_server.open_document(document(1, shadowed_source));
+        let inner_member = shadowed_source.rfind("inner").unwrap();
+        let shadowed_completion = shadowed_server
+            .completion(
+                &test_uri(),
+                position_at_byte(shadowed_source, inner_member + "inner".len()),
+            )
+            .unwrap();
+        assert_eq!(
+            shadowed_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["inner"]
+        );
+
+        let indirect_source = "let profile = {name: \"Ada\"}\nlet alias = (profile)\nalias.name";
+        let mut indirect_server = SplashLanguageServer::default();
+        indirect_server.open_document(document(1, indirect_source));
+        assert!(indirect_server
+            .completion(
+                &test_uri(),
+                position_at_byte(indirect_source, indirect_source.len()),
             )
             .unwrap()
             .items
             .is_empty());
-        assert!(alias_server
-            .definition(
+
+        let mut depth_source = String::from("let profile = {name: \"Ada\"}\n");
+        let mut previous = "profile".to_owned();
+        for index in 0..MAX_STATIC_RECORD_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            depth_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        depth_source.push_str(&format!("{previous}.name"));
+        let mut depth_server = SplashLanguageServer::default();
+        depth_server.open_document(document(1, &depth_source));
+        assert_eq!(
+            depth_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(&depth_source, depth_source.len()),
+                )
+                .unwrap()
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["name"]
+        );
+
+        let mut too_deep_source = String::from("let profile = {name: \"Ada\"}\n");
+        let mut previous = "profile".to_owned();
+        for index in 0..=MAX_STATIC_RECORD_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            too_deep_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        too_deep_source.push_str(&format!("{previous}.name"));
+        let mut too_deep_server = SplashLanguageServer::default();
+        too_deep_server.open_document(document(1, &too_deep_source));
+        assert!(too_deep_server
+            .completion(
                 &test_uri(),
-                position_at_byte(alias_source, alias_source.rfind("name").unwrap()),
+                position_at_byte(&too_deep_source, too_deep_source.len()),
             )
             .unwrap()
-            .is_none());
+            .items
+            .is_empty());
     }
 
     #[test]
@@ -4108,6 +4405,11 @@ mod tests {
             "let profile = {name: \"Ada\"}\nprofile.name = \"Grace\"\nprofile.",
             "let profile = {name: \"Ada\"}\nprofile[\"name\"]\nprofile.",
             "let profile = {name: \"Ada\"}\nprofile.refresh()\nprofile.",
+            "let profile = {name: \"Ada\"}\nmutate(profile)\nprofile.",
+            "let profile = {name: \"Ada\"}\nlet alias = profile\nalias.name = \"Grace\"\nprofile.",
+            "let profile = {name: \"Ada\"}\nlet first = profile\nlet second = first\nsecond[\"name\"]\nprofile.",
+            "let profile = {name: \"Ada\"}\nlet alias = profile\nalias.refresh()\nprofile.",
+            "let profile = {name: \"Ada\"}\nlet alias = profile\nmutate(alias)\nprofile.",
         ] {
             let mut server = SplashLanguageServer::default();
             server.open_document(document(1, source));
@@ -4119,6 +4421,32 @@ mod tests {
                 "static record fields must be suppressed after a potentially mutating path: {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn fails_closed_when_static_record_alias_metadata_is_truncated() {
+        let mut source = String::from("let profile = {name: \"Ada\"}\n");
+        for index in 0..=MAX_STATIC_RECORD_ALIASES {
+            source.push_str(&format!("let alias_{index} = profile\n"));
+        }
+        source.push_str("profile.name");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+        let member = source.rfind("name").unwrap();
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, source.len()))
+            .unwrap();
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
+        assert!(server
+            .definition(&test_uri(), position_at_byte(&source, member + 1))
+            .unwrap()
+            .is_none());
+        assert!(server
+            .hover(&test_uri(), position_at_byte(&source, member + 1))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

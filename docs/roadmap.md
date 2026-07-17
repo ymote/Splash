@@ -37,10 +37,15 @@
   plan, or grant a capability. A complete JSON-null pair atomically clears
   terminal or unavailable metadata instead of retaining stale fields.
 - Bounded direct literal-record field metadata for exact visible
-  `let binding = { ... }` initializers, with same-document completion, hover,
-  and definition. It is advisory and does not infer aliases, mutation, control
-  flow, imported values, function returns, or runtime types; an earlier direct
-  write or potentially mutating member, index, or call path suppresses it.
+  `let binding = { ... }` initializers and lexical exact
+  `let alias = binding` chains of at most 16 hops, with same-document
+  completion, hover, and definition. It is advisory and does not infer
+  parenthesized or computed aliases, assignments, control flow, imported
+  values, function returns, or runtime types. An earlier direct write or
+  potentially mutating member, index, call, or escape path through the root or
+  any retained direct alias suppresses it. Independent 1,024-shape and 4,096-field
+  caps mark retained completion incomplete; the 1,024-alias cap fails closed
+  for omitted alias edges.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.
@@ -234,9 +239,10 @@
 ## Before a stable language release
 
 - Additional semantic editor features beyond lexical completion, fixed
-  `mod.tool`, direct literal-record fields, catalog-backed chained lookup from
-  a visible imported-module binding, and direct advisory workflow-data fields.
-  General module resolution and broader type-aware field semantics remain open.
+  `mod.tool`, bounded direct literal/direct-alias record fields,
+  catalog-backed chained lookup from a visible imported-module binding, and
+  direct advisory workflow-data fields. General module resolution and broader
+  type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Independent security review of effectful adapters.

@@ -20,8 +20,8 @@ and keeps UI support optional rather than making UI the language boundary.
   bounded refreshable advisory tool-catalog projection for direct tool-name
   literals, and an optional refreshable module-interface projection for direct
   import paths and bounded chained imported-module members, plus bounded
-  direct-literal record-field completion, hover, and definition without runtime
-  type inference.
+  direct-literal record-field completion, hover, and definition through exact
+  direct alias chains without runtime type inference.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -431,15 +431,20 @@ catalog file, or derives a grant from this metadata. The projection is bounded
 to 128 entries, 512 KiB of retained names and descriptions, 128-byte names,
 and 4 KiB descriptions; malformed, duplicate, or oversized input is discarded
 as a whole and marks that completion result incomplete. The lexical service
-also recognizes an exact visible direct `let binding = { ... }` initializer:
-at `binding.field` it offers the literal field names and supports hover and
-definition to the field key. That metadata has 1,024-shape and 4,096-field
-bounds and never follows aliases, assignments, function returns, imported
-values, or runtime data. The LSP suppresses the shape after an earlier direct
-write or potentially mutating member, index, or call path. It otherwise remains
-conservative: it does not infer
-forward references, general types, arbitrary record fields, builtins, arbitrary
-catalog data, or runtime-derived imported-module exports.
+also recognizes an exact visible direct `let binding = { ... }` initializer.
+At `binding.field`, or through a direct `let alias = binding` chain of at most
+16 hops, it offers the literal field names and supports hover and definition to
+the field key. Alias targets resolve at their source position, so lexical
+shadowing remains intact. This metadata has 1,024-shape, 4,096-field, and
+1,024-direct-alias bounds. An omitted alias edge makes retained record
+completion empty and incomplete and disables static field hover and definition.
+The LSP suppresses a shape after an earlier direct write or potentially
+mutating member, index, call, or escape path through the root or any retained
+direct alias that resolves to it. It does not infer parenthesized or computed aliases,
+assignments, control flow, function returns, imported values, or runtime data.
+It otherwise remains conservative: it does not infer forward references,
+general types, arbitrary record fields, builtins, arbitrary catalog data, or
+runtime-derived imported-module exports.
 
 An editor may also supply a separate advisory module-interface projection
 through `initializationOptions.splash.moduleCatalog` or a later

@@ -136,6 +136,23 @@ candidates from a symbol-truncated report: an omitted inner definition may
 shadow a retained outer binding. The LSP therefore returns an incomplete empty
 candidate set in that case.
 
+For bounded static record metadata, Rust hosts can call
+`splash_core::static_record_shape_report` or its named, limit-aware variant.
+It retains exact direct `let binding = { ... }` shapes plus exact
+`let alias = binding` source edges before `valid_prefix_end_byte`; it never
+evaluates source, resolves an import, or creates a capability host. The LSP can
+use a lexical direct-alias chain of at most 16 hops for same-document field
+completion, hover, and definition. Target resolution is source-position-aware,
+so a shadowed name follows the binding visible at the alias initializer. The
+report caps shapes at 1,024, fields at 4,096, and alias edges at 1,024. Static
+fields are unavailable after a direct write or potentially mutating member,
+index, call, or escape path through the root or any retained direct alias that
+resolves to it. Shape truncation marks retained completion incomplete; alias truncation
+returns no static fields, marks completion incomplete, and disables static
+field hover and definition. This is not general type inference: parenthesized
+or computed aliases, assignments, control flow, returns, imports, and runtime
+values remain outside the claim and never grant authority.
+
 An editor may separately supply `initializationOptions.splash.moduleCatalog`
 or a later `settings.splash.moduleCatalog` update: a bounded list of canonical
 `mod.*` paths plus optional plain-text descriptions. This LSP-only

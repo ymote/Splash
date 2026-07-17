@@ -89,6 +89,11 @@ pub const MAX_LEXICAL_COMPLETION_SITES: usize = 4_096;
 /// static editor metadata bounded even for generated documents with many
 /// records.
 pub const MAX_STATIC_RECORD_SHAPES: usize = 1_024;
+/// Maximum retained direct aliases of a static record binding per source snapshot.
+///
+/// This is independent of the direct-shape and aggregate-field bounds. It
+/// prevents source-only alias metadata from growing with generated documents.
+pub const MAX_STATIC_RECORD_ALIASES: usize = 1_024;
 /// Maximum direct literal-record fields retained across one source snapshot.
 ///
 /// When this aggregate cap is reached, later complete record shapes are
@@ -415,18 +420,33 @@ pub struct StaticRecordShape {
     pub fields: Vec<StaticRecordField>,
 }
 
+/// One exact direct `let alias = target` source alias edge.
+///
+/// Both spans identify canonical identifiers in one complete initializer. This
+/// is source-only metadata: it does not resolve the target, prove that it is a
+/// record, infer a value type, or authorize any runtime behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticRecordAlias {
+    pub binding: SourceSpan,
+    pub target: SourceSpan,
+}
+
 /// Bounded static literal-record metadata for one source snapshot.
 ///
-/// The report is intentionally not general type inference. It retains only
-/// completed direct record literals ending at or before
+/// The report is intentionally not general type inference. It retains completed
+/// direct record literals and exact direct alias edges ending at or before
 /// `valid_prefix_end_byte`, allowing editor features to remain useful before a
 /// trailing syntax diagnostic without assigning meaning to later recovery
 /// tokens. `truncated` means one or more complete shapes were omitted at the
-/// fixed shape or aggregate-field bound.
+/// fixed shape or aggregate-field bound. `aliases_truncated` means one or more
+/// direct alias edges were omitted at [`MAX_STATIC_RECORD_ALIASES`]; consumers
+/// that need whole-alias-group stability must fail closed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StaticRecordShapeReport {
     pub shapes: Vec<StaticRecordShape>,
+    pub aliases: Vec<StaticRecordAlias>,
     pub truncated: bool,
+    pub aliases_truncated: bool,
     pub valid_prefix_end_byte: usize,
 }
 
@@ -737,12 +757,13 @@ impl<H: Any, S: Any> Runtime<H, S> {
         module_import_report_named("inline.splash", source, self.limits)
     }
 
-    /// Builds bounded direct literal-record metadata without evaluating bytecode,
-    /// resolving imports, or entering any host binding.
+    /// Builds bounded direct literal-record and direct alias metadata without
+    /// evaluating bytecode, resolving imports, or entering any host binding.
     ///
     /// This is advisory editor metadata only. It reports exact direct
-    /// `let binding = { ... }` initializers and never infers aliases, mutation,
-    /// types, or runtime values.
+    /// `let binding = { ... }` initializers and `let alias = target` source
+    /// edges, but never resolves an alias or infers mutation, types, or runtime
+    /// values.
     pub fn static_record_shape_report(
         &self,
         source: &str,
@@ -928,13 +949,15 @@ pub fn module_import_report(source: &str) -> Result<ModuleImportReport, RuntimeE
     module_import_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
-/// Builds bounded advisory shapes for direct literal-record bindings without
-/// evaluating source, resolving imports, or creating a capability host.
+/// Builds bounded advisory shapes for direct literal-record bindings and exact
+/// direct alias edges without evaluating source, resolving imports, or creating
+/// a capability host.
 ///
-/// Only a complete `let name = { ... }` initializer is retained. This is not
-/// general type inference and never follows aliases, assignments, function
-/// returns, imported values, or runtime data. For invalid source, only shapes
-/// ending before the first syntax diagnostic are retained.
+/// Only a complete `let name = { ... }` initializer and exact
+/// `let alias = target` edge are retained. This is not general type inference
+/// and never resolves an alias or follows parenthesized/computed aliases,
+/// assignments, function returns, imported values, or runtime data. For invalid
+/// source, only metadata ending before the first syntax diagnostic is retained.
 pub fn static_record_shape_report(source: &str) -> Result<StaticRecordShapeReport, RuntimeError> {
     static_record_shape_report_named("inline.splash", source, ExecutionLimits::default())
 }
@@ -1275,13 +1298,15 @@ pub fn module_import_report_named(
 }
 
 /// Builds bounded static metadata for complete direct literal-record bindings
-/// in named canonical source without evaluating it, resolving document URIs,
-/// or loading an import.
+/// and exact direct alias edges in named canonical source without evaluating
+/// it, resolving document URIs, or loading an import.
 ///
 /// A retained shape proves only that the source directly initialized that
-/// binding with a record literal before `valid_prefix_end_byte`. It does not
-/// infer an alias, field value type, mutation, function return, or runtime
-/// value, and cannot authorize an effect or module access.
+/// binding with a record literal before `valid_prefix_end_byte`. A retained
+/// alias proves only the exact source spelling `let alias = target`; it does
+/// not resolve `target`. Neither metadata kind infers a field value type,
+/// mutation, function return, or runtime value, and neither can authorize an
+/// effect or module access.
 pub fn static_record_shape_report_named(
     file: &str,
     source: &str,
@@ -3104,7 +3129,7 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
     }
 
     #[test]
-    fn static_record_shapes_retain_only_direct_literal_initializers() {
+    fn static_record_metadata_retains_only_direct_literal_and_alias_initializers() {
         let source = "let settings = {\n\
                       title: \"Splash\",\n\
                       nested: {enabled: true},\n\
@@ -3112,11 +3137,13 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                       }\n\
                       let alias = settings\n\
                       let selected = {value: 1}.value\n\
+                      let parenthesized = (settings)\n\
                       settings.";
         let report = static_record_shape_report(source).expect("source is within default limits");
 
         assert_eq!(report.valid_prefix_end_byte, source.len());
         assert!(!report.truncated);
+        assert!(!report.aliases_truncated);
         assert_eq!(report.shapes.len(), 1);
         let shape = &report.shapes[0];
         assert_eq!(
@@ -3137,6 +3164,16 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                 field.name
             );
         }
+        assert_eq!(report.aliases.len(), 1);
+        let alias = report.aliases[0];
+        assert_eq!(
+            &source[alias.binding.start_byte..alias.binding.end_byte],
+            "alias"
+        );
+        assert_eq!(
+            &source[alias.target.start_byte..alias.target.end_byte],
+            "settings"
+        );
 
         let runtime = Runtime::default();
         assert_eq!(runtime.static_record_shape_report(source).unwrap(), report);
@@ -3168,6 +3205,33 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
         assert_eq!(
             bounded_report.shapes.last().unwrap().fields[0].name,
             "field"
+        );
+
+        let mut too_many_aliases = String::from("let root = {field: 0}\n");
+        for index in 0..=MAX_STATIC_RECORD_ALIASES {
+            too_many_aliases.push_str(&format!("let alias_{index} = root\n"));
+        }
+        let alias_bounded_report = static_record_shape_report(&too_many_aliases).unwrap();
+        assert_eq!(alias_bounded_report.shapes.len(), 1);
+        assert_eq!(
+            alias_bounded_report.aliases.len(),
+            MAX_STATIC_RECORD_ALIASES
+        );
+        assert!(alias_bounded_report.aliases_truncated);
+        assert_eq!(
+            &too_many_aliases[alias_bounded_report.aliases[0].binding.start_byte
+                ..alias_bounded_report.aliases[0].binding.end_byte],
+            "alias_0"
+        );
+        assert_eq!(
+            &too_many_aliases[alias_bounded_report
+                .aliases
+                .last()
+                .unwrap()
+                .target
+                .start_byte
+                ..alias_bounded_report.aliases.last().unwrap().target.end_byte],
+            "root"
         );
 
         let mut too_many_fields = String::from("let oversized = {");

@@ -8,8 +8,8 @@ use splash_core::{
     top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
     ModuleImportReport, RuntimeError, StaticRecordShapeReport, ToolCallHint, TopLevelDeclaration,
     TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
-    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
-    MAX_TOOL_CALL_HINTS,
+    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS,
+    MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -288,6 +288,7 @@ fn normalized_import_path(source: &str) -> String {
 
 fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShapeReport) {
     assert!(report.shapes.len() <= MAX_STATIC_RECORD_SHAPES);
+    assert!(report.aliases.len() <= MAX_STATIC_RECORD_ALIASES);
     assert!(report.valid_prefix_end_byte <= source.len());
     assert!(source.is_char_boundary(report.valid_prefix_end_byte));
 
@@ -343,6 +344,34 @@ fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShap
         previous_binding_start = shape.binding.start_byte;
     }
     assert!(retained_fields <= MAX_STATIC_RECORD_FIELDS);
+
+    let mut previous_alias_binding_start = 0_usize;
+    for alias in &report.aliases {
+        assert!(
+            previous_alias_binding_start <= alias.binding.start_byte
+                && alias.binding.start_byte < alias.binding.end_byte
+                && alias.binding.end_byte <= alias.target.start_byte
+                && alias.target.start_byte < alias.target.end_byte
+                && alias.target.end_byte <= report.valid_prefix_end_byte,
+            "static record alias span is unordered or exceeds the safe prefix: {alias:?}"
+        );
+        assert!(
+            source.is_char_boundary(alias.binding.start_byte)
+                && source.is_char_boundary(alias.binding.end_byte)
+                && source.is_char_boundary(alias.target.start_byte)
+                && source.is_char_boundary(alias.target.end_byte),
+            "static record alias span is not a UTF-8 boundary: {alias:?}"
+        );
+        assert!(
+            is_canonical_identifier(&source[alias.binding.start_byte..alias.binding.end_byte])
+                && is_canonical_identifier(&source[alias.target.start_byte..alias.target.end_byte]),
+            "static record alias is not a canonical identifier: {alias:?}"
+        );
+        previous_alias_binding_start = alias.binding.start_byte;
+    }
+    if report.aliases_truncated {
+        assert_eq!(report.aliases.len(), MAX_STATIC_RECORD_ALIASES);
+    }
 }
 
 fn assert_tool_call_hint_invariants(source: &str, hints: &[ToolCallHint]) {
