@@ -372,11 +372,12 @@ or make an adapter callable. A visible local or imported `workflow` binding
 shadows it, absent metadata creates no namespace, and malformed input fails
 closed. The optional `workflowDataStepContext` admits only an exact prefix of
 the catalog's projected outputs and its next projected step, then filters output
-completion and hover to that prefix. It remains host-supplied static metadata,
-not a live workflow-state proof. A host can replace the complete pair through
-`workspace/didChangeConfiguration`; partial or malformed relevant updates fail
-closed instead of retaining stale fields. See [Editor workflow-data
-projection](workflow-data-catalog.md).
+completion and hover to that prefix. A host using `splash-workflow` can generate
+that pair from an exact suspended continuation or validated checkpoint, but the
+LSP remains unable to inspect or authorize runtime state. A host can replace the
+complete pair through `workspace/didChangeConfiguration`; partial or malformed
+relevant updates fail closed instead of retaining stale fields. See [Editor
+workflow-data projection](workflow-data-catalog.md).
 
 Rename does not edit the final segment of a `use` path. For another indexed
 binding it accepts exactly one non-reserved canonical identifier, rewrites the

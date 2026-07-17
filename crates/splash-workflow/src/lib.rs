@@ -50,9 +50,9 @@ use splash_capabilities::{
     ExternalToolInvocation, JsonValue, ToolError,
 };
 use splash_core::{
-    check_syntax_named, parse_bounded_json, serialize_bounded_json, tool_call_hint_report_named,
-    Evaluation, ExecutionLimits, RuntimeError, RuntimeJsonError, SyntaxReport, ToolCallHint,
-    CANONICAL_PROFILE_ID, MAX_SYNTAX_DIAGNOSTICS,
+    check_syntax_named, is_canonical_identifier, parse_bounded_json, serialize_bounded_json,
+    tool_call_hint_report_named, Evaluation, ExecutionLimits, RuntimeError, RuntimeJsonError,
+    SyntaxReport, ToolCallHint, CANONICAL_PROFILE_ID, MAX_SYNTAX_DIAGNOSTICS,
 };
 use splash_protocol::{
     canonical_operation_input_bytes, AuthenticatedWorkerMessage, CapabilityGrant,
@@ -157,6 +157,24 @@ pub const MAX_WORKFLOW_DATA_DEPTH: usize = 64;
 /// generated plan cannot multiply the per-schema limit into an impractical
 /// embedded-memory policy object.
 pub const MAX_WORKFLOW_DATA_CONTRACT_BYTES: usize = 256 * 1024;
+/// Maximum output entries emitted in one workflow-data LSP projection.
+///
+/// This mirrors the `splash-lsp` parser limit. The projection intentionally
+/// includes only the direct-member-addressable completed prefix and current
+/// step, so a larger future plan does not make an active editor update fail.
+pub const MAX_WORKFLOW_DATA_LSP_OUTPUTS: usize = 128;
+/// Maximum input and output fields emitted in one workflow-data LSP
+/// projection.
+pub const MAX_WORKFLOW_DATA_LSP_FIELDS: usize = 1_024;
+/// Maximum aggregate normalized field metadata bytes emitted in one
+/// workflow-data LSP projection.
+pub const MAX_WORKFLOW_DATA_LSP_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 byte length of a direct-member-addressable field or step
+/// name emitted in a workflow-data LSP projection.
+pub const MAX_WORKFLOW_DATA_LSP_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a field description emitted in a
+/// workflow-data LSP projection.
+pub const MAX_WORKFLOW_DATA_LSP_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// Current serialized host-dataflow context format version.
 pub const WORKFLOW_DATA_FORMAT_VERSION: u8 = 1;
 /// Host-injected Splash identifier containing the current dataflow context.
@@ -984,6 +1002,452 @@ fn workflow_data_contract_bytes(
         bytes = bytes.saturating_add(output_contract.schema.source().to_string().len());
     }
     bytes
+}
+
+/// One direct-member field type accepted by the workflow-data LSP wire format.
+///
+/// This is intentionally the small executable-schema subset that can be
+/// represented without exposing schema source or runtime values to an editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowDataLspFieldType {
+    Any,
+    Null,
+    Boolean,
+    Number,
+    Integer,
+    String,
+    Array,
+    Object,
+}
+
+impl WorkflowDataLspFieldType {
+    /// Returns the exact lowercase token used on the LSP wire.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Integer => "integer",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+}
+
+/// A bounded, metadata-only `splash` configuration for `splash-lsp`.
+///
+/// Construct this from a bound [`WorkflowDataContract`] and an exact completed
+/// dataflow prefix. Serialization produces only `workflowDataCatalog` and
+/// `workflowDataStepContext`; it never includes input values, output values,
+/// capability state, approvals, or schema source. The projection contains the
+/// direct-member-addressable completed outputs plus the current step needed to
+/// prove the projected prefix to the LSP. It intentionally omits future steps.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDataLspProjection {
+    #[serde(rename = "workflowDataCatalog")]
+    catalog: WorkflowDataLspCatalog,
+    #[serde(rename = "workflowDataStepContext")]
+    step_context: WorkflowDataLspStepContext,
+    #[serde(skip)]
+    plan_fingerprint: String,
+    #[serde(skip)]
+    data_contract_fingerprint: String,
+    #[serde(skip)]
+    completed_step_count: usize,
+}
+
+impl WorkflowDataLspProjection {
+    /// Derives a complete LSP projection from a validated, bound dataflow
+    /// prefix.
+    ///
+    /// The caller-supplied data must retain the exact contract fingerprint and
+    /// satisfy the plan's completed prefix. For a live engine-owned value,
+    /// prefer [`WorkflowEngine::suspended_dataflow_lsp_projection`], which
+    /// reads the retained continuation state directly.
+    pub fn from_dataflow_prefix(
+        plan: &WorkflowPlan,
+        data: &WorkflowData,
+        data_contract: &WorkflowDataContract,
+        completed_step_count: usize,
+    ) -> Result<Self, WorkflowDataLspProjectionError> {
+        let Some(current_step) = plan.steps.get(completed_step_count) else {
+            return Err(WorkflowDataLspProjectionError::NoCurrentStep {
+                completed: completed_step_count,
+                total: plan.steps.len(),
+            });
+        };
+        if !is_workflow_data_lsp_path_segment(&current_step.id) {
+            return Err(WorkflowDataLspProjectionError::CurrentStepNotAddressable(
+                current_step.id.clone(),
+            ));
+        }
+
+        let data_contract_fingerprint = data_contract.fingerprint();
+        match data.contract_fingerprint() {
+            Some(fingerprint) if fingerprint == data_contract_fingerprint => {}
+            Some(_) => return Err(WorkflowDataLspProjectionError::ContractBindingMismatch),
+            None => return Err(WorkflowDataLspProjectionError::ContractBindingMissing),
+        }
+        data_contract
+            .validate_for(plan, data, completed_step_count)
+            .map_err(WorkflowDataLspProjectionError::DataContract)?;
+
+        let mut budget = WorkflowDataLspProjectionBudget::default();
+        let input_fields = workflow_data_lsp_fields(data_contract.input_schema(), &mut budget)?;
+        let mut completed_output_step_ids = Vec::new();
+        let mut outputs = Vec::new();
+
+        for (step_index, (step, output_contract)) in plan
+            .steps
+            .iter()
+            .zip(data_contract.output_contracts())
+            .take(completed_step_count.saturating_add(1))
+            .enumerate()
+        {
+            if !is_workflow_data_lsp_path_segment(&step.id) {
+                continue;
+            }
+            budget.retain_output(&step.id)?;
+            let fields = workflow_data_lsp_fields(output_contract.schema(), &mut budget)?;
+            if step_index < completed_step_count {
+                completed_output_step_ids.push(step.id.clone());
+            }
+            outputs.push(WorkflowDataLspOutput {
+                step_id: step.id.clone(),
+                fields,
+            });
+        }
+
+        let catalog = WorkflowDataLspCatalog {
+            input_fields,
+            outputs,
+        };
+        let step_context = WorkflowDataLspStepContext {
+            current_step_id: current_step.id.clone(),
+            completed_output_step_ids,
+        };
+        Ok(Self {
+            catalog,
+            step_context,
+            plan_fingerprint: plan.fingerprint.clone(),
+            data_contract_fingerprint,
+            completed_step_count,
+        })
+    }
+
+    /// Derives a complete LSP projection from a durable checkpoint and its
+    /// separately retained, bound dataflow context.
+    ///
+    /// The checkpoint validation binds plan, data, and contract digests before
+    /// this method emits editor metadata. It still creates no approval, lease,
+    /// adapter call, or runtime continuation.
+    pub fn from_checkpoint(
+        plan: &WorkflowPlan,
+        checkpoint: &WorkflowCheckpoint,
+        data: &WorkflowData,
+        data_contract: &WorkflowDataContract,
+    ) -> Result<Self, WorkflowDataLspProjectionError> {
+        checkpoint
+            .validate_dataflow_contract_for(plan, data, data_contract)
+            .map_err(WorkflowDataLspProjectionError::Checkpoint)?;
+        Self::from_dataflow_prefix(plan, data, data_contract, checkpoint.completed_step_count())
+    }
+
+    /// Returns the serializable catalog portion of this projection.
+    pub fn catalog(&self) -> &WorkflowDataLspCatalog {
+        &self.catalog
+    }
+
+    /// Returns the serializable current-step context portion of this
+    /// projection.
+    pub fn step_context(&self) -> &WorkflowDataLspStepContext {
+        &self.step_context
+    }
+
+    /// Returns the trusted plan digest from which this projection was derived.
+    pub fn plan_fingerprint(&self) -> &str {
+        &self.plan_fingerprint
+    }
+
+    /// Returns the contract digest from which this projection was derived.
+    pub fn data_contract_fingerprint(&self) -> &str {
+        &self.data_contract_fingerprint
+    }
+
+    /// Returns the actual runtime completed-step count, including any prior
+    /// step IDs that cannot be represented as direct Splash members.
+    pub fn completed_step_count(&self) -> usize {
+        self.completed_step_count
+    }
+}
+
+/// Catalog metadata serialized as `workflowDataCatalog` inside a
+/// [`WorkflowDataLspProjection`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDataLspCatalog {
+    #[serde(rename = "inputFields")]
+    input_fields: Vec<WorkflowDataLspField>,
+    outputs: Vec<WorkflowDataLspOutput>,
+}
+
+impl WorkflowDataLspCatalog {
+    pub fn input_fields(&self) -> &[WorkflowDataLspField] {
+        &self.input_fields
+    }
+
+    pub fn outputs(&self) -> &[WorkflowDataLspOutput] {
+        &self.outputs
+    }
+}
+
+/// One direct-member-addressable output entry inside a workflow-data LSP
+/// catalog.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDataLspOutput {
+    #[serde(rename = "stepId")]
+    step_id: String,
+    fields: Vec<WorkflowDataLspField>,
+}
+
+impl WorkflowDataLspOutput {
+    pub fn step_id(&self) -> &str {
+        &self.step_id
+    }
+
+    pub fn fields(&self) -> &[WorkflowDataLspField] {
+        &self.fields
+    }
+}
+
+/// One direct-member field descriptor inside a workflow-data LSP catalog.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDataLspField {
+    name: String,
+    #[serde(rename = "type")]
+    field_type: WorkflowDataLspFieldType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+impl WorkflowDataLspField {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn field_type(&self) -> WorkflowDataLspFieldType {
+        self.field_type
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+/// Current-step metadata serialized as `workflowDataStepContext` inside a
+/// [`WorkflowDataLspProjection`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkflowDataLspStepContext {
+    #[serde(rename = "currentStepId")]
+    current_step_id: String,
+    #[serde(rename = "completedOutputStepIds")]
+    completed_output_step_ids: Vec<String>,
+}
+
+impl WorkflowDataLspStepContext {
+    pub fn current_step_id(&self) -> &str {
+        &self.current_step_id
+    }
+
+    pub fn completed_output_step_ids(&self) -> &[String] {
+        &self.completed_output_step_ids
+    }
+}
+
+/// Rejection while deriving a bounded editor projection from workflow data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkflowDataLspProjectionError {
+    NoCurrentStep { completed: usize, total: usize },
+    CurrentStepNotAddressable(String),
+    ContractBindingMissing,
+    ContractBindingMismatch,
+    DataContract(WorkflowDataContractError),
+    Checkpoint(WorkflowCheckpointError),
+    TooManyOutputs { actual: usize, maximum: usize },
+    TooManyFields { actual: usize, maximum: usize },
+    TooManyBytes { actual: usize, maximum: usize },
+}
+
+impl Display for WorkflowDataLspProjectionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoCurrentStep { completed, total } => write!(
+                formatter,
+                "workflow data projection cannot select a current step after {completed} completed steps in a {total}-step plan"
+            ),
+            Self::CurrentStepNotAddressable(step_id) => write!(
+                formatter,
+                "workflow data projection current step is not a direct Splash identifier: {}",
+                workflow_error_text(step_id)
+            ),
+            Self::ContractBindingMissing => formatter.write_str(
+                "workflow data projection requires data bound to the supplied contract",
+            ),
+            Self::ContractBindingMismatch => formatter.write_str(
+                "workflow data projection data is bound to a different contract",
+            ),
+            Self::DataContract(error) => {
+                write!(formatter, "workflow data projection contract error: {error}")
+            }
+            Self::Checkpoint(error) => {
+                write!(formatter, "workflow data projection checkpoint error: {error}")
+            }
+            Self::TooManyOutputs { actual, maximum } => write!(
+                formatter,
+                "workflow data projection has {actual} outputs but may retain at most {maximum}"
+            ),
+            Self::TooManyFields { actual, maximum } => write!(
+                formatter,
+                "workflow data projection has {actual} fields but may retain at most {maximum}"
+            ),
+            Self::TooManyBytes { actual, maximum } => write!(
+                formatter,
+                "workflow data projection has {actual} metadata bytes but may retain at most {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowDataLspProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DataContract(error) => Some(error),
+            Self::Checkpoint(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkflowDataLspProjectionBudget {
+    outputs: usize,
+    fields: usize,
+    bytes: usize,
+}
+
+impl WorkflowDataLspProjectionBudget {
+    fn retain_output(&mut self, step_id: &str) -> Result<(), WorkflowDataLspProjectionError> {
+        self.outputs = self.outputs.saturating_add(1);
+        if self.outputs > MAX_WORKFLOW_DATA_LSP_OUTPUTS {
+            return Err(WorkflowDataLspProjectionError::TooManyOutputs {
+                actual: self.outputs,
+                maximum: MAX_WORKFLOW_DATA_LSP_OUTPUTS,
+            });
+        }
+        self.retain_bytes(step_id.len().saturating_add(1))
+    }
+
+    fn retain_field(
+        &mut self,
+        name: &str,
+        field_type: WorkflowDataLspFieldType,
+        description: Option<&str>,
+    ) -> Result<(), WorkflowDataLspProjectionError> {
+        self.fields = self.fields.saturating_add(1);
+        if self.fields > MAX_WORKFLOW_DATA_LSP_FIELDS {
+            return Err(WorkflowDataLspProjectionError::TooManyFields {
+                actual: self.fields,
+                maximum: MAX_WORKFLOW_DATA_LSP_FIELDS,
+            });
+        }
+        let bytes = name
+            .len()
+            .saturating_add(field_type.label().len())
+            .saturating_add(description.map_or(0, str::len))
+            .saturating_add(1);
+        self.retain_bytes(bytes)
+    }
+
+    fn retain_bytes(&mut self, bytes: usize) -> Result<(), WorkflowDataLspProjectionError> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_WORKFLOW_DATA_LSP_BYTES {
+            return Err(WorkflowDataLspProjectionError::TooManyBytes {
+                actual: self.bytes,
+                maximum: MAX_WORKFLOW_DATA_LSP_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn workflow_data_lsp_fields(
+    schema: &JsonSchema,
+    budget: &mut WorkflowDataLspProjectionBudget,
+) -> Result<Vec<WorkflowDataLspField>, WorkflowDataLspProjectionError> {
+    let Some(properties) = schema
+        .source()
+        .as_object()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(JsonValue::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut fields = Vec::with_capacity(properties.len());
+    for (name, property_schema) in properties {
+        if !is_workflow_data_lsp_path_segment(name) {
+            continue;
+        }
+        let field_type = workflow_data_lsp_field_type(property_schema);
+        let description = property_schema
+            .as_object()
+            .and_then(|schema| schema.get("description"))
+            .and_then(JsonValue::as_str)
+            .filter(|description| description.len() <= MAX_WORKFLOW_DATA_LSP_DESCRIPTION_BYTES)
+            .map(str::to_owned);
+        budget.retain_field(name, field_type, description.as_deref())?;
+        fields.push(WorkflowDataLspField {
+            name: name.clone(),
+            field_type,
+            description,
+        });
+    }
+    Ok(fields)
+}
+
+fn workflow_data_lsp_field_type(schema: &JsonValue) -> WorkflowDataLspFieldType {
+    let Some(schema) = schema.as_object() else {
+        return WorkflowDataLspFieldType::Any;
+    };
+    match schema.get("type").and_then(JsonValue::as_str) {
+        Some("null") => WorkflowDataLspFieldType::Null,
+        Some("boolean") => WorkflowDataLspFieldType::Boolean,
+        Some("number") => WorkflowDataLspFieldType::Number,
+        Some("integer") => WorkflowDataLspFieldType::Integer,
+        Some("string") => WorkflowDataLspFieldType::String,
+        Some("array") => WorkflowDataLspFieldType::Array,
+        Some("object") => WorkflowDataLspFieldType::Object,
+        Some(_) => WorkflowDataLspFieldType::Any,
+        None if schema.contains_key("properties")
+            || schema.contains_key("required")
+            || schema.contains_key("additionalProperties") =>
+        {
+            WorkflowDataLspFieldType::Object
+        }
+        None if schema.contains_key("items")
+            || schema.contains_key("minItems")
+            || schema.contains_key("maxItems") =>
+        {
+            WorkflowDataLspFieldType::Array
+        }
+        None => WorkflowDataLspFieldType::Any,
+    }
+}
+
+fn is_workflow_data_lsp_path_segment(value: &str) -> bool {
+    value.len() <= MAX_WORKFLOW_DATA_LSP_NAME_BYTES && is_canonical_identifier(value)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3502,6 +3966,7 @@ pub enum WorkflowError {
     Checkpoint(WorkflowCheckpointError),
     Data(WorkflowDataError),
     DataContract(WorkflowDataContractError),
+    DataLspProjection(WorkflowDataLspProjectionError),
     OperationLedger(WorkflowOperationLedgerError),
     Runtime(RuntimeError),
     StepSuspended {
@@ -3582,6 +4047,9 @@ impl Display for WorkflowError {
             Self::Checkpoint(error) => write!(formatter, "workflow checkpoint error: {error}"),
             Self::Data(error) => write!(formatter, "workflow data error: {error}"),
             Self::DataContract(error) => write!(formatter, "workflow data contract error: {error}"),
+            Self::DataLspProjection(error) => {
+                write!(formatter, "workflow data LSP projection error: {error}")
+            }
             Self::OperationLedger(error) => {
                 write!(formatter, "workflow operation ledger error: {error}")
             }
@@ -3625,6 +4093,7 @@ impl std::error::Error for WorkflowError {
             Self::Checkpoint(error) => Some(error),
             Self::Data(error) => Some(error),
             Self::DataContract(error) => Some(error),
+            Self::DataLspProjection(error) => Some(error),
             Self::OperationLedger(error) => Some(error),
             Self::Runtime(error) => Some(error),
             Self::DataflowOutput { error, .. } => Some(error),
@@ -3778,6 +4247,45 @@ impl WorkflowEngine {
             .and_then(|execution| execution.dataflow.as_ref())
             .map(|dataflow| &dataflow.data)
             .or(self.last_dataflow.as_ref())
+    }
+
+    /// Derives current editor metadata from this engine's retained suspended
+    /// dataflow continuation.
+    ///
+    /// A returned projection is based on the exact plan, completed step index,
+    /// contract, and data context that the engine will resume. It contains no
+    /// raw input/output values and is still advisory LSP metadata: it cannot
+    /// approve work, issue a capability, or make a tool callable. `Ok(None)`
+    /// means there is no suspended, contract-bound dataflow execution to
+    /// project, including a non-dataflow suspension or a terminal workflow.
+    pub fn suspended_dataflow_lsp_projection(
+        &self,
+        plan: &WorkflowPlan,
+    ) -> Result<Option<WorkflowDataLspProjection>, WorkflowError> {
+        if !self.owns_plan(plan) {
+            return Err(WorkflowError::PlanOwnershipMismatch);
+        }
+        let Some(execution) = self.suspended_execution.as_ref() else {
+            return Ok(None);
+        };
+        if execution.plan.id != plan.id || execution.plan.fingerprint != plan.fingerprint {
+            return Err(WorkflowError::ApprovalMismatch);
+        }
+        let Some(dataflow) = execution.dataflow.as_ref() else {
+            return Ok(None);
+        };
+        let Some(data_contract) = dataflow.data_contract.as_ref() else {
+            return Ok(None);
+        };
+
+        WorkflowDataLspProjection::from_dataflow_prefix(
+            &execution.plan,
+            &dataflow.data,
+            data_contract,
+            execution.step_index,
+        )
+        .map(Some)
+        .map_err(WorkflowError::DataLspProjection)
     }
 
     /// Takes the most recent terminal dataflow state.
@@ -10662,6 +11170,414 @@ mod tests {
                 .unwrap_err(),
             WorkflowError::Checkpoint(WorkflowCheckpointError::DataflowContractRequired)
         );
+    }
+
+    #[test]
+    fn dataflow_lsp_projection_is_bound_redacted_and_uses_addressable_prefix() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![
+                WorkflowStep::new("prepare", "1"),
+                WorkflowStep::new("release-publish", "2"),
+                WorkflowStep::new("calculate", "3"),
+            ])
+            .unwrap();
+        let long_field_name = format!("field_{}", "x".repeat(MAX_WORKFLOW_DATA_LSP_NAME_BYTES));
+        let contract = workflow_data_contract(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "left": {"type": "integer", "description": "Left operand."},
+                    "metadata": {
+                        "properties": {"nested": {"type": "string"}},
+                        "description": "Structured metadata."
+                    },
+                    "release-name": {"type": "string"},
+                    "undocumented": {"description": "Free-form input."},
+                    long_field_name.clone(): {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            vec![
+                (
+                    "prepare",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "total": {"type": "integer", "description": "Calculated sum."},
+                            "not-direct": {"type": "string"}
+                        },
+                        "required": ["total", "not-direct"],
+                        "additionalProperties": false
+                    }),
+                ),
+                (
+                    "release-publish",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"receipt": {"type": "string"}},
+                        "required": ["receipt"],
+                        "additionalProperties": false
+                    }),
+                ),
+                (
+                    "calculate",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "sum": {
+                                "type": "number",
+                                "description": "x".repeat(MAX_WORKFLOW_DATA_LSP_DESCRIPTION_BYTES + 1)
+                            }
+                        },
+                        "required": ["sum"],
+                        "additionalProperties": false
+                    }),
+                ),
+            ],
+        );
+        let mut input = serde_json::json!({
+            "left": 3,
+            "metadata": {"nested": "secret input"},
+            "release-name": "ignored direct path",
+            "undocumented": null
+        });
+        input.as_object_mut().unwrap().insert(
+            long_field_name,
+            JsonValue::String("ignored long path".to_owned()),
+        );
+        let mut data = WorkflowData::new(input).unwrap();
+        data.insert_output(
+            "prepare",
+            serde_json::json!({"total": 5, "not-direct": "secret output"}),
+        )
+        .unwrap();
+        data.insert_output(
+            "release-publish",
+            serde_json::json!({"receipt": "private receipt"}),
+        )
+        .unwrap();
+        data.bind_contract(&contract).unwrap();
+
+        let projection =
+            WorkflowDataLspProjection::from_dataflow_prefix(&plan, &data, &contract, 2).unwrap();
+        assert_eq!(projection.plan_fingerprint(), plan.fingerprint());
+        assert_eq!(
+            projection.data_contract_fingerprint(),
+            contract.fingerprint().as_str()
+        );
+        assert_eq!(projection.completed_step_count(), 2);
+        assert_eq!(
+            projection
+                .catalog()
+                .input_fields()
+                .iter()
+                .map(|field| (field.name(), field.field_type(), field.description()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "left",
+                    WorkflowDataLspFieldType::Integer,
+                    Some("Left operand."),
+                ),
+                (
+                    "metadata",
+                    WorkflowDataLspFieldType::Object,
+                    Some("Structured metadata."),
+                ),
+                (
+                    "undocumented",
+                    WorkflowDataLspFieldType::Any,
+                    Some("Free-form input."),
+                ),
+            ]
+        );
+        assert_eq!(
+            projection
+                .catalog()
+                .outputs()
+                .iter()
+                .map(|output| output.step_id())
+                .collect::<Vec<_>>(),
+            ["prepare", "calculate"]
+        );
+        assert_eq!(
+            projection.catalog().outputs()[0]
+                .fields()
+                .iter()
+                .map(|field| (field.name(), field.field_type(), field.description()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "total",
+                WorkflowDataLspFieldType::Integer,
+                Some("Calculated sum."),
+            )]
+        );
+        assert_eq!(
+            projection.catalog().outputs()[1]
+                .fields()
+                .iter()
+                .map(|field| (field.name(), field.field_type(), field.description()))
+                .collect::<Vec<_>>(),
+            vec![("sum", WorkflowDataLspFieldType::Number, None)]
+        );
+        assert_eq!(projection.step_context().current_step_id(), "calculate");
+        assert_eq!(
+            projection.step_context().completed_output_step_ids(),
+            ["prepare"]
+        );
+
+        let encoded_value = serde_json::to_value(&projection).unwrap();
+        assert_eq!(
+            encoded_value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["workflowDataCatalog", "workflowDataStepContext"]
+        );
+        let encoded = serde_json::to_string(&projection).unwrap();
+        assert!(encoded.contains("workflowDataCatalog"));
+        assert!(encoded.contains("workflowDataStepContext"));
+        assert!(!encoded.contains("secret input"));
+        assert!(!encoded.contains("secret output"));
+        assert!(!encoded.contains("private receipt"));
+        assert!(!encoded.contains("release-publish"));
+        assert!(!encoded.contains(plan.fingerprint()));
+        assert!(!encoded.contains(projection.data_contract_fingerprint()));
+
+        let checkpoint = engine
+            .dataflow_checkpoint_after_with_contract(&plan, &mut data, &contract, 2)
+            .unwrap();
+        assert_eq!(
+            WorkflowDataLspProjection::from_checkpoint(&plan, &checkpoint, &data, &contract)
+                .unwrap(),
+            projection
+        );
+    }
+
+    #[test]
+    fn dataflow_lsp_projection_rejects_unbound_unaddressable_and_oversized_prefixes() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![WorkflowStep::new("current", "1")])
+            .unwrap();
+        let contract = workflow_data_contract(
+            serde_json::json!({"type": "object"}),
+            vec![("current", serde_json::json!({"type": "string"}))],
+        );
+        let mut data = WorkflowData::new(serde_json::json!({})).unwrap();
+        assert_eq!(
+            WorkflowDataLspProjection::from_dataflow_prefix(&plan, &data, &contract, 0)
+                .unwrap_err(),
+            WorkflowDataLspProjectionError::ContractBindingMissing
+        );
+
+        let other_contract = workflow_data_contract(
+            serde_json::json!({"type": "object", "description": "different"}),
+            vec![("current", serde_json::json!({"type": "string"}))],
+        );
+        data.bind_contract(&other_contract).unwrap();
+        assert_eq!(
+            WorkflowDataLspProjection::from_dataflow_prefix(&plan, &data, &contract, 0)
+                .unwrap_err(),
+            WorkflowDataLspProjectionError::ContractBindingMismatch
+        );
+
+        let unaddressable_plan = engine
+            .plan(vec![WorkflowStep::new("release-publish", "1")])
+            .unwrap();
+        let unaddressable_contract = workflow_data_contract(
+            serde_json::json!({"type": "object"}),
+            vec![("release-publish", serde_json::json!({"type": "string"}))],
+        );
+        let mut unaddressable_data = WorkflowData::new(serde_json::json!({})).unwrap();
+        unaddressable_data
+            .bind_contract(&unaddressable_contract)
+            .unwrap();
+        assert_eq!(
+            WorkflowDataLspProjection::from_dataflow_prefix(
+                &unaddressable_plan,
+                &unaddressable_data,
+                &unaddressable_contract,
+                0,
+            )
+            .unwrap_err(),
+            WorkflowDataLspProjectionError::CurrentStepNotAddressable("release-publish".to_owned())
+        );
+
+        let steps = (0..=MAX_WORKFLOW_DATA_LSP_OUTPUTS)
+            .map(|index| WorkflowStep::new(format!("step_{index}"), "1"))
+            .collect::<Vec<_>>();
+        let oversized_plan = engine.plan(steps).unwrap();
+        let oversized_step_ids = (0..=MAX_WORKFLOW_DATA_LSP_OUTPUTS)
+            .map(|index| format!("step_{index}"))
+            .collect::<Vec<_>>();
+        let oversized_contract = workflow_data_contract(
+            serde_json::json!({"type": "object"}),
+            oversized_step_ids
+                .iter()
+                .map(|step_id| (step_id.as_str(), serde_json::json!({"type": "string"})))
+                .collect(),
+        );
+        let mut oversized_data = WorkflowData::new(serde_json::json!({})).unwrap();
+        for index in 0..MAX_WORKFLOW_DATA_LSP_OUTPUTS {
+            oversized_data
+                .insert_output(
+                    &format!("step_{index}"),
+                    JsonValue::String("done".to_owned()),
+                )
+                .unwrap();
+        }
+        oversized_data.bind_contract(&oversized_contract).unwrap();
+        assert_eq!(
+            WorkflowDataLspProjection::from_dataflow_prefix(
+                &oversized_plan,
+                &oversized_data,
+                &oversized_contract,
+                MAX_WORKFLOW_DATA_LSP_OUTPUTS,
+            )
+            .unwrap_err(),
+            WorkflowDataLspProjectionError::TooManyOutputs {
+                actual: MAX_WORKFLOW_DATA_LSP_OUTPUTS + 1,
+                maximum: MAX_WORKFLOW_DATA_LSP_OUTPUTS,
+            }
+        );
+    }
+
+    #[test]
+    fn suspended_dataflow_lsp_projection_tracks_the_engine_prefix() {
+        let mut runtime = CapabilityRuntime::default();
+        let mut remote_policy = ToolPolicy::new("text.remote");
+        remote_policy.max_calls = 2;
+        runtime.register_external_tool(remote_policy).unwrap();
+        let mut engine = WorkflowEngine::new(runtime);
+        let plan = engine
+            .plan(vec![
+                WorkflowStep::new(
+                    "remote_first",
+                    "use mod.tool\n\
+                     let text = tool.start(\"text.remote\", workflow.input.message).await()\n\
+                     let result = text\n\
+                     result",
+                ),
+                WorkflowStep::new(
+                    "remote_second",
+                    "use mod.tool\n\
+                     let text = tool.start(\"text.remote\", workflow.outputs.remote_first).await()\n\
+                     let result = text\n\
+                     result",
+                ),
+            ])
+            .unwrap();
+        let contract = workflow_data_contract(
+            serde_json::json!({
+                "type": "object",
+                "properties": {"message": {"type": "string", "description": "Request text."}},
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+            vec![
+                ("remote_first", serde_json::json!({"type": "string"})),
+                ("remote_second", serde_json::json!({"type": "string"})),
+            ],
+        );
+        let approval = engine
+            .approve_dataflow_with_contract_and_step_capability_policies(
+                &plan,
+                WorkflowData::new(serde_json::json!({"message": "secret request"})).unwrap(),
+                contract,
+                vec![
+                    WorkflowStepCapabilityPolicy::new(
+                        "remote_first",
+                        [CapabilityLeaseGrant::new("text.remote", 1)],
+                    ),
+                    WorkflowStepCapabilityPolicy::new(
+                        "remote_second",
+                        [CapabilityLeaseGrant::new("text.remote", 1)],
+                    ),
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            engine.execute_dataflow(&plan, approval),
+            Err(WorkflowError::StepSuspended {
+                ref step_id,
+                completed_steps: 0,
+            }) if step_id == "remote_first"
+        ));
+        let first_projection = engine
+            .suspended_dataflow_lsp_projection(&plan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_projection.completed_step_count(), 0);
+        assert_eq!(
+            first_projection.step_context().current_step_id(),
+            "remote_first"
+        );
+        assert!(first_projection
+            .step_context()
+            .completed_output_step_ids()
+            .is_empty());
+        assert_eq!(
+            first_projection
+                .catalog()
+                .outputs()
+                .iter()
+                .map(|output| output.step_id())
+                .collect::<Vec<_>>(),
+            ["remote_first"]
+        );
+        assert!(!serde_json::to_string(&first_projection)
+            .unwrap()
+            .contains("secret request"));
+
+        let first_invocation = engine.claim_next_external_tool().unwrap();
+        let first_completion =
+            engine.complete_external_tool(first_invocation.id, Ok("first result".to_owned()));
+        assert!(
+            matches!(
+                first_completion,
+                Err(WorkflowError::StepSuspended {
+                    ref step_id,
+                    completed_steps: 1,
+                }) if step_id == "remote_second"
+            ),
+            "unexpected first completion: {first_completion:?}"
+        );
+        let second_projection = engine
+            .suspended_dataflow_lsp_projection(&plan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_projection.completed_step_count(), 1);
+        assert_eq!(
+            second_projection.step_context().current_step_id(),
+            "remote_second"
+        );
+        assert_eq!(
+            second_projection.step_context().completed_output_step_ids(),
+            ["remote_first"]
+        );
+        assert_eq!(
+            second_projection
+                .catalog()
+                .outputs()
+                .iter()
+                .map(|output| output.step_id())
+                .collect::<Vec<_>>(),
+            ["remote_first", "remote_second"]
+        );
+
+        let second_invocation = engine.claim_next_external_tool().unwrap();
+        engine
+            .complete_external_tool(second_invocation.id, Ok("second result".to_owned()))
+            .unwrap();
+        assert!(engine
+            .suspended_dataflow_lsp_projection(&plan)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

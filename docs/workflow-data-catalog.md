@@ -1,16 +1,43 @@
 # Editor workflow-data projection
 
-`splash-lsp` can receive a bounded, static authoring projection of a host's
-workflow data contract through
+`splash-lsp` receives a bounded authoring projection through
 `initializationOptions.splash.workflowDataCatalog`. A host can later replace a
 complete workflow projection and current-step context through the standard LSP
-configuration notification described below.
+configuration notification described below. The server never connects to an
+engine itself.
 
 This is not a JSON Schema transport. A host derives this compact projection
 from its own trusted `WorkflowDataContract`, approved plan, or equivalent
 application configuration before it starts the LSP session. The LSP never
 loads a schema, follows a reference, reads a workflow checkpoint, or connects
 to a workflow engine.
+
+For a host using `splash-workflow`, `WorkflowDataLspProjection` builds this
+exact wire shape from a contract-bound `WorkflowData` prefix. It validates the
+plan/contract binding, the data contract, the completed prefix, and the stored
+contract digest before it emits metadata. The preferred live path is
+`WorkflowEngine::suspended_dataflow_lsp_projection`: it derives the catalog
+and current step from the engine's retained suspended continuation rather than
+from host-reconstructed counters. A durable host can use
+`WorkflowDataLspProjection::from_checkpoint` after validating a checkpoint and
+its separately retained dataflow context.
+
+```rust
+let Some(projection) = engine.suspended_dataflow_lsp_projection(&plan)? else {
+    return Ok(());
+};
+let settings = serde_json::json!({
+    "settings": {
+        "splash": projection
+    }
+});
+```
+
+The serialized projection contains no input values, output values, source
+text, approval, lease, tool identity, or schema source. It contains only field
+types and descriptions plus the direct-member-addressable completed prefix and
+current step. The host still delivers those bytes to the editor; the LSP can
+only validate their structure and remains non-authoritative.
 
 ```json
 {
@@ -88,9 +115,20 @@ field schema is known.
 
 The ordering is only over the direct-member-addressable projection. A host can
 omit runtime step IDs that cannot appear after `.`, but must then provide the
-prefix and current step in that reduced projected order. The LSP cannot verify
-that the host-provided position matches a live workflow engine, plan, or
-checkpoint.
+prefix and current step in that reduced projected order.
+
+`WorkflowDataLspProjection` intentionally retains only addressable completed
+outputs and the current addressable step, never future workflow outputs. At the
+first step, the catalog therefore contains that current step but completion
+shows no output yet. After a later suspension, a new projection adds the
+completed output and the new current step. If the actual current step cannot be
+spelled as a direct Splash member, or if the projected prefix exceeds the LSP
+bounds, construction fails so an integration does not send stale metadata.
+
+The LSP cannot independently verify that an arbitrary client-provided position
+matches a live workflow engine, plan, or checkpoint. A projection produced by
+the workflow API is runtime-confirmed at its host boundary, not proof that the
+editor process itself has authority over workflow state.
 
 ## Configuration refresh
 
@@ -129,7 +167,8 @@ settings do not change the current projection.
 
 The notification is only a delivery path for host metadata. The server does not
 read a workflow engine, plan, checkpoint, or runtime data and cannot verify
-that the new position reflects live execution.
+that the new position reflects live execution. A host that uses the workflow
+projection API performs that validation before the notification is sent.
 
 The LSP completes only these direct, unshadowed paths:
 
@@ -158,8 +197,8 @@ Names and step IDs are limited to 128 bytes; descriptions are limited to
 types, malformed arrays, and every over-limit projection fail closed.
 
 This projection is static between initialization or explicit configuration
-refreshes and is advisory client input. It does not validate `workflow.input`,
-prove that an output has entered the runtime completed prefix, issue a
-capability lease, approve a workflow, expose a tool, or make a Rust adapter
-callable. Runtime data validation and capability approval remain host-owned
-boundaries.
+refreshes and is advisory client input. The workflow API can generate an exact
+runtime-confirmed host update, but the LSP still does not validate
+`workflow.input`, issue a capability lease, approve a workflow, expose a tool,
+or make a Rust adapter callable. Runtime data validation and capability
+approval remain host-owned boundaries.

@@ -4342,6 +4342,122 @@ mod tests {
     }
 
     #[test]
+    fn accepts_the_workflow_crates_runtime_confirmed_dataflow_projection() {
+        use splash_capabilities::CapabilityRuntime;
+        use splash_schema::JsonSchema;
+        use splash_workflow::{
+            WorkflowData, WorkflowDataContract, WorkflowDataLspProjection, WorkflowEngine,
+            WorkflowStep, WorkflowStepOutputContract, MAX_WORKFLOW_DATA_LSP_BYTES,
+            MAX_WORKFLOW_DATA_LSP_DESCRIPTION_BYTES, MAX_WORKFLOW_DATA_LSP_FIELDS,
+            MAX_WORKFLOW_DATA_LSP_NAME_BYTES, MAX_WORKFLOW_DATA_LSP_OUTPUTS,
+        };
+
+        assert_eq!(MAX_WORKFLOW_DATA_LSP_OUTPUTS, MAX_LSP_WORKFLOW_DATA_OUTPUTS);
+        assert_eq!(MAX_WORKFLOW_DATA_LSP_FIELDS, MAX_LSP_WORKFLOW_DATA_FIELDS);
+        assert_eq!(MAX_WORKFLOW_DATA_LSP_BYTES, MAX_LSP_WORKFLOW_DATA_BYTES);
+        assert_eq!(
+            MAX_WORKFLOW_DATA_LSP_NAME_BYTES,
+            MAX_LSP_WORKFLOW_DATA_FIELD_NAME_BYTES
+        );
+        assert_eq!(
+            MAX_WORKFLOW_DATA_LSP_DESCRIPTION_BYTES,
+            MAX_LSP_WORKFLOW_DATA_FIELD_DESCRIPTION_BYTES
+        );
+
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![
+                WorkflowStep::new("prepare", "1"),
+                WorkflowStep::new("calculate", "2"),
+            ])
+            .expect("workflow plan is valid");
+        let contract = WorkflowDataContract::new(
+            JsonSchema::compile(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "left": {"type": "integer", "description": "Left operand."}
+                },
+                "required": ["left"],
+                "additionalProperties": false
+            }))
+            .expect("input schema is valid"),
+            vec![
+                WorkflowStepOutputContract::new(
+                    "prepare",
+                    JsonSchema::compile(serde_json::json!({
+                        "type": "object",
+                        "properties": {"total": {"type": "integer"}},
+                        "required": ["total"],
+                        "additionalProperties": false
+                    }))
+                    .expect("prepare schema is valid"),
+                ),
+                WorkflowStepOutputContract::new(
+                    "calculate",
+                    JsonSchema::compile(serde_json::json!({"type": "number"}))
+                        .expect("calculate schema is valid"),
+                ),
+            ],
+        )
+        .expect("dataflow contract is within bounds");
+        let mut data =
+            WorkflowData::new(serde_json::json!({"left": 3})).expect("workflow input is bounded");
+        let checkpoint = engine
+            .dataflow_checkpoint_after_with_contract(&plan, &mut data, &contract, 0)
+            .expect("initial dataflow checkpoint is valid");
+        let projection =
+            WorkflowDataLspProjection::from_checkpoint(&plan, &checkpoint, &data, &contract)
+                .expect("bound workflow state produces an LSP projection");
+        let splash = serde_json::to_value(&projection).expect("projection serializes");
+
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({"splash": splash})),
+            ..InitializeParams::default()
+        };
+        let catalog = workflow_data_completion_catalog_from_initialize_options(&params);
+        let step_context = workflow_data_step_context_from_initialize_options(&params);
+        assert!(catalog.configured);
+        assert!(!catalog.unavailable);
+        assert_eq!(
+            catalog
+                .input_fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["left"]
+        );
+        assert_eq!(
+            catalog
+                .outputs
+                .iter()
+                .map(|output| output.step_id.as_str())
+                .collect::<Vec<_>>(),
+            ["prepare"]
+        );
+        assert!(step_context.configured);
+        assert!(!step_context.unavailable);
+        assert_eq!(step_context.completed_output_count, 0);
+
+        let source = "workflow.input.";
+        let mut server = SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            catalog,
+            step_context,
+        );
+        server.open_document(document(1, source));
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("workflow projection completion succeeds");
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["left"]
+        );
+    }
+
+    #[test]
     fn workflow_data_step_context_fails_closed_when_not_an_exact_catalog_prefix() {
         let catalog = workflow_data_catalog(serde_json::json!({
             "inputFields": [],

@@ -14,3 +14,8 @@ lsp-server = "0.9.0"
 lsp-types = "0.97.0"
 serde_json = "1.0.150"
 splash-core = { path = "../splash-core" }
+
+[dev-dependencies]
+splash-capabilities = { path = "../splash-capabilities" }
+splash-schema = { path = "../splash-schema" }
+splash-workflow = { path = "../splash-workflow" }

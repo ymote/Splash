@@ -712,7 +712,10 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "serde_json",
+ "splash-capabilities",
  "splash-core",
+ "splash-schema",
+ "splash-workflow",
 ]
 
 [[package]]

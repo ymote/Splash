@@ -28,10 +28,12 @@
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context
-  filters outputs to a host-declared projected completed prefix and next
-  projected step, without creating runtime data, proving live availability,
-  loading schemas or checkpoints, validating values, approving a plan, or
-  granting a capability.
+  filters outputs to a projected completed prefix and next projected step. The
+  `splash-workflow` API can derive that complete pair from contract-bound data,
+  a validated checkpoint, or exact suspended engine state without serializing
+  values, source, approvals, leases, or schema source. The LSP itself remains
+  advisory: it does not load schemas/checkpoints, validate values, approve a
+  plan, or grant a capability.
 - Bounded direct literal-record field metadata for exact visible
   `let binding = { ... }` initializers, with same-document completion, hover,
   and definition. It is advisory and does not infer aliases, mutation, control
@@ -232,8 +234,7 @@
 - Additional semantic editor features beyond lexical completion, fixed
   `mod.tool`, direct literal-record fields, catalog-backed chained lookup from
   a visible imported-module binding, and direct advisory workflow-data fields.
-  Runtime-confirmed dataflow-state synchronization, general module resolution,
-  and broader type-aware field semantics remain open.
+  General module resolution and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Independent security review of effectful adapters.
