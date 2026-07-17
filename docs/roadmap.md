@@ -114,7 +114,10 @@
   with input-drift rejection and tenant scope validation.
 - Explicit, host-approved worker compensation intents with a separate bounded
   grant, exact grant fingerprint, one inverse effect per succeeded operation,
-  and crash-safe worker-journal recovery.
+  crash-safe worker-journal recovery, and a product-owned action verifier that
+  rechecks the exact inverse payload before hardened intent recording,
+  approval, and worker-frame sealing. It does not define a universal inverse
+  action or automatic rollback policy.
 - Worker-side capability runtime with explicit Rust adapter registration,
   fresh-session admission, durable journal ordering, bounded reconciliation,
   and indeterminate-effect recovery.
@@ -233,5 +236,4 @@
   and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
-- Product-specific compensation action policies.
 - Independent security review of effectful adapters.

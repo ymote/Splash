@@ -92,8 +92,9 @@ and keeps UI support optional rather than making UI the language boundary.
   for replay-safe idempotency across a worker restart.
 - A capability-scoped worker runtime that dispatches only explicitly
   registered Rust adapters and enforces durable operation ordering.
-- Host-approved, current-policy-revalidated durable compensation intents with
-  one inverse effect per succeeded operation and replay-safe worker recovery.
+- Host-approved, current-policy- and product-action-revalidated durable
+  compensation intents with one inverse effect per succeeded operation and
+  replay-safe worker recovery.
 - Approval-bound, catalog-fingerprinted capability leases that attenuate
   dynamic workflow tool calls across `await` and resume, including one
   least-privilege lease per trusted workflow step.

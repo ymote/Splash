@@ -1572,6 +1572,112 @@ pub trait CompensationGrantVerifier {
     ) -> Result<(), WorkflowOperationLedgerError>;
 }
 
+/// Product-owned context for deciding whether one exact inverse payload is
+/// currently allowed.
+///
+/// This value is only constructed while a trusted host is recording,
+/// approving, or sealing a compensation request. It carries the raw canonical
+/// compensation input because a product policy may need to validate an
+/// adapter-specific inverse shape. Its `Debug` implementation deliberately
+/// omits that input.
+pub struct WorkflowCompensationAction<'a> {
+    plan_fingerprint: &'a str,
+    operation: &'a WorkflowOperation,
+    policy: &'a WorkflowCompensationPolicy,
+    grant: &'a CapabilityGrant,
+    compensation_input: &'a [u8],
+}
+
+impl fmt::Debug for WorkflowCompensationAction<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowCompensationAction")
+            .field("plan_fingerprint", &self.plan_fingerprint)
+            .field("operation_key", &self.operation.operation_key)
+            .field("step_id", &self.operation.step_id)
+            .field("tool", &self.operation.tool)
+            .field("tenant_scope", &self.policy.tenant_scope)
+            .field("compensation_input_bytes", &self.compensation_input.len())
+            .finish()
+    }
+}
+
+impl<'a> WorkflowCompensationAction<'a> {
+    fn new(
+        plan: &'a WorkflowPlan,
+        operation: &'a WorkflowOperation,
+        policy: &'a WorkflowCompensationPolicy,
+        grant: &'a CapabilityGrant,
+        compensation_input: &'a [u8],
+    ) -> Self {
+        Self {
+            plan_fingerprint: plan.fingerprint(),
+            operation,
+            policy,
+            grant,
+            compensation_input,
+        }
+    }
+
+    /// Returns the stable fingerprint of the reviewed workflow plan.
+    pub fn plan_fingerprint(&self) -> &str {
+        self.plan_fingerprint
+    }
+
+    /// Returns the durable original operation key.
+    pub fn operation_key(&self) -> &str {
+        &self.operation.operation_key
+    }
+
+    /// Returns the reviewed workflow step that created the original operation.
+    pub fn step_id(&self) -> &str {
+        &self.operation.step_id
+    }
+
+    /// Returns the fixed adapter name for both the original and inverse effect.
+    pub fn tool(&self) -> &str {
+        &self.operation.tool
+    }
+
+    /// Returns the original operation input fingerprint, never its raw input.
+    pub fn original_input_fingerprint(&self) -> &str {
+        &self.operation.input_fingerprint
+    }
+
+    /// Returns the current tenant or policy scope.
+    pub fn tenant_scope(&self) -> &str {
+        &self.policy.tenant_scope
+    }
+
+    /// Returns the current host grant after the target verified its binding.
+    pub fn grant(&self) -> &CapabilityGrant {
+        self.grant
+    }
+
+    /// Returns the exact canonical inverse payload that the host is considering.
+    ///
+    /// Treat this as sensitive host data. It is not retained in the durable
+    /// workflow ledger and should not be logged by a policy implementation.
+    pub fn compensation_input(&self) -> &[u8] {
+        self.compensation_input
+    }
+}
+
+/// Product-owned policy hook for one adapter-specific compensation action.
+///
+/// A grant limits which adapter may receive an inverse effect, but it cannot
+/// prove that arbitrary payload is a valid inverse. Implementations should
+/// validate the exact payload against current product policy, original
+/// operation identity, tenant state, and any adapter-specific recovery rules.
+/// The hook runs before an action-aware intent is recorded, before approval is
+/// issued, and again immediately before the worker frame is sealed.
+pub trait CompensationActionVerifier {
+    fn verify_compensation_action(
+        &self,
+        action: &WorkflowCompensationAction<'_>,
+    ) -> Result<(), WorkflowOperationLedgerError>;
+}
+
 /// The operation, policy, and current grant that a host is considering for
 /// compensation.
 ///
@@ -1583,7 +1689,8 @@ pub struct WorkflowCompensationTarget<'a> {
     operation_key: &'a str,
     policy: &'a WorkflowCompensationPolicy,
     grant: &'a CapabilityGrant,
-    verifier: &'a dyn CompensationGrantVerifier,
+    grant_verifier: &'a dyn CompensationGrantVerifier,
+    action_verifier: &'a dyn CompensationActionVerifier,
 }
 
 impl fmt::Debug for WorkflowCompensationTarget<'_> {
@@ -1593,7 +1700,8 @@ impl fmt::Debug for WorkflowCompensationTarget<'_> {
             .field("operation_key", &self.operation_key)
             .field("policy", &self.policy)
             .field("grant", &self.grant)
-            .field("verifier", &"[trusted host policy]")
+            .field("grant_verifier", &"[trusted host policy]")
+            .field("action_verifier", &"[trusted host policy]")
             .finish()
     }
 }
@@ -1603,13 +1711,15 @@ impl<'a> WorkflowCompensationTarget<'a> {
         operation_key: &'a str,
         policy: &'a WorkflowCompensationPolicy,
         grant: &'a CapabilityGrant,
-        verifier: &'a dyn CompensationGrantVerifier,
+        grant_verifier: &'a dyn CompensationGrantVerifier,
+        action_verifier: &'a dyn CompensationActionVerifier,
     ) -> Self {
         Self {
             operation_key,
             policy,
             grant,
-            verifier,
+            grant_verifier,
+            action_verifier,
         }
     }
 
@@ -1625,15 +1735,36 @@ impl<'a> WorkflowCompensationTarget<'a> {
         self.grant
     }
 
-    fn verify_current(self) -> Result<(), WorkflowOperationLedgerError> {
+    fn verify_grant_current(self) -> Result<(), WorkflowOperationLedgerError> {
         self.policy.validate_syntax()?;
         if !self.policy.matches_grant(self.grant)? {
             return Err(WorkflowOperationLedgerError::CompensationPolicyMismatch(
                 self.operation_key.to_owned(),
             ));
         }
-        self.verifier
+        self.grant_verifier
             .verify_compensation_grant(self.policy.tenant_scope(), self.grant)
+    }
+
+    fn verify_action_current(
+        self,
+        plan: &WorkflowPlan,
+        operation: &WorkflowOperation,
+        input: &[u8],
+    ) -> Result<(), WorkflowOperationLedgerError> {
+        if self.operation_key != operation.operation_key {
+            return Err(WorkflowOperationLedgerError::OperationBindingMismatch(
+                self.operation_key.to_owned(),
+            ));
+        }
+        if operation.tool != self.policy.tool {
+            return Err(WorkflowOperationLedgerError::CompensationPolicyMismatch(
+                operation.operation_key.clone(),
+            ));
+        }
+        let action =
+            WorkflowCompensationAction::new(plan, operation, self.policy, self.grant, input);
+        self.action_verifier.verify_compensation_action(&action)
     }
 }
 
@@ -2114,12 +2245,13 @@ impl WorkflowOperationLedger {
         Ok(())
     }
 
-    /// Records one host-approved compensation intent for a succeeded operation.
+    /// Records one host-selected compensation intent for a succeeded operation.
     ///
     /// The compensation key is deliberately separate from the original
     /// operation key and can be recorded only once per original operation.
     /// Persist this mutation through authenticated compare-and-swap storage
     /// before a host issues a compensation approval or sends a worker frame.
+    /// This low-level ledger mutation does not authorize a compensation action.
     pub fn record_compensation(
         &mut self,
         operation_key: &str,
@@ -2449,6 +2581,11 @@ pub enum WorkflowOperationLedgerError {
         tool: String,
         tenant_scope: String,
     },
+    CompensationActionDenied {
+        operation_key: String,
+        tool: String,
+        tenant_scope: String,
+    },
     CompensationNotGranted(String),
     CompensationInputFingerprintMismatch(String),
     CompensationAlreadyRecorded(String),
@@ -2582,6 +2719,17 @@ impl Display for WorkflowOperationLedgerError {
             Self::CompensationGrantDenied { tool, tenant_scope } => write!(
                 formatter,
                 "current host policy denied compensation grant {} for tenant {}",
+                workflow_error_text(tool),
+                workflow_error_text(tenant_scope)
+            ),
+            Self::CompensationActionDenied {
+                operation_key,
+                tool,
+                tenant_scope,
+            } => write!(
+                formatter,
+                "current host policy denied compensation for operation {} through tool {} in tenant {}",
+                workflow_error_text(operation_key),
                 workflow_error_text(tool),
                 workflow_error_text(tenant_scope)
             ),
@@ -4646,6 +4794,10 @@ impl WorkflowEngine {
     /// Records the one durable compensation intent permitted for a succeeded
     /// operation. Persist the ledger through compare-and-swap storage before
     /// creating an approval or sending the resulting worker frame.
+    ///
+    /// This compatibility path does not invoke a product action verifier. Use
+    /// [`Self::record_compensation_with_action_verifier`] for the hardened
+    /// intent-recording sequence.
     pub fn record_compensation(
         &mut self,
         plan: &WorkflowPlan,
@@ -4673,8 +4825,72 @@ impl WorkflowEngine {
         Ok(())
     }
 
+    /// Records one durable compensation intent after product policy approved
+    /// the exact canonical inverse payload.
+    ///
+    /// This is the hardened recording path. It verifies the target's current
+    /// grant and action policy before changing the ledger, then callers must
+    /// still persist that ledger through authenticated compare-and-swap
+    /// storage before issuing approval or sending a worker frame. The lower
+    /// level [`Self::record_compensation`] remains available for hosts that
+    /// manage durable storage plumbing separately, but it does not invoke an
+    /// action verifier and cannot itself dispatch an effect.
+    pub fn record_compensation_with_action_verifier(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &mut WorkflowOperationLedger,
+        target: WorkflowCompensationTarget<'_>,
+        compensation_key: impl Into<String>,
+        input: &[u8],
+    ) -> Result<(), WorkflowError> {
+        if !self.owns_plan(plan) {
+            return Err(WorkflowError::PlanOwnershipMismatch);
+        }
+        ledger
+            .validate_for(plan)
+            .map_err(WorkflowError::OperationLedger)?;
+        target
+            .verify_grant_current()
+            .map_err(WorkflowError::OperationLedger)?;
+        if input.len() > MAX_WORKFLOW_OPERATION_INPUT_BYTES {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::InputTooLarge {
+                    actual: input.len(),
+                    maximum: MAX_WORKFLOW_OPERATION_INPUT_BYTES,
+                },
+            ));
+        }
+        let operation_key = target.operation_key();
+        let operation = ledger.operation(operation_key).ok_or_else(|| {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownOperation(
+                operation_key.to_owned(),
+            ))
+        })?;
+        target
+            .verify_action_current(plan, operation, input)
+            .map_err(WorkflowError::OperationLedger)?;
+        let compensation_key = compensation_key.into();
+        ledger
+            .record_compensation(
+                operation_key,
+                target.policy(),
+                compensation_key.clone(),
+                input,
+            )
+            .map_err(WorkflowError::OperationLedger)?;
+        self.record_event(WorkflowEvent::CompensationRecorded {
+            plan_id: plan.id,
+            operation_key: operation_key.to_owned(),
+            compensation_key,
+        });
+        Ok(())
+    }
+
     /// Derives and records a durable compensation intent for a succeeded
-    /// operation.
+    /// operation without invoking a product action verifier.
+    ///
+    /// Use [`Self::record_derived_compensation_with_action_verifier`] for the
+    /// hardened intent-recording sequence.
     pub fn record_derived_compensation(
         &mut self,
         plan: &WorkflowPlan,
@@ -4697,6 +4913,34 @@ impl WorkflowEngine {
             ledger,
             operation_key,
             policy,
+            compensation_key.clone(),
+            input,
+        )?;
+        Ok(compensation_key)
+    }
+
+    /// Derives and records a durable compensation intent through the hardened
+    /// product action-verifier path.
+    pub fn record_derived_compensation_with_action_verifier(
+        &mut self,
+        plan: &WorkflowPlan,
+        ledger: &mut WorkflowOperationLedger,
+        target: WorkflowCompensationTarget<'_>,
+        input: &[u8],
+        compensation_nonce: &[u8],
+    ) -> Result<String, WorkflowError> {
+        let compensation_key = self.derive_compensation_key(
+            plan,
+            ledger,
+            target.operation_key(),
+            target.policy(),
+            input,
+            compensation_nonce,
+        )?;
+        self.record_compensation_with_action_verifier(
+            plan,
+            ledger,
+            target,
             compensation_key.clone(),
             input,
         )?;
@@ -4831,7 +5075,7 @@ impl WorkflowEngine {
         }
         self.validate_operation_ledger(plan, ledger)?;
         target
-            .verify_current()
+            .verify_grant_current()
             .map_err(WorkflowError::OperationLedger)?;
         let operation = ledger.operation(operation_key).ok_or_else(|| {
             WorkflowError::OperationLedger(WorkflowOperationLedgerError::UnknownOperation(
@@ -4867,6 +5111,9 @@ impl WorkflowEngine {
         }
         compensation
             .verify_input(input)
+            .map_err(WorkflowError::OperationLedger)?;
+        target
+            .verify_action_current(plan, operation, input)
             .map_err(WorkflowError::OperationLedger)?;
 
         let approval = self.issue_approval(
@@ -4909,7 +5156,7 @@ impl WorkflowEngine {
         }
         self.validate_operation_ledger(plan, ledger)?;
         target
-            .verify_current()
+            .verify_grant_current()
             .map_err(WorkflowError::OperationLedger)?;
         if !self.approval_matches(plan, &approval) {
             return Err(WorkflowError::ApprovalMismatch);
@@ -4968,6 +5215,9 @@ impl WorkflowEngine {
         })?;
         compensation
             .verify_input(&input)
+            .map_err(WorkflowError::OperationLedger)?;
+        target
+            .verify_action_current(plan, operation, &input)
             .map_err(WorkflowError::OperationLedger)?;
         let frame = authenticator
             .seal(WorkerMessage::CompensateOperation {
@@ -6491,6 +6741,8 @@ struct WorkflowDraftStepRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+
     use splash_capabilities::{CapabilityLeaseError, CapabilityLeaseGrant, ToolPolicy};
     use splash_protocol::{canonical_operation_input_bytes, SessionKey, AUTH_TAG_BYTES};
     use splash_schema::JsonSchema;
@@ -6547,6 +6799,75 @@ mod tests {
             Err(WorkflowOperationLedgerError::CompensationGrantDenied {
                 tool: grant.tool.clone(),
                 tenant_scope: tenant_scope.to_owned(),
+            })
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RecordedCompensationAction {
+        plan_fingerprint: String,
+        operation_key: String,
+        step_id: String,
+        tool: String,
+        tenant_scope: String,
+        original_input_fingerprint: String,
+        grant_tool: String,
+        input: Vec<u8>,
+        debug: String,
+    }
+
+    #[derive(Default)]
+    struct RecordingCompensationActionVerifier {
+        calls: RefCell<Vec<RecordedCompensationAction>>,
+    }
+
+    impl CompensationActionVerifier for RecordingCompensationActionVerifier {
+        fn verify_compensation_action(
+            &self,
+            action: &WorkflowCompensationAction<'_>,
+        ) -> Result<(), WorkflowOperationLedgerError> {
+            self.calls.borrow_mut().push(RecordedCompensationAction {
+                plan_fingerprint: action.plan_fingerprint().to_owned(),
+                operation_key: action.operation_key().to_owned(),
+                step_id: action.step_id().to_owned(),
+                tool: action.tool().to_owned(),
+                tenant_scope: action.tenant_scope().to_owned(),
+                original_input_fingerprint: action.original_input_fingerprint().to_owned(),
+                grant_tool: action.grant().tool.clone(),
+                input: action.compensation_input().to_vec(),
+                debug: format!("{action:?}"),
+            });
+            Ok(())
+        }
+    }
+
+    struct GatedCompensationActionVerifier {
+        allowed: Cell<bool>,
+        calls: Cell<usize>,
+    }
+
+    impl GatedCompensationActionVerifier {
+        fn new(allowed: bool) -> Self {
+            Self {
+                allowed: Cell::new(allowed),
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl CompensationActionVerifier for GatedCompensationActionVerifier {
+        fn verify_compensation_action(
+            &self,
+            action: &WorkflowCompensationAction<'_>,
+        ) -> Result<(), WorkflowOperationLedgerError> {
+            self.calls.set(self.calls.get().saturating_add(1));
+            if self.allowed.get() {
+                return Ok(());
+            }
+            Err(WorkflowOperationLedgerError::CompensationActionDenied {
+                operation_key: action.operation_key().to_owned(),
+                tool: action.tool().to_owned(),
+                tenant_scope: action.tenant_scope().to_owned(),
             })
         }
     }
@@ -8339,25 +8660,33 @@ mod tests {
 
         let grant = CapabilityGrant::json("release.publish").with_compensation_limit(1);
         let policy = WorkflowCompensationPolicy::new("tenant-release", &grant).unwrap();
-        let verifier = AllowCompensationGrantVerifier;
-        let target = WorkflowCompensationTarget::new(&operation_key, &policy, &grant, &verifier);
+        let grant_verifier = AllowCompensationGrantVerifier;
+        let action_verifier = RecordingCompensationActionVerifier::default();
+        let target = WorkflowCompensationTarget::new(
+            &operation_key,
+            &policy,
+            &grant,
+            &grant_verifier,
+            &action_verifier,
+        );
         let compensation_payload = ToolPayload::Json(serde_json::json!({"undo": "release"}));
         let compensation_input = canonical_operation_input_bytes(&compensation_payload).unwrap();
         let (mut host, mut worker) = operation_reconciliation_authenticators();
 
         let compensation_key = engine
-            .record_derived_compensation(
+            .record_derived_compensation_with_action_verifier(
                 &plan,
                 &mut ledger,
-                &operation_key,
-                &policy,
+                target,
                 &compensation_input,
                 b"release-42:publish:undo:1",
             )
             .unwrap();
+        assert_eq!(action_verifier.calls.borrow().len(), 1);
         let drift_approval = engine
             .approve_compensation(&plan, &ledger, target, &compensation_input, &host)
             .unwrap();
+        assert_eq!(action_verifier.calls.borrow().len(), 2);
         assert_eq!(
             engine
                 .prepare_authenticated_operation_compensation(
@@ -8381,6 +8710,7 @@ mod tests {
         let approval = engine
             .approve_compensation(&plan, &ledger, target, &compensation_input, &host)
             .unwrap();
+        assert_eq!(action_verifier.calls.borrow().len(), 3);
         let outbound = engine
             .prepare_authenticated_operation_compensation(
                 &plan,
@@ -8394,6 +8724,19 @@ mod tests {
                 &mut host,
             )
             .unwrap();
+        let action_calls = action_verifier.calls.borrow();
+        assert_eq!(action_calls.len(), 4);
+        assert!(action_calls.iter().all(|call| {
+            call.plan_fingerprint == plan.fingerprint()
+                && call.operation_key == operation_key
+                && call.step_id == "publish"
+                && call.tool == "release.publish"
+                && call.tenant_scope == "tenant-release"
+                && call.grant_tool == "release.publish"
+                && call.input == compensation_input
+                && !call.debug.contains("undo")
+        }));
+        drop(action_calls);
         let WorkerMessage::CompensateOperation { request } = worker.open(outbound.frame).unwrap()
         else {
             panic!("host must send a compensation request");
@@ -8521,7 +8864,14 @@ mod tests {
         let grant = CapabilityGrant::json("release.publish").with_compensation_limit(1);
         let policy = WorkflowCompensationPolicy::new("tenant-release", &grant).unwrap();
         let verifier = DenyCompensationGrantVerifier;
-        let target = WorkflowCompensationTarget::new("op-release-42", &policy, &grant, &verifier);
+        let action_verifier = RecordingCompensationActionVerifier::default();
+        let target = WorkflowCompensationTarget::new(
+            "op-release-42",
+            &policy,
+            &grant,
+            &verifier,
+            &action_verifier,
+        );
         let (mut host, _) = operation_reconciliation_authenticators();
         let expected =
             WorkflowError::OperationLedger(WorkflowOperationLedgerError::CompensationGrantDenied {
@@ -8551,6 +8901,138 @@ mod tests {
                 )
                 .unwrap_err(),
             expected
+        );
+    }
+
+    #[test]
+    fn compensation_action_policy_blocks_recording_and_rechecks_before_frame_seal() {
+        let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
+        let plan = engine
+            .plan(vec![WorkflowStep::new("publish", "let release = true")])
+            .unwrap();
+        let mut ledger = engine.operation_ledger(&plan).unwrap();
+        let operation_payload = ToolPayload::Json(serde_json::json!({"version": "1.2.3"}));
+        let operation_input = canonical_operation_input_bytes(&operation_payload).unwrap();
+        let operation_key = engine
+            .record_derived_operation(
+                &plan,
+                &mut ledger,
+                "publish",
+                "release.publish",
+                &operation_input,
+                b"release-42:publish:1",
+            )
+            .unwrap();
+        let original_request = OperationReconcileRequest::new(
+            "worker-1",
+            "original-status-1",
+            "release.publish",
+            operation_key.clone(),
+        )
+        .unwrap();
+        let original_result = OperationReconcileResult::new(
+            "worker-1",
+            "original-status-1",
+            "release.publish",
+            operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(serde_json::json!({"published": true})),
+            },
+        )
+        .unwrap();
+        engine
+            .apply_verified_operation_reconciliation(
+                &plan,
+                &mut ledger,
+                &original_request,
+                &original_result,
+            )
+            .unwrap();
+
+        let grant = CapabilityGrant::json("release.publish").with_compensation_limit(1);
+        let policy = WorkflowCompensationPolicy::new("tenant-release", &grant).unwrap();
+        let grant_verifier = AllowCompensationGrantVerifier;
+        let action_verifier = GatedCompensationActionVerifier::new(false);
+        let target = WorkflowCompensationTarget::new(
+            &operation_key,
+            &policy,
+            &grant,
+            &grant_verifier,
+            &action_verifier,
+        );
+        let compensation_payload = ToolPayload::Json(serde_json::json!({"undo": "release"}));
+        let compensation_input = canonical_operation_input_bytes(&compensation_payload).unwrap();
+        let expected = || {
+            WorkflowError::OperationLedger(WorkflowOperationLedgerError::CompensationActionDenied {
+                operation_key: operation_key.clone(),
+                tool: "release.publish".to_owned(),
+                tenant_scope: "tenant-release".to_owned(),
+            })
+        };
+
+        let revision_before_rejection = ledger.revision();
+        assert_eq!(
+            engine
+                .record_derived_compensation_with_action_verifier(
+                    &plan,
+                    &mut ledger,
+                    target,
+                    &compensation_input,
+                    b"release-42:publish:undo:1",
+                )
+                .unwrap_err(),
+            expected()
+        );
+        assert_eq!(ledger.revision(), revision_before_rejection);
+        assert!(ledger
+            .operation(&operation_key)
+            .unwrap()
+            .compensation()
+            .is_none());
+        assert_eq!(action_verifier.calls.get(), 1);
+
+        action_verifier.allowed.set(true);
+        let compensation_key = engine
+            .record_derived_compensation_with_action_verifier(
+                &plan,
+                &mut ledger,
+                target,
+                &compensation_input,
+                b"release-42:publish:undo:1",
+            )
+            .unwrap();
+        let (mut host, _) = operation_reconciliation_authenticators();
+        let approval = engine
+            .approve_compensation(&plan, &ledger, target, &compensation_input, &host)
+            .unwrap();
+        assert_eq!(action_verifier.calls.get(), 3);
+
+        action_verifier.allowed.set(false);
+        assert_eq!(
+            engine
+                .prepare_authenticated_operation_compensation(
+                    &plan,
+                    &ledger,
+                    target,
+                    WorkflowCompensationDispatch::new(
+                        "compensation-request-1",
+                        compensation_payload
+                    ),
+                    approval,
+                    &mut host,
+                )
+                .unwrap_err(),
+            expected()
+        );
+        assert_eq!(action_verifier.calls.get(), 4);
+        assert_eq!(
+            ledger
+                .operation(&operation_key)
+                .unwrap()
+                .compensation()
+                .unwrap()
+                .compensation_key(),
+            compensation_key
         );
     }
 

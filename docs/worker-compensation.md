@@ -34,7 +34,10 @@ The requirement that the compensation use the original tool limits authority
 to the same adapter boundary. It does not make arbitrary input an inverse.
 Every effectful adapter must expose a dedicated compensation handler and
 validate that handler's payload against its own explicit inverse-operation
-contract.
+contract. The host must also supply a product-specific
+`CompensationActionVerifier`: a grant controls which adapter may receive the
+effect, while the action verifier decides whether this exact canonical inverse
+payload is currently allowed for the original operation and tenant.
 
 ## Host Sequence
 
@@ -44,7 +47,7 @@ effect. A typical flow is:
 ```rust
 use splash_protocol::{canonical_operation_input_bytes, CapabilityGrant, ToolPayload};
 use splash_workflow::{
-    CompensationGrantVerifier, WorkflowCompensationDispatch,
+    CompensationActionVerifier, CompensationGrantVerifier, WorkflowCompensationDispatch,
     WorkflowCompensationPolicy, WorkflowCompensationTarget,
 };
 
@@ -53,24 +56,24 @@ let policy = WorkflowCompensationPolicy::new("tenant-release", &grant)?;
 let payload = ToolPayload::Json(serde_json::json!({"undo": "release"}));
 let input = canonical_operation_input_bytes(&payload)?;
 
-let compensation_key = engine.record_derived_compensation(
-    &plan,
-    &mut ledger,
-    &operation_key,
-    &policy,
-    &input,
-    b"release-42:publish:undo:1",
-)?;
-persist_ledger_compare_and_swap(&ledger)?;
-
-// `current_grant_verifier` implements CompensationGrantVerifier and checks
-// the tenant's current policy, revocations, and any grant lease.
+// `current_grant_verifier` checks tenant policy, revocations, and grants.
+// `current_action_verifier` implements CompensationActionVerifier and checks
+// the exact adapter-specific inverse payload without logging it.
 let target = WorkflowCompensationTarget::new(
     &operation_key,
     &policy,
     &grant,
     &current_grant_verifier,
+    &current_action_verifier,
 );
+let compensation_key = engine.record_derived_compensation_with_action_verifier(
+    &plan,
+    &mut ledger,
+    target,
+    &input,
+    b"release-42:publish:undo:1",
+)?;
+persist_ledger_compare_and_swap(&ledger)?;
 let approval = engine.approve_compensation(
     &plan,
     &ledger,
@@ -88,11 +91,14 @@ let outbound = engine.prepare_authenticated_operation_compensation(
 )?;
 ```
 
-`record_derived_compensation` derives the stable key from the plan, original
-operation key, tool, tenant scope, grant fingerprint, full compensation input,
-and a host-supplied durable nonce. It records only a fingerprint of the input,
-not raw input, output, or error text. A ledger permits exactly one compensation
-record per original operation.
+`record_derived_compensation_with_action_verifier` derives the stable key from
+the plan, original operation key, tool, tenant scope, grant fingerprint, full
+compensation input, and a host-supplied durable nonce. It calls both current
+policy verifiers before mutating the ledger, then records only a fingerprint of
+the input, not raw input, output, or error text. A ledger permits exactly one
+compensation record per original operation. The lower-level recording methods
+remain non-authoritative storage plumbing, but no worker frame can be sealed
+without a `WorkflowCompensationTarget` and its action verifier.
 
 The `Approval` is process-local and one-use. It binds the workflow engine,
 plan, ledger revision, original operation key, compensation key, input
@@ -101,11 +107,14 @@ After a restart, recreate the plan and active policy, load and validate the
 ledger through authenticated rollback-protected storage, then issue a fresh
 approval for the existing intent.
 
-`CompensationGrantVerifier` runs both when the host issues approval and again
-immediately before it seals the frame. It is the host's explicit revocation
-and current-tenant-policy boundary: the implementation must resolve current
-state rather than accept a cached grant simply because its historical
-fingerprint matches. The contained worker independently reauthorizes the
+`CompensationGrantVerifier` and `CompensationActionVerifier` run both when the
+host issues approval and again immediately before it seals the frame. The
+action verifier receives the reviewed plan fingerprint, original operation
+identity and input fingerprint, tenant scope, current grant, and the exact
+canonical inverse input. Its debug representation redacts that input. Both
+verifiers are the host's explicit revocation and current-policy boundary: they
+must resolve current state rather than accept a cached grant or historical
+payload fingerprint. The contained worker independently reauthorizes the
 request against its current session manifest before it admits the effect.
 
 The host sends `outbound.frame` only after the ledger write is durable. It
@@ -151,8 +160,8 @@ Treat every uncertain state conservatively:
 | Condition | Required host/worker action |
 | --- | --- |
 | Original `pending`, `running`, `failed`, or `cancelled` | Do not create compensation. Reconcile the original with adapter-specific status lookup or escalate to an operator. |
-| Original `succeeded`, no compensation intent | The trusted host may record one intent after its own policy or operator approval. Persist it before sending any worker frame. |
-| Compensation `pending` or `running` after a crash | Recreate a session, revalidate the same grant and tenant, issue a fresh approval, and send the same `cmp-` key and input. The worker returns `Existing`; use adapter-specific status recovery or manual escalation. Do not execute a new inverse blindly. |
+| Original `succeeded`, no compensation intent | The trusted host may record one intent after its own grant and action-policy approval. Persist it before sending any worker frame. |
+| Compensation `pending` or `running` after a crash | Recreate a session, revalidate the same grant, tenant, and action policy, issue a fresh approval, and send the same `cmp-` key and input. The worker returns `Existing`; use adapter-specific status recovery or manual escalation. Do not execute a new inverse blindly. |
 | Compensation `succeeded` | Persist and report completion. Do not create another compensation for that original operation. |
 | Compensation `failed` or `cancelled` | Persist the state and require an explicit adapter or operator recovery policy. There is no automatic retry or new compensation key. |
 | Grant, tenant, tool, key, or input drift | Fail closed. A policy change cannot reuse the stored intent automatically. |
@@ -170,7 +179,8 @@ The compensation protocol protects identity, authority, sequencing, and
 durable deduplication. It does not provide any of the following:
 
 - semantic proof that an action is reversible;
-- a universal rollback command or automatic compensation policy;
+- a universal rollback command or automatic compensation policy; the host
+  action verifier is product-specific and must supply that decision;
 - process containment, secure key bootstrap, encrypted transport, or worker
   attestation;
 - storage encryption; the worker journal may retain terminal payloads and must
