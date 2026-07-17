@@ -230,9 +230,11 @@ fn assert_module_import_invariants(source: &str, report: &ModuleImportReport) {
             );
         }
         assert_eq!(
-            &source[import.path_span.start_byte..import.path_span.end_byte],
+            normalized_import_path(
+                &source[import.path_span.start_byte..import.path_span.end_byte]
+            ),
             import.path.join("."),
-            "import path span does not match its segments: {import:?}"
+            "import path span does not normalize to its segments: {import:?}"
         );
         assert_eq!(
             &source[import.binding.start_byte..import.binding.end_byte],
@@ -248,6 +250,38 @@ fn assert_module_import_invariants(source: &str, report: &ModuleImportReport) {
         );
         previous_start_byte = import.path_span.start_byte;
     }
+}
+
+fn normalized_import_path(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut normalized = String::with_capacity(source.len());
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+                index += 1;
+            }
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            index = index.saturating_add(2);
+        } else {
+            let character = source[index..]
+                .chars()
+                .next()
+                .expect("index remains at a UTF-8 boundary");
+            normalized.push(character);
+            index += character.len_utf8();
+        }
+    }
+
+    normalized
 }
 
 fn assert_tool_call_hint_invariants(source: &str, hints: &[ToolCallHint]) {

@@ -346,7 +346,8 @@ pub struct SourceSpan {
 ///
 /// `path` always begins with `"mod"`, contains at least one following
 /// identifier, and is ordered as it appeared in source. `path_span` covers
-/// the complete `mod.<path>` spelling; `binding` covers its final identifier.
+/// the complete `mod.<path>` source region, including any permitted whitespace
+/// or comments between path tokens; `binding` covers its final identifier.
 /// This is source metadata only. It neither loads a module nor proves that a
 /// corresponding host binding, capability, or adapter exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2779,6 +2780,24 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
 
         let runtime = Runtime::default();
         assert_eq!(runtime.module_import_report(source).unwrap(), report);
+    }
+
+    #[test]
+    fn import_path_spans_retain_permitted_spacing_between_path_tokens() {
+        let source = "use mod. /* selected by host */ worker";
+        let report = module_import_report(source).expect("source is within default limits");
+
+        assert_eq!(report.imports.len(), 1);
+        let import = &report.imports[0];
+        assert_eq!(import.path, ["mod", "worker"]);
+        assert_eq!(
+            &source[import.path_span.start_byte..import.path_span.end_byte],
+            "mod. /* selected by host */ worker"
+        );
+        assert_eq!(
+            &source[import.binding.start_byte..import.binding.end_byte],
+            "worker"
+        );
     }
 
     #[test]
