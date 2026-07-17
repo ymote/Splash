@@ -16,10 +16,9 @@ use splash_storage::{
 };
 
 use crate::{
-    is_valid_tool_name, AuditEvent, AuditEventBatch, AuditOutcome, RetryClass,
-    CAPABILITY_AUDIT_JOURNAL_FORMAT_VERSION, MAX_DURABLE_CAPABILITY_AUDIT_EVENTS,
+    is_valid_tool_name, AuditEvent, AuditEventBatch, AuditEventValidationError, AuditOutcome,
+    RetryClass, CAPABILITY_AUDIT_JOURNAL_FORMAT_VERSION, MAX_DURABLE_CAPABILITY_AUDIT_EVENTS,
     MAX_DURABLE_CAPABILITY_AUDIT_JOURNAL_BYTES, MAX_DURABLE_CAPABILITY_AUDIT_STORE_RETRIES,
-    UNRECOGNIZED_AUDIT_TOOL_PREFIX,
 };
 
 /// A host-selected identity for one contiguous capability-audit stream.
@@ -451,41 +450,7 @@ fn validate_batch(batch: &AuditEventBatch) -> Result<(), CapabilityAuditBatchErr
 }
 
 fn validate_event(event: &AuditEvent) -> Result<(), CapabilityAuditEventValidationError> {
-    if event.event_sequence == 0 || event.event_sequence == u64::MAX {
-        return Err(CapabilityAuditEventValidationError::InvalidEventSequence);
-    }
-    if !is_valid_audit_tool_label(&event.tool) {
-        return Err(CapabilityAuditEventValidationError::InvalidTool);
-    }
-    match (event.outcome, event.retry_class) {
-        (AuditOutcome::RetryScheduled, Some(_)) => {}
-        (AuditOutcome::RetryScheduled, None) => {
-            return Err(CapabilityAuditEventValidationError::RetryClassRequired)
-        }
-        (_, Some(_)) => return Err(CapabilityAuditEventValidationError::RetryClassUnexpected),
-        (_, None) => {}
-    }
-    if !matches!(
-        event.outcome,
-        AuditOutcome::Allowed | AuditOutcome::Streamed
-    ) && event.output_bytes != 0
-    {
-        return Err(CapabilityAuditEventValidationError::UnexpectedOutputBytes);
-    }
-    Ok(())
-}
-
-fn is_valid_audit_tool_label(value: &str) -> bool {
-    if is_valid_tool_name(value) {
-        return true;
-    }
-    let Some(digest) = value.strip_prefix(UNRECOGNIZED_AUDIT_TOOL_PREFIX) else {
-        return false;
-    };
-    digest.len() == blake3::OUT_LEN * 2
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    event.validate_for_durable_telemetry().map_err(Into::into)
 }
 
 /// Invalid decoded or supplied capability-audit metadata.
@@ -496,6 +461,18 @@ pub enum CapabilityAuditEventValidationError {
     RetryClassRequired,
     RetryClassUnexpected,
     UnexpectedOutputBytes,
+}
+
+impl From<AuditEventValidationError> for CapabilityAuditEventValidationError {
+    fn from(error: AuditEventValidationError) -> Self {
+        match error {
+            AuditEventValidationError::InvalidEventSequence => Self::InvalidEventSequence,
+            AuditEventValidationError::InvalidTool => Self::InvalidTool,
+            AuditEventValidationError::RetryClassRequired => Self::RetryClassRequired,
+            AuditEventValidationError::RetryClassUnexpected => Self::RetryClassUnexpected,
+            AuditEventValidationError::UnexpectedOutputBytes => Self::UnexpectedOutputBytes,
+        }
+    }
 }
 
 impl Display for CapabilityAuditEventValidationError {

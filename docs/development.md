@@ -329,13 +329,19 @@ and gap rejection, aggregate eviction cursors, and source continuity after an
 aggregate clear. It runs only a fixed local `text.echo` adapter to construct
 audit telemetry; fuzz input never becomes Splash source, a tool name, or a
 tool payload.
+`durable_cross_stream_telemetry` feeds bounded UTF-8 documents through the
+authenticated aggregate-journal decoder. Every accepted journal must re-encode
+and round-trip under the maximum retention capacity, then accept one fixed
+valid workflow event at a persisted source cursor when a source slot remains.
+It never creates a capability host, runs an adapter, or treats aggregate
+telemetry as recovery or authority.
 `json_line_worker` feeds bounded arbitrary bytes through small, variable
 `BufReader` capacities, optionally appends a line terminator, and attempts two
 successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all ten targets and performs a short 128-run coverage-only smoke pass
+CI compiles all eleven targets and performs a short 128-run coverage-only smoke pass
 with `--sanitizer none`. Run the longer local commands below with the default
 sanitizer whenever the platform supports it.
 
@@ -353,6 +359,7 @@ cargo +nightly fuzz run workflow_external_operation -- -max_total_time=60 -max_l
 cargo +nightly fuzz run workflow_event_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run capability_audit_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run cross_stream_telemetry -- -max_total_time=60 -max_len=4096
+cargo +nightly fuzz run durable_cross_stream_telemetry -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run json_line_worker -- -max_total_time=60 -max_len=1048578
 ```
 
@@ -371,6 +378,7 @@ cargo +nightly fuzz run --sanitizer none workflow_external_operation -- -max_tot
 cargo +nightly fuzz run --sanitizer none workflow_event_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run --sanitizer none capability_audit_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run --sanitizer none cross_stream_telemetry -- -max_total_time=60 -max_len=4096
+cargo +nightly fuzz run --sanitizer none durable_cross_stream_telemetry -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run --sanitizer none json_line_worker -- -max_total_time=60 -max_len=1048578
 ```
 
@@ -386,5 +394,6 @@ cargo +nightly fuzz run workflow_external_operation artifacts/workflow_external_
 cargo +nightly fuzz run workflow_event_journal artifacts/workflow_event_journal/<artifact>
 cargo +nightly fuzz run capability_audit_journal artifacts/capability_audit_journal/<artifact>
 cargo +nightly fuzz run cross_stream_telemetry artifacts/cross_stream_telemetry/<artifact>
+cargo +nightly fuzz run durable_cross_stream_telemetry artifacts/durable_cross_stream_telemetry/<artifact>
 cargo +nightly fuzz run json_line_worker artifacts/json_line_worker/<artifact>
 ```

@@ -51,10 +51,10 @@ and keeps UI support optional rather than making UI the language boundary.
   capability-audit journal and authenticated workflow-event journal for
   host-owned operator/audit replay that remain separate from workflow
   authority.
-- A bounded host-receipt-order cross-stream telemetry aggregator for named
-  capability-audit and workflow-event source segments, with exact source and
-  aggregate cursors, explicit loss detection, and no durable or recovery
-  authority.
+- Bounded host-receipt-order cross-stream telemetry for named capability-audit
+  and workflow-event source segments, including an in-memory aggregator and an
+  authenticated durable aggregate journal with exact source and aggregate
+  cursors, explicit loss detection, and no recovery or capability authority.
 - Audited tool calls with input/output and call-count limits.
 - Bounded executable JSON contracts for structured tool inputs and outputs.
 - Schema-required Serde bridges for reviewed Rust input and output types.
@@ -486,8 +486,8 @@ than retaining a stale projection. See [editor workflow-data projection](docs/wo
   Bubblewrap backend is Linux-only and deliberately narrow, with bounded
   manifest-selected ephemeral file roots for scratch data.
 - `splash-workflow`: host-owned planning, lease-bound approval, bounded JSON
-  dataflow, bounded in-memory and authenticated durable event replay,
-  host-receipt-order cross-stream telemetry aggregation,
+  dataflow, bounded in-memory and authenticated durable event and cross-stream
+  telemetry journals, host-receipt-order aggregation,
   checkpointing, durable operation records, optional fenced Bubblewrap
   post-stop reconciliation, a multiplexed-worker completion sink, sequential
   execution, and a sealed mobile/embedded workflow facade for static local
@@ -531,8 +531,8 @@ host-export cursor, optional authenticated durable journal, and explicit
 observability-gap behavior.
 
 [Cross-stream telemetry](docs/cross-stream-telemetry.md) defines bounded
-host-receipt-order aggregation of source telemetry without creating durable
-recovery or capability authority.
+in-memory and authenticated durable host-receipt-order aggregation of source
+telemetry without creating recovery or capability authority.
 
 [Workflow drafts](docs/workflow-drafts.md) define the untrusted LLM-plan
 interchange and review boundary before a host-owned approval.

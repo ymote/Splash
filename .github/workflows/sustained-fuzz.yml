@@ -88,6 +88,11 @@ jobs:
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none cross_stream_telemetry --
           -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=4096
         working-directory: fuzz
+      - name: Durable cross-stream telemetry fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none durable_cross_stream_telemetry --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=196608
+        working-directory: fuzz
       - name: JSON-line worker fuzzing
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none json_line_worker --

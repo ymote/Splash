@@ -26,6 +26,9 @@ vendor/makepad/target/
 !/fuzz/corpus/capability_audit_journal/
 /fuzz/corpus/capability_audit_journal/*
 !/fuzz/corpus/capability_audit_journal/*.json
+!/fuzz/corpus/durable_cross_stream_telemetry/
+/fuzz/corpus/durable_cross_stream_telemetry/*
+!/fuzz/corpus/durable_cross_stream_telemetry/*.json
 /fuzz/target/
 *.swp
 .DS_Store

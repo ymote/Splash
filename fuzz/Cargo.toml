@@ -72,6 +72,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "durable_cross_stream_telemetry"
+path = "fuzz_targets/durable_cross_stream_telemetry.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "json_line_worker"
 path = "fuzz_targets/json_line_worker.rs"
 test = false

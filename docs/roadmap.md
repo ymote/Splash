@@ -102,7 +102,9 @@
   external effect.
 - Bounded host-receipt-order cross-stream aggregation of named capability-audit
   and workflow-event source segments, with exact cursors, explicit source and
-  aggregate retention gaps, and no durable, recovery, or capability authority.
+  aggregate retention gaps, plus an authenticated durable aggregate journal
+  that persists source-segment state and receipt order without creating
+  recovery or capability authority.
 - Plan-bound durable operation ledgers with input fingerprint checks, derived
   worker keys, revision-watermark hooks, and a two-stage
   prepare/persist/exact-claim bridge for live external workflow steps.
@@ -231,6 +233,5 @@
   and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
-- Durable cross-stream aggregation/retention and product-specific compensation
-  action policies.
+- Product-specific compensation action policies.
 - Independent security review of effectful adapters.

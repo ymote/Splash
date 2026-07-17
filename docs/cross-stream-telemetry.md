@@ -2,17 +2,19 @@
 
 `splash_workflow::telemetry::CrossStreamTelemetryAggregator` is a bounded,
 in-memory host helper that combines retained capability-audit and workflow-event
-batches into one local timeline. Its aggregate sequence means only **the order
-in which this host instance accepted source batches**. It does not establish
-wall-clock order, causal order, transaction order, or an adapter-effect
-outcome.
+batches into one local timeline. `telemetry::durable::CrossStreamTelemetryStore`
+persists the same kind of source batches through a host-owned authenticated
+storage record. In either form, an aggregate sequence means only **the order in
+which that host accepted source batches**. It does not establish wall-clock
+order, causal order, transaction order, or an adapter-effect outcome.
 
-The aggregator is useful for a local operator view or for feeding a host-owned
-sink. It is not a durable journal, an authenticated store, a source of
-capability or workflow authority, a recovery log, or a compensation policy.
-Use the source journals described in [capability audit export](capability-audits.md)
-and [durable workflow events](workflow-events.md) when durable source telemetry
-is required.
+The in-memory aggregator is useful for a local operator view or for feeding a
+host-owned sink. The durable store is useful for an authenticated aggregate
+operator timeline. Neither is a source of capability or workflow authority, a
+recovery log, or a compensation policy. Source journals described in
+[capability audit export](capability-audits.md) and
+[durable workflow events](workflow-events.md) remain the appropriate records
+when a host needs independently retained source telemetry.
 
 ## Source Identity And Cursors
 
@@ -38,7 +40,7 @@ it as a continuous history.
 `next_source_sequence` expose the boundary and the next required source cursor.
 They are observability metadata only.
 
-## Host Lifecycle
+## In-Memory Host Lifecycle
 
 Export each source with its normal cursor, ingest the exact batch once, then
 advance that source cursor only after ingestion succeeds. Separately export the
@@ -86,23 +88,97 @@ For a sealed mobile or embedded workflow host,
 exports. They do not expose mutable adapter registration, plan approval,
 external dispatch, or capability escalation.
 
-The aggregator has no durable state and no transactional link to source cursors
-or the host sink. A process restart needs new in-memory aggregation state and
-a host-defined reconciliation strategy. A host that needs complete retained
-source telemetry should persist the independent authenticated source journals;
-do not use aggregate retention as recovery evidence.
+The in-memory aggregator has no durable state and no transactional link to
+source cursors or the host sink. A process restart needs new in-memory
+aggregation state and a host-defined reconciliation strategy. A host that needs
+complete retained source telemetry should persist the independent authenticated
+source journals; do not use aggregate retention as recovery evidence.
+
+## Durable Aggregate Journal
+
+`telemetry::durable::CrossStreamTelemetryStore` persists the aggregate receipt
+order and each source segment's exact next cursor in one authenticated record.
+It accepts `AuditEventBatch` and `WorkflowEventBatch` directly, assigning its
+own aggregate sequence when the host commits a mutation. Do not persist output
+from `CrossStreamTelemetryAggregator` as though its aggregate cursor survived a
+restart: that in-memory cursor starts from one for every new aggregator.
+
+Choose one bounded non-secret `CrossStreamTelemetryStreamId` and
+`StorageRecordKey` for each durable aggregate timeline. A host also owns the
+rollback-protected storage backend and the retention capacity. The journal
+retains at most 1,024 aggregate records, 128 source segments, and 192 KiB of
+encoded telemetry. Writes use authenticated compare-and-swap with four bounded
+retries.
+
+```rust
+use std::num::NonZeroUsize;
+
+use splash_storage::StorageRecordKey;
+use splash_workflow::telemetry::{
+    durable::{CrossStreamTelemetryStore, CrossStreamTelemetryStreamId},
+    CrossStreamTelemetryKind, CrossStreamTelemetrySource,
+};
+
+let stream_id = CrossStreamTelemetryStreamId::new("release-42-attempt-1")?;
+let mut telemetry = CrossStreamTelemetryStore::new(
+    authenticated_store,
+    StorageRecordKey::new("cross-stream-telemetry", "release-42-attempt-1")?,
+    stream_id,
+    NonZeroUsize::new(1_024).unwrap(),
+)?;
+
+let audit_source = CrossStreamTelemetrySource::new(
+    CrossStreamTelemetryKind::CapabilityAudit,
+    "audit.runtime_42",
+)?;
+let audit_batch = capability_runtime.audit_since(audit_cursor)?;
+if !audit_batch.is_empty() {
+    let persisted = telemetry.ingest_audit_batch(&audit_source, &audit_batch)?;
+    audit_cursor = persisted
+        .journal()
+        .source_state(&audit_source)
+        .expect("accepted source state")
+        .next_source_sequence();
+}
+```
+
+An exact retained source replay is a no-op, so a host may retry after an
+ambiguous caller-side storage result. A source gap, contradictory overlap, or a
+replay that predates aggregate retention fails closed. When a source's own
+export reports a known preexisting gap, persist
+`register_source_at(source, first_retained_source_cursor)` before ingesting the
+first batch. This explicit source-segment boundary survives restart; it does
+not infer or hide omitted events. A source identity must still be fresh when a
+runtime or engine begins a new source-local history at cursor one.
+
+`PersistedCrossStreamTelemetryJournal::journal().events_since(cursor)` exports
+the durable aggregate view. Advance an external sink cursor only after that
+sink accepts the returned records. An aggregate cursor overtaken by retention
+returns `CrossStreamTelemetryCursorError::Evicted` rather than a partial
+timeline.
+
+Use an `AuthenticatedStore<B>` whose `B` genuinely satisfies the
+rollback-protected storage contract. `VolatileMemoryStore` is for tests and
+local development only. Authentication does not provide confidentiality, and
+the journal does not contain raw Splash source, tool input/output, credentials,
+approvals, leases, worker keys, promises, or dataflow values. Encrypt retained
+metadata separately when it needs confidentiality.
 
 ## Retention And Failure Semantics
 
-Aggregate retention defaults to 1,024 records and is capped at 8,192. Once the
-aggregate view fills, the oldest record is evicted and `dropped_events()`
-increases. `events_since` rejects an evicted aggregate cursor rather than
-returning a partial timeline. `clear_events` similarly creates an explicit
-aggregate observability gap while retaining the per-source expected cursors.
+The in-memory aggregate retention defaults to 1,024 records and is capped at
+8,192. Once the view fills, the oldest record is evicted and `dropped_events()`
+increases. The durable journal has a separately bounded 1,024-record maximum
+and also records its aggregate evictions in `dropped_events()`. In both cases,
+`events_since` rejects an evicted aggregate cursor rather than returning a
+partial timeline. `clear_events` applies only to the in-memory aggregator and
+creates an explicit aggregate observability gap while retaining the per-source
+expected cursors.
 
 An aggregate cursor, a source cursor, a source identity, or an event record
 cannot prove that a local or remote effect happened. None may grant a tool,
 approve or resume a workflow, acknowledge cancellation, select a retry,
-reconcile an external operation, or choose compensation. Use fresh host
+reconcile an external operation, or choose compensation. This remains true
+after the aggregate journal is authenticated and restored. Use fresh host
 approval, workflow checkpoints, durable operation ledgers, and authenticated
 worker reconciliation for those decisions.

@@ -1238,6 +1238,80 @@ pub struct AuditEvent {
     pub retry_class: Option<RetryClass>,
 }
 
+impl AuditEvent {
+    /// Validates the bounded metadata retained by a durable telemetry sink.
+    ///
+    /// This verifies telemetry shape only. A valid audit event cannot grant a
+    /// capability, prove an adapter effect, acknowledge cancellation, or
+    /// authorize workflow recovery.
+    pub fn validate_for_durable_telemetry(&self) -> Result<(), AuditEventValidationError> {
+        if self.event_sequence == 0 || self.event_sequence == u64::MAX {
+            return Err(AuditEventValidationError::InvalidEventSequence);
+        }
+        if !is_valid_audit_tool_label(&self.tool) {
+            return Err(AuditEventValidationError::InvalidTool);
+        }
+        match (self.outcome, self.retry_class) {
+            (AuditOutcome::RetryScheduled, Some(_)) => {}
+            (AuditOutcome::RetryScheduled, None) => {
+                return Err(AuditEventValidationError::RetryClassRequired)
+            }
+            (_, Some(_)) => return Err(AuditEventValidationError::RetryClassUnexpected),
+            (_, None) => {}
+        }
+        if !matches!(self.outcome, AuditOutcome::Allowed | AuditOutcome::Streamed)
+            && self.output_bytes != 0
+        {
+            return Err(AuditEventValidationError::UnexpectedOutputBytes);
+        }
+        Ok(())
+    }
+}
+
+/// Invalid metadata in a durable capability-audit telemetry event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditEventValidationError {
+    InvalidEventSequence,
+    InvalidTool,
+    RetryClassRequired,
+    RetryClassUnexpected,
+    UnexpectedOutputBytes,
+}
+
+impl Display for AuditEventValidationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEventSequence => {
+                formatter.write_str("invalid capability audit event sequence")
+            }
+            Self::InvalidTool => formatter.write_str("invalid capability audit tool label"),
+            Self::RetryClassRequired => {
+                formatter.write_str("retry-scheduled capability audit event requires a retry class")
+            }
+            Self::RetryClassUnexpected => formatter
+                .write_str("only retry-scheduled capability audit events may carry a retry class"),
+            Self::UnexpectedOutputBytes => {
+                formatter.write_str("capability audit outcome cannot carry output bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuditEventValidationError {}
+
+fn is_valid_audit_tool_label(value: &str) -> bool {
+    if is_valid_tool_name(value) {
+        return true;
+    }
+    let Some(digest) = value.strip_prefix(UNRECOGNIZED_AUDIT_TOOL_PREFIX) else {
+        return false;
+    };
+    digest.len() == blake3::OUT_LEN * 2
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 /// A contiguous source-local range of exported capability audit events.
 ///
 /// Hosts persist a batch under a stable host-selected stream identity. The

@@ -11,9 +11,16 @@ use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroUsize;
 use std::ops::Index;
 
+use serde::{Deserialize, Serialize};
 use splash_capabilities::{AuditEvent, AuditEventBatch};
 
 use crate::{WorkflowEvent, WorkflowEventBatch};
+
+/// Authenticated bounded persistence for host-receipt-order telemetry.
+///
+/// The durable journal assigns its own aggregate cursor while accepting exact
+/// source batches. It remains observability only and cannot recover effects.
+pub mod durable;
 
 /// Default number of cross-stream telemetry records retained in memory.
 pub const DEFAULT_MAX_CROSS_STREAM_TELEMETRY_EVENTS: usize = 1_024;
@@ -28,7 +35,8 @@ pub const MAX_CROSS_STREAM_TELEMETRY_SOURCE_ID_BYTES: usize = 128;
 pub const MAX_CROSS_STREAM_TELEMETRY_BATCH_EVENTS: usize = MAX_CROSS_STREAM_TELEMETRY_EVENTS;
 
 /// The source-specific telemetry family carried by one aggregate record.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CrossStreamTelemetryKind {
     CapabilityAudit,
     Workflow,

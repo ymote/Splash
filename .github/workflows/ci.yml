@@ -77,6 +77,10 @@ jobs:
           -runs=128 -max_len=4096
         working-directory: fuzz
       - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none durable_cross_stream_telemetry --
+          -runs=128 -max_len=196608
+        working-directory: fuzz
+      - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none json_line_worker --
           -runs=128 -max_len=1048578
         working-directory: fuzz
