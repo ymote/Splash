@@ -109,3 +109,15 @@ terminal-marker paths.
 Upstream-sync note: this local safety patch is carried against the pinned
 `makepad/makepad dev` import and must be reapplied or retired when that import
 is next synchronized.
+
+## `platform/script`: UTF-8-safe suggestion previews
+
+The inherited suggestion formatter truncated inline and heap strings with a
+fixed byte slice. A valid multibyte character crossing that byte offset caused
+a panic while formatting an otherwise recoverable script error. Splash now
+truncates previews at character boundaries and covers the exact boundary case
+with a regression test.
+
+Upstream-sync note: this local safety patch is carried against the pinned
+`makepad/makepad dev` import and must be reapplied or retired when that import
+is next synchronized.
