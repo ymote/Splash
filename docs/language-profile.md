@@ -162,7 +162,9 @@ visible local or imported `workflow` binding shadows it. An optional
 `workflowDataStepContext` can structurally identify the host-declared projected
 completed prefix and next projected step, which filters output completion and
 hover without proving live workflow state. Invalid context discards the full
-workflow projection. See [Editor workflow-data projection](workflow-data-catalog.md)
+workflow projection. A host can atomically replace both values through
+`workspace/didChangeConfiguration`; a partial or malformed relevant refresh
+also discards the workflow projection. See [Editor workflow-data projection](workflow-data-catalog.md)
 for the exact wire shape, limits, and non-authority boundary.
 
 For a pre-approval effect summary, hosts can call

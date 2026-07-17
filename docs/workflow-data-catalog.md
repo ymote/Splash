@@ -2,7 +2,9 @@
 
 `splash-lsp` can receive a bounded, static authoring projection of a host's
 workflow data contract through
-`initializationOptions.splash.workflowDataCatalog`.
+`initializationOptions.splash.workflowDataCatalog`. A host can later replace a
+complete workflow projection and current-step context through the standard LSP
+configuration notification described below.
 
 This is not a JSON Schema transport. A host derives this compact projection
 from its own trusted `WorkflowDataContract`, approved plan, or equivalent
@@ -90,6 +92,45 @@ prefix and current step in that reduced projected order. The LSP cannot verify
 that the host-provided position matches a live workflow engine, plan, or
 checkpoint.
 
+## Configuration refresh
+
+After an authoritative host workflow transition, an editor integration can
+send `workspace/didChangeConfiguration` with a `settings.splash` object that
+contains both `workflowDataCatalog` and `workflowDataStepContext` in exactly
+the shapes above. This is a complete replacement, not a patch: the server
+validates the new catalog and context together before making either visible.
+
+```json
+{
+  "settings": {
+    "splash": {
+      "workflowDataCatalog": {
+        "inputFields": [],
+        "outputs": [
+          {"stepId": "prepare", "fields": []},
+          {"stepId": "calculate", "fields": []}
+        ]
+      },
+      "workflowDataStepContext": {
+        "currentStepId": "calculate",
+        "completedOutputStepIds": ["prepare"]
+      }
+    }
+  }
+}
+```
+
+An update that mentions either workflow key must contain both. A malformed
+`settings` value, malformed `splash` object, invalid catalog, invalid context,
+or partial pair discards the full workflow projection and returns incomplete
+empty workflow matches rather than retaining stale fields. A well-formed
+configuration update with neither workflow key is ignored, so unrelated editor
+settings do not change the current projection.
+
+The notification is only a delivery path for host metadata. The server does not
+read a workflow engine, plan, checkpoint, or runtime data and cannot verify
+that the new position reflects live execution.
+
 The LSP completes only these direct, unshadowed paths:
 
 - `workflow.`: `input` and `outputs`
@@ -116,8 +157,9 @@ Names and step IDs are limited to 128 bytes; descriptions are limited to
 4 KiB. Duplicate field names within one object, duplicate step IDs, unsupported
 types, malformed arrays, and every over-limit projection fail closed.
 
-This projection is static for one LSP session and is advisory client input. It
-does not validate `workflow.input`, prove that an output has entered the
-runtime completed prefix, issue a capability lease, approve a workflow, expose
-a tool, or make a Rust adapter callable. Runtime data validation and capability
-approval remain host-owned boundaries.
+This projection is static between initialization or explicit configuration
+refreshes and is advisory client input. It does not validate `workflow.input`,
+prove that an output has entered the runtime completed prefix, issue a
+capability lease, approve a workflow, expose a tool, or make a Rust adapter
+callable. Runtime data validation and capability approval remain host-owned
+boundaries.

@@ -25,12 +25,13 @@
   interface projection can complete direct `use mod.*` path segments and
   bounded catalog paths below a direct visible imported-module binding without
   module loading, resolution, runtime export inspection, or authority inference.
-- A bounded initialization-time advisory workflow-data projection for direct,
-  unshadowed `workflow.input.*` and `workflow.outputs.<stepId>.*` completion
-  and hover. Its optional ordered step context filters outputs to a
-  host-declared projected completed prefix and next projected step, without
-  creating runtime data, proving live availability, loading schemas or
-  checkpoints, validating values, approving a plan, or granting a capability.
+- A bounded initialization-time or explicit configuration-refresh advisory
+  workflow-data projection for direct, unshadowed `workflow.input.*` and
+  `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context
+  filters outputs to a host-declared projected completed prefix and next
+  projected step, without creating runtime data, proving live availability,
+  loading schemas or checkpoints, validating values, approving a plan, or
+  granting a capability.
 - Bounded direct literal-record field metadata for exact visible
   `let binding = { ... }` initializers, with same-document completion, hover,
   and definition. It is advisory and does not infer aliases, mutation, control

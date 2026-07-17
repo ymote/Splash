@@ -373,7 +373,9 @@ shadows it, absent metadata creates no namespace, and malformed input fails
 closed. The optional `workflowDataStepContext` admits only an exact prefix of
 the catalog's projected outputs and its next projected step, then filters output
 completion and hover to that prefix. It remains host-supplied static metadata,
-not a live workflow-state proof. See [Editor workflow-data
+not a live workflow-state proof. A host can replace the complete pair through
+`workspace/didChangeConfiguration`; partial or malformed relevant updates fail
+closed instead of retaining stale fields. See [Editor workflow-data
 projection](workflow-data-catalog.md).
 
 Rename does not edit the final segment of a `use` path. For another indexed

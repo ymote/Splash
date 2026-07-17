@@ -12,8 +12,8 @@ use std::{cell::OnceCell, collections::HashMap, error::Error, io, process::ExitC
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
     notification::{
-        DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Exit,
-        Notification as LspNotification, PublishDiagnostics,
+        DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+        Exit, Notification as LspNotification, PublishDiagnostics,
     },
     request::{
         Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
@@ -21,11 +21,11 @@ use lsp_types::{
     },
     CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
     CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentChanges, DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind,
-    DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentChanges, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
+    DocumentSymbolResponse, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
     OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, PrepareRenameResponse,
     PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
     ServerCapabilities, SymbolKind, TextDocumentEdit, TextDocumentItem, TextDocumentPositionParams,
@@ -229,6 +229,18 @@ struct WorkflowDataStepContext {
     unavailable: bool,
 }
 
+/// One optional replacement of the advisory workflow-data metadata received
+/// through `workspace/didChangeConfiguration`. A host must provide a complete
+/// catalog and a structurally valid current-step context together; partial or
+/// malformed relevant settings poison only this advisory projection.
+enum WorkflowDataConfigurationUpdate {
+    Keep,
+    Replace {
+        catalog: WorkflowDataCompletionCatalog,
+        step_context: WorkflowDataStepContext,
+    },
+}
+
 #[derive(Debug)]
 struct DocumentState {
     source: Option<String>,
@@ -329,6 +341,28 @@ impl SplashLanguageServer {
             workflow_data_catalog,
             workflow_data_step_context,
         }
+    }
+
+    /// Replaces workflow-only editor metadata after a host configuration
+    /// update. The parsed value is fully validated before either field changes,
+    /// so a reader never observes a mixed catalog/context pair.
+    fn refresh_workflow_data_configuration(&mut self, settings: &serde_json::Value) {
+        let WorkflowDataConfigurationUpdate::Replace {
+            catalog,
+            step_context,
+        } = workflow_data_configuration_update_from_settings(settings)
+        else {
+            return;
+        };
+        self.workflow_data_catalog = catalog;
+        self.workflow_data_step_context = step_context;
+    }
+
+    /// A malformed configuration notification must not leave potentially stale
+    /// workflow metadata available to the editor.
+    fn invalidate_workflow_data_configuration(&mut self) {
+        self.workflow_data_catalog = unavailable_workflow_data_completion_catalog();
+        self.workflow_data_step_context = unavailable_workflow_data_step_context();
     }
 
     fn open_document(&mut self, item: TextDocumentItem) -> PublishDiagnosticsParams {
@@ -1323,6 +1357,55 @@ fn parse_workflow_data_step_context(
     })
 }
 
+/// Parses the workflow-specific portion of a standard LSP configuration
+/// update. The update deliberately requires both catalog and context: merging
+/// a new position into an old schema, or retaining an old position after a
+/// malformed replacement, could present stale dataflow suggestions.
+fn workflow_data_configuration_update_from_settings(
+    settings: &serde_json::Value,
+) -> WorkflowDataConfigurationUpdate {
+    let Some(settings) = settings.as_object() else {
+        return unavailable_workflow_data_configuration_update();
+    };
+    let Some(splash) = settings.get("splash") else {
+        return WorkflowDataConfigurationUpdate::Keep;
+    };
+    let Some(splash) = splash.as_object() else {
+        return unavailable_workflow_data_configuration_update();
+    };
+    let (Some(catalog), Some(context)) = (
+        splash.get("workflowDataCatalog"),
+        splash.get("workflowDataStepContext"),
+    ) else {
+        return if splash.contains_key("workflowDataCatalog")
+            || splash.contains_key("workflowDataStepContext")
+        {
+            unavailable_workflow_data_configuration_update()
+        } else {
+            WorkflowDataConfigurationUpdate::Keep
+        };
+    };
+
+    let mut catalog = parse_workflow_data_completion_catalog(catalog)
+        .unwrap_or_else(unavailable_workflow_data_completion_catalog);
+    let step_context = parse_workflow_data_step_context(context, &catalog)
+        .unwrap_or_else(unavailable_workflow_data_step_context);
+    if step_context.unavailable {
+        catalog = unavailable_workflow_data_completion_catalog();
+    }
+    WorkflowDataConfigurationUpdate::Replace {
+        catalog,
+        step_context,
+    }
+}
+
+fn unavailable_workflow_data_configuration_update() -> WorkflowDataConfigurationUpdate {
+    WorkflowDataConfigurationUpdate::Replace {
+        catalog: unavailable_workflow_data_completion_catalog(),
+        step_context: unavailable_workflow_data_step_context(),
+    }
+}
+
 fn parse_workflow_data_fields(
     value: &serde_json::Value,
     retained_bytes: &mut usize,
@@ -1578,6 +1661,13 @@ fn handle_notification(
     notification: Notification,
 ) -> ServerResult<()> {
     let diagnostics = match notification.method.as_str() {
+        DidChangeConfiguration::METHOD => {
+            match serde_json::from_value::<DidChangeConfigurationParams>(notification.params) {
+                Ok(params) => server.refresh_workflow_data_configuration(&params.settings),
+                Err(_) => server.invalidate_workflow_data_configuration(),
+            }
+            None
+        }
         DidOpenTextDocument::METHOD => {
             serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
                 .ok()
@@ -3198,8 +3288,9 @@ mod tests {
     use std::{str::FromStr, time::Duration};
 
     use lsp_types::{
-        notification::{Initialized, Notification as LspNotification},
-        FormattingOptions, TextDocumentContentChangeEvent, VersionedTextDocumentIdentifier,
+        notification::{DidChangeConfiguration, Initialized, Notification as LspNotification},
+        DidChangeConfigurationParams, FormattingOptions, TextDocumentContentChangeEvent,
+        VersionedTextDocumentIdentifier,
     };
 
     use super::*;
@@ -4328,6 +4419,182 @@ mod tests {
         );
         assert!(
             workflow_data_step_context_from_initialize_options(&context_without_catalog)
+                .unavailable
+        );
+    }
+
+    #[test]
+    fn refreshes_workflow_data_configuration_atomically_and_fails_closed() {
+        let initial_catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [{"name": "old_input", "type": "integer"}],
+            "outputs": [
+                {"stepId": "prepare", "fields": [{"name": "total", "type": "integer"}]},
+                {"stepId": "calculate", "fields": [{"name": "sum", "type": "integer"}]}
+            ]
+        }));
+        let initial_context = workflow_data_step_context_for(
+            serde_json::json!({
+                "currentStepId": "calculate",
+                "completedOutputStepIds": ["prepare"]
+            }),
+            &initial_catalog,
+        );
+        let mut server = SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            initial_catalog,
+            initial_context,
+        );
+        let source = "workflow.outputs.";
+        server.open_document(document(1, source));
+        let initial_completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("initial workflow output completion succeeds");
+        assert_eq!(
+            initial_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["prepare"]
+        );
+
+        let (server_connection, _client_connection) = Connection::memory();
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {
+                            "workflowDataCatalog": {
+                                "inputFields": [{"name": "new_input", "type": "string"}],
+                                "outputs": [
+                                    {"stepId": "ingest", "fields": [{"name": "value", "type": "string"}]},
+                                    {"stepId": "publish", "fields": [{"name": "receipt", "type": "string"}]}
+                                ]
+                            },
+                            "workflowDataStepContext": {
+                                "currentStepId": "publish",
+                                "completedOutputStepIds": ["ingest"]
+                            }
+                        }
+                    }),
+                },
+            ),
+        )
+        .expect("valid workflow configuration refresh succeeds");
+        assert_eq!(
+            server
+                .workflow_data_catalog
+                .input_fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["new_input"]
+        );
+        assert_eq!(
+            server
+                .workflow_data_catalog
+                .outputs
+                .iter()
+                .map(|output| output.step_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ingest", "publish"]
+        );
+        assert!(server.workflow_data_step_context.configured);
+        assert_eq!(server.workflow_data_step_context.completed_output_count, 1);
+
+        let refreshed_completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("refreshed workflow output completion succeeds");
+        assert!(!refreshed_completion.is_incomplete);
+        assert_eq!(
+            refreshed_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["ingest"]
+        );
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({"editor": {"tabSize": 4}}),
+                },
+            ),
+        )
+        .expect("unrelated configuration update succeeds");
+        assert_eq!(
+            server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("unrelated configuration retains workflow completion")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["ingest"]
+        );
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {
+                            "workflowDataCatalog": {
+                                "inputFields": [],
+                                "outputs": []
+                            }
+                        }
+                    }),
+                },
+            ),
+        )
+        .expect("partial workflow configuration notification is handled");
+        assert!(server.workflow_data_catalog.unavailable);
+        assert!(server.workflow_data_step_context.unavailable);
+        let unavailable_completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("unavailable workflow completion request succeeds");
+        assert!(unavailable_completion.is_incomplete);
+        assert!(unavailable_completion.items.is_empty());
+
+        let replacement_catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [],
+            "outputs": [{"stepId": "prepare", "fields": []}, {"stepId": "calculate", "fields": []}]
+        }));
+        let replacement_context = workflow_data_step_context_for(
+            serde_json::json!({
+                "currentStepId": "calculate",
+                "completedOutputStepIds": ["prepare"]
+            }),
+            &replacement_catalog,
+        );
+        let mut malformed_params_server =
+            SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+                replacement_catalog,
+                replacement_context,
+            );
+        malformed_params_server.open_document(document(1, source));
+        handle_notification(
+            &server_connection,
+            &mut malformed_params_server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                serde_json::json!({"unexpected": true}),
+            ),
+        )
+        .expect("malformed configuration notification is handled");
+        assert!(malformed_params_server.workflow_data_catalog.unavailable);
+        assert!(
+            malformed_params_server
+                .workflow_data_step_context
                 .unavailable
         );
     }
