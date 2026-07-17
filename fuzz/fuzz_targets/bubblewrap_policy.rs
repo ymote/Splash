@@ -6,7 +6,7 @@ use libfuzzer_sys::fuzz_target;
 use splash_protocol::{CapabilityGrant, CapabilityManifest, ResourceKind, ResourceSelector};
 use splash_sandbox::bubblewrap::{
     BubblewrapPolicyError, BubblewrapWorkerPolicy, EphemeralFileRoot, FileRootAccess,
-    FileRootBinding, ReadOnlyMount,
+    FileRootBinding, ReadOnlyMount, DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS,
 };
 
 const MAX_FUZZ_INPUT_BYTES: usize = 64;
@@ -24,6 +24,17 @@ fuzz_target!(|data: &[u8]| {
     let control = FuzzControl::from_bytes(data);
     let (policy, manifest) = configured_policy(control);
     let result = policy.compile(&manifest);
+
+    if control.select_active_file_root_limit_overflow && !control.policy_configuration_must_fail() {
+        assert!(matches!(
+            result,
+            Err(BubblewrapPolicyError::ActiveFileRootLimitExceeded {
+                maximum_file_roots: DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS,
+                active_file_roots,
+            }) if active_file_roots > DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS
+        ));
+        return;
+    }
 
     if control.compile_must_fail() {
         assert!(
@@ -120,6 +131,7 @@ struct FuzzControl {
     aggregate_limit: Option<usize>,
     try_invalid_aggregate_limit: bool,
     aggregate_before_private_tmpfs: bool,
+    select_active_file_root_limit_overflow: bool,
 }
 
 impl FuzzControl {
@@ -141,8 +153,9 @@ impl FuzzControl {
             namespace_lockdown: policy & 2 != 0,
             private_tmpfs: PrivateTmpfs::from_bits(policy >> 2),
             aggregate_limit: aggregate_limit(aggregate),
-            try_invalid_aggregate_limit: (aggregate / 9) % 2 != 0,
+            try_invalid_aggregate_limit: !(aggregate / 9).is_multiple_of(2),
             aggregate_before_private_tmpfs: byte(data, 4) & 1 != 0,
+            select_active_file_root_limit_overflow: byte(data, 5) & 1 != 0,
         }
     }
 
@@ -164,14 +177,18 @@ impl FuzzControl {
     fn compile_must_fail(self) -> bool {
         self.select_missing
             || self.selects_unsupported_resource()
-            || (self.require_bounded_writes
-                && (!self.namespace_lockdown
-                    || self.private_tmpfs == PrivateTmpfs::Unbounded
-                    || self.select_writable))
+            || self.select_active_file_root_limit_overflow
+            || self.policy_configuration_must_fail()
+            || (self.require_bounded_writes && self.select_writable)
             || self.aggregate_limit.is_some_and(|maximum_bytes| {
                 self.private_tmpfs == PrivateTmpfs::Unbounded
                     || self.aggregate_requested_bytes() > maximum_bytes
             })
+    }
+
+    fn policy_configuration_must_fail(self) -> bool {
+        self.require_bounded_writes
+            && (!self.namespace_lockdown || self.private_tmpfs == PrivateTmpfs::Unbounded)
     }
 }
 
@@ -356,7 +373,23 @@ fn manifest(control: FuzzControl) -> CapabilityManifest {
             );
         }
     }
-    CapabilityManifest::new("fuzz-session", vec![grant])
+    let grants = if control.select_active_file_root_limit_overflow {
+        let mut limit_grant = CapabilityGrant::json("fuzz.limit");
+        for index in 0..DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS {
+            limit_grant.resources.insert(
+                ResourceSelector::new(ResourceKind::FileRoot, format!("limit-{index}"))
+                    .expect("the fixed limit resource selector is valid"),
+            );
+        }
+        grant.resources.insert(
+            ResourceSelector::new(ResourceKind::FileRoot, "limit-last")
+                .expect("the fixed limit resource selector is valid"),
+        );
+        vec![limit_grant, grant]
+    } else {
+        vec![grant]
+    };
+    CapabilityManifest::new("fuzz-session", grants)
         .expect("the fixed fuzz capability manifest is valid")
 }
 

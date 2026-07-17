@@ -393,6 +393,14 @@ syscall policy permit. Keep the fixed worker free of subprocess behavior or add
 a separately reviewed execution mediator; rejecting an `executable` selector
 does not prevent a native worker from calling `execve`.
 
+`BubblewrapWorkerPolicy` also bounds mount-plan expansion to 64 unique active
+`file_root` selectors by default. It unions grants first, then rejects a plan
+over that count before resolving any selected host source or constructing
+Bubblewrap mount arguments. A host can lower the bound, including to zero, or
+explicitly raise it with `set_maximum_active_file_roots`, but never above 256.
+This does not limit inactive registered roots, trusted runtime mounts, manifest
+or wire size, filesystem data blocks, inode use, or persistent storage.
+
 `require_bounded_file_root_writes` is an opt-in compile-time hardening mode. It
 allows read-only host roots and bounded ephemeral roots, but rejects every
 active host-backed read-write root. It also rejects an enabled unbounded

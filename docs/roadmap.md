@@ -193,7 +193,10 @@
   tmpfs mounts whose potential aggregate capacity exceeds a host maximum. The
   mounts still have independent runtime ceilings rather than a shared quota,
   have no independent inode cap, and are neither durable storage, an
-  executable-path policy, nor a persistent-filesystem quota.
+  executable-path policy, nor a persistent-filesystem quota. A worker plan
+  defaults to 64 unique active file-root selectors; trusted configuration can
+  lower that bound, including to zero, or explicitly raise it only to the fixed
+  256-root maximum, constraining mount-plan expansion before source resolution.
 - Optional Bubblewrap user-namespace hardening that requires a usable user
   namespace and prevents further user namespace creation, with no compatibility
   fallback to a weaker worker policy.

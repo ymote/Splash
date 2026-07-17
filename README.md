@@ -160,7 +160,10 @@ and keeps UI support optional rather than making UI the language boundary.
   potential capacity before launch. This remains independent per-mount tmpfs
   accounting, not a shared runtime quota; it does not independently cap inodes
   and is not persistent storage, a `noexec` guarantee, or a host-filesystem
-  quota.
+  quota. A worker plan also defaults to at most 64 unique active `file_root`
+  selections; a host can lower that bound, including to zero, or explicitly
+  raise it only to the fixed 256-root maximum, bounding mount-plan expansion
+  rather than disk use.
 - Optional Linux cgroup-v2 worker sessions with host-delegated CPU bandwidth,
   memory, swap, task, and per-device I/O limits; a fixed runner joins the
   cgroup before Bubblewrap starts, and managed lifecycle teardown kills the

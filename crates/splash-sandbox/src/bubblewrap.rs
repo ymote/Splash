@@ -45,6 +45,13 @@ const MAX_TMPFS_BYTES: usize = usize::MAX >> 1;
 const MAX_FINITE_RESOURCE_LIMIT: u64 = u64::MAX - 1;
 const MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS: usize = 4_096;
 
+/// Default maximum number of unique manifest-selected file roots in one
+/// Bubblewrap worker launch plan.
+pub const DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS: usize = 64;
+/// Absolute maximum number of unique manifest-selected file roots in one
+/// Bubblewrap worker launch plan.
+pub const MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS: usize = 256;
+
 /// Upper bound for syscalls in one strict worker seccomp policy.
 ///
 /// The cap keeps the generated cBPF program comfortably below Linux's 4,096
@@ -678,6 +685,7 @@ pub struct BubblewrapWorkerPolicy {
     executable_source_binding: ExecutableSourceBinding,
     private_tmpfs: PrivateTmpfs,
     maximum_aggregate_ephemeral_tmpfs_bytes: Option<NonZeroUsize>,
+    maximum_active_file_roots: usize,
     bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
@@ -709,6 +717,7 @@ impl BubblewrapWorkerPolicy {
             executable_source_binding: ExecutableSourceBinding::Path,
             private_tmpfs: PrivateTmpfs::Disabled,
             maximum_aggregate_ephemeral_tmpfs_bytes: None,
+            maximum_active_file_roots: DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS,
             bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
@@ -914,6 +923,34 @@ impl BubblewrapWorkerPolicy {
         }
     }
 
+    /// Sets the maximum number of unique active `file_root` selectors.
+    ///
+    /// Compilation counts selectors after it unions all manifest grants and
+    /// rejects the plan before resolving any selected source paths when the
+    /// count exceeds this bound. The default is
+    /// [`DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS`]; callers can lower it,
+    /// including to zero, or explicitly raise it only through
+    /// [`MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS`]. This bounds Bubblewrap mount-plan
+    /// expansion, not registered inactive roots, trusted runtime mounts,
+    /// manifest/wire size, or host-backed persistent storage.
+    pub fn set_maximum_active_file_roots(
+        &mut self,
+        maximum_file_roots: usize,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
+        if maximum_file_roots > MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS {
+            return Err(BubblewrapPolicyError::InvalidMaximumActiveFileRoots {
+                maximum_file_roots,
+            });
+        }
+        self.maximum_active_file_roots = maximum_file_roots;
+        Ok(self)
+    }
+
+    /// Returns the maximum number of unique active `file_root` selectors.
+    pub const fn maximum_active_file_roots(&self) -> usize {
+        self.maximum_active_file_roots
+    }
+
     /// Returns the requested user-namespace hardening mode.
     pub const fn user_namespace_policy(&self) -> UserNamespacePolicy {
         self.user_namespace_policy
@@ -1019,6 +1056,23 @@ impl BubblewrapWorkerPolicy {
         {
             return Err(BubblewrapPolicyError::BoundedFileRootWritesRequireUserNamespaceLockdown);
         }
+
+        let resources = manifest
+            .grants
+            .iter()
+            .flat_map(|grant| grant.resources.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let active_file_roots = resources
+            .iter()
+            .filter(|resource| resource.kind == ResourceKind::FileRoot)
+            .count();
+        if active_file_roots > self.maximum_active_file_roots {
+            return Err(BubblewrapPolicyError::ActiveFileRootLimitExceeded {
+                maximum_file_roots: self.maximum_active_file_roots,
+                active_file_roots,
+            });
+        }
+
         let bwrap_program = compile_host_executable(
             "Bubblewrap program",
             &self.bwrap_program,
@@ -1031,11 +1085,6 @@ impl BubblewrapWorkerPolicy {
             .map(|mount| resolve_runtime_mount(mount, self.mount_source_binding))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let resources = manifest
-            .grants
-            .iter()
-            .flat_map(|grant| grant.resources.iter().cloned())
-            .collect::<BTreeSet<_>>();
         for resource in resources {
             match resource.kind {
                 ResourceKind::FileRoot => {
@@ -2613,6 +2662,9 @@ pub enum BubblewrapPolicyError {
     InvalidAggregateEphemeralTmpfsSize {
         maximum_bytes: usize,
     },
+    InvalidMaximumActiveFileRoots {
+        maximum_file_roots: usize,
+    },
     InvalidEphemeralFileRootSize {
         maximum_bytes: usize,
     },
@@ -2620,6 +2672,10 @@ pub enum BubblewrapPolicyError {
     AggregateEphemeralTmpfsLimitExceeded {
         maximum_bytes: usize,
         requested_bytes: u128,
+    },
+    ActiveFileRootLimitExceeded {
+        maximum_file_roots: usize,
+        active_file_roots: usize,
     },
     UnboundedFileRootWriteForbidden {
         id: String,
@@ -2711,6 +2767,10 @@ impl Display for BubblewrapPolicyError {
                 formatter,
                 "aggregate ephemeral tmpfs maximum must be greater than zero bytes; got {maximum_bytes}"
             ),
+            Self::InvalidMaximumActiveFileRoots { maximum_file_roots } => write!(
+                formatter,
+                "active file-root maximum must be within 0..={MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS}; got {maximum_file_roots}"
+            ),
             Self::InvalidEphemeralFileRootSize { maximum_bytes } => write!(
                 formatter,
                 "ephemeral file-root maximum must be within 1..={MAX_TMPFS_BYTES} bytes; got {maximum_bytes}"
@@ -2723,6 +2783,13 @@ impl Display for BubblewrapPolicyError {
             } => write!(
                 formatter,
                 "active private tmpfs maximums total {requested_bytes} bytes, exceeding the aggregate ephemeral tmpfs maximum of {maximum_bytes} bytes"
+            ),
+            Self::ActiveFileRootLimitExceeded {
+                maximum_file_roots,
+                active_file_roots,
+            } => write!(
+                formatter,
+                "active file-root count {active_file_roots} exceeds the configured maximum of {maximum_file_roots}"
             ),
             Self::UnboundedFileRootWriteForbidden { id } => write!(
                 formatter,
@@ -2863,9 +2930,11 @@ impl std::error::Error for BubblewrapPolicyError {
             Self::SourceIo { source, .. } => Some(source),
             Self::InvalidPrivateTmpfsSize { .. }
             | Self::InvalidAggregateEphemeralTmpfsSize { .. }
+            | Self::InvalidMaximumActiveFileRoots { .. }
             | Self::InvalidEphemeralFileRootSize { .. }
             | Self::UnboundedPrivateTmpfsCannotMeetAggregateEphemeralTmpfsLimit
             | Self::AggregateEphemeralTmpfsLimitExceeded { .. }
+            | Self::ActiveFileRootLimitExceeded { .. }
             | Self::UnboundedFileRootWriteForbidden { .. }
             | Self::UnboundedPrivateTmpfsForbidden
             | Self::BoundedFileRootWritesRequireUserNamespaceLockdown
@@ -4454,6 +4523,22 @@ mod tests {
         CapabilityManifest::new("session-1", vec![grant]).unwrap()
     }
 
+    fn manifest_with_file_roots(ids: &[String]) -> CapabilityManifest {
+        let grants = ids
+            .chunks(64)
+            .enumerate()
+            .map(|(grant_index, ids)| {
+                let mut grant = CapabilityGrant::json(format!("tool-{grant_index}"));
+                grant.resources = ids
+                    .iter()
+                    .map(|id| selector(ResourceKind::FileRoot, id))
+                    .collect();
+                grant
+            })
+            .collect();
+        CapabilityManifest::new("session-1", grants).unwrap()
+    }
+
     fn selector(kind: ResourceKind, id: &str) -> ResourceSelector {
         ResourceSelector::new(kind, id).unwrap()
     }
@@ -5869,6 +5954,94 @@ print("seccomp-active")
             .position(|window| window.iter().map(String::as_str).eq(["--remount-ro", "/"]))
             .unwrap();
         assert!(scratch_mount < root_lockdown);
+    }
+
+    #[test]
+    fn active_file_root_limit_bounds_union_before_source_resolution() {
+        let root = TestDirectory::new();
+        let mut policy =
+            BubblewrapWorkerPolicy::new(root.path().join("missing-bwrap"), "/opt/splash/worker")
+                .unwrap();
+        let mut ids = Vec::new();
+        for index in 0..=DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS {
+            let id = format!("scratch-{index}");
+            policy
+                .add_ephemeral_file_root(
+                    id.clone(),
+                    EphemeralFileRoot::new(format!("/workspace/{id}"), 1024).unwrap(),
+                )
+                .unwrap();
+            ids.push(id);
+        }
+
+        assert_eq!(
+            policy.maximum_active_file_roots(),
+            DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS
+        );
+        assert!(matches!(
+            policy.compile(&manifest_with_file_roots(&ids)),
+            Err(BubblewrapPolicyError::ActiveFileRootLimitExceeded {
+                maximum_file_roots,
+                active_file_roots,
+            }) if maximum_file_roots == DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS
+                && active_file_roots == DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS + 1
+        ));
+    }
+
+    #[test]
+    fn active_file_root_limit_is_explicitly_bounded_host_configuration() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert!(matches!(
+            policy.set_maximum_active_file_roots(MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS + 1),
+            Err(BubblewrapPolicyError::InvalidMaximumActiveFileRoots {
+                maximum_file_roots,
+            }) if maximum_file_roots == MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS + 1
+        ));
+        policy
+            .set_maximum_active_file_roots(MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS)
+            .unwrap();
+        assert_eq!(
+            policy.maximum_active_file_roots(),
+            MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS
+        );
+
+        let mut ids = Vec::new();
+        for index in 0..2 {
+            let id = format!("scratch-{index}");
+            policy
+                .add_ephemeral_file_root(
+                    id.clone(),
+                    EphemeralFileRoot::new(format!("/workspace/{id}"), 1024).unwrap(),
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        assert!(policy.compile(&manifest([])).is_ok());
+
+        policy.set_maximum_active_file_roots(0).unwrap();
+        assert_eq!(policy.maximum_active_file_roots(), 0);
+        assert!(policy.compile(&manifest([])).is_ok());
+        assert!(matches!(
+            policy.compile(&manifest_with_file_roots(&ids)),
+            Err(BubblewrapPolicyError::ActiveFileRootLimitExceeded {
+                maximum_file_roots: 0,
+                active_file_roots: 2,
+            })
+        ));
+
+        policy.set_maximum_active_file_roots(1).unwrap();
+        assert_eq!(policy.maximum_active_file_roots(), 1);
+        assert!(matches!(
+            policy.compile(&manifest_with_file_roots(&ids)),
+            Err(BubblewrapPolicyError::ActiveFileRootLimitExceeded {
+                maximum_file_roots: 1,
+                active_file_roots: 2,
+            })
+        ));
+
+        policy.set_maximum_active_file_roots(2).unwrap();
+        assert!(policy.compile(&manifest_with_file_roots(&ids)).is_ok());
     }
 
     #[test]
