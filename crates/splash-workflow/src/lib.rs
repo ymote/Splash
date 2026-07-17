@@ -1454,6 +1454,11 @@ pub enum WorkflowOperationState {
 }
 
 impl WorkflowOperationState {
+    /// Returns whether a worker has reported a final lifecycle state.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
     fn accepts(self, observed: Self) -> bool {
         match self {
             Self::Pending => matches!(
@@ -2426,6 +2431,10 @@ pub enum WorkflowOperationLedgerError {
     InvalidInputFingerprint,
     InputFingerprintMismatch(String),
     OperationBindingMismatch(String),
+    OperationAlreadyTerminal {
+        operation_key: String,
+        state: WorkflowOperationState,
+    },
     InvalidCompensationKey(String),
     InvalidCompensationTenantScope(String),
     InvalidCompensationGrantFingerprint,
@@ -2538,6 +2547,14 @@ impl Display for WorkflowOperationLedgerError {
                     workflow_error_text(key)
                 )
             }
+            Self::OperationAlreadyTerminal {
+                operation_key,
+                state,
+            } => write!(
+                formatter,
+                "workflow operation is already terminal: {} ({state:?})",
+                workflow_error_text(operation_key)
+            ),
             Self::InvalidCompensationKey(key) => {
                 write!(
                     formatter,
@@ -5776,6 +5793,14 @@ impl WorkflowEngine {
                 WorkflowOperationLedgerError::OperationBindingMismatch(operation_key.to_owned()),
             ));
         }
+        if operation.state.is_terminal() {
+            return Err(WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::OperationAlreadyTerminal {
+                    operation_key: operation.operation_key.clone(),
+                    state: operation.state,
+                },
+            ));
+        }
         operation
             .verify_input(canonical_input)
             .map_err(WorkflowError::OperationLedger)
@@ -8070,6 +8095,74 @@ mod tests {
         assert_eq!(
             ledger.operation(&operation_key).unwrap().state(),
             WorkflowOperationState::Pending
+        );
+    }
+
+    #[test]
+    fn terminal_external_operation_cannot_be_prepared_for_a_second_dispatch() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_external_tool(ToolPolicy::json("release.publish"))
+            .unwrap();
+        let mut engine = WorkflowEngine::new(runtime);
+        let plan = engine
+            .plan(vec![WorkflowStep::new(
+                "publish",
+                "use mod.tool\n\
+                 tool.start_json(\"release.publish\", {version: \"1.2.3\"}).await()",
+            )])
+            .unwrap();
+        let approval = engine.approve(&plan).unwrap();
+        assert!(matches!(
+            engine.execute(&plan, approval),
+            Err(WorkflowError::StepSuspended { .. })
+        ));
+
+        let nonce = b"release-42:publish:operation-0";
+        let mut ledger = engine.operation_ledger(&plan).unwrap();
+        let prepared = engine
+            .prepare_next_external_operation(&plan, &mut ledger, nonce)
+            .unwrap()
+            .unwrap();
+        let operation_key = prepared.operation_key().to_owned();
+        let input = canonical_operation_input_bytes(prepared.payload()).unwrap();
+        let request = engine
+            .operation_reconcile_request(
+                &plan,
+                &ledger,
+                &operation_key,
+                &input,
+                "session-1",
+                "reconcile-1",
+            )
+            .unwrap();
+        let result = OperationReconcileResult::new(
+            request.session_id.clone(),
+            request.request_id.clone(),
+            request.tool.clone(),
+            request.operation_key.clone(),
+            OperationStatus::Succeeded {
+                payload: ToolPayload::Json(serde_json::json!({"published": true})),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            engine
+                .apply_verified_operation_reconciliation(&plan, &mut ledger, &request, &result)
+                .unwrap(),
+            WorkflowOperationState::Succeeded
+        );
+
+        assert_eq!(
+            engine
+                .prepare_next_external_operation(&plan, &mut ledger, nonce)
+                .unwrap_err(),
+            WorkflowError::OperationLedger(
+                WorkflowOperationLedgerError::OperationAlreadyTerminal {
+                    operation_key,
+                    state: WorkflowOperationState::Succeeded,
+                }
+            )
         );
     }
 

@@ -8,7 +8,8 @@ and keeps UI support optional rather than making UI the language boundary.
 
 - A standalone, vendored VM and parser with upstream provenance.
 - An effect-free, bounded canonical-language preflight with structured
-  diagnostics for generated source and editor tooling.
+  diagnostics for generated source and editor tooling, plus token-aware
+  lowering of canonical newline statement boundaries for the inherited VM.
 - An effect-free canonical formatter that preserves comments and literal
   spellings while normalizing valid Splash source for LLM and editor workflows.
 - A bounded, grammar-aware lexical symbol index for imports, functions, local

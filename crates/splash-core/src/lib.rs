@@ -14,11 +14,13 @@ use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 pub use makepad_script as vm;
+#[cfg(any(fuzzing, test))]
+use profile::check_canonical_profile;
 use profile::{
-    check_canonical_profile, collect_lexical_completions, collect_lexical_symbols,
-    collect_module_imports, collect_static_record_shapes, collect_tool_call_hints,
-    collect_top_level_declarations, format_canonical_source,
-    is_canonical_identifier as profile_is_canonical_identifier, ProfileFormatError,
+    collect_lexical_completions, collect_lexical_symbols, collect_module_imports,
+    collect_static_record_shapes, collect_tool_call_hints, collect_top_level_declarations,
+    format_canonical_source, is_canonical_identifier as profile_is_canonical_identifier,
+    lower_canonical_source_for_vm, ProfileFormatError, ProfileReport,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -153,6 +155,13 @@ impl ExecutionLimits {
         if self.budget_sample_interval == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "budget_sample_interval must be greater than zero",
+            ));
+        }
+        if u32::try_from(self.instruction_limit)
+            .is_ok_and(|instruction_limit| self.budget_sample_interval >= instruction_limit)
+        {
+            return Err(RuntimeError::InvalidLimits(
+                "budget_sample_interval must be less than instruction_limit",
             ));
         }
         Ok(self)
@@ -747,6 +756,10 @@ impl<H: Any, S: Any> Runtime<H, S> {
 
     /// Evaluates source only after it passes the canonical Splash v0.2 profile.
     ///
+    /// Canonical statement-ending newlines are lowered to explicit VM
+    /// separators before evaluation, preserving the portable grammar even
+    /// though the inherited streaming tokenizer treats newlines as whitespace.
+    ///
     /// This is the normal execution entry point for generated and user-authored
     /// source. Use [`Self::eval_vm_compatibility`] only for a trusted host that
     /// deliberately needs a Makepad compatibility construct outside Splash.
@@ -755,7 +768,8 @@ impl<H: Any, S: Any> Runtime<H, S> {
         if !report.valid {
             return Err(RuntimeError::SyntaxRejected(report));
         }
-        self.eval_preflighted(source)
+        let vm_source = lower_canonical_source_with_validated_limits(source, self.limits)?;
+        self.eval_preflighted(&vm_source)
     }
 
     /// Evaluates the vendored Makepad parser's broader compatibility syntax.
@@ -967,11 +981,11 @@ pub mod fuzzing {
 /// Validates named canonical Splash source without executing it.
 ///
 /// This function rejects Makepad compatibility syntax outside the documented
-/// Splash v0.2 grammar. Only source accepted by that profile reaches the
-/// same bounded vendored-VM preflight used by
-/// [`check_vm_compatibility_named`]. `file` appears only in VM-parser
-/// diagnostics. It never loads a module, resolves an import, runs bytecode,
-/// or invokes a host tool.
+/// Splash v0.2 grammar. It lowers validated canonical statement-ending
+/// newlines to explicit VM separators before the same bounded vendored-VM
+/// preflight used by [`check_vm_compatibility_named`]. `file` appears only in
+/// VM-parser diagnostics. It never loads a module, resolves an import, runs
+/// bytecode, or invokes a host tool.
 pub fn check_syntax_named(
     file: &str,
     source: &str,
@@ -979,12 +993,20 @@ pub fn check_syntax_named(
 ) -> Result<SyntaxReport, RuntimeError> {
     let limits = limits.validate()?;
     validate_source_length(source, limits)?;
-    let profile = check_profile_with_validated_limits(source, limits);
-    if !profile.valid {
-        return Ok(profile);
-    }
+    let lowered = match lower_canonical_source_for_vm(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+    ) {
+        Ok(lowered) => lowered,
+        Err(profile) => return Ok(syntax_report_from_profile(profile)),
+    };
 
-    Ok(check_vm_syntax_with_validated_limits(file, source, limits))
+    Ok(check_vm_syntax_with_validated_limits(
+        file,
+        &lowered.source,
+        vm_limits_after_canonical_lowering(limits, lowered.inserted_statement_separators),
+    ))
 }
 
 /// Validates named inherited Makepad compatibility syntax without executing
@@ -1360,6 +1382,7 @@ fn check_profile_named(
     Ok(check_profile_with_validated_limits(source, limits))
 }
 
+#[cfg(fuzzing)]
 fn check_profile_with_validated_limits(source: &str, limits: ExecutionLimits) -> SyntaxReport {
     let profile =
         check_canonical_profile(source, limits.max_syntax_tokens, limits.max_syntax_nesting);
@@ -1375,6 +1398,39 @@ fn check_profile_with_validated_limits(source: &str, limits: ExecutionLimits) ->
         valid: true,
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
+    }
+}
+
+fn lower_canonical_source_with_validated_limits(
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<String, RuntimeError> {
+    match lower_canonical_source_for_vm(source, limits.max_syntax_tokens, limits.max_syntax_nesting)
+    {
+        Ok(lowered) => Ok(lowered.source),
+        Err(profile) => Err(RuntimeError::SyntaxRejected(syntax_report_from_profile(
+            profile,
+        ))),
+    }
+}
+
+fn syntax_report_from_profile(profile: ProfileReport) -> SyntaxReport {
+    SyntaxReport {
+        valid: false,
+        diagnostics: profile.diagnostics,
+        diagnostics_truncated: profile.diagnostics_truncated,
+    }
+}
+
+fn vm_limits_after_canonical_lowering(
+    limits: ExecutionLimits,
+    inserted_statement_separators: usize,
+) -> ExecutionLimits {
+    ExecutionLimits {
+        max_syntax_tokens: limits
+            .max_syntax_tokens
+            .saturating_add(inserted_statement_separators),
+        ..limits
     }
 }
 
@@ -2358,6 +2414,7 @@ mod tests {
     fn canonical_try_catch_cannot_recover_from_instruction_exhaustion() {
         let limits = ExecutionLimits {
             instruction_limit: 128,
+            budget_sample_interval: 64,
             ..ExecutionLimits::default()
         };
         let mut runtime = Runtime::with_limits((), (), limits).unwrap();
@@ -2559,6 +2616,53 @@ mod tests {
 
         assert!(report.valid, "{:?}", report.diagnostics);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn canonical_newline_boundaries_are_lowered_for_vm_compatibility() {
+        // The inherited tokenizer sees the newline as whitespace and would
+        // otherwise parse `(42)` as a call on the imported module field.
+        let source = "use mod.std.a\n(42)\n";
+        let compatibility = check_vm_compatibility(source).unwrap();
+        let canonical = check_syntax(source).unwrap();
+
+        assert!(!compatibility.valid);
+        assert!(canonical.valid, "{:?}", canonical.diagnostics);
+    }
+
+    #[test]
+    fn canonical_newline_boundaries_do_not_become_vm_postfix_operations() {
+        for source in [
+            "let first = 1\n(42)",
+            "let first = 1 /* comment crosses a newline\n*/\n(42)",
+        ] {
+            let mut runtime = Runtime::default();
+            let report = runtime.eval(source).unwrap();
+
+            assert!(report.succeeded(), "{:?}", report.diagnostics);
+            assert_eq!(
+                runtime
+                    .script_value_as_json(
+                        report.value,
+                        DEFAULT_MAX_JSON_DATA_BYTES,
+                        DEFAULT_MAX_JSON_DATA_DEPTH,
+                    )
+                    .unwrap(),
+                serde_json::json!(42),
+                "source: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_lowering_reserves_vm_tokens_for_compiled_boundaries() {
+        let limits = ExecutionLimits {
+            max_syntax_tokens: 6,
+            ..ExecutionLimits::default()
+        };
+        let report = check_syntax_named("boundary.splash", "let value = 1\nvalue", limits).unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
     }
 
     #[test]
@@ -3415,6 +3519,12 @@ compute(outer, 2)
             "",
             "try",
             "true",
+            "and",
+            "or",
+            "is",
+            "mut",
+            "me",
+            "scope",
             "two words",
             "value ",
             "value/*comment*/",
@@ -3462,6 +3572,16 @@ compute(outer, 2)
     }
 
     #[test]
+    fn formatter_preserves_numeric_field_access_separator() {
+        let source = "let value = 1 .field";
+        let formatted = format_source(source).unwrap();
+
+        assert_eq!(formatted, "let value = 1 .field\n");
+        assert!(check_syntax(&formatted).unwrap().valid);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
     fn canonical_profile_rejects_bare_carriage_returns_before_vm_preflight() {
         let source = "true\r[]";
 
@@ -3477,6 +3597,93 @@ compute(outer, 2)
             check_vm_compatibility_named("line-endings.splash", source, ExecutionLimits::default())
                 .unwrap();
         assert!(!compatibility.valid);
+    }
+
+    #[test]
+    fn canonical_profile_matches_vm_block_comment_terminators() {
+        // The Makepad streaming tokenizer does not let the second `*` in
+        // `**/` form an overlapping block-comment terminator.
+        let source = "/*//**///*//";
+
+        let profile =
+            check_syntax_named("comment.splash", source, ExecutionLimits::default()).unwrap();
+        let compatibility =
+            check_vm_compatibility_named("comment.splash", source, ExecutionLimits::default())
+                .unwrap();
+
+        assert!(!profile.valid);
+        assert!(!compatibility.valid);
+    }
+
+    #[test]
+    fn canonical_profile_rejects_adjacent_numeric_field_access() {
+        let source = "(5.ci)";
+        let profile =
+            check_syntax_named("numeric-field.splash", source, ExecutionLimits::default()).unwrap();
+        let compatibility = check_vm_compatibility_named(
+            "numeric-field.splash",
+            source,
+            ExecutionLimits::default(),
+        )
+        .unwrap();
+
+        assert!(!profile.valid);
+        assert!(profile.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("numeric literal decimal points must be followed by a digit")
+        }));
+        assert!(!compatibility.valid);
+    }
+
+    #[test]
+    fn canonical_conditions_require_parenthesized_control_expressions() {
+        let source = "if if t trute{}\n";
+        let report =
+            check_syntax_named("condition.splash", source, ExecutionLimits::default()).unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains(
+                "control expression used as an `if` condition or iterable must be parenthesized",
+            )
+        }));
+    }
+
+    #[test]
+    fn canonical_conditions_require_parenthesized_lambdas() {
+        let unparenthesized = "if || nil {\n0\n}";
+        let report = check_syntax(unparenthesized).unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("lambda used as an `if` condition or iterable must be parenthesized")
+        }));
+
+        let parenthesized = "if (|| nil) {\n0\n}";
+        let report = check_syntax(parenthesized).unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn canonical_conditional_branches_require_lambda_blocks() {
+        let unparenthesized = "if true |value| value";
+        let report = check_syntax(unparenthesized).unwrap();
+
+        assert!(!report.valid);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("a lambda used as a conditional branch must be written in a block")
+        }));
+
+        let block = "if true {\n|value| value\n}";
+        let report = check_syntax(block).unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
     }
 
     #[test]
@@ -3669,7 +3876,7 @@ compute(outer, 2)
     #[test]
     fn preserves_field_access_after_numeric_literals_and_comment_newlines() {
         let report = check_syntax(
-            "let field = 1.value\n\
+            "let field = 1 .value\n\
              let first = 1 /* a block comment\n\
              */\n\
              let second = 2",
@@ -3816,6 +4023,36 @@ compute(outer, 2)
     }
 
     #[test]
+    fn rejects_contextual_makepad_words_that_would_change_vm_parsing() {
+        let report = check_syntax("or\nor\n").unwrap();
+        assert!(!report.valid);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("reserved words")));
+
+        for source in [
+            "let and = 1",
+            "let is = 1",
+            "let mut = 1",
+            "let me = 1",
+            "let scope = 1",
+        ] {
+            let report = check_syntax(source).unwrap();
+
+            assert!(!report.valid, "unexpectedly accepted: {source}");
+            assert!(!report.diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn canonical_catch_remains_an_identifier_outside_try() {
+        let report = check_syntax("let catch = 1\ncatch").unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
     fn reports_canonical_profile_locations() {
         let report = check_syntax("let first = 1\nlet record = {first: first second: 2}").unwrap();
 
@@ -3930,9 +4167,26 @@ compute(outer, 2)
     }
 
     #[test]
+    fn rejects_a_time_budget_interval_that_cannot_sample_before_instruction_limit() {
+        let limits = ExecutionLimits {
+            instruction_limit: 64,
+            budget_sample_interval: 64,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("limits.splash", "true", limits).unwrap_err(),
+            RuntimeError::InvalidLimits(
+                "budget_sample_interval must be less than instruction_limit"
+            )
+        );
+    }
+
+    #[test]
     fn stops_runaway_code_at_the_instruction_limit() {
         let limits = ExecutionLimits {
             instruction_limit: 128,
+            budget_sample_interval: 64,
             ..ExecutionLimits::default()
         };
         let mut runtime = Runtime::with_limits((), (), limits).unwrap();

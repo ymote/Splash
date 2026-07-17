@@ -4,8 +4,8 @@ This document specifies the portable source subset for Splash producers,
 formatters, editors, and LLMs. It is intentionally narrower than the
 vendored Makepad parser: compatibility syntax outside this document is not a
 stable Splash language promise. `splash check` and
-`splash_core::check_syntax` enforce this profile before reporting VM parser
-compatibility.
+`splash_core::check_syntax` enforce this profile and lower canonical statement
+boundaries before reporting VM parser compatibility.
 
 The parser accepts a few legacy separator and declaration forms for Makepad
 compatibility. Generated workflow source must use the canonical forms below.
@@ -40,11 +40,16 @@ Identifiers are case-sensitive. Unicode escapes use either exactly four
 hexadecimal digits or one through six digits between braces. `if`, `elif`,
 `else`, `try`, `for`, `in`, `loop`, `while`, `fn`, `let`, `return`, `break`,
 `continue`, `use`, `true`, `false`, and `nil` are canonical keywords. `var`,
-`match`, `ok`, and `do` are reserved compatibility words and are rejected in
-canonical source. `catch` is a contextual separator after a `try` branch and
-remains an ordinary identifier elsewhere. A Unicode escape must encode a valid
-Unicode scalar value: surrogate code points and values above `U+10FFFF` are
-rejected. Strings use double quotes.
+`match`, `ok`, `do`, `and`, `or`, `is`, `mut`, `me`, and `scope` are reserved
+compatibility or contextual words and are rejected in canonical source. `catch`
+is a contextual separator after a `try` branch and remains an ordinary
+identifier elsewhere. A Unicode escape must encode a valid Unicode scalar
+value: surrogate code points and values above `U+10FFFF` are rejected. Strings
+use double quotes. A decimal point in a number must be immediately followed by
+a digit; write `5 .field` or `(5).field` for intentional numeric field access.
+Block-comment terminators follow the inherited streaming
+tokenizer: `**/` does not form an overlapping terminator, so use a single `*`
+immediately followed by `/` when closing a block comment.
 
 ## Program and Statements
 
@@ -76,7 +81,10 @@ accepted when emitting a compact one-line program; commas are reserved for
 argument, array, record-member, and parameter separation. `let` bindings may
 be reassigned with an assignment operator such as `=`, `+=`, or `-=`.
 Multiline records may include leading, separating, and closing newlines, but
-not a trailing comma.
+not a trailing comma. Before canonical preflight or execution reaches the
+inherited VM, Splash lowers each validated newline statement boundary to an
+explicit VM semicolon. This preserves portable newline semantics even though
+the inherited streaming tokenizer otherwise treats newlines as whitespace.
 
 ## Expressions
 
@@ -85,8 +93,8 @@ expression         = control-expression | assignment ;
 control-expression = conditional-expression
                    | try-expression
                    | loop-expression ;
-conditional-expression = "if", expression, expression-or-block,
-                         { "elif", expression, expression-or-block },
+conditional-expression = "if", assignment, expression-or-block,
+                         { "elif", assignment, expression-or-block },
                          [ "else", expression-or-block ] ;
 try-expression     = "try", try-branch, "catch", try-branch ;
 try-branch         = expression | value-block ;
@@ -94,9 +102,9 @@ value-block        = "{", { statement, statement-end },
                      expression, statement-end, "}" ;
 expression-or-block = block | expression ;
 
-loop-expression    = "for", for-bindings, "in", expression, block
+loop-expression    = "for", for-bindings, "in", assignment, block
                    | "loop", block
-                   | "while", expression, block ;
+                   | "while", assignment, block ;
 for-bindings       = identifier, [ ",", identifier, [ ",", identifier ] ] ;
 
 assignment         = logical-or, [ assignment-operator, assignment ] ;
@@ -141,7 +149,12 @@ value; place an explicit `nil` or another result expression after them.
 
 The grammar makes the portable operator precedence explicit rather than making
 every inherited VM operator part of the language contract. Use parentheses
-when a generated expression mixes control expressions and operators. A tool
+when a generated expression mixes control expressions and operators, including
+when a control expression or lambda supplies an `if`/`elif`/`while` condition
+or `for` iterable. For example, write `if (|| ready) { ... }` rather than an
+unparenthesized lambda condition. A lambda cannot be an unparenthesized
+`if`/`elif`/`else` branch; place it in a block, for example
+`if ready {\n    |value| value\n}`. A tool
 promise is explicitly awaited with `tool.start(...).await()`; `await` is not a
 standalone keyword or scheduler.
 
@@ -182,10 +195,12 @@ them. This keeps LLM output deterministic: valid source has one documented
 producer grammar rather than an inherited parser superset.
 
 The VM remains the execution engine, but `Runtime::eval` and
-`CapabilityRuntime::eval` now enforce this profile before evaluation. The
-explicit `check_vm_compatibility` and `check_vm_compatibility_named` APIs let a
-trusted migration or UI host inspect inherited Makepad syntax with source,
-VM-token, and delimiter-nesting bounds but without evaluating it.
+`CapabilityRuntime::eval` now enforce this profile and perform canonical
+statement-boundary lowering before evaluation. The explicit
+`check_vm_compatibility` and `check_vm_compatibility_named` APIs instead let a
+trusted migration or UI host inspect raw inherited Makepad syntax with source,
+VM-token, and delimiter-nesting bounds but without canonical lowering or
+evaluation.
 `Runtime::eval_vm_compatibility` uses that same preflight before it evaluates.
 These compatibility APIs must not receive LLM-generated or otherwise untrusted
 source, and they do not resolve imports, install modules, or grant authority.

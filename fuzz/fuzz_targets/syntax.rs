@@ -46,13 +46,8 @@ fuzz_target!(|data: &[u8]| {
 
     if profile.valid {
         assert!(
-            compatibility.valid,
-            "canonical profile accepted source that the VM compatibility preflight rejected: {source:?}\n{:?}",
-            compatibility.diagnostics
-        );
-        assert!(
             full.valid,
-            "canonical profile accepted source that the VM parser rejected: {source:?}\n{:?}",
+            "canonical profile lowering produced source that the VM parser rejected: {source:?}\n{:?}",
             full.diagnostics
         );
 

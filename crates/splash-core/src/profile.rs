@@ -25,6 +25,17 @@ pub(super) enum ProfileFormatError {
     OutputTooLarge { actual: usize, maximum: usize },
 }
 
+/// Canonical source prepared for the inherited VM parser.
+///
+/// Makepad's streaming tokenizer treats newlines as whitespace. Canonical
+/// Splash gives newlines statement-boundary meaning, so a validated source is
+/// lowered by inserting only the VM separators that preserve those boundaries.
+pub(super) struct LoweredCanonicalSource {
+    pub(super) source: String,
+    pub(super) inserted_statement_separators: usize,
+}
+
+#[cfg(any(fuzzing, test))]
 pub(super) fn check_canonical_profile(
     source: &str,
     max_tokens: usize,
@@ -40,6 +51,25 @@ pub(super) fn check_canonical_profile(
     }
 
     CanonicalParser::new(tokens, max_nesting).parse()
+}
+
+/// Validates canonical source and lowers its statement-ending newlines to the
+/// explicit separators required by the inherited VM tokenizer.
+pub(super) fn lower_canonical_source_for_vm(
+    source: &str,
+    max_tokens: usize,
+    max_nesting: usize,
+) -> Result<LoweredCanonicalSource, ProfileReport> {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, diagnostics, diagnostics_truncated) = lexer.tokenize();
+    if !diagnostics.is_empty() || diagnostics_truncated {
+        return Err(ProfileReport {
+            diagnostics,
+            diagnostics_truncated,
+        });
+    }
+
+    CanonicalParser::new(tokens, max_nesting).lower_for_vm(source)
 }
 
 pub(super) fn is_canonical_identifier(name: &str) -> bool {
@@ -899,13 +929,21 @@ impl<'source> ProfileLexer<'source> {
         let start = self.index;
         self.consume_ascii_digits();
 
-        if self.current() == Some('.')
-            && self
+        if self.current() == Some('.') {
+            if self
                 .peek()
                 .is_some_and(|character| character.is_ascii_digit())
-        {
-            self.advance();
-            self.consume_ascii_digits();
+            {
+                self.advance();
+                self.consume_ascii_digits();
+            } else {
+                let (decimal_line, decimal_column) = self.location();
+                self.report(
+                    decimal_line,
+                    decimal_column,
+                    "numeric literal decimal points must be followed by a digit; use whitespace or parentheses before field access",
+                );
+            }
         }
 
         if self
@@ -1127,13 +1165,32 @@ impl<'source> ProfileLexer<'source> {
         let (line, column) = self.location();
         self.advance();
         self.advance();
+        let mut possible_terminator = false;
         while self.current().is_some() {
+            if possible_terminator {
+                if self.current() == Some('/') {
+                    self.advance();
+                    return;
+                }
+
+                // Mirror the inherited streaming tokenizer: after a failed
+                // `*` terminator candidate, the current character has already
+                // been consumed and cannot start an overlapping `*/` pair.
+                // In particular, `**/` is not a block-comment terminator.
+                possible_terminator = false;
+                self.advance();
+                continue;
+            }
             if self.current() == Some('*') && self.peek() == Some('/') {
                 self.advance();
                 self.advance();
                 return;
             }
             match self.current() {
+                Some('*') => {
+                    possible_terminator = true;
+                    self.advance();
+                }
                 Some('\n') => self.emit_newline(),
                 Some('\r') => self.emit_carriage_return_newline(),
                 Some(_) => {
@@ -1409,6 +1466,11 @@ fn needs_space(
     if is_operator(previous, "|") {
         return previous_lambda_delimiter_closed;
     }
+    // The inherited VM treats an adjacent dot after a number as part of the
+    // numeric token. Preserve the canonical separator for numeric field access.
+    if matches!(previous, TokenKind::Number) && is_operator(current, ".") {
+        return true;
+    }
     if matches!(previous, TokenKind::OpenRound | TokenKind::OpenSquare)
         || is_operator(previous, ".")
         || matches!(
@@ -1571,6 +1633,7 @@ struct CanonicalParser {
     symbols: Option<SymbolCollector>,
     imports: Option<ModuleImportCollector>,
     static_record_shapes: Option<StaticRecordShapeCollector>,
+    vm_statement_separator_offsets: Option<Vec<usize>>,
 }
 
 impl CanonicalParser {
@@ -1585,6 +1648,7 @@ impl CanonicalParser {
             symbols: None,
             imports: None,
             static_record_shapes: None,
+            vm_statement_separator_offsets: None,
         }
     }
 
@@ -1594,6 +1658,40 @@ impl CanonicalParser {
             diagnostics: self.diagnostics,
             diagnostics_truncated: self.diagnostics_truncated,
         }
+    }
+
+    fn lower_for_vm(mut self, source: &str) -> Result<LoweredCanonicalSource, ProfileReport> {
+        self.vm_statement_separator_offsets = Some(Vec::new());
+        self.parse_program();
+        let profile = ProfileReport {
+            diagnostics: self.diagnostics,
+            diagnostics_truncated: self.diagnostics_truncated,
+        };
+        if !profile.diagnostics.is_empty() || profile.diagnostics_truncated {
+            return Err(profile);
+        }
+
+        let offsets = self
+            .vm_statement_separator_offsets
+            .take()
+            .expect("VM statement-separator collection was enabled");
+        let inserted_statement_separators = offsets.len();
+        let mut lowered = String::with_capacity(source.len() + inserted_statement_separators);
+        let mut source_offset = 0_usize;
+
+        for offset in offsets {
+            debug_assert!(source_offset <= offset && offset <= source.len());
+            debug_assert!(source.is_char_boundary(offset));
+            lowered.push_str(&source[source_offset..offset]);
+            lowered.push(';');
+            source_offset = offset;
+        }
+        lowered.push_str(&source[source_offset..]);
+
+        Ok(LoweredCanonicalSource {
+            source: lowered,
+            inserted_statement_separators,
+        })
     }
 
     fn collect_symbols(mut self, source_end_byte: usize) -> CollectedLexicalData {
@@ -1819,13 +1917,42 @@ impl CanonicalParser {
         } else if self.at_identifier("while") {
             self.advance();
             self.push_symbol_scope();
-            self.parse_expression();
+            self.parse_condition_or_iterable("while");
             self.parse_block();
             self.pop_symbol_scope();
         } else {
             self.parse_assignment();
         }
         self.leave_nesting();
+    }
+
+    fn parse_condition_or_iterable(&mut self, context: &'static str) {
+        if self.starts_control_expression() {
+            self.report_current(format!(
+                "a control expression used as an `{context}` condition or iterable must be parenthesized"
+            ));
+            return;
+        }
+        if self.starts_lambda_expression() {
+            self.report_current(format!(
+                "a lambda used as an `{context}` condition or iterable must be parenthesized"
+            ));
+            return;
+        }
+        self.parse_assignment();
+    }
+
+    fn starts_control_expression(&self) -> bool {
+        ["if", "try", "for", "loop", "while"]
+            .iter()
+            .any(|keyword| self.at_identifier(keyword))
+    }
+
+    fn starts_lambda_expression(&self) -> bool {
+        matches!(
+            &self.current().kind,
+            TokenKind::Operator(operator) if matches!(operator.as_str(), "|" | "||")
+        )
     }
 
     fn parse_try_expression(&mut self) {
@@ -1892,23 +2019,35 @@ impl CanonicalParser {
         if self.at_expression_boundary() {
             self.report_current("expected a condition after `if`");
         } else {
-            self.parse_expression();
+            self.parse_condition_or_iterable("if");
         }
-        self.parse_expression_or_block();
+        self.parse_conditional_branch();
 
         while self.at_identifier("elif") {
             self.advance();
             if self.at_expression_boundary() {
                 self.report_current("expected a condition after `elif`");
             } else {
-                self.parse_expression();
+                self.parse_condition_or_iterable("elif");
             }
-            self.parse_expression_or_block();
+            self.parse_conditional_branch();
         }
 
         if self.at_identifier("else") {
             self.advance();
-            self.parse_expression_or_block();
+            self.parse_conditional_branch();
+        }
+    }
+
+    fn parse_conditional_branch(&mut self) {
+        if self.at_kind(&TokenKind::OpenCurly) {
+            self.parse_block();
+        } else if self.starts_lambda_expression() {
+            self.report_current("a lambda used as a conditional branch must be written in a block");
+        } else if self.at_expression_boundary() {
+            self.report_current("expected an expression or block");
+        } else {
+            self.parse_expression();
         }
     }
 
@@ -1948,7 +2087,7 @@ impl CanonicalParser {
         if self.at_expression_boundary() {
             self.report_current("expected an iterable expression after `in`");
         } else {
-            self.parse_expression();
+            self.parse_condition_or_iterable("for");
         }
         self.push_symbol_scope();
         for binding in binding_tokens {
@@ -2206,6 +2345,7 @@ impl CanonicalParser {
 
     fn require_statement_end(&mut self) {
         if self.at_kind(&TokenKind::Newline) || self.at_kind(&TokenKind::Semicolon) {
+            self.record_vm_statement_boundary();
             self.consume_statement_ends();
         } else if !self.at_end() {
             self.report_current("expected a newline or `;` after a statement");
@@ -2227,6 +2367,46 @@ impl CanonicalParser {
     fn consume_statement_ends(&mut self) {
         while self.at_kind(&TokenKind::Newline) || self.at_kind(&TokenKind::Semicolon) {
             self.advance();
+        }
+    }
+
+    fn record_vm_statement_boundary(&mut self) {
+        if self.vm_statement_separator_offsets.is_none() {
+            return;
+        }
+
+        let mut boundary_end = self.index;
+        let mut contains_semicolon = false;
+        while let Some(token) = self.tokens.get(boundary_end) {
+            match &token.kind {
+                TokenKind::Newline => boundary_end += 1,
+                TokenKind::Semicolon => {
+                    contains_semicolon = true;
+                    boundary_end += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if contains_semicolon
+            || self
+                .tokens
+                .get(boundary_end)
+                .is_none_or(|token| matches!(&token.kind, TokenKind::End))
+        {
+            return;
+        }
+
+        // Insert beside the next real token rather than at the first newline:
+        // a newline emitted while skipping a block comment sits inside that
+        // comment, where a semicolon would not reach the inherited tokenizer.
+        let offset = self.tokens[boundary_end].start_byte;
+        let offsets = self
+            .vm_statement_separator_offsets
+            .as_mut()
+            .expect("VM statement-separator collection was enabled");
+        if offsets.last().copied() != Some(offset) {
+            offsets.push(offset);
         }
     }
 
@@ -2458,5 +2638,15 @@ fn is_reserved_identifier(identifier: &str) -> bool {
             | "try"
             | "ok"
             | "do"
+            // The inherited parser recognizes these as contextual operators,
+            // bindings, or ambient values. Canonical source has no spelling
+            // for those compatibility semantics, so accepting them as normal
+            // identifiers would make profile admission diverge from the VM.
+            | "and"
+            | "or"
+            | "is"
+            | "mut"
+            | "me"
+            | "scope"
     )
 }

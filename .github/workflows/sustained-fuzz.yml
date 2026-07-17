@@ -40,3 +40,53 @@ jobs:
           path: fuzz/artifacts
           if-no-files-found: ignore
           retention-days: 14
+
+  authority-and-durability:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly fmt --manifest-path fuzz/Cargo.toml --check
+      - run: RUSTFLAGS='--cfg fuzzing' cargo +nightly check --locked --manifest-path fuzz/Cargo.toml
+      - name: Capability lease fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none capability_lease --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=8192
+        working-directory: fuzz
+      - name: Workflow draft fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none workflow_draft --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=65536
+        working-directory: fuzz
+      - name: Workflow external-operation fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none workflow_external_operation --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=65536
+        working-directory: fuzz
+      - name: Workflow event-journal fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none workflow_event_journal --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=196608
+        working-directory: fuzz
+      - name: Capability audit-journal fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none capability_audit_journal --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=196608
+        working-directory: fuzz
+      - name: JSON-line worker fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none json_line_worker --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=1048578
+        working-directory: fuzz
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sustained-authority-fuzz-artifacts-${{ github.run_id }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 14

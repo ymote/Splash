@@ -72,3 +72,33 @@ jobs:
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none json_line_worker --
           -runs=128 -max_len=1048578
         working-directory: fuzz
+
+  fuzz-memory-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: AddressSanitizer evaluator fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run execution --
+          -runs=128 -max_len=8192 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
+      - name: AddressSanitizer capability-lease fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run capability_lease --
+          -runs=128 -max_len=8192
+        working-directory: fuzz
+
+  miri-vm-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo +nightly miri setup
+      - name: Check re-entrant VM body reload under Miri
+        run: >
+          cargo +nightly miri test --manifest-path vendor/makepad/Cargo.toml -p makepad-script
+          reentrant_reload_of_the_active_body_does_not_keep_an_opcode_pointer
