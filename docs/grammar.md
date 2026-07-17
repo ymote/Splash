@@ -340,19 +340,24 @@ the first syntax diagnostic.
 
 Separately, the server recognizes an exact visible direct initializer of the
 form `let binding = { ... }` and exact `let alias = binding` source edges. At a
-direct `binding.field` member site, including a lexical direct-alias chain of
-at most 16 hops, it offers the literal's retained field names, hovers a known
-field, and defines it at the literal key. Alias targets resolve at their source
-position, preserving lexical shadowing. This is bounded source metadata, not
-general type inference: it does not follow parenthesized or computed aliases,
-assignments, control flow, function returns, imports, or runtime values. It
-retains at most 1,024 shapes, 4,096 fields, and 1,024 alias edges. A truncated
-shape report marks its completion incomplete and never exposes a partial field
-list for a binding. A truncated alias report returns no static field items,
-marks completion incomplete, and disables static field hover and definition.
-The LSP stops using a shape after an earlier direct write or a potentially
-mutating member, index, call, or escape path through the root or any retained
-direct alias that resolves to it. Static field hover and definition also fail closed
+direct `binding.field` member site, or a direct
+`binding.child.field` site where `child: { ... }` is the whole literal field
+value, including a lexical root-alias chain of at most 16 hops, it offers the
+retained field names, hovers a known field, and defines it at the literal key.
+Alias targets resolve at their source position, preserving lexical shadowing.
+This is bounded source metadata, not general type inference: it does not follow
+parenthesized or computed aliases, parenthesized or computed child values, child
+aliases, deeper member paths, assignments, control flow, function returns,
+imports, or runtime values.
+Duplicate parent record fields discard every child shape, and duplicate child
+fields discard that child shape. It retains at most 1,024 root shapes, 4,096
+aggregate root-and-child fields, and 1,024 alias edges. A truncated shape report
+marks its completion incomplete and never exposes a partial field list for a
+binding. A truncated alias report returns no static field items, marks
+completion incomplete, and disables static field hover and definition. The LSP
+stops using a shape after an earlier direct write or a potentially mutating
+member, index, call, or escape path through the root or any retained direct
+alias that resolves to it. Static field hover and definition also fail closed
 when the lexical index is truncated, because an omitted earlier reference could
 be a mutation.
 

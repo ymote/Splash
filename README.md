@@ -21,7 +21,7 @@ and keeps UI support optional rather than making UI the language boundary.
   literals, and an optional refreshable module-interface projection for direct
   import paths and bounded chained imported-module members, plus bounded
   direct-literal record-field completion, hover, and definition through exact
-  direct alias chains without runtime type inference.
+  direct child literals and root-alias chains without runtime type inference.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM

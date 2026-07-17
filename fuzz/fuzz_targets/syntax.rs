@@ -341,6 +341,55 @@ fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShap
             previous_field_start = field.definition.end_byte;
             retained_fields += 1;
         }
+
+        let mut previous_child_field_start = shape.binding.end_byte;
+        let mut child_names = std::collections::BTreeSet::new();
+        for child in &shape.direct_field_shapes {
+            assert!(
+                shape.fields.iter().any(|field| field == &child.field),
+                "direct child shape is not rooted at a retained parent field: {shape:?}"
+            );
+            assert!(
+                previous_child_field_start <= child.field.definition.start_byte,
+                "direct child shapes are not source ordered: {shape:?}"
+            );
+            assert!(
+                child_names.insert(child.field.name.as_str()),
+                "direct child shapes are not deduplicated: {shape:?}"
+            );
+
+            let mut previous_nested_field_start = child.field.definition.end_byte;
+            let mut nested_field_names = std::collections::BTreeSet::new();
+            for field in &child.fields {
+                assert!(
+                    previous_nested_field_start <= field.definition.start_byte
+                        && field.definition.start_byte < field.definition.end_byte
+                        && field.definition.end_byte <= report.valid_prefix_end_byte,
+                    "direct child static record field span is unordered or exceeds the safe prefix: {shape:?}"
+                );
+                assert!(
+                    source.is_char_boundary(field.definition.start_byte)
+                        && source.is_char_boundary(field.definition.end_byte),
+                    "direct child static record field span is not a UTF-8 boundary: {shape:?}"
+                );
+                assert_eq!(
+                    &source[field.definition.start_byte..field.definition.end_byte],
+                    field.name,
+                    "direct child static record field span does not match its name: {shape:?}"
+                );
+                assert!(
+                    is_canonical_identifier(&field.name),
+                    "direct child static record field is not a canonical identifier: {shape:?}"
+                );
+                assert!(
+                    nested_field_names.insert(field.name.as_str()),
+                    "direct child static record fields are not deduplicated: {shape:?}"
+                );
+                previous_nested_field_start = field.definition.end_byte;
+                retained_fields += 1;
+            }
+            previous_child_field_start = child.field.definition.end_byte;
+        }
         previous_binding_start = shape.binding.start_byte;
     }
     assert!(retained_fields <= MAX_STATIC_RECORD_FIELDS);

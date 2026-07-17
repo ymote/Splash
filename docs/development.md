@@ -93,16 +93,20 @@ an omitted inner definition could shadow a retained outer binding.
 
 For an exact visible `let binding = { ... }` initializer, the server separately
 retains a bounded static record shape and exact `let alias = binding` edges. At
-a direct `binding.field` site, including a lexical direct-alias chain of at
-most 16 hops, it can complete the literal's field names, hover a known field,
-and navigate to that field key. Each alias target resolves at its original
-source position, preserving lexical shadowing. This is source-only advisory
-metadata, not runtime type inference: it does not follow parenthesized or
-computed aliases, assignments, control flow, function returns, imported values,
-or runtime data. The LSP stops using a shape after an earlier direct write or a
-potentially mutating member, index, call, or escape path through the root or
-any retained direct alias resolving to that root. The report retains at most 1,024
-shapes, 4,096 fields, and 1,024 direct alias edges. A truncated shape report
+a direct `binding.field` site or a direct `binding.child.field` site whose
+`child: { ... }` value is an exact literal, including a lexical root-alias chain
+of at most 16 hops, it can complete the literal's field names, hover a known
+field, and navigate to that field key. Each alias target resolves at its
+original source position, preserving lexical shadowing. This is source-only
+advisory metadata, not runtime type inference: it does not follow parenthesized
+or computed aliases, parenthesized or computed child values, child aliases,
+deeper paths, assignments, control flow, function returns, imported values, or
+runtime data. Duplicate parent record fields discard every child shape, and
+duplicate child fields discard that child shape. The LSP stops using a shape
+after an earlier direct write or a potentially mutating member, index, call, or
+escape path through the root or any retained direct alias resolving to that
+root. The report retains at most 1,024 root shapes, 4,096 aggregate
+root-and-child fields, and 1,024 direct alias edges. A truncated shape report
 marks a retained member completion `isIncomplete`; a truncated alias report
 returns no static field items, marks completion incomplete, and disables static
 field hover and definition. Static field hover and definition also fail closed
@@ -249,7 +253,7 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has ten bounded targets. `syntax` differentially
+The standalone `fuzz` package has eleven bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser under a rotating set
 of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
 to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also
@@ -275,9 +279,10 @@ prefix boundaries, independent symbol/site caps, and truncation signals. The
 same invalid-source coverage validates bounded source-only import reports:
 every retained `mod.<path>` spelling and final binding span is ordered,
 UTF-8-safe, within the safe prefix, and structurally consistent; truncation is
-explicit at the fixed import cap. It also validates direct literal-record shape
-spans, unique field names, direct alias binding and target spans, safe-prefix
-boundaries, and the separate shape, aggregate-field, and alias caps.
+explicit at the fixed import cap. It also validates direct literal-record root
+and exact child shape spans, unique field names, direct alias binding and target
+spans, safe-prefix boundaries, and the separate shape, aggregate root-and-child
+field, and alias caps.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 4,096 instruction cap, one-instruction deadline sampling, and a 32 ms

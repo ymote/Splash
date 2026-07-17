@@ -1,6 +1,7 @@
 let profile = {
     name: "Ada",
     active: true,
-    nested: {level: 1}
+    nested: {level: 1, flags: {ignored: true}}
 }
-profile.name
+let alias = profile
+alias.nested.level

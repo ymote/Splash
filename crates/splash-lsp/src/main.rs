@@ -512,9 +512,7 @@ impl SplashLanguageServer {
         };
         let shapes = self.static_record_shapes(uri)?;
         if !report.truncated {
-            if let Some(site) = direct_module_member_completion_site(source, byte_offset)
-                .filter(|site| site.has_direct_receiver())
-            {
+            if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
                 if let Some(field) = static_record_field_for_member(
                     source,
                     &report.symbols,
@@ -559,22 +557,20 @@ impl SplashLanguageServer {
                         range: Some(span_range(source, site.member)),
                     }));
                 }
-                if site.has_direct_receiver() {
-                    if let Some(field) = static_record_field_for_member(
-                        source,
-                        &report.symbols,
-                        source.len(),
-                        shapes,
-                        site,
-                    ) {
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: format!("**static record field** `{}`", field.name),
-                            }),
-                            range: Some(span_range(source, site.member)),
-                        }));
-                    }
+                if let Some(field) = static_record_field_for_member(
+                    source,
+                    &report.symbols,
+                    source.len(),
+                    shapes,
+                    site,
+                ) {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!("**static record field** `{}`", field.name),
+                        }),
+                        range: Some(span_range(source, site.member)),
+                    }));
                 }
             }
         }
@@ -717,23 +713,21 @@ impl SplashLanguageServer {
                 ));
             }
             let shapes = self.static_record_shapes(uri)?;
-            if member_site.has_direct_receiver() {
-                if let Some(shape) = visible_static_record_shape(
+            if let Some(fields) = visible_static_record_fields(
+                source,
+                &report.symbols,
+                report.valid_prefix_end_byte,
+                shapes,
+                member_site,
+            ) {
+                return Ok(static_record_member_completion(
                     source,
-                    &report.symbols,
-                    report.valid_prefix_end_byte,
+                    report,
                     shapes,
-                    member_site.receiver,
-                ) {
-                    return Ok(static_record_member_completion(
-                        source,
-                        report,
-                        shapes,
-                        shape,
-                        member_site,
-                        lexical_incomplete,
-                    ));
-                }
+                    fields,
+                    member_site,
+                    lexical_incomplete,
+                ));
             }
             return Ok(module_catalog_member_completion(
                 source,
@@ -2458,7 +2452,7 @@ fn static_record_member_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
     shapes: &StaticRecordShapeReport,
-    shape: &StaticRecordShape,
+    fields: &[StaticRecordField],
     site: MemberCompletionSite,
     is_incomplete: bool,
 ) -> CompletionList {
@@ -2477,13 +2471,12 @@ fn static_record_member_completion(
     }
 
     let edit_range = span_range(source, site.member);
-    let mut items = shape
-        .fields
+    let mut items = fields
         .iter()
         .map(|field| CompletionItem {
             label: field.name.clone(),
             kind: Some(CompletionItemKind::FIELD),
-            detail: Some("static record field; direct literal or alias".to_owned()),
+            detail: Some("static record field; direct literal, child literal, or alias".to_owned()),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                 edit_range,
                 field.name.clone(),
@@ -3085,6 +3078,50 @@ fn visible_static_record_shape<'shape>(
         .find(|shape| shape.binding == root_binding)
 }
 
+/// Returns static fields for either the root literal or one exact direct child
+/// literal. This is not a general member-path resolver: child aliases,
+/// computed paths, and deeper chains intentionally have no static metadata.
+fn visible_static_record_fields<'shape>(
+    source: &str,
+    symbols: &[LexicalSymbol],
+    valid_prefix_end_byte: usize,
+    shapes: &'shape StaticRecordShapeReport,
+    site: MemberCompletionSite,
+) -> Option<&'shape [StaticRecordField]> {
+    let shape = visible_static_record_shape(
+        source,
+        symbols,
+        valid_prefix_end_byte,
+        shapes,
+        site.receiver,
+    )?;
+    match static_record_direct_child_name(source, site)? {
+        None => Some(&shape.fields),
+        Some(child_name) => shape
+            .direct_field_shapes
+            .iter()
+            .find(|child| child.field.name == child_name)
+            .map(|child| child.fields.as_slice()),
+    }
+}
+
+/// Extracts the one optional direct child identifier between a root binding
+/// and a member being completed. The lexical member recognizer has already
+/// rejected strings, comments, indexes, calls, and non-identifier segments.
+fn static_record_direct_child_name(
+    source: &str,
+    site: MemberCompletionSite,
+) -> Option<Option<&str>> {
+    let root = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
+    let chain = source.get(site.receiver_chain.start_byte..site.receiver_chain.end_byte)?;
+    if chain == root {
+        return Some(None);
+    }
+
+    let child = chain.strip_prefix(root)?.strip_prefix('.')?;
+    (!child.contains('.') && is_canonical_identifier(child)).then_some(Some(child))
+}
+
 fn static_record_alias_group_is_stable(
     source: &str,
     shapes: &StaticRecordShapeReport,
@@ -3247,14 +3284,9 @@ fn static_record_field_for_member<'field>(
         return None;
     }
     let member_name = source.get(site.member.start_byte..site.member.end_byte)?;
-    let shape = visible_static_record_shape(
-        source,
-        symbols,
-        valid_prefix_end_byte,
-        shapes,
-        site.receiver,
-    )?;
-    shape.fields.iter().find(|field| field.name == member_name)
+    let fields =
+        visible_static_record_fields(source, symbols, valid_prefix_end_byte, shapes, site)?;
+    fields.iter().find(|field| field.name == member_name)
 }
 
 fn is_builtin_tool_module_import(import: &ModuleImport) -> bool {
@@ -4189,7 +4221,8 @@ mod tests {
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
-                && item.detail.as_deref() == Some("static record field; direct literal or alias")
+                && item.detail.as_deref()
+                    == Some("static record field; direct literal, child literal, or alias")
                 && matches!(
                     &item.text_edit,
                     Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
@@ -4274,6 +4307,122 @@ mod tests {
             )
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn completes_and_navigates_one_level_direct_static_record_child_fields() {
+        let source = "let profile = {user: {name: \"Ada\", active: true}}\nprofile.user.name";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let member_start = source.rfind("name").unwrap();
+        let completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, member_start + "name".len()),
+            )
+            .expect("direct child static record completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "name"]
+        );
+
+        let field_definition = source.find("name:").unwrap();
+        let definition = server
+            .definition(&test_uri(), position_at_byte(source, member_start + 1))
+            .expect("direct child static field definition succeeds")
+            .expect("known direct child static field has a definition");
+        assert_eq!(
+            definition.range,
+            Range::new(
+                position_at_byte(source, field_definition),
+                position_at_byte(source, field_definition + "name".len()),
+            )
+        );
+        assert_eq!(
+            server
+                .hover(&test_uri(), position_at_byte(source, member_start + 1))
+                .expect("direct child static field hover succeeds")
+                .expect("known direct child static field has hover information")
+                .contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "**static record field** `name`".to_owned(),
+            })
+        );
+
+        let alias_source = "let profile = {user: {name: \"Ada\"}}\n\
+                            let alias = profile\n\
+                            alias.user.";
+        let mut alias_server = SplashLanguageServer::default();
+        alias_server.open_document(document(1, alias_source));
+        assert_eq!(
+            alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(alias_source, alias_source.len()),
+                )
+                .expect("direct alias child completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["name"]
+        );
+
+        for unsupported_source in [
+            "let profile = {user: ({name: \"Ada\"})}\nprofile.user.",
+            "let profile = {user: {name: \"Ada\"}.name}\nprofile.user.",
+            "let profile = {user: {name: {deeper: true}}}\nprofile.user.name.",
+            "let profile = {user: {name: \"Ada\"}, user: {other: true}}\nprofile.user.",
+        ] {
+            let mut unsupported_server = SplashLanguageServer::default();
+            unsupported_server.open_document(document(1, unsupported_source));
+            assert!(
+                unsupported_server
+                    .completion(
+                        &test_uri(),
+                        position_at_byte(unsupported_source, unsupported_source.len()),
+                    )
+                    .expect("unsupported nested completion request succeeds")
+                    .items
+                    .is_empty(),
+                "static child metadata must fail closed for {unsupported_source:?}"
+            );
+        }
+
+        let duplicate_child_source =
+            "let profile = {user: {name: \"Ada\", name: \"Grace\"}}\nprofile.user.name";
+        let mut duplicate_child_server = SplashLanguageServer::default();
+        duplicate_child_server.open_document(document(1, duplicate_child_source));
+        let duplicate_member = duplicate_child_source.rfind("name").unwrap();
+        assert!(duplicate_child_server
+            .completion(
+                &test_uri(),
+                position_at_byte(duplicate_child_source, duplicate_member + "name".len(),),
+            )
+            .expect("duplicate child completion request succeeds")
+            .items
+            .is_empty());
+        assert!(duplicate_child_server
+            .definition(
+                &test_uri(),
+                position_at_byte(duplicate_child_source, duplicate_member + 1),
+            )
+            .expect("duplicate child definition request succeeds")
+            .is_none());
+        assert!(duplicate_child_server
+            .hover(
+                &test_uri(),
+                position_at_byte(duplicate_child_source, duplicate_member + 1),
+            )
+            .expect("duplicate child hover request succeeds")
+            .is_none());
     }
 
     #[test]
@@ -4410,6 +4559,7 @@ mod tests {
             "let profile = {name: \"Ada\"}\nlet first = profile\nlet second = first\nsecond[\"name\"]\nprofile.",
             "let profile = {name: \"Ada\"}\nlet alias = profile\nalias.refresh()\nprofile.",
             "let profile = {name: \"Ada\"}\nlet alias = profile\nmutate(alias)\nprofile.",
+            "let profile = {user: {name: \"Ada\"}}\nprofile.user.name = \"Grace\"\nprofile.user.",
         ] {
             let mut server = SplashLanguageServer::default();
             server.open_document(document(1, source));
@@ -5357,21 +5507,28 @@ mod tests {
             "inputFields": [{"name": "left", "type": "integer"}],
             "outputs": []
         }));
-        for shadowed_source in [
-            "let workflow = {input: {local: true}}\nworkflow.input.",
-            "use mod.workflow\nworkflow.input.",
+        for (shadowed_source, expected) in [
+            (
+                "let workflow = {input: {local: true}}\nworkflow.input.",
+                &["local"][..],
+            ),
+            ("use mod.workflow\nworkflow.input.", &[][..]),
         ] {
             let mut server = SplashLanguageServer::with_workflow_data_catalog(catalog.clone());
             server.open_document(document(1, shadowed_source));
-            assert!(
-                server
-                    .completion(
-                        &test_uri(),
-                        position_at_byte(shadowed_source, shadowed_source.len()),
-                    )
-                    .expect("shadowed workflow completion succeeds")
-                    .items
-                    .is_empty(),
+            let completion = server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(shadowed_source, shadowed_source.len()),
+                )
+                .expect("shadowed workflow completion succeeds");
+            let labels = completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                labels, expected,
                 "workflow projection must not override {shadowed_source:?}"
             );
         }

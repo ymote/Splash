@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::{
     LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
-    ModuleImportReport, SourceSpan, StaticRecordAlias, StaticRecordField, StaticRecordShape,
-    StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind,
-    TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
+    ModuleImportReport, SourceSpan, StaticRecordAlias, StaticRecordField, StaticRecordNestedShape,
+    StaticRecordShape, StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport,
+    ToolCallKind, TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
     MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES,
     MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
     MAX_TOOL_CALL_HINTS,
@@ -335,7 +335,15 @@ struct StaticRecordShapeCollector {
 
 struct DirectRecordShape {
     fields: Vec<StaticRecordField>,
+    direct_field_shapes: Vec<StaticRecordNestedShape>,
     end_byte: usize,
+}
+
+struct ParsedDirectRecord {
+    fields: Vec<StaticRecordField>,
+    direct_field_shapes: Vec<StaticRecordNestedShape>,
+    has_duplicate_fields: bool,
+    closing_index: usize,
 }
 
 struct DirectRecordAlias {
@@ -359,17 +367,19 @@ impl StaticRecordShapeCollector {
         if shape.end_byte > self.valid_prefix_end_byte {
             return;
         }
+        let retained_fields = shape.retained_field_count();
         if self.shapes.len() == MAX_STATIC_RECORD_SHAPES
-            || self.retained_fields.saturating_add(shape.fields.len()) > MAX_STATIC_RECORD_FIELDS
+            || self.retained_fields.saturating_add(retained_fields) > MAX_STATIC_RECORD_FIELDS
         {
             self.truncated = true;
             return;
         }
 
-        self.retained_fields += shape.fields.len();
+        self.retained_fields += retained_fields;
         self.shapes.push(StaticRecordShape {
             binding,
             fields: shape.fields,
+            direct_field_shapes: shape.direct_field_shapes,
         });
     }
 
@@ -396,6 +406,16 @@ impl StaticRecordShapeCollector {
             aliases_truncated: self.aliases_truncated,
             valid_prefix_end_byte: self.valid_prefix_end_byte,
         }
+    }
+}
+
+impl DirectRecordShape {
+    fn retained_field_count(&self) -> usize {
+        self.direct_field_shapes
+            .iter()
+            .fold(self.fields.len(), |count, child| {
+                count.saturating_add(child.fields.len())
+            })
     }
 }
 
@@ -1577,7 +1597,8 @@ fn direct_record_shape_from_tokens(
         return None;
     }
 
-    let (fields, closing_index) = direct_record_fields(tokens, opening_index)?;
+    let record = direct_record_fields(tokens, opening_index, true)?;
+    let closing_index = record.closing_index;
     if !matches!(
         &tokens.get(closing_index + 1)?.kind,
         TokenKind::Newline | TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::End
@@ -1586,7 +1607,8 @@ fn direct_record_shape_from_tokens(
     }
 
     Some(DirectRecordShape {
-        fields,
+        fields: record.fields,
+        direct_field_shapes: record.direct_field_shapes,
         end_byte: tokens.get(closing_index)?.end_byte,
     })
 }
@@ -1620,9 +1642,16 @@ fn direct_record_alias_from_tokens(
 fn direct_record_fields(
     tokens: &[Token],
     opening_index: usize,
-) -> Option<(Vec<StaticRecordField>, usize)> {
+    collect_direct_field_shapes: bool,
+) -> Option<ParsedDirectRecord> {
+    if !matches!(&tokens.get(opening_index)?.kind, TokenKind::OpenCurly) {
+        return None;
+    }
+
     let mut fields = Vec::new();
     let mut field_names = HashSet::<&str>::new();
+    let mut direct_field_shapes = Vec::new();
+    let mut has_duplicate_fields = false;
     let mut index = opening_index.checked_add(1)?;
 
     loop {
@@ -1630,7 +1659,16 @@ fn direct_record_fields(
             index += 1;
         }
         if matches!(&tokens.get(index)?.kind, TokenKind::CloseCurly) {
-            return Some((fields, index));
+            return Some(ParsedDirectRecord {
+                fields,
+                direct_field_shapes: if has_duplicate_fields {
+                    Vec::new()
+                } else {
+                    direct_field_shapes
+                },
+                has_duplicate_fields,
+                closing_index: index,
+            });
         }
 
         let field = tokens.get(index)?;
@@ -1652,14 +1690,34 @@ fn direct_record_fields(
             return None;
         }
 
-        if field_names.insert(name.as_str()) {
-            fields.push(StaticRecordField {
-                name: name.clone(),
-                definition: SourceSpan {
-                    start_byte: field.start_byte,
-                    end_byte: field.end_byte,
-                },
-            });
+        let field_metadata = StaticRecordField {
+            name: name.clone(),
+            definition: SourceSpan {
+                start_byte: field.start_byte,
+                end_byte: field.end_byte,
+            },
+        };
+        let field_is_unique = field_names.insert(name.as_str());
+        if field_is_unique {
+            fields.push(field_metadata.clone());
+        } else {
+            has_duplicate_fields = true;
+        }
+
+        if collect_direct_field_shapes && field_is_unique {
+            if let Some(child) = direct_record_fields(tokens, index, false) {
+                if !child.has_duplicate_fields
+                    && matches!(
+                        &tokens.get(child.closing_index + 1)?.kind,
+                        TokenKind::Comma | TokenKind::Newline | TokenKind::CloseCurly
+                    )
+                {
+                    direct_field_shapes.push(StaticRecordNestedShape {
+                        field: field_metadata,
+                        fields: child.fields,
+                    });
+                }
+            }
         }
 
         let mut round_depth = 0_usize;
@@ -1676,7 +1734,18 @@ fn direct_record_fields(
                 TokenKind::CloseSquare if square_depth == 0 => return None,
                 TokenKind::CloseSquare => square_depth -= 1,
                 TokenKind::CloseCurly if curly_depth > 0 => curly_depth -= 1,
-                TokenKind::CloseCurly => return Some((fields, index)),
+                TokenKind::CloseCurly => {
+                    return Some(ParsedDirectRecord {
+                        fields,
+                        direct_field_shapes: if has_duplicate_fields {
+                            Vec::new()
+                        } else {
+                            direct_field_shapes
+                        },
+                        has_duplicate_fields,
+                        closing_index: index,
+                    })
+                }
                 TokenKind::Comma | TokenKind::Newline
                     if round_depth == 0 && square_depth == 0 && curly_depth == 0 =>
                 {
