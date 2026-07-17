@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "windows", test))]
 use zeroize::Zeroize;
 
 use crate::http_endpoint_catalog::{
