@@ -362,6 +362,16 @@ projection, and a suggestion does not make a capability installed, approved,
 or callable. Malformed, duplicate, or over-limit input is discarded as a whole
 rather than presented partially.
 
+For host-managed dataflow authoring, an editor may separately provide the
+bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP
+uses it only for direct unshadowed `workflow.input.*` and
+`workflow.outputs.<stepId>.*` completion and field hover. It is static advisory
+metadata, not a JSON Schema loader or a runtime snapshot: it cannot establish
+that an output is completed, validate a value, approve a plan, issue a lease,
+or make an adapter callable. A visible local or imported `workflow` binding
+shadows it, absent metadata creates no namespace, and malformed input fails
+closed. See [Editor workflow-data projection](workflow-data-catalog.md).
+
 Rename does not edit the final segment of a `use` path. For another indexed
 binding it accepts exactly one non-reserved canonical identifier, rewrites the
 definition and resolved references in memory, validates the resulting canonical

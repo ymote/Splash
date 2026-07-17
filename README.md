@@ -446,6 +446,15 @@ lexical index can still serve retained, sound definitions and hover, but
 exhaustive reference, highlight, and rename requests fail instead of returning
 a partial set.
 
+For a host-managed dataflow authoring session, an editor can also supply a
+separate static `initializationOptions.splash.workflowDataCatalog` projection.
+It completes direct unshadowed `workflow.input.*` and
+`workflow.outputs.<stepId>.*` paths and hovers known field metadata, without
+loading schemas or runtime state. It does not claim that an output is complete,
+validate data, approve a workflow, issue a lease, or make an adapter callable;
+missing metadata does not create a `workflow` namespace, and malformed input
+fails closed. See [editor workflow-data projection](docs/workflow-data-catalog.md).
+
 ## Workspace
 
 - `splash-core`: bounded VM wrapper and diagnostics.

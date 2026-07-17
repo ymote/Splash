@@ -62,6 +62,17 @@ const MAX_LSP_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_LSP_MODULE_PATH_BYTES: usize = 256;
 const MAX_LSP_MODULE_PATH_SEGMENTS: usize = 16;
 const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum completed workflow outputs retained in the advisory dataflow
+/// projection. This stays far below the workflow-plan hard cap so editor
+/// metadata remains inexpensive on mobile and embedded hosts.
+const MAX_LSP_WORKFLOW_DATA_OUTPUTS: usize = 128;
+/// Maximum input and output fields retained across one advisory dataflow
+/// projection.
+const MAX_LSP_WORKFLOW_DATA_FIELDS: usize = 1_024;
+/// Maximum aggregate retained bytes in the advisory workflow-data projection.
+const MAX_LSP_WORKFLOW_DATA_BYTES: usize = 512 * 1024;
+const MAX_LSP_WORKFLOW_DATA_FIELD_NAME_BYTES: usize = 128;
+const MAX_LSP_WORKFLOW_DATA_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
 
 type ServerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -137,6 +148,75 @@ struct ModuleCompletionCatalog {
     unavailable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowDataFieldType {
+    Any,
+    Null,
+    Boolean,
+    Number,
+    Integer,
+    String,
+    Array,
+    Object,
+}
+
+impl WorkflowDataFieldType {
+    fn from_catalog_value(value: &str) -> Option<Self> {
+        match value {
+            "any" => Some(Self::Any),
+            "null" => Some(Self::Null),
+            "boolean" => Some(Self::Boolean),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "string" => Some(Self::String),
+            "array" => Some(Self::Array),
+            "object" => Some(Self::Object),
+            _ => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Integer => "integer",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkflowDataFieldCompletion {
+    name: String,
+    field_type: WorkflowDataFieldType,
+    description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkflowDataOutputCompletion {
+    step_id: String,
+    fields: Vec<WorkflowDataFieldCompletion>,
+}
+
+/// A bounded, static projection of host-owned workflow data contracts.
+///
+/// This is authoring metadata only. It neither validates a workflow value,
+/// constructs a dataflow approval, issues a lease, nor makes an output
+/// available at runtime.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WorkflowDataCompletionCatalog {
+    input_fields: Vec<WorkflowDataFieldCompletion>,
+    outputs: Vec<WorkflowDataOutputCompletion>,
+    /// Distinguishes an absent advisory projection from an explicitly supplied
+    /// empty projection. The former must not invent a `workflow` namespace.
+    configured: bool,
+    unavailable: bool,
+}
+
 #[derive(Debug)]
 struct DocumentState {
     source: Option<String>,
@@ -178,6 +258,7 @@ struct SplashLanguageServer {
     documents: HashMap<Uri, DocumentState>,
     tool_catalog: ToolCompletionCatalog,
     module_catalog: ModuleCompletionCatalog,
+    workflow_data_catalog: WorkflowDataCompletionCatalog,
 }
 
 impl SplashLanguageServer {
@@ -186,14 +267,37 @@ impl SplashLanguageServer {
         Self::with_completion_catalogs(tool_catalog, ModuleCompletionCatalog::default())
     }
 
+    #[cfg(test)]
+    fn with_workflow_data_catalog(workflow_data_catalog: WorkflowDataCompletionCatalog) -> Self {
+        Self::with_completion_catalogs_and_workflow_data(
+            ToolCompletionCatalog::default(),
+            ModuleCompletionCatalog::default(),
+            workflow_data_catalog,
+        )
+    }
+
+    #[cfg(test)]
     fn with_completion_catalogs(
         tool_catalog: ToolCompletionCatalog,
         module_catalog: ModuleCompletionCatalog,
+    ) -> Self {
+        Self::with_completion_catalogs_and_workflow_data(
+            tool_catalog,
+            module_catalog,
+            WorkflowDataCompletionCatalog::default(),
+        )
+    }
+
+    fn with_completion_catalogs_and_workflow_data(
+        tool_catalog: ToolCompletionCatalog,
+        module_catalog: ModuleCompletionCatalog,
+        workflow_data_catalog: WorkflowDataCompletionCatalog,
     ) -> Self {
         Self {
             documents: HashMap::new(),
             tool_catalog,
             module_catalog,
+            workflow_data_catalog,
         }
     }
 
@@ -301,23 +405,40 @@ impl SplashLanguageServer {
         };
         let shapes = self.static_record_shapes(uri)?;
         if !report.truncated {
-            if let Some(site) = direct_module_member_completion_site(source, byte_offset)
-                .filter(|site| site.has_direct_receiver())
-            {
-                if let Some(field) = static_record_field_for_member(
+            if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
+                if let Some((field, context)) = workflow_data_field_for_member(
                     source,
                     &report.symbols,
                     source.len(),
-                    shapes,
+                    &self.workflow_data_catalog,
                     site,
                 ) {
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!("**static record field** `{}`", field.name),
+                            // Contract descriptions are host supplied. Keep them plain text so
+                            // metadata cannot inject markup into the editor.
+                            kind: MarkupKind::PlainText,
+                            value: workflow_data_field_hover_text(field, context),
                         }),
                         range: Some(span_range(source, site.member)),
                     }));
+                }
+                if site.has_direct_receiver() {
+                    if let Some(field) = static_record_field_for_member(
+                        source,
+                        &report.symbols,
+                        source.len(),
+                        shapes,
+                        site,
+                    ) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!("**static record field** `{}`", field.name),
+                            }),
+                            range: Some(span_range(source, site.member)),
+                        }));
+                    }
                 }
             }
         }
@@ -436,6 +557,15 @@ impl SplashLanguageServer {
         }
 
         if let Some(member_site) = direct_module_member_completion_site(source, byte_offset) {
+            if let Some(completion) = workflow_data_member_completion(
+                source,
+                report,
+                &self.workflow_data_catalog,
+                member_site,
+                lexical_incomplete,
+            ) {
+                return Ok(completion);
+            }
             let imports = self.module_imports(uri)?;
             let is_incomplete = lexical_incomplete || imports.truncated;
             if member_site.has_direct_receiver()
@@ -767,7 +897,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
     let initialize_params =
         serde_json::from_value::<InitializeParams>(initialize_value).unwrap_or_default();
     let versioned_document_edits = supports_versioned_document_edits(&initialize_params);
-    let (tool_catalog, module_catalog) =
+    let (tool_catalog, module_catalog, workflow_data_catalog) =
         completion_catalogs_from_initialize_options(&initialize_params);
     connection.initialize_finish(
         initialize_id,
@@ -776,7 +906,11 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
         }),
     )?;
 
-    let mut server = SplashLanguageServer::with_completion_catalogs(tool_catalog, module_catalog);
+    let mut server = SplashLanguageServer::with_completion_catalogs_and_workflow_data(
+        tool_catalog,
+        module_catalog,
+        workflow_data_catalog,
+    );
     while let Ok(message) = connection.receiver.recv() {
         match message {
             Message::Request(request) => {
@@ -813,29 +947,37 @@ fn supports_versioned_document_edits(params: &InitializeParams) -> bool {
 
 fn completion_catalogs_from_initialize_options(
     params: &InitializeParams,
-) -> (ToolCompletionCatalog, ModuleCompletionCatalog) {
+) -> (
+    ToolCompletionCatalog,
+    ModuleCompletionCatalog,
+    WorkflowDataCompletionCatalog,
+) {
     let Some(options) = params.initialization_options.as_ref() else {
         return (
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
+            WorkflowDataCompletionCatalog::default(),
         );
     };
     let Some(options) = options.as_object() else {
         return (
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
+            WorkflowDataCompletionCatalog::default(),
         );
     };
     let Some(splash) = options.get("splash") else {
         return (
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
+            WorkflowDataCompletionCatalog::default(),
         );
     };
     let Some(splash) = splash.as_object() else {
         return (
             unavailable_tool_completion_catalog(),
             unavailable_module_completion_catalog(),
+            unavailable_workflow_data_completion_catalog(),
         );
     };
 
@@ -849,7 +991,12 @@ fn completion_catalogs_from_initialize_options(
             .unwrap_or_else(unavailable_module_completion_catalog),
         None => ModuleCompletionCatalog::default(),
     };
-    (tool_catalog, module_catalog)
+    let workflow_data_catalog = match splash.get("workflowDataCatalog") {
+        Some(catalog) => parse_workflow_data_completion_catalog(catalog)
+            .unwrap_or_else(unavailable_workflow_data_completion_catalog),
+        None => WorkflowDataCompletionCatalog::default(),
+    };
+    (tool_catalog, module_catalog, workflow_data_catalog)
 }
 
 #[cfg(test)]
@@ -866,6 +1013,13 @@ fn module_completion_catalog_from_initialize_options(
     completion_catalogs_from_initialize_options(params).1
 }
 
+#[cfg(test)]
+fn workflow_data_completion_catalog_from_initialize_options(
+    params: &InitializeParams,
+) -> WorkflowDataCompletionCatalog {
+    completion_catalogs_from_initialize_options(params).2
+}
+
 fn unavailable_tool_completion_catalog() -> ToolCompletionCatalog {
     ToolCompletionCatalog {
         tools: Vec::new(),
@@ -876,6 +1030,15 @@ fn unavailable_tool_completion_catalog() -> ToolCompletionCatalog {
 fn unavailable_module_completion_catalog() -> ModuleCompletionCatalog {
     ModuleCompletionCatalog {
         modules: Vec::new(),
+        unavailable: true,
+    }
+}
+
+fn unavailable_workflow_data_completion_catalog() -> WorkflowDataCompletionCatalog {
+    WorkflowDataCompletionCatalog {
+        input_fields: Vec::new(),
+        outputs: Vec::new(),
+        configured: true,
         unavailable: true,
     }
 }
@@ -1001,6 +1164,118 @@ fn parse_module_catalog_path(path: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(segments)
+}
+
+/// Reads a normalized, static projection of host-owned workflow data schemas.
+///
+/// The projection intentionally contains only identifier-addressable object
+/// fields. Hosts must derive it from their own executable contracts; this
+/// parser never accepts source schemas, follows references, or infers a
+/// runtime value. Any malformed, duplicate, or over-limit entry discards the
+/// complete projection.
+fn parse_workflow_data_completion_catalog(
+    value: &serde_json::Value,
+) -> Option<WorkflowDataCompletionCatalog> {
+    let object = value.as_object()?;
+    let mut retained_bytes = 0_usize;
+    let mut retained_fields = 0_usize;
+    let input_fields = parse_workflow_data_fields(
+        object.get("inputFields")?,
+        &mut retained_bytes,
+        &mut retained_fields,
+    )?;
+    let output_entries = object.get("outputs")?.as_array()?;
+    if output_entries.len() > MAX_LSP_WORKFLOW_DATA_OUTPUTS {
+        return None;
+    }
+
+    let mut outputs = Vec::with_capacity(output_entries.len());
+    for entry in output_entries {
+        let output = entry.as_object()?;
+        let step_id = output.get("stepId")?.as_str()?;
+        if !is_valid_workflow_data_path_segment(step_id)
+            || outputs
+                .iter()
+                .any(|existing: &WorkflowDataOutputCompletion| existing.step_id == step_id)
+        {
+            return None;
+        }
+        retained_bytes = retained_bytes.checked_add(step_id.len())?.checked_add(1)?;
+        if retained_bytes > MAX_LSP_WORKFLOW_DATA_BYTES {
+            return None;
+        }
+        let fields = parse_workflow_data_fields(
+            output.get("fields")?,
+            &mut retained_bytes,
+            &mut retained_fields,
+        )?;
+        outputs.push(WorkflowDataOutputCompletion {
+            step_id: step_id.to_owned(),
+            fields,
+        });
+    }
+    outputs.sort_by(|left, right| left.step_id.cmp(&right.step_id));
+
+    Some(WorkflowDataCompletionCatalog {
+        input_fields,
+        outputs,
+        configured: true,
+        unavailable: false,
+    })
+}
+
+fn parse_workflow_data_fields(
+    value: &serde_json::Value,
+    retained_bytes: &mut usize,
+    retained_fields: &mut usize,
+) -> Option<Vec<WorkflowDataFieldCompletion>> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_LSP_WORKFLOW_DATA_FIELDS {
+        return None;
+    }
+
+    let mut fields = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let field = entry.as_object()?;
+        let name = field.get("name")?.as_str()?;
+        let field_type = WorkflowDataFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
+        let description = match field.get("description") {
+            Some(value) => value.as_str()?,
+            None => "",
+        };
+        if !is_valid_workflow_data_path_segment(name)
+            || description.len() > MAX_LSP_WORKFLOW_DATA_FIELD_DESCRIPTION_BYTES
+            || fields
+                .iter()
+                .any(|existing: &WorkflowDataFieldCompletion| existing.name == name)
+        {
+            return None;
+        }
+        *retained_fields = retained_fields.checked_add(1)?;
+        if *retained_fields > MAX_LSP_WORKFLOW_DATA_FIELDS {
+            return None;
+        }
+        let entry_bytes = name
+            .len()
+            .checked_add(field_type.label().len())?
+            .checked_add(description.len())?
+            .checked_add(1)?;
+        *retained_bytes = retained_bytes.checked_add(entry_bytes)?;
+        if *retained_bytes > MAX_LSP_WORKFLOW_DATA_BYTES {
+            return None;
+        }
+        fields.push(WorkflowDataFieldCompletion {
+            name: name.to_owned(),
+            field_type,
+            description: description.to_owned(),
+        });
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(fields)
+}
+
+fn is_valid_workflow_data_path_segment(value: &str) -> bool {
+    value.len() <= MAX_LSP_WORKFLOW_DATA_FIELD_NAME_BYTES && is_canonical_identifier(value)
 }
 
 fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
@@ -1900,6 +2175,170 @@ fn static_record_member_completion(
     }
 }
 
+/// Identifies a direct, unshadowed advisory workflow-data member path.
+///
+/// `workflow` is intentionally not a Splash binding. A host must supply a
+/// catalog before completion recognizes this lexical root, and any visible
+/// local or imported binding named `workflow` wins over the advisory view.
+fn workflow_data_member_path<'source>(
+    source: &'source str,
+    symbols: &[LexicalSymbol],
+    site: MemberCompletionSite,
+) -> Option<Vec<&'source str>> {
+    let receiver_name = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
+    if receiver_name != "workflow"
+        || visible_symbol_in(symbols, "workflow", site.receiver.start_byte).is_some()
+    {
+        return None;
+    }
+
+    let receiver_chain =
+        source.get(site.receiver_chain.start_byte..site.receiver_chain.end_byte)?;
+    let path = receiver_chain.split('.').collect::<Vec<_>>();
+    (path.first() == Some(&"workflow")
+        && path.iter().all(|segment| is_canonical_identifier(segment)))
+    .then_some(path)
+}
+
+fn workflow_data_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    catalog: &WorkflowDataCompletionCatalog,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> Option<CompletionList> {
+    if !catalog.configured {
+        return None;
+    }
+    let path = workflow_data_member_path(source, &lexical.symbols, site)?;
+    let is_incomplete = is_incomplete || catalog.unavailable;
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if site.member.end_byte > lexical.valid_prefix_end_byte || catalog.unavailable {
+        return Some(empty());
+    }
+
+    let edit_range = span_range(source, site.member);
+    let items = match path.as_slice() {
+        ["workflow"] => ["input", "outputs"]
+            .into_iter()
+            .map(|name| CompletionItem {
+                label: name.to_owned(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some("workflow data namespace; advisory host data contract".to_owned()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                    edit_range,
+                    name.to_owned(),
+                ))),
+                ..CompletionItem::default()
+            })
+            .collect(),
+        ["workflow", "input"] => workflow_data_field_completion_items(
+            &catalog.input_fields,
+            edit_range,
+            "workflow input",
+        ),
+        ["workflow", "outputs"] => catalog
+            .outputs
+            .iter()
+            .map(|output| CompletionItem {
+                label: output.step_id.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some("workflow output; advisory host data contract".to_owned()),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                    edit_range,
+                    output.step_id.clone(),
+                ))),
+                ..CompletionItem::default()
+            })
+            .collect(),
+        ["workflow", "outputs", step_id] => {
+            let Some(output) = catalog
+                .outputs
+                .iter()
+                .find(|output| output.step_id == *step_id)
+            else {
+                return Some(empty());
+            };
+            workflow_data_field_completion_items(&output.fields, edit_range, "workflow output")
+        }
+        _ => return Some(empty()),
+    };
+
+    Some(CompletionList {
+        is_incomplete,
+        items,
+    })
+}
+
+fn workflow_data_field_completion_items(
+    fields: &[WorkflowDataFieldCompletion],
+    edit_range: Range,
+    context: &str,
+) -> Vec<CompletionItem> {
+    fields
+        .iter()
+        .map(|field| CompletionItem {
+            label: field.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(format!("{context} field; advisory host data contract")),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: workflow_data_field_hover_text(field, context),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                field.name.clone(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect()
+}
+
+fn workflow_data_field_for_member<'field>(
+    source: &str,
+    symbols: &[LexicalSymbol],
+    valid_prefix_end_byte: usize,
+    catalog: &'field WorkflowDataCompletionCatalog,
+    site: MemberCompletionSite,
+) -> Option<(&'field WorkflowDataFieldCompletion, &'static str)> {
+    if !catalog.configured || catalog.unavailable || site.member.end_byte > valid_prefix_end_byte {
+        return None;
+    }
+    let path = workflow_data_member_path(source, symbols, site)?;
+    let member_name = source.get(site.member.start_byte..site.member.end_byte)?;
+    match path.as_slice() {
+        ["workflow", "input"] => catalog
+            .input_fields
+            .iter()
+            .find(|field| field.name == member_name)
+            .map(|field| (field, "workflow input")),
+        ["workflow", "outputs", step_id] => catalog
+            .outputs
+            .iter()
+            .find(|output| output.step_id == *step_id)
+            .and_then(|output| output.fields.iter().find(|field| field.name == member_name))
+            .map(|field| (field, "workflow output")),
+        _ => None,
+    }
+}
+
+fn workflow_data_field_hover_text(field: &WorkflowDataFieldCompletion, context: &str) -> String {
+    let mut text = format!(
+        "{context} field {}\nType: {}",
+        field.name,
+        field.field_type.label()
+    );
+    if !field.description.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&field.description);
+    }
+    text.push_str("\n\nAdvisory host data contract; not runtime authority.");
+    text
+}
+
 fn module_catalog_path_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -2639,6 +3078,11 @@ mod tests {
         parse_module_completion_catalog(&value).expect("module catalog projection is valid")
     }
 
+    fn workflow_data_catalog(value: serde_json::Value) -> WorkflowDataCompletionCatalog {
+        parse_workflow_data_completion_catalog(&value)
+            .expect("workflow data catalog projection is valid")
+    }
+
     fn apply_text_edits(source: &str, edits: &[TextEdit]) -> String {
         let mut byte_edits = edits
             .iter()
@@ -3337,6 +3781,255 @@ mod tests {
     }
 
     #[test]
+    fn completes_and_hovers_bounded_advisory_workflow_data() {
+        let catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [
+                {"name": "verbose", "type": "boolean"},
+                {"name": "left", "type": "integer", "description": "Left *literal* operand."}
+            ],
+            "outputs": [{
+                "stepId": "prepare",
+                "fields": [{"name": "total", "type": "integer", "description": "Calculated total."}]
+            }, {
+                "stepId": "publish",
+                "fields": [{"name": "receipt", "type": "string"}]
+            }]
+        }));
+
+        for (source, expected) in [
+            ("workflow.", vec!["input", "outputs"]),
+            ("workflow.input.le", vec!["left", "verbose"]),
+            ("workflow.outputs.", vec!["prepare", "publish"]),
+            ("workflow.outputs.prepare.to", vec!["total"]),
+        ] {
+            let mut server = SplashLanguageServer::with_workflow_data_catalog(catalog.clone());
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("workflow completion succeeds");
+            assert!(!completion.is_incomplete);
+            assert_eq!(
+                completion
+                    .items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "unexpected workflow completion for {source:?}"
+            );
+        }
+
+        let input_source = "workflow.input.le";
+        let mut input_server = SplashLanguageServer::with_workflow_data_catalog(catalog.clone());
+        input_server.open_document(document(1, input_source));
+        let input_completion = input_server
+            .completion(&test_uri(), position_at_byte(input_source, input_source.len()))
+            .expect("workflow input completion succeeds");
+        let left = input_completion
+            .items
+            .iter()
+            .find(|item| item.label == "left")
+            .expect("known input field is completed");
+        assert_eq!(left.kind, Some(CompletionItemKind::FIELD));
+        assert_eq!(
+            left.detail.as_deref(),
+            Some("workflow input field; advisory host data contract")
+        );
+        assert_eq!(
+            left.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "workflow input field left\nType: integer\n\nLeft *literal* operand.\n\nAdvisory host data contract; not runtime authority.".to_owned(),
+            }))
+        );
+        assert!(matches!(
+            &left.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                if *range == Range::new(
+                    position_at_byte(input_source, input_source.rfind("le").unwrap()),
+                    position_at_byte(input_source, input_source.len()),
+                )
+        ));
+
+        let hover_source = "workflow.input.left\nworkflow.outputs.prepare.total";
+        let mut hover_server = SplashLanguageServer::with_workflow_data_catalog(catalog);
+        hover_server.open_document(document(1, hover_source));
+        let input_member = hover_source.find("left").expect("input member exists");
+        let input_hover = hover_server
+            .hover(&test_uri(), position_at_byte(hover_source, input_member + 1))
+            .expect("workflow input hover succeeds")
+            .expect("known workflow input field has hover information");
+        assert_eq!(
+            input_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "workflow input field left\nType: integer\n\nLeft *literal* operand.\n\nAdvisory host data contract; not runtime authority.".to_owned(),
+            })
+        );
+        assert_eq!(
+            input_hover.range,
+            Some(Range::new(
+                position_at_byte(hover_source, input_member),
+                position_at_byte(hover_source, input_member + "left".len()),
+            ))
+        );
+        assert!(hover_server
+            .definition(&test_uri(), position_at_byte(hover_source, input_member + 1))
+            .expect("workflow input definition request succeeds")
+            .is_none());
+
+        let output_member = hover_source.rfind("total").expect("output member exists");
+        let output_hover = hover_server
+            .hover(&test_uri(), position_at_byte(hover_source, output_member + 1))
+            .expect("workflow output hover succeeds")
+            .expect("known workflow output field has hover information");
+        assert_eq!(
+            output_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "workflow output field total\nType: integer\n\nCalculated total.\n\nAdvisory host data contract; not runtime authority.".to_owned(),
+            })
+        );
+
+        let deeper_source = "workflow.input.left.";
+        let mut deeper_server = SplashLanguageServer::with_workflow_data_catalog(
+            workflow_data_catalog(serde_json::json!({
+                "inputFields": [{"name": "left", "type": "integer"}],
+                "outputs": []
+            })),
+        );
+        deeper_server.open_document(document(1, deeper_source));
+        assert!(deeper_server
+            .completion(&test_uri(), position_at_byte(deeper_source, deeper_source.len()))
+            .expect("non-schema member completion succeeds")
+            .items
+            .is_empty());
+    }
+
+    #[test]
+    fn workflow_data_projection_fails_closed_and_respects_shadowing() {
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "workflowDataCatalog": {
+                        "inputFields": [
+                            {"name": "right", "type": "integer"},
+                            {"name": "left", "type": "integer"}
+                        ],
+                        "outputs": [{
+                            "stepId": "prepare",
+                            "fields": [{"name": "total", "type": "integer"}]
+                        }]
+                    }
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let parsed = workflow_data_completion_catalog_from_initialize_options(&params);
+        assert!(parsed.configured);
+        assert!(!parsed.unavailable);
+        assert_eq!(
+            parsed
+                .input_fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["left", "right"]
+        );
+
+        let invalid_params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "workflowDataCatalog": {
+                        "inputFields": [
+                            {"name": "left", "type": "integer"},
+                            {"name": "left", "type": "number"}
+                        ],
+                        "outputs": []
+                    }
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let invalid = workflow_data_completion_catalog_from_initialize_options(&invalid_params);
+        assert!(invalid.configured);
+        assert!(invalid.unavailable);
+        let source = "workflow.input.";
+        let mut invalid_server = SplashLanguageServer::with_workflow_data_catalog(invalid);
+        invalid_server.open_document(document(1, source));
+        let invalid_completion = invalid_server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("malformed workflow projection completion succeeds");
+        assert!(invalid_completion.is_incomplete);
+        assert!(invalid_completion.items.is_empty());
+
+        let mut absent_server = SplashLanguageServer::default();
+        absent_server.open_document(document(1, source));
+        let absent_completion = absent_server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("absent workflow projection completion succeeds");
+        assert!(!absent_completion.is_incomplete);
+        assert!(absent_completion.items.is_empty());
+
+        let catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [{"name": "left", "type": "integer"}],
+            "outputs": []
+        }));
+        for shadowed_source in [
+            "let workflow = {input: {local: true}}\nworkflow.input.",
+            "use mod.workflow\nworkflow.input.",
+        ] {
+            let mut server = SplashLanguageServer::with_workflow_data_catalog(catalog.clone());
+            server.open_document(document(1, shadowed_source));
+            assert!(server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(shadowed_source, shadowed_source.len()),
+                )
+                .expect("shadowed workflow completion succeeds")
+                .items
+                .is_empty(), "workflow projection must not override {shadowed_source:?}");
+        }
+
+        assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
+            "inputFields": [{"name": "valid", "type": "unsupported"}],
+            "outputs": []
+        })).is_none());
+        assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
+            "inputFields": [],
+            "outputs": [{"stepId": "release-publish", "fields": []}]
+        })).is_none());
+        assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
+            "inputFields": [{
+                "name": "valid",
+                "type": "string",
+                "description": "x".repeat(MAX_LSP_WORKFLOW_DATA_FIELD_DESCRIPTION_BYTES + 1)
+            }],
+            "outputs": []
+        })).is_none());
+
+        let too_many_outputs = serde_json::Value::Array(
+            (0..=MAX_LSP_WORKFLOW_DATA_OUTPUTS)
+                .map(|index| serde_json::json!({"stepId": format!("step_{index}"), "fields": []}))
+                .collect(),
+        );
+        assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
+            "inputFields": [],
+            "outputs": too_many_outputs
+        })).is_none());
+
+        let too_many_fields = serde_json::Value::Array(
+            (0..=MAX_LSP_WORKFLOW_DATA_FIELDS)
+                .map(|index| serde_json::json!({"name": format!("field_{index}"), "type": "any"}))
+                .collect(),
+        );
+        assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
+            "inputFields": too_many_fields,
+            "outputs": []
+        })).is_none());
+    }
+
+    #[test]
     fn completes_bounded_catalog_names_for_direct_visible_tool_calls() {
         let catalog = tool_catalog(serde_json::json!([
             {
@@ -3820,7 +4513,7 @@ mod tests {
             })),
             ..InitializeParams::default()
         };
-        let (invalid_tools, valid_modules) =
+        let (invalid_tools, valid_modules, _) =
             completion_catalogs_from_initialize_options(&independent_params);
         assert!(invalid_tools.unavailable);
         assert!(!valid_modules.unavailable);
@@ -3895,7 +4588,7 @@ mod tests {
             })),
             ..InitializeParams::default()
         };
-        let (valid_tools, invalid_modules) =
+        let (valid_tools, invalid_modules, _) =
             completion_catalogs_from_initialize_options(&valid_tool_invalid_modules);
         assert!(!valid_tools.unavailable);
         assert!(invalid_modules.unavailable);

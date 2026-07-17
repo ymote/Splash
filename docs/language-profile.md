@@ -149,6 +149,19 @@ authority; malformed, duplicate, or over-limit input is discarded as a whole
 and makes matching completion incomplete. See [Editor module interface
 projection](module-catalog.md) for the exact wire shape and limits.
 
+For dataflow authoring, an editor may instead supply the separate bounded
+`initializationOptions.splash.workflowDataCatalog` projection. It contains only
+host-selected input fields and per-step output fields, and can complete direct
+unshadowed `workflow.input.*` and `workflow.outputs.<stepId>.*` paths plus hover
+known fields. It is not a JSON Schema loader or a runtime data snapshot: the
+editor cannot infer that an output has completed, validate an input, approve a
+workflow, issue a capability lease, or make a Rust adapter callable. Missing
+metadata does not create a `workflow` namespace; malformed or over-limit
+metadata is discarded as a whole and returns an incomplete empty match. A
+visible local or imported `workflow` binding shadows it. See [Editor
+workflow-data projection](workflow-data-catalog.md) for the exact wire shape,
+limits, and non-authority boundary.
+
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash
 tool-calls <file>` exposes the same result as structured JSON. The report

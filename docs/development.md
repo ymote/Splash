@@ -193,6 +193,21 @@ as a whole and marks matching completion
 projection](module-catalog.md) for the complete contract. This completion does
 not make a host binding available or authorize a capability.
 
+For an approved dataflow authoring session, an editor integration may also
+provide a bounded static projection through
+`initializationOptions.splash.workflowDataCatalog`. It is a normalized list of
+input fields and named step-output fields, derived by the host from its own
+`WorkflowDataContract` or approved plan. The LSP completes only direct,
+unshadowed `workflow.input.*` and `workflow.outputs.<stepId>.*` paths, and
+hovers known projected fields with plain-text documentation. It neither
+introduces `workflow` when the projection is absent nor claims that a planned
+output is in the runtime completed prefix. A local or imported `workflow`
+binding wins over the metadata. Malformed, duplicate, or over-limit metadata is
+discarded as a whole and produces an incomplete empty result for a matching
+path. It never validates data, loads a schema or checkpoint, approves a plan,
+issues a lease, or authorizes a tool. See [Editor workflow-data
+projection](workflow-data-catalog.md) for the exact wire shape and bounds.
+
 Rename is advertised only when the editor supports versioned
 `documentChanges`. It refuses import path edits and truncated reports, validates
 the new name with the canonical lexer, reparses the rewritten source, and
