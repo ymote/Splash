@@ -62,9 +62,9 @@ const MAX_LSP_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_LSP_MODULE_PATH_BYTES: usize = 256;
 const MAX_LSP_MODULE_PATH_SEGMENTS: usize = 16;
 const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
-/// Maximum completed workflow outputs retained in the advisory dataflow
-/// projection. This stays far below the workflow-plan hard cap so editor
-/// metadata remains inexpensive on mobile and embedded hosts.
+/// Maximum projected workflow outputs retained in the advisory dataflow
+/// catalog. This stays far below the workflow-plan hard cap so editor metadata
+/// remains inexpensive on mobile and embedded hosts.
 const MAX_LSP_WORKFLOW_DATA_OUTPUTS: usize = 128;
 /// Maximum input and output fields retained across one advisory dataflow
 /// projection.
@@ -217,6 +217,18 @@ struct WorkflowDataCompletionCatalog {
     unavailable: bool,
 }
 
+/// A static, host-supplied view of the projected workflow position currently
+/// being authored. It narrows output metadata only; it is never a runtime
+/// completion proof or authority boundary.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WorkflowDataStepContext {
+    /// Number of catalog outputs in the host-declared completed projected
+    /// prefix. Parsing proves it is no greater than `catalog.outputs.len()`.
+    completed_output_count: usize,
+    configured: bool,
+    unavailable: bool,
+}
+
 #[derive(Debug)]
 struct DocumentState {
     source: Option<String>,
@@ -259,6 +271,7 @@ struct SplashLanguageServer {
     tool_catalog: ToolCompletionCatalog,
     module_catalog: ModuleCompletionCatalog,
     workflow_data_catalog: WorkflowDataCompletionCatalog,
+    workflow_data_step_context: WorkflowDataStepContext,
 }
 
 impl SplashLanguageServer {
@@ -273,6 +286,20 @@ impl SplashLanguageServer {
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
             workflow_data_catalog,
+            WorkflowDataStepContext::default(),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_workflow_data_catalog_and_step_context(
+        workflow_data_catalog: WorkflowDataCompletionCatalog,
+        workflow_data_step_context: WorkflowDataStepContext,
+    ) -> Self {
+        Self::with_completion_catalogs_and_workflow_data(
+            ToolCompletionCatalog::default(),
+            ModuleCompletionCatalog::default(),
+            workflow_data_catalog,
+            workflow_data_step_context,
         )
     }
 
@@ -285,6 +312,7 @@ impl SplashLanguageServer {
             tool_catalog,
             module_catalog,
             WorkflowDataCompletionCatalog::default(),
+            WorkflowDataStepContext::default(),
         )
     }
 
@@ -292,12 +320,14 @@ impl SplashLanguageServer {
         tool_catalog: ToolCompletionCatalog,
         module_catalog: ModuleCompletionCatalog,
         workflow_data_catalog: WorkflowDataCompletionCatalog,
+        workflow_data_step_context: WorkflowDataStepContext,
     ) -> Self {
         Self {
             documents: HashMap::new(),
             tool_catalog,
             module_catalog,
             workflow_data_catalog,
+            workflow_data_step_context,
         }
     }
 
@@ -411,6 +441,7 @@ impl SplashLanguageServer {
                     &report.symbols,
                     source.len(),
                     &self.workflow_data_catalog,
+                    &self.workflow_data_step_context,
                     site,
                 ) {
                     return Ok(Some(Hover {
@@ -561,6 +592,7 @@ impl SplashLanguageServer {
                 source,
                 report,
                 &self.workflow_data_catalog,
+                &self.workflow_data_step_context,
                 member_site,
                 lexical_incomplete,
             ) {
@@ -897,7 +929,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
     let initialize_params =
         serde_json::from_value::<InitializeParams>(initialize_value).unwrap_or_default();
     let versioned_document_edits = supports_versioned_document_edits(&initialize_params);
-    let (tool_catalog, module_catalog, workflow_data_catalog) =
+    let (tool_catalog, module_catalog, workflow_data_catalog, workflow_data_step_context) =
         completion_catalogs_from_initialize_options(&initialize_params);
     connection.initialize_finish(
         initialize_id,
@@ -910,6 +942,7 @@ fn run_connection(connection: &Connection) -> ServerResult<()> {
         tool_catalog,
         module_catalog,
         workflow_data_catalog,
+        workflow_data_step_context,
     );
     while let Ok(message) = connection.receiver.recv() {
         match message {
@@ -951,12 +984,14 @@ fn completion_catalogs_from_initialize_options(
     ToolCompletionCatalog,
     ModuleCompletionCatalog,
     WorkflowDataCompletionCatalog,
+    WorkflowDataStepContext,
 ) {
     let Some(options) = params.initialization_options.as_ref() else {
         return (
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
             WorkflowDataCompletionCatalog::default(),
+            WorkflowDataStepContext::default(),
         );
     };
     let Some(options) = options.as_object() else {
@@ -964,6 +999,7 @@ fn completion_catalogs_from_initialize_options(
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
             WorkflowDataCompletionCatalog::default(),
+            WorkflowDataStepContext::default(),
         );
     };
     let Some(splash) = options.get("splash") else {
@@ -971,6 +1007,7 @@ fn completion_catalogs_from_initialize_options(
             ToolCompletionCatalog::default(),
             ModuleCompletionCatalog::default(),
             WorkflowDataCompletionCatalog::default(),
+            WorkflowDataStepContext::default(),
         );
     };
     let Some(splash) = splash.as_object() else {
@@ -978,6 +1015,7 @@ fn completion_catalogs_from_initialize_options(
             unavailable_tool_completion_catalog(),
             unavailable_module_completion_catalog(),
             unavailable_workflow_data_completion_catalog(),
+            unavailable_workflow_data_step_context(),
         );
     };
 
@@ -991,12 +1029,25 @@ fn completion_catalogs_from_initialize_options(
             .unwrap_or_else(unavailable_module_completion_catalog),
         None => ModuleCompletionCatalog::default(),
     };
-    let workflow_data_catalog = match splash.get("workflowDataCatalog") {
+    let mut workflow_data_catalog = match splash.get("workflowDataCatalog") {
         Some(catalog) => parse_workflow_data_completion_catalog(catalog)
             .unwrap_or_else(unavailable_workflow_data_completion_catalog),
         None => WorkflowDataCompletionCatalog::default(),
     };
-    (tool_catalog, module_catalog, workflow_data_catalog)
+    let workflow_data_step_context = match splash.get("workflowDataStepContext") {
+        Some(context) => parse_workflow_data_step_context(context, &workflow_data_catalog)
+            .unwrap_or_else(unavailable_workflow_data_step_context),
+        None => WorkflowDataStepContext::default(),
+    };
+    if workflow_data_step_context.unavailable {
+        workflow_data_catalog = unavailable_workflow_data_completion_catalog();
+    }
+    (
+        tool_catalog,
+        module_catalog,
+        workflow_data_catalog,
+        workflow_data_step_context,
+    )
 }
 
 #[cfg(test)]
@@ -1020,6 +1071,13 @@ fn workflow_data_completion_catalog_from_initialize_options(
     completion_catalogs_from_initialize_options(params).2
 }
 
+#[cfg(test)]
+fn workflow_data_step_context_from_initialize_options(
+    params: &InitializeParams,
+) -> WorkflowDataStepContext {
+    completion_catalogs_from_initialize_options(params).3
+}
+
 fn unavailable_tool_completion_catalog() -> ToolCompletionCatalog {
     ToolCompletionCatalog {
         tools: Vec::new(),
@@ -1038,6 +1096,14 @@ fn unavailable_workflow_data_completion_catalog() -> WorkflowDataCompletionCatal
     WorkflowDataCompletionCatalog {
         input_fields: Vec::new(),
         outputs: Vec::new(),
+        configured: true,
+        unavailable: true,
+    }
+}
+
+fn unavailable_workflow_data_step_context() -> WorkflowDataStepContext {
+    WorkflowDataStepContext {
+        completed_output_count: 0,
         configured: true,
         unavailable: true,
     }
@@ -1214,11 +1280,44 @@ fn parse_workflow_data_completion_catalog(
             fields,
         });
     }
-    outputs.sort_by(|left, right| left.step_id.cmp(&right.step_id));
+    // Preserve host order so an optional step context can prove a completed
+    // projected prefix. Completion presentation remains sorted separately.
 
     Some(WorkflowDataCompletionCatalog {
         input_fields,
         outputs,
+        configured: true,
+        unavailable: false,
+    })
+}
+
+/// Reads a bounded advisory workflow position against one already-valid static
+/// projection. The current step must be exactly the catalog entry after the
+/// declared completed prefix, which rejects skipped, reordered, and future
+/// projected outputs without consulting a runtime or plan.
+fn parse_workflow_data_step_context(
+    value: &serde_json::Value,
+    catalog: &WorkflowDataCompletionCatalog,
+) -> Option<WorkflowDataStepContext> {
+    if !catalog.configured || catalog.unavailable {
+        return None;
+    }
+    let object = value.as_object()?;
+    let current_step_id = object.get("currentStepId")?.as_str()?;
+    let completed_step_ids = object.get("completedOutputStepIds")?.as_array()?;
+    let current = catalog.outputs.get(completed_step_ids.len())?;
+    if current.step_id != current_step_id
+        || !catalog
+            .outputs
+            .iter()
+            .zip(completed_step_ids)
+            .all(|(output, step_id)| step_id.as_str() == Some(output.step_id.as_str()))
+    {
+        return None;
+    }
+
+    Some(WorkflowDataStepContext {
+        completed_output_count: completed_step_ids.len(),
         configured: true,
         unavailable: false,
     })
@@ -2204,6 +2303,7 @@ fn workflow_data_member_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
     catalog: &WorkflowDataCompletionCatalog,
+    step_context: &WorkflowDataStepContext,
     site: MemberCompletionSite,
     is_incomplete: bool,
 ) -> Option<CompletionList> {
@@ -2211,12 +2311,15 @@ fn workflow_data_member_completion(
         return None;
     }
     let path = workflow_data_member_path(source, &lexical.symbols, site)?;
-    let is_incomplete = is_incomplete || catalog.unavailable;
+    let is_incomplete = is_incomplete || catalog.unavailable || step_context.unavailable;
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
     };
-    if site.member.end_byte > lexical.valid_prefix_end_byte || catalog.unavailable {
+    if site.member.end_byte > lexical.valid_prefix_end_byte
+        || catalog.unavailable
+        || step_context.unavailable
+    {
         return Some(empty());
     }
 
@@ -2240,29 +2343,43 @@ fn workflow_data_member_completion(
             edit_range,
             "workflow input",
         ),
-        ["workflow", "outputs"] => catalog
-            .outputs
-            .iter()
-            .map(|output| CompletionItem {
-                label: output.step_id.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                detail: Some("workflow output; advisory host data contract".to_owned()),
-                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
-                    edit_range,
-                    output.step_id.clone(),
-                ))),
-                ..CompletionItem::default()
-            })
-            .collect(),
-        ["workflow", "outputs", step_id] => {
-            let Some(output) = catalog
-                .outputs
+        ["workflow", "outputs"] => {
+            let Some(outputs) = workflow_data_visible_outputs(catalog, step_context) else {
+                return Some(empty());
+            };
+            let detail = if step_context.configured {
+                "completed workflow output; advisory host data contract"
+            } else {
+                "workflow output; advisory host data contract"
+            };
+            let mut items = outputs
                 .iter()
-                .find(|output| output.step_id == *step_id)
+                .map(|output| CompletionItem {
+                    label: output.step_id.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(detail.to_owned()),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                        edit_range,
+                        output.step_id.clone(),
+                    ))),
+                    ..CompletionItem::default()
+                })
+                .collect::<Vec<_>>();
+            items.sort_by(|left, right| left.label.cmp(&right.label));
+            items
+        }
+        ["workflow", "outputs", step_id] => {
+            let Some(output) = workflow_data_visible_outputs(catalog, step_context)
+                .and_then(|outputs| outputs.iter().find(|output| output.step_id == *step_id))
             else {
                 return Some(empty());
             };
-            workflow_data_field_completion_items(&output.fields, edit_range, "workflow output")
+            let context = if step_context.configured {
+                "completed workflow output"
+            } else {
+                "workflow output"
+            };
+            workflow_data_field_completion_items(&output.fields, edit_range, context)
         }
         _ => return Some(empty()),
     };
@@ -2271,6 +2388,21 @@ fn workflow_data_member_completion(
         is_incomplete,
         items,
     })
+}
+
+fn workflow_data_visible_outputs<'catalog>(
+    catalog: &'catalog WorkflowDataCompletionCatalog,
+    step_context: &WorkflowDataStepContext,
+) -> Option<&'catalog [WorkflowDataOutputCompletion]> {
+    if step_context.unavailable {
+        return None;
+    }
+    let count = if step_context.configured {
+        step_context.completed_output_count
+    } else {
+        catalog.outputs.len()
+    };
+    catalog.outputs.get(..count)
 }
 
 fn workflow_data_field_completion_items(
@@ -2302,9 +2434,14 @@ fn workflow_data_field_for_member<'field>(
     symbols: &[LexicalSymbol],
     valid_prefix_end_byte: usize,
     catalog: &'field WorkflowDataCompletionCatalog,
+    step_context: &WorkflowDataStepContext,
     site: MemberCompletionSite,
 ) -> Option<(&'field WorkflowDataFieldCompletion, &'static str)> {
-    if !catalog.configured || catalog.unavailable || site.member.end_byte > valid_prefix_end_byte {
+    if !catalog.configured
+        || catalog.unavailable
+        || step_context.unavailable
+        || site.member.end_byte > valid_prefix_end_byte
+    {
         return None;
     }
     let path = workflow_data_member_path(source, symbols, site)?;
@@ -2315,12 +2452,17 @@ fn workflow_data_field_for_member<'field>(
             .iter()
             .find(|field| field.name == member_name)
             .map(|field| (field, "workflow input")),
-        ["workflow", "outputs", step_id] => catalog
-            .outputs
-            .iter()
-            .find(|output| output.step_id == *step_id)
+        ["workflow", "outputs", step_id] => workflow_data_visible_outputs(catalog, step_context)
+            .and_then(|outputs| outputs.iter().find(|output| output.step_id == *step_id))
             .and_then(|output| output.fields.iter().find(|field| field.name == member_name))
-            .map(|field| (field, "workflow output")),
+            .map(|field| {
+                let context = if step_context.configured {
+                    "completed workflow output"
+                } else {
+                    "workflow output"
+                };
+                (field, context)
+            }),
         _ => None,
     }
 }
@@ -3081,6 +3223,14 @@ mod tests {
     fn workflow_data_catalog(value: serde_json::Value) -> WorkflowDataCompletionCatalog {
         parse_workflow_data_completion_catalog(&value)
             .expect("workflow data catalog projection is valid")
+    }
+
+    fn workflow_data_step_context_for(
+        value: serde_json::Value,
+        catalog: &WorkflowDataCompletionCatalog,
+    ) -> WorkflowDataStepContext {
+        parse_workflow_data_step_context(&value, catalog)
+            .expect("workflow data step context projection is valid")
     }
 
     fn apply_text_edits(source: &str, edits: &[TextEdit]) -> String {
@@ -3922,6 +4072,267 @@ mod tests {
     }
 
     #[test]
+    fn limits_workflow_outputs_to_a_completed_projected_prefix() {
+        let catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [{"name": "left", "type": "integer"}],
+            "outputs": [{
+                "stepId": "prepare",
+                "fields": [{"name": "total", "type": "integer", "description": "Prepared total."}]
+            }, {
+                "stepId": "calculate",
+                "fields": [{"name": "sum", "type": "integer", "description": "Calculated sum."}]
+            }, {
+                "stepId": "publish",
+                "fields": [{"name": "receipt", "type": "string"}]
+            }]
+        }));
+        let step_context = workflow_data_step_context_for(
+            serde_json::json!({
+                "currentStepId": "calculate",
+                "completedOutputStepIds": ["prepare"]
+            }),
+            &catalog,
+        );
+        assert!(step_context.configured);
+        assert!(!step_context.unavailable);
+        assert_eq!(step_context.completed_output_count, 1);
+
+        let outputs_source = "workflow.outputs.";
+        let mut outputs_server = SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            catalog.clone(),
+            step_context.clone(),
+        );
+        outputs_server.open_document(document(1, outputs_source));
+        let outputs_completion = outputs_server
+            .completion(
+                &test_uri(),
+                position_at_byte(outputs_source, outputs_source.len()),
+            )
+            .expect("completed-prefix output completion succeeds");
+        assert!(!outputs_completion.is_incomplete);
+        assert_eq!(
+            outputs_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["prepare"]
+        );
+        assert_eq!(
+            outputs_completion.items[0].detail.as_deref(),
+            Some("completed workflow output; advisory host data contract")
+        );
+
+        let first_step_context = workflow_data_step_context_for(
+            serde_json::json!({
+                "currentStepId": "prepare",
+                "completedOutputStepIds": []
+            }),
+            &catalog,
+        );
+        let mut first_step_server =
+            SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+                catalog.clone(),
+                first_step_context,
+            );
+        first_step_server.open_document(document(1, outputs_source));
+        assert!(first_step_server
+            .completion(
+                &test_uri(),
+                position_at_byte(outputs_source, outputs_source.len()),
+            )
+            .expect("empty completed-prefix completion succeeds")
+            .items
+            .is_empty());
+
+        let completed_field_source = "workflow.outputs.prepare.to";
+        let mut completed_field_server =
+            SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+                catalog.clone(),
+                step_context.clone(),
+            );
+        completed_field_server.open_document(document(1, completed_field_source));
+        let completed_field_completion = completed_field_server
+            .completion(
+                &test_uri(),
+                position_at_byte(completed_field_source, completed_field_source.len()),
+            )
+            .expect("completed output field completion succeeds");
+        assert_eq!(
+            completed_field_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+        assert_eq!(
+            completed_field_completion.items[0].detail.as_deref(),
+            Some("completed workflow output field; advisory host data contract")
+        );
+
+        let future_field_source = "workflow.outputs.calculate.su";
+        let mut future_field_server =
+            SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+                catalog.clone(),
+                step_context.clone(),
+            );
+        future_field_server.open_document(document(1, future_field_source));
+        assert!(future_field_server
+            .completion(
+                &test_uri(),
+                position_at_byte(future_field_source, future_field_source.len()),
+            )
+            .expect("future output field completion request succeeds")
+            .items
+            .is_empty());
+
+        let hover_source = "workflow.outputs.prepare.total\nworkflow.outputs.calculate.sum";
+        let mut hover_server = SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            catalog,
+            step_context,
+        );
+        hover_server.open_document(document(1, hover_source));
+        let completed_member = hover_source.find("total").expect("completed member exists");
+        let completed_hover = hover_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hover_source, completed_member + 1),
+            )
+            .expect("completed output hover succeeds")
+            .expect("completed output field has hover information");
+        assert_eq!(
+            completed_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "completed workflow output field total\nType: integer\n\nPrepared total.\n\nAdvisory host data contract; not runtime authority.".to_owned(),
+            })
+        );
+        let future_member = hover_source.rfind("sum").expect("future member exists");
+        assert!(hover_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hover_source, future_member + 1),
+            )
+            .expect("future output hover request succeeds")
+            .is_none());
+
+        let params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "workflowDataCatalog": {
+                        "inputFields": [],
+                        "outputs": [
+                            {"stepId": "prepare", "fields": []},
+                            {"stepId": "calculate", "fields": []},
+                            {"stepId": "publish", "fields": []}
+                        ]
+                    },
+                    "workflowDataStepContext": {
+                        "currentStepId": "calculate",
+                        "completedOutputStepIds": ["prepare"]
+                    }
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let parsed_catalog = workflow_data_completion_catalog_from_initialize_options(&params);
+        assert_eq!(
+            parsed_catalog
+                .outputs
+                .iter()
+                .map(|output| output.step_id.as_str())
+                .collect::<Vec<_>>(),
+            ["prepare", "calculate", "publish"]
+        );
+        let parsed_context = workflow_data_step_context_from_initialize_options(&params);
+        assert!(parsed_context.configured);
+        assert_eq!(parsed_context.completed_output_count, 1);
+    }
+
+    #[test]
+    fn workflow_data_step_context_fails_closed_when_not_an_exact_catalog_prefix() {
+        let catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [],
+            "outputs": [
+                {"stepId": "prepare", "fields": []},
+                {"stepId": "calculate", "fields": []}
+            ]
+        }));
+        assert!(parse_workflow_data_step_context(
+            &serde_json::json!({
+                "currentStepId": "calculate",
+                "completedOutputStepIds": ["calculate"]
+            }),
+            &catalog,
+        )
+        .is_none());
+        assert!(parse_workflow_data_step_context(
+            &serde_json::json!({
+                "currentStepId": "calculate",
+                "completedOutputStepIds": ["prepare", "calculate"]
+            }),
+            &catalog,
+        )
+        .is_none());
+
+        let invalid_params = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "workflowDataCatalog": {
+                        "inputFields": [],
+                        "outputs": [
+                            {"stepId": "prepare", "fields": []},
+                            {"stepId": "calculate", "fields": []}
+                        ]
+                    },
+                    "workflowDataStepContext": {
+                        "currentStepId": "calculate",
+                        "completedOutputStepIds": ["calculate"]
+                    }
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        let invalid_catalog =
+            workflow_data_completion_catalog_from_initialize_options(&invalid_params);
+        let invalid_context = workflow_data_step_context_from_initialize_options(&invalid_params);
+        assert!(invalid_catalog.unavailable);
+        assert!(invalid_context.unavailable);
+        let source = "workflow.outputs.";
+        let mut invalid_server = SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            invalid_catalog,
+            invalid_context,
+        );
+        invalid_server.open_document(document(1, source));
+        let completion = invalid_server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("invalid context completion request succeeds");
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
+
+        let context_without_catalog = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "splash": {
+                    "workflowDataStepContext": {
+                        "currentStepId": "prepare",
+                        "completedOutputStepIds": []
+                    }
+                }
+            })),
+            ..InitializeParams::default()
+        };
+        assert!(
+            workflow_data_completion_catalog_from_initialize_options(&context_without_catalog)
+                .unavailable
+        );
+        assert!(
+            workflow_data_step_context_from_initialize_options(&context_without_catalog)
+                .unavailable
+        );
+    }
+
+    #[test]
     fn workflow_data_projection_fails_closed_and_respects_shadowing() {
         let params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -4536,7 +4947,7 @@ mod tests {
             })),
             ..InitializeParams::default()
         };
-        let (invalid_tools, valid_modules, _) =
+        let (invalid_tools, valid_modules, _, _) =
             completion_catalogs_from_initialize_options(&independent_params);
         assert!(invalid_tools.unavailable);
         assert!(!valid_modules.unavailable);
@@ -4611,7 +5022,7 @@ mod tests {
             })),
             ..InitializeParams::default()
         };
-        let (valid_tools, invalid_modules, _) =
+        let (valid_tools, invalid_modules, _, _) =
             completion_catalogs_from_initialize_options(&valid_tool_invalid_modules);
         assert!(!valid_tools.unavailable);
         assert!(invalid_modules.unavailable);

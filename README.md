@@ -453,7 +453,10 @@ It completes direct unshadowed `workflow.input.*` and
 loading schemas or runtime state. It does not claim that an output is complete,
 validate data, approve a workflow, issue a lease, or make an adapter callable;
 missing metadata does not create a `workflow` namespace, and malformed input
-fails closed. See [editor workflow-data projection](docs/workflow-data-catalog.md).
+fails closed. A host may provide `workflowDataStepContext` to structurally bind
+one projected current step and its prior projected output prefix, which filters
+output completion and hover without proving live state. See [editor workflow-data
+projection](docs/workflow-data-catalog.md).
 
 ## Workspace
 

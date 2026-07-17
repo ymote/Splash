@@ -27,9 +27,10 @@
   module loading, resolution, runtime export inspection, or authority inference.
 - A bounded initialization-time advisory workflow-data projection for direct,
   unshadowed `workflow.input.*` and `workflow.outputs.<stepId>.*` completion
-  and hover. It does not create runtime data, establish completed-prefix
-  availability, load schemas or checkpoints, validate values, approve a plan,
-  or grant a capability.
+  and hover. Its optional ordered step context filters outputs to a
+  host-declared projected completed prefix and next projected step, without
+  creating runtime data, proving live availability, loading schemas or
+  checkpoints, validating values, approving a plan, or granting a capability.
 - Bounded direct literal-record field metadata for exact visible
   `let binding = { ... }` initializers, with same-document completion, hover,
   and definition. It is advisory and does not infer aliases, mutation, control
@@ -222,8 +223,8 @@
 - Additional semantic editor features beyond lexical completion, fixed
   `mod.tool`, direct literal-record fields, catalog-backed chained lookup from
   a visible imported-module binding, and direct advisory workflow-data fields.
-  Per-step completed-prefix awareness, general module resolution, and broader
-  type-aware field semantics remain open.
+  Runtime-confirmed dataflow-state synchronization, general module resolution,
+  and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Cross-stream event retention/aggregation and product-specific compensation

@@ -370,7 +370,11 @@ metadata, not a JSON Schema loader or a runtime snapshot: it cannot establish
 that an output is completed, validate a value, approve a plan, issue a lease,
 or make an adapter callable. A visible local or imported `workflow` binding
 shadows it, absent metadata creates no namespace, and malformed input fails
-closed. See [Editor workflow-data projection](workflow-data-catalog.md).
+closed. The optional `workflowDataStepContext` admits only an exact prefix of
+the catalog's projected outputs and its next projected step, then filters output
+completion and hover to that prefix. It remains host-supplied static metadata,
+not a live workflow-state proof. See [Editor workflow-data
+projection](workflow-data-catalog.md).
 
 Rename does not edit the final segment of a `use` path. For another indexed
 binding it accepts exactly one non-reserved canonical identifier, rewrites the

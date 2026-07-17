@@ -201,11 +201,15 @@ input fields and named step-output fields, derived by the host from its own
 unshadowed `workflow.input.*` and `workflow.outputs.<stepId>.*` paths, and
 hovers known projected fields with plain-text documentation. It neither
 introduces `workflow` when the projection is absent nor claims that a planned
-output is in the runtime completed prefix. A local or imported `workflow`
-binding wins over the metadata. Malformed, duplicate, or over-limit metadata is
-discarded as a whole and produces an incomplete empty result for a matching
-path. It never validates data, loads a schema or checkpoint, approves a plan,
-issues a lease, or authorizes a tool. See [Editor workflow-data
+output is in the runtime completed prefix. When the host also provides
+`workflowDataStepContext`, the LSP accepts only an exact ordered prefix of the
+projected output IDs and the next projected step ID, then filters output
+completion and hover to that prefix. This is still host-supplied static context,
+not a runtime-state proof. A local or imported `workflow` binding wins over the
+metadata. Malformed, duplicate, or over-limit catalog metadata, or malformed
+step context, is discarded as a whole and produces an incomplete empty result
+for a matching path. It never validates data, loads a schema or checkpoint,
+approves a plan, issues a lease, or authorizes a tool. See [Editor workflow-data
 projection](workflow-data-catalog.md) for the exact wire shape and bounds.
 
 Rename is advertised only when the editor supports versioned

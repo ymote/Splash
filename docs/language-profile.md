@@ -158,9 +158,12 @@ editor cannot infer that an output has completed, validate an input, approve a
 workflow, issue a capability lease, or make a Rust adapter callable. Missing
 metadata does not create a `workflow` namespace; malformed or over-limit
 metadata is discarded as a whole and returns an incomplete empty match. A
-visible local or imported `workflow` binding shadows it. See [Editor
-workflow-data projection](workflow-data-catalog.md) for the exact wire shape,
-limits, and non-authority boundary.
+visible local or imported `workflow` binding shadows it. An optional
+`workflowDataStepContext` can structurally identify the host-declared projected
+completed prefix and next projected step, which filters output completion and
+hover without proving live workflow state. Invalid context discards the full
+workflow projection. See [Editor workflow-data projection](workflow-data-catalog.md)
+for the exact wire shape, limits, and non-authority boundary.
 
 For a pre-approval effect summary, hosts can call
 `splash_core::tool_call_hint_report` or `tool_call_hint_report_named`; `splash
