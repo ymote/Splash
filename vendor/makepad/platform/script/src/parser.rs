@@ -833,6 +833,17 @@ impl ScriptParser {
         self.source_map.push(None);
     }
 
+    fn insert_code_with_source(&mut self, index: usize, code: ScriptValue, source: Option<u32>) {
+        debug_assert!(index <= self.opcodes.len());
+
+        // Entries beyond the opcode stream cannot describe an executable opcode.
+        // Fill missing entries as synthetic before inserting a paired opcode.
+        self.source_map.truncate(self.opcodes.len());
+        self.source_map.resize(self.opcodes.len(), None);
+        self.opcodes.insert(index, code);
+        self.source_map.insert(index, source);
+    }
+
     fn set_pop_to_me(&mut self) {
         if let Some(code) = self.opcodes.last_mut() {
             if let Some((opcode, _args)) = code.as_opcode() {
@@ -3753,15 +3764,40 @@ impl ScriptParser {
                                         }
                                     }
 
-                                    // Now insert ME at chain_start
-                                    self.opcodes.insert(chain_start, Opcode::ME.into());
-                                    self.source_map.insert(chain_start, Some(self.index));
-
-                                    // Insert PROTO_FIELD after the first id (which is now at chain_start + 1)
-                                    // The first id is at chain_start + 1, so PROTO_FIELD goes at chain_start + 2
-                                    self.opcodes
-                                        .insert(chain_start + 2, Opcode::PROTO_FIELD.into());
-                                    self.source_map.insert(chain_start + 2, Some(self.index));
+                                    let Some(proto_field_index) = chain_start.checked_add(2) else {
+                                        error!(
+                                            self,
+                                            tokenizer,
+                                            "Malformed prototype field assignment"
+                                        );
+                                        self.state.push(State::BeginExpr { required: true });
+                                        return 1;
+                                    };
+                                    let chain_starts_with_id = self
+                                        .opcodes
+                                        .get(chain_start)
+                                        .is_some_and(ScriptValue::is_id);
+                                    let proto_field_slot_is_valid =
+                                        proto_field_index <= self.opcodes.len().saturating_add(1);
+                                    if !chain_starts_with_id || !proto_field_slot_is_valid {
+                                        error!(
+                                            self,
+                                            tokenizer,
+                                            "Malformed prototype field assignment"
+                                        );
+                                        self.state.push(State::BeginExpr { required: true });
+                                        return 1;
+                                    }
+                                    self.insert_code_with_source(
+                                        chain_start,
+                                        Opcode::ME.into(),
+                                        Some(self.index),
+                                    );
+                                    self.insert_code_with_source(
+                                        proto_field_index,
+                                        Opcode::PROTO_FIELD.into(),
+                                        Some(self.index),
+                                    );
                                 }
 
                                 // Patch remaining FIELD to PROTO_FIELD
@@ -4404,5 +4440,51 @@ impl ScriptParser {
             println!("{:3}: {:?}", i, op);
         }
         println!("=== END OPCODES ===");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_proto_field_assignment_keeps_opcode_metadata_in_lockstep() {
+        let source = concat!(
+            "H.-",
+            "\x17\x17\x17\x17\x0e",
+            "\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17",
+            "m: ",
+            "\x17\x17\x17\x17\x17\x17\x17\x17\x17",
+            "return ",
+            "\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17",
+            "=!"
+        );
+        let mut heap = crate::heap::ScriptHeap::default();
+        let mut tokenizer = ScriptTokenizer::default();
+        tokenizer.tokenize(source, &mut heap);
+        tokenizer.tokenize("\n;", &mut heap);
+        let mut parser = ScriptParser::default();
+        parser.set_emit_errors(false);
+
+        parser.parse(&tokenizer, "fuzz.splash", (0, 0), &[]);
+
+        assert!(parser.had_error);
+        assert_eq!(parser.opcodes.len(), parser.source_map.len());
+        assert!(parser.state.is_empty());
+        assert_eq!(parser.index as usize, tokenizer.tokens.len() - 1);
+    }
+
+    #[test]
+    fn proto_field_assignment_accepts_an_identifier_chain() {
+        let mut heap = crate::heap::ScriptHeap::default();
+        let mut tokenizer = ScriptTokenizer::default();
+        tokenizer.tokenize("draw_bg.color: 1\n;", &mut heap);
+        let mut parser = ScriptParser::default();
+        parser.set_emit_errors(false);
+
+        parser.parse(&tokenizer, "valid.splash", (0, 0), &[]);
+
+        assert!(!parser.had_error, "{:?}", parser.diagnostics);
+        assert_eq!(parser.opcodes.len(), parser.source_map.len());
     }
 }

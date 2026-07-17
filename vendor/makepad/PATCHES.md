@@ -81,6 +81,20 @@ Upstream-sync note: this local safety patch is carried against the pinned
 `makepad/makepad dev` import and must be reapplied or retired when that import
 is next synchronized.
 
+## `platform/script`: malformed prototype-field assignment metadata
+
+The `:` prototype-field rewrite inserted paired opcodes directly into the
+opcode stream and its source-map sidecar. Malformed field chains can reach that
+rewrite with a missing synthetic source-map entry, making the second sidecar
+insert out of bounds. Splash validates that the chain begins with an identifier
+and inserts through one helper that restores missing entries as synthetic
+metadata before mutating both vectors. The parser now returns its normal syntax
+diagnostic and retains opcode/source-map lockstep for the minimized fuzz input.
+
+Upstream-sync note: this local safety patch is carried against the pinned
+`makepad/makepad dev` import and must be reapplied or retired when that import
+is next synchronized.
+
 ## `platform/script`: malformed numeric-boundary tokenizer state
 
 The inherited tokenizer ignores underscores inside numeric literals, but it

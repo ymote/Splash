@@ -2622,6 +2622,38 @@ mod tests {
     }
 
     #[test]
+    fn vm_compatibility_preflight_accepts_proto_field_assignments() {
+        let report = check_vm_compatibility_named(
+            "legacy.splash",
+            "draw_bg.color: 1",
+            ExecutionLimits::default(),
+        )
+        .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn vm_compatibility_preflight_rejects_a_malformed_proto_field_assignment_without_panicking() {
+        let source = concat!(
+            "H.-",
+            "\x17\x17\x17\x17\x0e",
+            "\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17",
+            "m: ",
+            "\x17\x17\x17\x17\x17\x17\x17\x17\x17",
+            "return ",
+            "\x17\x17\x17\x17\x17\x17\x17\x17\x17\x17",
+            "=!"
+        );
+        let report =
+            check_vm_compatibility_named("legacy.splash", source, ExecutionLimits::default())
+                .unwrap();
+
+        assert!(!report.valid);
+        assert!(!report.diagnostics.is_empty());
+    }
+
+    #[test]
     fn vm_compatibility_preflight_accepts_legacy_source_at_the_exact_token_limit() {
         let limits = ExecutionLimits {
             max_syntax_tokens: 4,
