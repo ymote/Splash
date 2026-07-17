@@ -17,3 +17,6 @@ path = "src/main.rs"
 splash-capabilities = { path = "../splash-capabilities" }
 splash-core = { path = "../splash-core" }
 splash-workflow = { version = "0.1.0", path = "../splash-workflow" }
+
+[dev-dependencies]
+serde_json = "1.0.150"

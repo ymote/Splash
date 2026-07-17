@@ -691,6 +691,7 @@ dependencies = [
 name = "splash-cli"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "splash-capabilities",
  "splash-core",
  "splash-workflow",
