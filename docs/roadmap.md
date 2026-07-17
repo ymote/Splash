@@ -189,8 +189,11 @@
   policy that rejects active read-write host bindings and an unbounded private
   `/tmp`, requires further-user-namespace lockdown, and remounts the namespace
   root, `/proc`, and `/dev` read-only. Each mount has a kernel-enforced `tmpfs`
-  data-block ceiling but no independent inode cap and is neither durable
-  storage, an executable-path policy, nor a persistent-filesystem quota.
+  data-block ceiling; an optional policy rejects a selected set of bounded
+  tmpfs mounts whose potential aggregate capacity exceeds a host maximum. The
+  mounts still have independent runtime ceilings rather than a shared quota,
+  have no independent inode cap, and are neither durable storage, an
+  executable-path policy, nor a persistent-filesystem quota.
 - Optional Bubblewrap user-namespace hardening that requires a usable user
   namespace and prevents further user namespace creation, with no compatibility
   fallback to a weaker worker policy.
@@ -230,8 +233,9 @@
 ## Next: contained local effects
 
 - Aggregate-disk quotas for persistent writable host-backed worker storage.
-  Bounded ephemeral file roots now cover scratch output beyond `/tmp`, but
-  their per-mount `tmpfs` ceilings do not quota a persistent filesystem.
+  Bounded ephemeral file roots now cover scratch output beyond `/tmp`, with an
+  optional aggregate potential-capacity check, but neither mechanism quotas a
+  persistent filesystem.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - A dynamic or origin-policy-evaluated network boundary, secret broker, and

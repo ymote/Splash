@@ -677,6 +677,7 @@ pub struct BubblewrapWorkerPolicy {
     mount_source_binding: MountSourceBinding,
     executable_source_binding: ExecutableSourceBinding,
     private_tmpfs: PrivateTmpfs,
+    maximum_aggregate_ephemeral_tmpfs_bytes: Option<NonZeroUsize>,
     bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
@@ -707,6 +708,7 @@ impl BubblewrapWorkerPolicy {
             mount_source_binding: MountSourceBinding::Path,
             executable_source_binding: ExecutableSourceBinding::Path,
             private_tmpfs: PrivateTmpfs::Disabled,
+            maximum_aggregate_ephemeral_tmpfs_bytes: None,
             bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
@@ -882,6 +884,36 @@ impl BubblewrapWorkerPolicy {
         Ok(self)
     }
 
+    /// Sets a compile-time upper bound on active private `tmpfs` capacity.
+    ///
+    /// The compiler sums a bounded private `/tmp`, if enabled, and only the
+    /// manifest-selected [`EphemeralFileRoot`] mounts. It rejects compilation
+    /// if that potential data-block capacity exceeds `maximum_bytes` or if
+    /// private `/tmp` is unbounded. The separate mounts retain their individual
+    /// Bubblewrap limits: this setting does not create a shared runtime quota,
+    /// pool unused capacity, constrain host-backed roots, or limit inodes,
+    /// memory, CPU, or persistent storage.
+    pub fn set_maximum_aggregate_ephemeral_tmpfs_bytes(
+        &mut self,
+        maximum_bytes: usize,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
+        let Some(maximum_bytes) = NonZeroUsize::new(maximum_bytes) else {
+            return Err(BubblewrapPolicyError::InvalidAggregateEphemeralTmpfsSize {
+                maximum_bytes,
+            });
+        };
+        self.maximum_aggregate_ephemeral_tmpfs_bytes = Some(maximum_bytes);
+        Ok(self)
+    }
+
+    /// Returns the configured aggregate active private `tmpfs` capacity bound.
+    pub const fn maximum_aggregate_ephemeral_tmpfs_bytes(&self) -> Option<usize> {
+        match self.maximum_aggregate_ephemeral_tmpfs_bytes {
+            Some(maximum_bytes) => Some(maximum_bytes.get()),
+            None => None,
+        }
+    }
+
     /// Returns the requested user-namespace hardening mode.
     pub const fn user_namespace_policy(&self) -> UserNamespacePolicy {
         self.user_namespace_policy
@@ -1036,6 +1068,11 @@ impl BubblewrapWorkerPolicy {
             }
         }
 
+        validate_aggregate_ephemeral_tmpfs_limit(
+            self.maximum_aggregate_ephemeral_tmpfs_bytes,
+            self.private_tmpfs,
+            &mounts,
+        )?;
         validate_mount_layout(&mut mounts, self.private_tmpfs.is_enabled())?;
         let worker_program_source = validate_runtime_program(
             &mounts,
@@ -2573,8 +2610,16 @@ pub enum BubblewrapPolicyError {
     InvalidPrivateTmpfsSize {
         maximum_bytes: usize,
     },
+    InvalidAggregateEphemeralTmpfsSize {
+        maximum_bytes: usize,
+    },
     InvalidEphemeralFileRootSize {
         maximum_bytes: usize,
+    },
+    UnboundedPrivateTmpfsCannotMeetAggregateEphemeralTmpfsLimit,
+    AggregateEphemeralTmpfsLimitExceeded {
+        maximum_bytes: usize,
+        requested_bytes: u128,
     },
     UnboundedFileRootWriteForbidden {
         id: String,
@@ -2662,9 +2707,22 @@ impl Display for BubblewrapPolicyError {
                 formatter,
                 "private tmpfs maximum must be within 1..={MAX_TMPFS_BYTES} bytes; got {maximum_bytes}"
             ),
+            Self::InvalidAggregateEphemeralTmpfsSize { maximum_bytes } => write!(
+                formatter,
+                "aggregate ephemeral tmpfs maximum must be greater than zero bytes; got {maximum_bytes}"
+            ),
             Self::InvalidEphemeralFileRootSize { maximum_bytes } => write!(
                 formatter,
                 "ephemeral file-root maximum must be within 1..={MAX_TMPFS_BYTES} bytes; got {maximum_bytes}"
+            ),
+            Self::UnboundedPrivateTmpfsCannotMeetAggregateEphemeralTmpfsLimit => formatter
+                .write_str("unbounded private /tmp cannot satisfy an aggregate ephemeral tmpfs maximum"),
+            Self::AggregateEphemeralTmpfsLimitExceeded {
+                maximum_bytes,
+                requested_bytes,
+            } => write!(
+                formatter,
+                "active private tmpfs maximums total {requested_bytes} bytes, exceeding the aggregate ephemeral tmpfs maximum of {maximum_bytes} bytes"
             ),
             Self::UnboundedFileRootWriteForbidden { id } => write!(
                 formatter,
@@ -2804,7 +2862,10 @@ impl std::error::Error for BubblewrapPolicyError {
             Self::Protocol(error) => Some(error),
             Self::SourceIo { source, .. } => Some(source),
             Self::InvalidPrivateTmpfsSize { .. }
+            | Self::InvalidAggregateEphemeralTmpfsSize { .. }
             | Self::InvalidEphemeralFileRootSize { .. }
+            | Self::UnboundedPrivateTmpfsCannotMeetAggregateEphemeralTmpfsLimit
+            | Self::AggregateEphemeralTmpfsLimitExceeded { .. }
             | Self::UnboundedFileRootWriteForbidden { .. }
             | Self::UnboundedPrivateTmpfsForbidden
             | Self::BoundedFileRootWritesRequireUserNamespaceLockdown
@@ -3644,6 +3705,41 @@ fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
             maximum_bytes: root.maximum_bytes,
         },
     }
+}
+
+fn validate_aggregate_ephemeral_tmpfs_limit(
+    maximum_bytes: Option<NonZeroUsize>,
+    private_tmpfs: PrivateTmpfs,
+    mounts: &[CompiledMount],
+) -> Result<(), BubblewrapPolicyError> {
+    let Some(maximum_bytes) = maximum_bytes else {
+        return Ok(());
+    };
+    if private_tmpfs == PrivateTmpfs::Unbounded {
+        return Err(
+            BubblewrapPolicyError::UnboundedPrivateTmpfsCannotMeetAggregateEphemeralTmpfsLimit,
+        );
+    }
+
+    let mut requested_bytes = private_tmpfs.maximum_bytes().map_or(0, NonZeroUsize::get) as u128;
+    for mount in mounts {
+        let CompiledMountKind::BoundedTmpfs {
+            maximum_bytes: mount_maximum_bytes,
+        } = &mount.kind
+        else {
+            continue;
+        };
+        requested_bytes = requested_bytes.saturating_add(mount_maximum_bytes.get() as u128);
+    }
+    if requested_bytes > maximum_bytes.get() as u128 {
+        return Err(
+            BubblewrapPolicyError::AggregateEphemeralTmpfsLimitExceeded {
+                maximum_bytes: maximum_bytes.get(),
+                requested_bytes,
+            },
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -5773,6 +5869,97 @@ print("seccomp-active")
             .position(|window| window.iter().map(String::as_str).eq(["--remount-ro", "/"]))
             .unwrap();
         assert!(scratch_mount < root_lockdown);
+    }
+
+    #[test]
+    fn aggregate_ephemeral_tmpfs_limit_counts_only_active_file_roots() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy
+            .add_ephemeral_file_root(
+                "first",
+                EphemeralFileRoot::new("/workspace/first", 32 * 1024).unwrap(),
+            )
+            .unwrap();
+        policy
+            .add_ephemeral_file_root(
+                "second",
+                EphemeralFileRoot::new("/workspace/second", 48 * 1024).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(policy.maximum_aggregate_ephemeral_tmpfs_bytes(), None);
+        policy
+            .set_maximum_aggregate_ephemeral_tmpfs_bytes(64 * 1024)
+            .unwrap();
+        assert_eq!(
+            policy.maximum_aggregate_ephemeral_tmpfs_bytes(),
+            Some(64 * 1024)
+        );
+
+        assert!(policy
+            .compile(&manifest([selector(ResourceKind::FileRoot, "first")]))
+            .is_ok());
+        assert!(matches!(
+            policy.compile(&manifest([
+                selector(ResourceKind::FileRoot, "first"),
+                selector(ResourceKind::FileRoot, "second"),
+            ])),
+            Err(BubblewrapPolicyError::AggregateEphemeralTmpfsLimitExceeded {
+                maximum_bytes,
+                requested_bytes,
+            }) if maximum_bytes == 64 * 1024 && requested_bytes == 80 * 1024
+        ));
+    }
+
+    #[test]
+    fn aggregate_ephemeral_tmpfs_limit_includes_private_tmpfs() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy
+            .add_ephemeral_file_root(
+                "scratch",
+                EphemeralFileRoot::new("/workspace/scratch", 32 * 1024).unwrap(),
+            )
+            .unwrap();
+        policy
+            .enable_private_tmpfs_with_maximum_bytes(32 * 1024)
+            .unwrap()
+            .set_maximum_aggregate_ephemeral_tmpfs_bytes(64 * 1024)
+            .unwrap();
+
+        assert!(policy
+            .compile(&manifest([selector(ResourceKind::FileRoot, "scratch")]))
+            .is_ok());
+
+        policy
+            .set_maximum_aggregate_ephemeral_tmpfs_bytes(64 * 1024 - 1)
+            .unwrap();
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "scratch")])),
+            Err(BubblewrapPolicyError::AggregateEphemeralTmpfsLimitExceeded {
+                maximum_bytes,
+                requested_bytes,
+            }) if maximum_bytes == 64 * 1024 - 1 && requested_bytes == 64 * 1024
+        ));
+    }
+
+    #[test]
+    fn aggregate_ephemeral_tmpfs_limit_rejects_invalid_or_unbounded_private_tmpfs() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert!(matches!(
+            policy.set_maximum_aggregate_ephemeral_tmpfs_bytes(0),
+            Err(BubblewrapPolicyError::InvalidAggregateEphemeralTmpfsSize { maximum_bytes: 0 })
+        ));
+
+        policy
+            .enable_private_tmpfs()
+            .set_maximum_aggregate_ephemeral_tmpfs_bytes(64 * 1024)
+            .unwrap();
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::UnboundedPrivateTmpfsCannotMeetAggregateEphemeralTmpfsLimit)
+        ));
     }
 
     #[test]

@@ -376,11 +376,17 @@ runtime mounts, host-backed roots, `/proc`, `/dev`, and an optional private
 `/tmp`, so a scratch mount cannot shadow another selected path. The root starts
 empty and disappears with the worker mount namespace. Its ceiling is aggregate
 for data blocks in that mount, but it does not independently cap inode count or
-directory-entry metadata. Separate active roots have separate ceilings; there
-is no shared session-wide disk budget. A tmpfs can consume memory or swap, so
-use cgroup memory and swap controls when those resources and metadata also need
-a hard limit. Never use an ephemeral root for a durable worker journal or
-effect record. Bubblewrap's tmpfs mount is `nosuid,nodev`, but it is not an
+directory-entry metadata. Separate active roots retain independent Bubblewrap
+ceilings. A host can opt into
+`set_maximum_aggregate_ephemeral_tmpfs_bytes`, which rejects compilation when
+the sum of active selected ephemeral-root ceilings and a bounded private `/tmp`
+would exceed the configured maximum; it also rejects an unbounded private
+`/tmp`. This is a compile-time bound on potential data-block capacity, not a
+shared runtime disk quota: unused capacity is not pooled and no filesystem
+quota mediates concurrent writers. A tmpfs can consume memory or swap, so use
+cgroup memory and swap controls when those resources and metadata also need a
+hard limit. Never use an ephemeral root for a durable worker journal or effect
+record. Bubblewrap's tmpfs mount is `nosuid,nodev`, but it is not an
 executable-path policy or a guaranteed `noexec` mount. A compromised worker can
 write an executable file there and invoke it when the exposed runtime and
 syscall policy permit. Keep the fixed worker free of subprocess behavior or add
@@ -644,8 +650,10 @@ It does not yet provide:
   optional cgroup-v2 policy adds CPU bandwidth, memory, swap, task, and
   per-device I/O controls; it is not a filesystem quota. An optional runner
   adds the narrower rlimits. A configured private `/tmp` and each active
-  ephemeral root have independent per-`tmpfs` allocation ceilings, and the
-  watchdog adds a process-lifetime wall-clock deadline;
+  ephemeral root have independent per-`tmpfs` allocation ceilings; a host can
+  validate their aggregate potential capacity before launch, but there is no
+  shared runtime quota. The watchdog adds a process-lifetime wall-clock
+  deadline;
 - D-Bus mediation, device-specific policy, an executable-path policy, or a
   network proxy. `DenyKnownEscapeSurface` is a narrow default-allow hardening
   filter, while `StrictAllowlist` is a target-specific syscall boundary, not a

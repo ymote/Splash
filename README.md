@@ -156,8 +156,11 @@ and keeps UI support optional rather than making UI the language boundary.
   paths, with an opt-in policy that rejects active writable host binds and an
   unbounded private `/tmp`, requires further-user-namespace lockdown, and
   remounts the base namespace filesystems read-only. Each root has its own
-  `tmpfs` allocation ceiling; this does not independently cap inodes and is not
-  persistent storage, a `noexec` guarantee, or a host-filesystem quota.
+  `tmpfs` allocation ceiling, and hosts can reject a configured aggregate
+  potential capacity before launch. This remains independent per-mount tmpfs
+  accounting, not a shared runtime quota; it does not independently cap inodes
+  and is not persistent storage, a `noexec` guarantee, or a host-filesystem
+  quota.
 - Optional Linux cgroup-v2 worker sessions with host-delegated CPU bandwidth,
   memory, swap, task, and per-device I/O limits; a fixed runner joins the
   cgroup before Bubblewrap starts, and managed lifecycle teardown kills the
