@@ -16,6 +16,13 @@ pub mod mobile;
 /// capability lease, suspended promise, or external operation.
 pub mod durable_events;
 
+/// Bounded host-receipt-order aggregation of capability-audit and workflow
+/// telemetry streams.
+///
+/// This module has no durable storage, approval, or recovery behavior. Hosts
+/// must explicitly name sources and advance source cursors without gaps.
+pub mod telemetry;
+
 /// Applies authenticated cancellable worker events through the workflow
 /// engine's suspended-step lifecycle.
 #[cfg(feature = "multiplexed-worker")]

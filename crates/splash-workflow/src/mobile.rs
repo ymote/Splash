@@ -24,8 +24,9 @@ use splash_core::{ExecutionLimits, RuntimeError};
 
 use crate::{
     Approval, WorkflowCheckpoint, WorkflowData, WorkflowDataContract, WorkflowDraft,
-    WorkflowEngine, WorkflowError, WorkflowEventHistoryError, WorkflowEventLog, WorkflowPlan,
-    WorkflowStep, WorkflowStepCapabilityPolicy, DEFAULT_MAX_WORKFLOW_EVENTS, MAX_WORKFLOW_EVENTS,
+    WorkflowEngine, WorkflowError, WorkflowEventBatch, WorkflowEventCursorError,
+    WorkflowEventHistoryError, WorkflowEventLog, WorkflowPlan, WorkflowStep,
+    WorkflowStepCapabilityPolicy, DEFAULT_MAX_WORKFLOW_EVENTS, MAX_WORKFLOW_EVENTS,
 };
 
 /// Setup-only builder for a sealed mobile or embedded workflow catalog.
@@ -320,6 +321,19 @@ impl MobileWorkflowRuntime {
     /// Returns the bounded workflow-event view.
     pub fn events(&self) -> WorkflowEventLog<'_> {
         self.engine.events()
+    }
+
+    /// Exports retained workflow telemetry after a host-maintained source
+    /// cursor.
+    ///
+    /// A retention gap fails closed for observability instead of silently
+    /// returning partial workflow history. This does not expose plan approval
+    /// or execution authority.
+    pub fn events_since(
+        &self,
+        next_sequence: u64,
+    ) -> Result<WorkflowEventBatch, WorkflowEventCursorError> {
+        self.engine.events_since(next_sequence)
     }
 
     /// Returns the number of workflow events evicted from memory.
@@ -767,6 +781,15 @@ mod tests {
         assert_eq!(audit.next_event_sequence(), 2);
         assert_eq!(audit.events()[0].tool, "math.add");
         assert!(runtime.audit_since(2).unwrap().is_empty());
+        let events = runtime.events_since(1).expect("retained event exports");
+        assert_eq!(events.first_sequence(), 1);
+        assert!(events.records().iter().any(|record| {
+            matches!(record.event(), WorkflowEvent::Completed { plan_id } if *plan_id == plan.id())
+        }));
+        assert!(runtime
+            .events_since(events.next_sequence())
+            .unwrap()
+            .is_empty());
         assert!(matches!(
             runtime.events().last(),
             Some(WorkflowEvent::Completed { plan_id }) if *plan_id == plan.id()

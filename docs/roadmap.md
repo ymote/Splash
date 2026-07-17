@@ -100,6 +100,9 @@
   exact retained replay checks, explicit retention loss, and optimistic-CAS
   persistence; they remain telemetry and cannot resume a workflow or prove an
   external effect.
+- Bounded host-receipt-order cross-stream aggregation of named capability-audit
+  and workflow-event source segments, with exact cursors, explicit source and
+  aggregate retention gaps, and no durable, recovery, or capability authority.
 - Plan-bound durable operation ledgers with input fingerprint checks, derived
   worker keys, revision-watermark hooks, and a two-stage
   prepare/persist/exact-claim bridge for live external workflow steps.
@@ -228,6 +231,6 @@
   and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
-- Cross-stream event retention/aggregation and product-specific compensation
+- Durable cross-stream aggregation/retention and product-specific compensation
   action policies.
 - Independent security review of effectful adapters.
