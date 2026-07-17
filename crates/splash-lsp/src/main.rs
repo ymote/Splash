@@ -3823,7 +3823,10 @@ mod tests {
         let mut input_server = SplashLanguageServer::with_workflow_data_catalog(catalog.clone());
         input_server.open_document(document(1, input_source));
         let input_completion = input_server
-            .completion(&test_uri(), position_at_byte(input_source, input_source.len()))
+            .completion(
+                &test_uri(),
+                position_at_byte(input_source, input_source.len()),
+            )
             .expect("workflow input completion succeeds");
         let left = input_completion
             .items
@@ -3856,7 +3859,10 @@ mod tests {
         hover_server.open_document(document(1, hover_source));
         let input_member = hover_source.find("left").expect("input member exists");
         let input_hover = hover_server
-            .hover(&test_uri(), position_at_byte(hover_source, input_member + 1))
+            .hover(
+                &test_uri(),
+                position_at_byte(hover_source, input_member + 1),
+            )
             .expect("workflow input hover succeeds")
             .expect("known workflow input field has hover information");
         assert_eq!(
@@ -3874,13 +3880,19 @@ mod tests {
             ))
         );
         assert!(hover_server
-            .definition(&test_uri(), position_at_byte(hover_source, input_member + 1))
+            .definition(
+                &test_uri(),
+                position_at_byte(hover_source, input_member + 1)
+            )
             .expect("workflow input definition request succeeds")
             .is_none());
 
         let output_member = hover_source.rfind("total").expect("output member exists");
         let output_hover = hover_server
-            .hover(&test_uri(), position_at_byte(hover_source, output_member + 1))
+            .hover(
+                &test_uri(),
+                position_at_byte(hover_source, output_member + 1),
+            )
             .expect("workflow output hover succeeds")
             .expect("known workflow output field has hover information");
         assert_eq!(
@@ -3900,7 +3912,10 @@ mod tests {
         );
         deeper_server.open_document(document(1, deeper_source));
         assert!(deeper_server
-            .completion(&test_uri(), position_at_byte(deeper_source, deeper_source.len()))
+            .completion(
+                &test_uri(),
+                position_at_byte(deeper_source, deeper_source.len())
+            )
             .expect("non-schema member completion succeeds")
             .items
             .is_empty());
@@ -3981,24 +3996,29 @@ mod tests {
         ] {
             let mut server = SplashLanguageServer::with_workflow_data_catalog(catalog.clone());
             server.open_document(document(1, shadowed_source));
-            assert!(server
-                .completion(
-                    &test_uri(),
-                    position_at_byte(shadowed_source, shadowed_source.len()),
-                )
-                .expect("shadowed workflow completion succeeds")
-                .items
-                .is_empty(), "workflow projection must not override {shadowed_source:?}");
+            assert!(
+                server
+                    .completion(
+                        &test_uri(),
+                        position_at_byte(shadowed_source, shadowed_source.len()),
+                    )
+                    .expect("shadowed workflow completion succeeds")
+                    .items
+                    .is_empty(),
+                "workflow projection must not override {shadowed_source:?}"
+            );
         }
 
         assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
             "inputFields": [{"name": "valid", "type": "unsupported"}],
             "outputs": []
-        })).is_none());
+        }))
+        .is_none());
         assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
             "inputFields": [],
             "outputs": [{"stepId": "release-publish", "fields": []}]
-        })).is_none());
+        }))
+        .is_none());
         assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
             "inputFields": [{
                 "name": "valid",
@@ -4006,7 +4026,8 @@ mod tests {
                 "description": "x".repeat(MAX_LSP_WORKFLOW_DATA_FIELD_DESCRIPTION_BYTES + 1)
             }],
             "outputs": []
-        })).is_none());
+        }))
+        .is_none());
 
         let too_many_outputs = serde_json::Value::Array(
             (0..=MAX_LSP_WORKFLOW_DATA_OUTPUTS)
@@ -4016,7 +4037,8 @@ mod tests {
         assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
             "inputFields": [],
             "outputs": too_many_outputs
-        })).is_none());
+        }))
+        .is_none());
 
         let too_many_fields = serde_json::Value::Array(
             (0..=MAX_LSP_WORKFLOW_DATA_FIELDS)
@@ -4026,7 +4048,8 @@ mod tests {
         assert!(parse_workflow_data_completion_catalog(&serde_json::json!({
             "inputFields": too_many_fields,
             "outputs": []
-        })).is_none());
+        }))
+        .is_none());
     }
 
     #[test]
