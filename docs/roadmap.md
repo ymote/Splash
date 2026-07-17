@@ -23,8 +23,8 @@
   lookup or authority inference; it performs no arbitrary module, type, or
   field inference. A separate bounded, initialization-time advisory module
   interface projection can complete direct `use mod.*` path segments and
-  immediate children of a direct visible imported-module binding without module
-  loading, resolution, runtime export inspection, or authority inference.
+  bounded catalog paths below a direct visible imported-module binding without
+  module loading, resolution, runtime export inspection, or authority inference.
 - Bounded direct literal-record field metadata for exact visible
   `let binding = { ... }` initializers, with same-document completion, hover,
   and definition. It is advisory and does not infer aliases, mutation, control
@@ -215,8 +215,9 @@
 ## Before a stable language release
 
 - Additional semantic editor features beyond lexical completion, fixed
-  `mod.tool`, and direct literal-record fields, including general
-  imported-module resolution and broader type-aware field semantics.
+  `mod.tool`, direct literal-record fields, and catalog-backed chained lookup
+  from a visible imported-module binding. General module resolution and broader
+  type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
 - Cross-stream event retention/aggregation and product-specific compensation

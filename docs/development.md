@@ -175,7 +175,7 @@ projection through `initializationOptions.splash.moduleCatalog`:
 ```
 
 The LSP completes the current segment in a direct statement-position `use
-mod.*` path, and immediate children after a direct visible imported-module
+mod.*` path, and bounded catalog paths below a direct visible imported-module
 binding. It does not offer metadata-defined members for `mod.tool`, which keeps
 its fixed four language methods. The server neither reads a module URI or file,
 nor resolves, validates, installs, or loads a module; it also does not inspect

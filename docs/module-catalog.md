@@ -43,30 +43,36 @@ host-defined interface descriptor.
 
 The LSP can complete the current segment in a direct statement-position import
 such as `use mod.` or `use mod.app.`. It also completes immediate static
-children after a direct, visible imported module binding:
+children after a direct, visible imported module binding, including a bounded
+chain of catalog paths below that binding:
 
 ```splash
 use mod.app.weather
 weather.
+weather.current.
 ```
 
-Only immediate children are exposed. Intermediate namespaces inferred from a
-deeper path have no borrowed leaf description. The LSP replaces exactly the
-current path or member segment and renders descriptions as plain text.
+Only immediate children at the selected catalog path are exposed. Intermediate
+namespaces inferred from a deeper path have no borrowed leaf description. The
+LSP replaces exactly the current path or member segment and renders descriptions
+as plain text. A chain has at most 16 identifier segments, and it must begin at
+the visible binding from a direct `use mod.*` statement.
 
 `mod.tool` remains a fixed language surface: a visible `use mod.tool` binding
 offers only `call`, `call_json`, `start`, and `start_json`, regardless of this
-projection. The projection is also refused for a shadowed binding, a chained
-receiver, comments, strings, or source after the first syntax diagnostic.
+projection. The projection is also refused for a shadowed binding, a receiver
+that does not begin at a visible import, comments, strings, or source after the
+first syntax diagnostic.
 
 ## Security and authority
 
-This is not general imported-module resolution or type inference. The LSP does
-not read module files, URIs, the environment, a Rust registry, a capability
-runtime, or a live catalog. It does not validate an imported path, load a
-module, inspect exports, infer record fields, or authorize a tool. The metadata
-is static for one LSP session, client-supplied, potentially stale, and advisory
-even when an integration generated it from trusted host configuration.
+This bounded catalog lookup is not general imported-module resolution or type
+inference. The LSP does not read module files, URIs, the environment, a Rust
+registry, a capability runtime, or a live catalog. It does not validate an
+imported path, load a module, inspect exports, infer record fields, or authorize
+a tool. The metadata is static for one LSP session, client-supplied,
+potentially stale, and advisory even when an integration generated it from
+trusted host configuration.
 
 Runtime module binding and all capability decisions remain host-owned. In
 particular, a suggested `mod.tool` call target is still checked against the

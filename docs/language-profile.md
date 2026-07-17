@@ -139,7 +139,7 @@ An editor may separately supply
 `initializationOptions.splash.moduleCatalog`: a bounded, static list of
 canonical `mod.*` paths plus optional plain-text descriptions. This LSP-only
 projection can complete the current segment of a direct statement-position
-`use mod.*` path, or an immediate child after a direct visible imported-module
+`use mod.*` path, or bounded catalog paths below a direct visible imported-module
 binding. It is not part of the core report and does not load a source file,
 resolve or validate a module, inspect runtime exports, infer arbitrary fields,
 or make a Rust adapter current or callable. `mod.tool` remains a fixed language

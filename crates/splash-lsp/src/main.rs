@@ -273,7 +273,9 @@ impl SplashLanguageServer {
         };
         let shapes = self.static_record_shapes(uri)?;
         if !report.truncated {
-            if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
+            if let Some(site) = direct_module_member_completion_site(source, byte_offset)
+                .filter(|site| site.has_direct_receiver())
+            {
                 if let Some(field) = static_record_field_for_member(
                     source,
                     &report.symbols,
@@ -299,7 +301,9 @@ impl SplashLanguageServer {
         };
         let shapes = self.static_record_shapes(uri)?;
         if !report.truncated {
-            if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
+            if let Some(site) = direct_module_member_completion_site(source, byte_offset)
+                .filter(|site| site.has_direct_receiver())
+            {
                 if let Some(field) = static_record_field_for_member(
                     source,
                     &report.symbols,
@@ -434,7 +438,9 @@ impl SplashLanguageServer {
         if let Some(member_site) = direct_module_member_completion_site(source, byte_offset) {
             let imports = self.module_imports(uri)?;
             let is_incomplete = lexical_incomplete || imports.truncated;
-            if is_visible_builtin_tool_receiver(source, report, imports, member_site.receiver) {
+            if member_site.has_direct_receiver()
+                && is_visible_builtin_tool_receiver(source, report, imports, member_site.receiver)
+            {
                 return Ok(tool_module_member_completion(
                     source,
                     report,
@@ -444,21 +450,23 @@ impl SplashLanguageServer {
                 ));
             }
             let shapes = self.static_record_shapes(uri)?;
-            if let Some(shape) = visible_static_record_shape(
-                source,
-                &report.symbols,
-                report.valid_prefix_end_byte,
-                shapes,
-                member_site.receiver,
-            ) {
-                return Ok(static_record_member_completion(
+            if member_site.has_direct_receiver() {
+                if let Some(shape) = visible_static_record_shape(
                     source,
-                    report,
+                    &report.symbols,
+                    report.valid_prefix_end_byte,
                     shapes,
-                    shape,
-                    member_site,
-                    lexical_incomplete || shapes.truncated,
-                ));
+                    member_site.receiver,
+                ) {
+                    return Ok(static_record_member_completion(
+                        source,
+                        report,
+                        shapes,
+                        shape,
+                        member_site,
+                        lexical_incomplete || shapes.truncated,
+                    ));
+                }
             }
             return Ok(module_catalog_member_completion(
                 source,
@@ -1401,8 +1409,19 @@ fn completion_item_kind(kind: LexicalSymbolKind) -> CompletionItemKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MemberCompletionSite {
+    /// The first receiver identifier. Built-in tool and static-record
+    /// completion intentionally accept only this direct form.
     receiver: SourceSpan,
+    /// The complete contiguous identifier path from `receiver` to the member
+    /// being completed. The module catalog may resolve its nested segments.
+    receiver_chain: SourceSpan,
     member: SourceSpan,
+}
+
+impl MemberCompletionSite {
+    fn has_direct_receiver(self) -> bool {
+        self.receiver == self.receiver_chain
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1447,26 +1466,37 @@ fn direct_module_member_completion_site(
         return None;
     }
 
-    let receiver_end = member_start - 1;
-    let mut receiver_start = receiver_end;
-    while receiver_start > 0 && is_identifier_byte(bytes[receiver_start - 1]) {
-        receiver_start -= 1;
-    }
-    if receiver_start == receiver_end
-        || !is_identifier_start_byte(bytes[receiver_start])
-        || (receiver_start > 0 && bytes[receiver_start - 1] == b'.')
-    {
-        return None;
-    }
-    let receiver_name = source.get(receiver_start..receiver_end)?;
-    if !is_canonical_identifier(receiver_name) {
-        return None;
-    }
-
-    Some(MemberCompletionSite {
-        receiver: SourceSpan {
+    let receiver_chain_end = member_start - 1;
+    let mut receiver_end = receiver_chain_end;
+    let mut receiver_segments = 0_usize;
+    let receiver = loop {
+        if receiver_segments == MAX_LSP_MODULE_PATH_SEGMENTS {
+            return None;
+        }
+        let receiver_start = identifier_start_before(source, receiver_end);
+        if receiver_start == receiver_end || !is_identifier_start_byte(bytes[receiver_start]) {
+            return None;
+        }
+        let receiver_name = source.get(receiver_start..receiver_end)?;
+        if !is_canonical_identifier(receiver_name) {
+            return None;
+        }
+        receiver_segments += 1;
+        let receiver = SourceSpan {
             start_byte: receiver_start,
             end_byte: receiver_end,
+        };
+        if receiver_start == 0 || bytes[receiver_start - 1] != b'.' {
+            break receiver;
+        }
+        receiver_end = receiver_start - 1;
+    };
+
+    Some(MemberCompletionSite {
+        receiver,
+        receiver_chain: SourceSpan {
+            start_byte: receiver.start_byte,
+            end_byte: receiver_chain_end,
         },
         member: SourceSpan {
             start_byte: member_start,
@@ -1934,9 +1964,27 @@ fn module_catalog_member_completion(
         return empty();
     };
 
+    let mut resolved_path = import.path.clone();
+    if !site.has_direct_receiver() {
+        let Some(suffix) = source
+            .get(site.receiver.end_byte..site.receiver_chain.end_byte)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+        else {
+            return empty();
+        };
+        for segment in suffix.split('.') {
+            if !is_canonical_identifier(segment)
+                || resolved_path.len() == MAX_LSP_MODULE_PATH_SEGMENTS
+            {
+                return empty();
+            }
+            resolved_path.push(segment.to_owned());
+        }
+    }
+
     let is_incomplete = is_incomplete || catalog.unavailable;
     let edit_range = span_range(source, site.member);
-    let items = module_catalog_children(catalog, &import.path)
+    let items = module_catalog_children(catalog, &resolved_path)
         .into_iter()
         .map(|child| CompletionItem {
             label: child.name.clone(),
@@ -3643,6 +3691,49 @@ mod tests {
             }))
         );
 
+        let chained_member_source = "use mod.std\nstd.inspect.";
+        let chained_catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.std.inspect.config",
+                "description": "Reads static inspector configuration."
+            },
+            {
+                "path": "mod.std.inspect.status",
+                "description": "Returns inspector status."
+            }
+        ]));
+        let mut chained_member_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            chained_catalog,
+        );
+        chained_member_server.open_document(document(1, chained_member_source));
+        let chained_completion = chained_member_server
+            .completion(
+                &test_uri(),
+                position_at_byte(chained_member_source, chained_member_source.len()),
+            )
+            .expect("nested imported-module completion succeeds");
+        assert!(!chained_completion.is_incomplete);
+        assert_eq!(
+            chained_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["config", "status"]
+        );
+        assert!(chained_completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::FIELD)
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                        if *range == Range::new(
+                            position_at_byte(chained_member_source, chained_member_source.len()),
+                            position_at_byte(chained_member_source, chained_member_source.len()),
+                        )
+                )
+        }));
+
         let tool_source = "use mod.tool\ntool.";
         let mut tool_server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
@@ -3873,6 +3964,22 @@ mod tests {
             )
             .expect("shadowed member completion request succeeds");
         assert!(completion.items.is_empty());
+
+        let chained_shadowed_source = "use mod.std\nlet std = 1\nstd.inspect.";
+        let mut chained_shadowed_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {"path": "mod.std.inspect.config", "description": "config"}
+            ])),
+        );
+        chained_shadowed_server.open_document(document(1, chained_shadowed_source));
+        let chained_completion = chained_shadowed_server
+            .completion(
+                &test_uri(),
+                position_at_byte(chained_shadowed_source, chained_shadowed_source.len()),
+            )
+            .expect("shadowed chained completion request succeeds");
+        assert!(chained_completion.items.is_empty());
     }
 
     #[test]
@@ -3881,6 +3988,7 @@ mod tests {
             "use mod.custom.tool\nlet output = tool.",
             "use mod.tool\nlet tool = 1\ntool.",
             "use mod.tool\nlet object = {tool: tool}\nobject.tool.",
+            "use mod.tool\ntool.call.",
             "use mod.tool\n@\ntool.",
         ] {
             let mut server = SplashLanguageServer::default();
@@ -3894,6 +4002,18 @@ mod tests {
                 "unexpected members for {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_chained_static_record_field_completion() {
+        let source = "let profile = {name: \"Ada\"}\nprofile.name.";
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("chained static record completion request succeeds");
+        assert!(completion.items.is_empty());
     }
 
     #[test]

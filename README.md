@@ -19,8 +19,8 @@ and keeps UI support optional rather than making UI the language boundary.
   member suggestions for an exact visible `use mod.tool` binding, an optional
   bounded advisory tool-catalog projection for direct tool-name literals, and
   an optional static module-interface projection for direct import paths and
-  imported-module members, plus bounded direct-literal record-field completion,
-  hover, and definition without runtime type inference.
+  bounded chained imported-module members, plus bounded direct-literal
+  record-field completion, hover, and definition without runtime type inference.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -435,12 +435,12 @@ catalog data, or runtime-derived imported-module exports.
 
 An editor may also supply a separate static advisory module-interface
 projection through `initializationOptions.splash.moduleCatalog`. It completes
-the current segment in a direct statement-position `use mod.*` path and an
-immediate member after a direct, visible imported module binding. It does not
-load a source file, resolve a module, inspect a runtime export, or override the
-fixed `mod.tool` API. The projection is client-supplied, static for the session,
-and never authorizes source; malformed or over-limit input is discarded as a
-whole and marks matching completion incomplete. See [editor module-interface
+the current segment in a direct statement-position `use mod.*` path and bounded
+catalog paths after a direct, visible imported module binding. It does not load
+a source file, resolve a module, inspect a runtime export, or override the fixed
+`mod.tool` API. The projection is client-supplied, static for the session, and
+never authorizes source; malformed or over-limit input is discarded as a whole
+and marks matching completion incomplete. See [editor module-interface
 projection](docs/module-catalog.md) for its exact format and bounds. A truncated
 lexical index can still serve retained, sound definitions and hover, but
 exhaustive reference, highlight, and rename requests fail instead of returning
