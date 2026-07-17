@@ -8,6 +8,9 @@ vendor/makepad/target/
 !/fuzz/corpus/execution/
 /fuzz/corpus/execution/*
 !/fuzz/corpus/execution/*.splash
+!/fuzz/corpus/execution_limits/
+/fuzz/corpus/execution_limits/*
+!/fuzz/corpus/execution_limits/*.splash
 !/fuzz/corpus/workflow_draft/
 /fuzz/corpus/workflow_draft/*
 !/fuzz/corpus/workflow_draft/*.json

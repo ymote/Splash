@@ -30,6 +30,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "execution_limits"
+path = "fuzz_targets/execution_limits.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "workflow_draft"
 path = "fuzz_targets/workflow_draft.rs"
 test = false

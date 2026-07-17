@@ -33,9 +33,9 @@ separate behavioral coverage for the imported VM.
 Pull-request CI runs short 128-input smoke campaigns for every fuzz target.
 The separate `Sustained Fuzzing` workflow runs daily and can be started
 manually from GitHub Actions. It gives the differential `syntax` target and
-the bounded `execution` target ten minutes each, with per-input timeout and
-RSS ceilings. A failure uploads its ignored `fuzz/artifacts` directory for 14
-days.
+the bounded `execution` target ten minutes each, then gives the variable-limit
+`execution_limits` target three minutes, all with per-input timeout and RSS
+ceilings. A failure uploads its ignored `fuzz/artifacts` directory for 14 days.
 
 Triage a downloaded crash before adding it to the repository:
 
@@ -208,7 +208,7 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has seven bounded targets. `syntax` differentially
+The standalone `fuzz` package has nine bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser under a rotating set
 of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
 to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also
@@ -246,7 +246,16 @@ capability or Rust adapter can run; a panic or hang is a fuzz failure.
 `execution` explicitly collects its fresh VM after evaluation so retained heap
 state cannot mask resource behavior. Their tracked `.splash` seeds cover
 canonical dataflow, deferred tools, loops, lambdas, recoverable error control
-flow, and an intentional instruction-limit case. `workflow_draft` feeds
+flow, and an intentional instruction-limit case.
+`execution_limits` rotates valid source, syntax, instruction, sampling, and
+deadline profiles through a fresh capability-free runtime. Equal soft and hard
+deadlines must terminate rather than leave a resumable evaluation. Its
+cooperative one-nanosecond soft-budget profile may yield, but it must then
+refuse a later `set_limits` request so the continuation keeps its original
+resource contract. A completed evaluation must accept the replacement profile.
+The target collects the VM after each case and never installs an adapter or
+capability. Its reviewed `.splash` seeds cover a cooperative budget yield and a
+tight instruction limit. `workflow_draft` feeds
 bounded UTF-8 JSON into the data-only `WorkflowDraft` decoder, then checks that
 every accepted draft
 round-trips through the current wire format and produces exactly one review
@@ -297,7 +306,7 @@ successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all eight targets and performs a short 128-run coverage-only smoke pass
+CI compiles all nine targets and performs a short 128-run coverage-only smoke pass
 with `--sanitizer none`. Run the longer local commands below with the default
 sanitizer whenever the platform supports it.
 
@@ -308,6 +317,7 @@ cargo install cargo-fuzz
 cd fuzz
 cargo +nightly fuzz run syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run workflow_draft -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run capability_lease -- -max_total_time=60 -max_len=8192
 cargo +nightly fuzz run workflow_external_operation -- -max_total_time=60 -max_len=65536
@@ -324,6 +334,7 @@ instrumentation:
 ```sh
 cargo +nightly fuzz run --sanitizer none syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run --sanitizer none execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none workflow_draft -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run --sanitizer none capability_lease -- -max_total_time=60 -max_len=8192
 cargo +nightly fuzz run --sanitizer none workflow_external_operation -- -max_total_time=60 -max_len=65536
@@ -337,6 +348,7 @@ Reproduce a saved failure from the same directory with:
 ```sh
 cargo +nightly fuzz run syntax artifacts/syntax/<artifact>
 cargo +nightly fuzz run execution artifacts/execution/<artifact>
+cargo +nightly fuzz run execution_limits artifacts/execution_limits/<artifact>
 cargo +nightly fuzz run workflow_draft artifacts/workflow_draft/<artifact>
 cargo +nightly fuzz run capability_lease artifacts/capability_lease/<artifact>
 cargo +nightly fuzz run workflow_external_operation artifacts/workflow_external_operation/<artifact>

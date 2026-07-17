@@ -582,8 +582,18 @@ impl<H: Any, S: Any> Runtime<H, S> {
         self.limits
     }
 
+    /// Replaces the host-selected execution bounds for later evaluations.
+    ///
+    /// A paused continuation retains the limits it started with. Changing
+    /// them while it waits could widen or weaken the resource contract after
+    /// an `await` or cooperative time-budget yield, so the update is refused
+    /// until that continuation reaches a terminal state.
     pub fn set_limits(&mut self, limits: ExecutionLimits) -> Result<(), RuntimeError> {
-        self.limits = limits.validate()?;
+        let limits = limits.validate()?;
+        if self.with_vm(|vm| has_paused_thread(vm)) {
+            return Err(RuntimeError::EvaluationInProgress);
+        }
+        self.limits = limits;
         Ok(())
     }
 
@@ -4249,6 +4259,31 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("instruction")));
+    }
+
+    #[test]
+    fn refuses_limit_changes_while_a_time_budget_yield_is_paused() {
+        let original = ExecutionLimits {
+            instruction_limit: 100_000,
+            soft_timeout: Duration::from_nanos(1),
+            hard_timeout: Duration::from_secs(1),
+            budget_sample_interval: 1,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), original).unwrap();
+        let evaluation = runtime.eval("loop {}").unwrap();
+        assert!(evaluation.suspended);
+
+        let replacement = ExecutionLimits {
+            instruction_limit: 64,
+            budget_sample_interval: 1,
+            ..ExecutionLimits::default()
+        };
+        assert_eq!(
+            runtime.set_limits(replacement),
+            Err(RuntimeError::EvaluationInProgress)
+        );
+        assert_eq!(runtime.limits(), original);
     }
 
     #[test]
