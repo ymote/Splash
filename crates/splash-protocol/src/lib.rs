@@ -41,6 +41,15 @@ pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 2;
 /// This keeps manifest validation, authorization state, and contained-worker
 /// launch planning bounded independently of the wire-frame byte ceiling.
 pub const MAX_CAPABILITY_GRANTS_PER_MANIFEST: usize = 128;
+/// Maximum unique ordinary, cancellation, durable-operation, reconciliation,
+/// and compensation identifiers retained by one [`SessionAuthorizer`].
+///
+/// A fresh, separately approved session is required after this limit. This
+/// bound prevents a valid manifest with a large call budget from growing
+/// authorization replay state for the lifetime of a worker process. A host
+/// that might cooperatively cancel an in-flight ordinary invocation must leave
+/// one slot available for its distinct cancellation identifier.
+pub const MAX_SESSION_REQUEST_IDS: usize = 1_024;
 const MAX_RESOURCES_PER_GRANT: usize = 64;
 const MAX_TOKEN_BYTES: usize = 128;
 const PRIVATE_PIPE_WORKER_BOOTSTRAP_MAGIC: [u8; 8] = *b"SPLPBOOT";
@@ -2419,8 +2428,7 @@ impl SessionAuthorizer {
         if self.seen_request_ids.contains(&request.cancellation_id) {
             return Err(ProtocolError::DuplicateRequest(request.cancellation_id));
         }
-        self.seen_request_ids
-            .insert(request.cancellation_id.clone());
+        self.reserve_request_id(&request.cancellation_id)?;
         self.cancellation_requested_ids
             .insert(request.request_id.clone());
         Ok(AuthorizedWorkerCancellation {
@@ -2468,7 +2476,7 @@ impl SessionAuthorizer {
         if self.seen_request_ids.contains(&request.request_id) {
             return Err(ProtocolError::DuplicateRequest(request.request_id));
         }
-        self.seen_request_ids.insert(request.request_id.clone());
+        self.reserve_request_id(&request.request_id)?;
         Ok(AuthorizedOperationReconciliation { request, grant })
     }
 
@@ -2513,17 +2521,22 @@ impl SessionAuthorizer {
         let already_authorized = self.compensation_identities.contains(&identity);
         let compensations = self
             .compensations_by_tool
-            .entry(grant.tool.clone())
-            .or_default();
-        if !already_authorized && *compensations >= grant.max_compensations {
+            .get(&grant.tool)
+            .copied()
+            .unwrap_or_default();
+        if !already_authorized && compensations >= grant.max_compensations {
             return Err(ProtocolError::CompensationBudgetExhausted {
                 tool: grant.tool,
                 maximum: grant.max_compensations,
             });
         }
-        self.seen_request_ids.insert(request.request_id.clone());
+        self.reserve_request_id(&request.request_id)?;
         if !already_authorized {
             self.compensation_identities.insert(identity);
+            let compensations = self
+                .compensations_by_tool
+                .entry(grant.tool.clone())
+                .or_default();
             *compensations = compensations.saturating_add(1);
         }
         Ok(AuthorizedOperationCompensation { request, grant })
@@ -2706,16 +2719,34 @@ impl SessionAuthorizer {
         if self.seen_request_ids.contains(request_id) {
             return Err(ProtocolError::DuplicateRequest(request_id.to_owned()));
         }
-        let calls = self.calls_by_tool.entry(grant.tool.clone()).or_default();
-        if *calls >= grant.max_calls {
+        let calls = self
+            .calls_by_tool
+            .get(&grant.tool)
+            .copied()
+            .unwrap_or_default();
+        if calls >= grant.max_calls {
             return Err(ProtocolError::CallBudgetExhausted {
                 tool: grant.tool.clone(),
                 maximum: grant.max_calls,
             });
         }
-        self.seen_request_ids.insert(request_id.to_owned());
+        self.reserve_request_id(request_id)?;
+        let calls = self.calls_by_tool.entry(grant.tool.clone()).or_default();
         *calls = calls.saturating_add(1);
         Ok(grant)
+    }
+
+    fn reserve_request_id(&mut self, request_id: &str) -> Result<(), ProtocolError> {
+        if self.seen_request_ids.contains(request_id) {
+            return Err(ProtocolError::DuplicateRequest(request_id.to_owned()));
+        }
+        if self.seen_request_ids.len() >= MAX_SESSION_REQUEST_IDS {
+            return Err(ProtocolError::SessionRequestLimitExceeded {
+                maximum: MAX_SESSION_REQUEST_IDS,
+            });
+        }
+        self.seen_request_ids.insert(request_id.to_owned());
+        Ok(())
     }
 }
 
@@ -2781,6 +2812,9 @@ pub enum ProtocolError {
     },
     InvalidAuthenticationTag,
     DuplicateRequest(String),
+    SessionRequestLimitExceeded {
+        maximum: usize,
+    },
     DuplicateResult(String),
     CancellationIdMatchesRequest,
     CancellationTargetMismatch,
@@ -2923,6 +2957,9 @@ impl Display for ProtocolError {
             }
             Self::DuplicateRequest(request_id) => {
                 write!(formatter, "duplicate worker request: {request_id}")
+            }
+            Self::SessionRequestLimitExceeded { maximum } => {
+                write!(formatter, "worker session exceeds its {maximum} request identity limit")
             }
             Self::DuplicateResult(request_id) => {
                 write!(formatter, "duplicate worker result: {request_id}")
@@ -3303,6 +3340,19 @@ mod tests {
             .collect()
     }
 
+    fn fill_authorizer_request_identity_capacity(authorizer: &mut SessionAuthorizer, count: usize) {
+        for index in 0..count {
+            let request = OperationReconcileRequest::new(
+                "session-1",
+                format!("reconcile-request-{index}"),
+                "math.add",
+                "operation-1",
+            )
+            .unwrap();
+            authorizer.authorize_reconciliation(request).unwrap();
+        }
+    }
+
     #[test]
     fn rejects_duplicate_capability_grants() {
         let error =
@@ -3541,6 +3591,332 @@ mod tests {
             authorizer.authorize(duplicate).unwrap_err(),
             ProtocolError::DuplicateRequest("request-1".to_owned())
         );
+    }
+
+    #[test]
+    fn authorizer_request_identity_limit_bounds_all_authorization_paths_without_mutation() {
+        let expected = ProtocolError::SessionRequestLimitExceeded {
+            maximum: MAX_SESSION_REQUEST_IDS,
+        };
+
+        let mut ordinary_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut ordinary_authorizer,
+            MAX_SESSION_REQUEST_IDS,
+        );
+        let invocation = ToolInvocation::new(
+            "session-1",
+            "request-over-limit",
+            "math.add",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary_authorizer.authorize(invocation).unwrap_err(),
+            expected
+        );
+        assert_eq!(ordinary_authorizer.calls_for("math.add"), 0);
+        assert_eq!(
+            ordinary_authorizer
+                .authorize_operation(operation_request(
+                    "operation-over-limit",
+                    "operation-over-limit",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                ))
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(ordinary_authorizer.calls_for("math.add"), 0);
+        assert_eq!(
+            ordinary_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+
+        let mut cancellation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let target = cancellation_authorizer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-target",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut cancellation_authorizer,
+            MAX_SESSION_REQUEST_IDS - 1,
+        );
+        let cancellation = WorkerCancellationRequest::new(
+            "session-1",
+            "cancel-over-limit",
+            "request-target",
+            "math.add",
+        )
+        .unwrap();
+        assert_eq!(
+            cancellation_authorizer
+                .authorize_cancellation(cancellation, &target)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(cancellation_authorizer.calls_for("math.add"), 1);
+        assert!(!cancellation_authorizer
+            .cancellation_requested_ids
+            .contains("request-target"));
+        assert_eq!(
+            cancellation_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+
+        let mut reconciliation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut reconciliation_authorizer,
+            MAX_SESSION_REQUEST_IDS,
+        );
+        assert_eq!(
+            reconciliation_authorizer
+                .authorize_reconciliation(
+                    OperationReconcileRequest::new(
+                        "session-1",
+                        "reconcile-over-limit",
+                        "math.add",
+                        "operation-1",
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            reconciliation_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+
+        let grant = compensation_grant();
+        let binding = compensation_binding(&grant);
+        let mut compensation_authorizer =
+            SessionAuthorizer::new(CapabilityManifest::new("session-1", vec![grant]).unwrap())
+                .unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut compensation_authorizer,
+            MAX_SESSION_REQUEST_IDS,
+        );
+        assert_eq!(
+            compensation_authorizer
+                .authorize_compensation(compensation_request(
+                    "compensation-over-limit",
+                    binding,
+                    ToolPayload::Json(json!({"undo": "release"})),
+                ))
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(compensation_authorizer.compensations_for("math.add"), 0);
+        assert!(compensation_authorizer.compensation_identities.is_empty());
+        assert_eq!(
+            compensation_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+    }
+
+    #[test]
+    fn result_validation_remains_available_after_request_identity_capacity_is_reached() {
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-1",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        fill_authorizer_request_identity_capacity(&mut authorizer, MAX_SESSION_REQUEST_IDS - 1);
+
+        authorizer
+            .validate_result(
+                &authorized,
+                &ToolResult::new(
+                    "session-1",
+                    "request-1",
+                    ToolPayload::Json(json!({"total": 42})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(authorizer.completed_request_ids.contains("request-1"));
+        assert_eq!(authorizer.seen_request_ids.len(), MAX_SESSION_REQUEST_IDS);
+    }
+
+    #[test]
+    fn durable_result_validation_remains_available_after_request_identity_capacity_is_reached() {
+        let mut operation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let operation = operation_request(
+            "operation-request-1",
+            "operation-1",
+            ToolPayload::Json(json!({"left": 20, "right": 22})),
+        );
+        let authorized_operation = operation_authorizer
+            .authorize_operation(operation.clone())
+            .unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut operation_authorizer,
+            MAX_SESSION_REQUEST_IDS - 1,
+        );
+        operation_authorizer
+            .validate_operation_result(
+                &authorized_operation,
+                &OperationReconcileResult::new(
+                    "session-1",
+                    "operation-request-1",
+                    "math.add",
+                    "operation-1",
+                    OperationStatus::Running,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(operation_authorizer
+            .completed_request_ids
+            .contains("operation-request-1"));
+        assert_eq!(
+            operation_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+
+        let mut reconciliation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let reconciliation = OperationReconcileRequest::new(
+            "session-1",
+            "reconcile-request-target",
+            "math.add",
+            "operation-1",
+        )
+        .unwrap();
+        let authorized_reconciliation = reconciliation_authorizer
+            .authorize_reconciliation(reconciliation.clone())
+            .unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut reconciliation_authorizer,
+            MAX_SESSION_REQUEST_IDS - 1,
+        );
+        reconciliation_authorizer
+            .validate_reconciliation_result(
+                &authorized_reconciliation,
+                &OperationReconcileResult::new(
+                    "session-1",
+                    "reconcile-request-target",
+                    "math.add",
+                    "operation-1",
+                    OperationStatus::Running,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(reconciliation_authorizer
+            .completed_request_ids
+            .contains("reconcile-request-target"));
+        assert_eq!(
+            reconciliation_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+
+        let grant = compensation_grant();
+        let binding = compensation_binding(&grant);
+        let mut compensation_authorizer =
+            SessionAuthorizer::new(CapabilityManifest::new("session-1", vec![grant]).unwrap())
+                .unwrap();
+        let compensation = compensation_request(
+            "compensation-request-target",
+            binding.clone(),
+            ToolPayload::Json(json!({"undo": "release"})),
+        );
+        let authorized_compensation = compensation_authorizer
+            .authorize_compensation(compensation)
+            .unwrap();
+        fill_authorizer_request_identity_capacity(
+            &mut compensation_authorizer,
+            MAX_SESSION_REQUEST_IDS - 1,
+        );
+        compensation_authorizer
+            .validate_compensation_result(
+                &authorized_compensation,
+                &OperationCompensationResult::new(
+                    "session-1",
+                    "compensation-request-target",
+                    binding,
+                    OperationStatus::Succeeded {
+                        payload: ToolPayload::Json(json!({"undone": true})),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(compensation_authorizer
+            .completed_request_ids
+            .contains("compensation-request-target"));
+        assert_eq!(
+            compensation_authorizer.seen_request_ids.len(),
+            MAX_SESSION_REQUEST_IDS
+        );
+    }
+
+    #[test]
+    fn duplicate_request_precedes_request_identity_capacity_rejection() {
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        fill_authorizer_request_identity_capacity(&mut authorizer, MAX_SESSION_REQUEST_IDS);
+
+        assert_eq!(
+            authorizer
+                .authorize_reconciliation(
+                    OperationReconcileRequest::new(
+                        "session-1",
+                        "reconcile-request-0",
+                        "math.add",
+                        "operation-1",
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            ProtocolError::DuplicateRequest("reconcile-request-0".to_owned())
+        );
+    }
+
+    #[test]
+    fn compensation_retransmission_at_request_identity_capacity_preserves_its_budget() {
+        let grant = compensation_grant();
+        let binding = compensation_binding(&grant);
+        let mut authorizer =
+            SessionAuthorizer::new(CapabilityManifest::new("session-1", vec![grant]).unwrap())
+                .unwrap();
+        authorizer
+            .authorize_compensation(compensation_request(
+                "compensation-request-1",
+                binding.clone(),
+                ToolPayload::Json(json!({"undo": "release"})),
+            ))
+            .unwrap();
+        fill_authorizer_request_identity_capacity(&mut authorizer, MAX_SESSION_REQUEST_IDS - 1);
+
+        assert_eq!(
+            authorizer
+                .authorize_compensation(compensation_request(
+                    "compensation-request-2",
+                    binding,
+                    ToolPayload::Json(json!({"undo": "release"})),
+                ))
+                .unwrap_err(),
+            ProtocolError::SessionRequestLimitExceeded {
+                maximum: MAX_SESSION_REQUEST_IDS,
+            }
+        );
+        assert_eq!(authorizer.compensations_for("math.add"), 1);
+        assert_eq!(authorizer.compensation_identities.len(), 1);
+        assert_eq!(authorizer.seen_request_ids.len(), MAX_SESSION_REQUEST_IDS);
     }
 
     #[test]

@@ -36,6 +36,16 @@ remains valid and grants no tool authority. A host that needs more must split
 work across separately approved worker sessions rather than expand one session
 manifest.
 
+`SessionAuthorizer` also retains at most 1,024 unique ordinary, cancellation,
+durable-operation, reconciliation, and compensation identifiers for a session.
+The limit is checked before it reserves a new ID, so rejection does not consume
+an ordinary-call or compensation budget or create cancellation state. A host
+that needs more requests must open a fresh, separately approved session; this
+is a retained replay-identity bound, not a worker lifetime, transport-frame,
+or adapter-effect quota. A fresh session cannot cancel an invocation from an
+exhausted session; the cancellation rule below requires one unused identity
+slot for each invocation that may need cooperative cancellation.
+
 Resource selectors have a kind (`file_root`, `executable`, `network_origin`,
 or `secret`) plus an opaque identifier. They are not paths, command lines, DNS
 names, or secret values. The policy host maps each selector to a real resource
@@ -132,8 +142,9 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
    bootstrap before it returns the worker pipes.
 3. The host sends an authenticated `open_session` frame. Before dispatching
    `invoke`, it calls `authorize`; this checks the session, request ID
-   uniqueness, envelope format, byte limit, and call budget. Call budget is
-   consumed before dispatch.
+   uniqueness, retained session-identity capacity, envelope format, byte
+   limit, and call budget. Call budget is consumed only after the ID is
+   reserved and before dispatch.
 4. The worker resolves opaque selectors through its backend policy and runs
    the adapter.
 5. The host opens the authenticated matching `result` frame and validates it
@@ -151,6 +162,13 @@ repeats the exact session, target request ID, and tool. It contains no tool
 input, `ExternalToolId`, path, executable, origin, secret, or new capability.
 The host and worker independently bind it to the already authorized invocation.
 Only one cancellation request is admitted for a target.
+
+The cancellation ID consumes one of the same 1,024 retained identity slots. A
+host that may cancel an in-flight invocation must preserve one unused slot
+before dispatching it. Once all slots are retained, a fresh session cannot
+cancel work in the exhausted session; the host must use its containment
+lifecycle policy and treat any stopped effect as requiring the normal
+indeterminate-effect/reconciliation path.
 
 The worker returns one of three dispositions:
 

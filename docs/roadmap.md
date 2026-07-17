@@ -92,8 +92,9 @@
   enforcement across deferred continuation and workflow resume, including
   ordered per-step attenuation for LLM-generated plans and host-owned named
   policy bindings that issue those leases only at approval time.
-- Portable worker protocol with capability attenuation, a fixed 128-grant
-  session-manifest ceiling, and bounded wire messages.
+- Portable worker protocol with capability attenuation, fixed 128-grant
+  session-manifest and 1,024 retained-request-identity ceilings, and bounded
+  wire messages.
 - Stable host-side tool catalog with bounded LLM metadata and configurable
   aggregate descriptor-count and serialized-byte limits.
 - Bounded executable JSON input/output contracts for local and worker tools.
