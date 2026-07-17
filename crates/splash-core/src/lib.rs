@@ -2613,6 +2613,15 @@ mod tests {
     }
 
     #[test]
+    fn vm_compatibility_preflight_accepts_numeric_separators_without_panicking() {
+        let report =
+            check_vm_compatibility_named("legacy.splash", "1_000", ExecutionLimits::default())
+                .unwrap();
+
+        assert!(report.valid, "{:?}", report.diagnostics);
+    }
+
+    #[test]
     fn vm_compatibility_preflight_accepts_legacy_source_at_the_exact_token_limit() {
         let limits = ExecutionLimits {
             max_syntax_tokens: 4,

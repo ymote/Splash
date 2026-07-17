@@ -80,3 +80,18 @@ instead of panicking during compatibility preflight.
 Upstream-sync note: this local safety patch is carried against the pinned
 `makepad/makepad dev` import and must be reapplied or retired when that import
 is next synchronized.
+
+## `platform/script`: malformed numeric-boundary tokenizer state
+
+The inherited tokenizer ignores underscores inside numeric literals, but it
+moved to whitespace while retaining the buffered number. A following
+separator, including Splash's terminal preflight marker, then reached
+`emit_separator` with stale text and panicked. Splash retains the numeric state
+across the separator so later digits remain part of the same literal and a
+separator flushes it through the normal number path. Focused tokenizer and
+compatibility-preflight regressions cover integer, fractional, exponent, and
+terminal-marker paths.
+
+Upstream-sync note: this local safety patch is carried against the pinned
+`makepad/makepad dev` import and must be reapplied or retired when that import
+is next synchronized.

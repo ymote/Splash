@@ -972,8 +972,9 @@ impl ScriptTokenizer {
                         self.emit_f16();
                         self.state = State::Whitespace
                     } else if c == '_' {
-                        // skip these
-                        self.state = State::Whitespace
+                        // Numeric separators stay in the literal. Moving to whitespace here
+                        // left `temp` stale and let a later separator panic.
+                        continue;
                     } else if c == '$' || c.is_alphabetic() {
                         self.emit_f64();
                         self.state = State::Identifier;
@@ -1072,5 +1073,25 @@ mod tests {
         tokenizer.tokenize("\u{540d} ", &mut heap);
 
         assert_eq!(tokenizer.tokens.len(), 1);
+    }
+
+    #[test]
+    fn numeric_underscores_stay_in_the_pending_number_until_a_separator() {
+        let mut heap = ScriptHeap::default();
+        let mut tokenizer = ScriptTokenizer::default();
+
+        tokenizer.tokenize("0_;1_000;1.5_;1e2_;", &mut heap);
+
+        assert_eq!(tokenizer.tokens.len(), 8);
+        assert_eq!(tokenizer.tokens[0].token.as_u40(), Some(0));
+        assert_eq!(tokenizer.tokens[2].token.as_u40(), Some(1_000));
+        assert_eq!(tokenizer.tokens[4].token.as_f64(), Some(1.5));
+        assert_eq!(tokenizer.tokens[6].token.as_f64(), Some(100.0));
+        for separator in [1, 3, 5, 7] {
+            assert!(matches!(
+                tokenizer.tokens[separator].token,
+                ScriptToken::Separator(_)
+            ));
+        }
     }
 }
