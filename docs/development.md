@@ -35,8 +35,9 @@ The separate `Sustained Fuzzing` workflow runs daily and can be started
 manually from GitHub Actions. It gives the differential `syntax` target and
 the bounded `execution` target ten minutes each, the source-only
 `lsp_document` target two minutes, and the variable-limit `execution_limits`
-target three minutes, all with per-input timeout and RSS ceilings. A failure
-uploads its ignored `fuzz/artifacts` directory for 14 days.
+target and no-spawn `bubblewrap_policy` target three minutes each, all with
+per-input timeout and RSS ceilings. A failure uploads its ignored
+`fuzz/artifacts` directory for 14 days.
 
 Triage a downloaded crash before adding it to the repository:
 
@@ -47,10 +48,10 @@ RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz tmin --sanitizer none syntax artif
 ```
 
 Then add a focused unit or integration regression and, when it improves the
-campaign, a reviewed text or JSON seed under `fuzz/corpus`. Do not commit raw
-generated corpus entries or `fuzz/artifacts`; they can include unreviewed
-input and are intentionally ignored. Keep vendor parser fixes documented in
-`vendor/makepad/PATCHES.md`.
+campaign, a reviewed text, JSON, or `.seed` input under `fuzz/corpus`. Do not
+commit raw generated corpus entries or `fuzz/artifacts`; they can include
+unreviewed input and are intentionally ignored. Keep vendor parser fixes
+documented in `vendor/makepad/PATCHES.md`.
 
 ## Language server
 
@@ -254,7 +255,7 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has twelve bounded targets. `syntax` differentially
+The standalone `fuzz` package has thirteen bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser under a rotating set
 of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
 to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also
@@ -311,7 +312,20 @@ refuse a later `set_limits` request so the continuation keeps its original
 resource contract. A completed evaluation must accept the replacement profile.
 The target collects the VM after each case and never installs an adapter or
 capability. Its reviewed `.splash` seeds cover a cooperative budget yield and a
-tight instruction limit. `workflow_draft` feeds
+tight instruction limit. `bubblewrap_policy` maps at most 64 fuzz bytes onto
+only host-derived Bubblewrap and runtime paths, host-authored file-root
+registrations, private tmpfs modes, aggregate tmpfs limits, and opaque manifest
+selectors. It never calls `spawn` or launches Bubblewrap. The target asserts
+that every modeled unsafe configuration fails compilation: an unknown or
+unsupported resource, an active writable host root under bounded-write mode,
+missing user-namespace lockdown for that mode, unbounded private `/tmp` where
+a bound is required, or bounded tmpfs capacity above the selected aggregate
+maximum.
+For a successful plan it verifies exact manifest retention, the fixed
+networkless/cleared-environment/capability-drop arguments, and selection of
+only the requested roots. Its reviewed `.seed` corpus covers ordinary,
+bounded, accepted and rejected aggregate, and unsupported-resource
+configurations. `workflow_draft` feeds
 bounded UTF-8 JSON into the data-only `WorkflowDraft` decoder, then checks that
 every accepted draft
 round-trips through the current wire format and produces exactly one review
@@ -375,10 +389,11 @@ successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all twelve targets and performs a short 128-run coverage-only smoke
-pass with `--sanitizer none`, plus a separate short AddressSanitizer campaign
-for the LSP document lifecycle. Run the longer local commands below with the
-default sanitizer whenever the platform supports it.
+CI compiles all thirteen targets and performs a short 128-run coverage-only
+smoke pass with `--sanitizer none`, plus separate short AddressSanitizer
+campaigns for the LSP document lifecycle and Bubblewrap policy compiler. Run
+the longer local commands below with the default sanitizer whenever the
+platform supports it.
 
 Install `cargo-fuzz` once, then run the target with nightly Rust:
 
@@ -389,6 +404,7 @@ cargo +nightly fuzz run syntax -- -max_total_time=60 -max_len=16384 -dict=dictio
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run bubblewrap_policy -- -max_total_time=60 -max_len=64
 cargo +nightly fuzz run workflow_draft -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run capability_lease -- -max_total_time=60 -max_len=8192
 cargo +nightly fuzz run workflow_external_operation -- -max_total_time=60 -max_len=65536

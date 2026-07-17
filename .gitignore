@@ -32,6 +32,9 @@ vendor/makepad/target/
 !/fuzz/corpus/durable_cross_stream_telemetry/
 /fuzz/corpus/durable_cross_stream_telemetry/*
 !/fuzz/corpus/durable_cross_stream_telemetry/*.json
+!/fuzz/corpus/bubblewrap_policy/
+/fuzz/corpus/bubblewrap_policy/*
+!/fuzz/corpus/bubblewrap_policy/*.seed
 /fuzz/target/
 *.swp
 .DS_Store

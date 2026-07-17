@@ -69,6 +69,11 @@ jobs:
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none capability_lease --
           -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=8192
         working-directory: fuzz
+      - name: Bubblewrap policy compiler fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none bubblewrap_policy --
+          -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=64
+        working-directory: fuzz
       - name: Workflow draft fuzzing
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none workflow_draft --
