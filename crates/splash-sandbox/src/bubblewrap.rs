@@ -780,7 +780,9 @@ impl BubblewrapWorkerPolicy {
     /// This is shorthand for selecting
     /// [`ExecutableSourceBinding::DescriptorPinned`]. Call
     /// [`Self::pin_mount_sources`] as well; compilation rejects a policy that
-    /// selects this mode without descriptor-pinned runtime roots.
+    /// selects this mode without descriptor-pinned runtime roots. The fixed
+    /// executable sources must also be readable so Splash can retain a
+    /// launchable descriptor for `/proc/self/fd` execution.
     pub fn pin_executable_sources(&mut self) -> &mut Self {
         self.set_executable_source_binding(ExecutableSourceBinding::DescriptorPinned)
     }
@@ -3543,7 +3545,7 @@ fn pin_executable_source(
     path: &Path,
 ) -> Result<PinnedSourceDescriptor, BubblewrapPolicyError> {
     let (descriptor, file_type, mode) =
-        open_pinned_source(path).map_err(|source| BubblewrapPolicyError::SourceIo {
+        open_pinned_executable(path).map_err(|source| BubblewrapPolicyError::SourceIo {
             field,
             path: path.to_path_buf(),
             source,
@@ -3570,7 +3572,7 @@ fn pin_host_executable_for_spawn(
     path: &Path,
 ) -> Result<CompiledHostExecutable, BubblewrapSpawnError> {
     let (pinned_descriptor, file_type, mode) =
-        open_pinned_source(path).map_err(BubblewrapSpawnError::PinnedExecutableTransport)?;
+        open_pinned_executable(path).map_err(BubblewrapSpawnError::PinnedExecutableTransport)?;
     if !file_type.is_file() || !is_executable_mode(mode) {
         return Err(BubblewrapSpawnError::PinnedExecutableTransport(
             io::Error::new(
@@ -3593,6 +3595,29 @@ fn open_pinned_source(path: &Path) -> io::Result<(PinnedSourceDescriptor, FileTy
     let descriptor = open(
         path,
         OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|source| -> io::Error { source.into() })?;
+    let metadata = fstat(&descriptor).map_err(|source| -> io::Error { source.into() })?;
+    let file_type = FileType::from_raw_mode(metadata.st_mode);
+    Ok((
+        PinnedSourceDescriptor {
+            descriptor: Arc::new(descriptor),
+        },
+        file_type,
+        metadata.st_mode,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_executable(path: &Path) -> io::Result<(PinnedSourceDescriptor, FileType, u32)> {
+    // Unlike a mount source, a host executable is later launched directly
+    // through `/proc/self/fd`. Linux can reject direct ELF execution through
+    // an `O_PATH` descriptor with `ETXTBSY`, so retain a read-only descriptor
+    // while still refusing symlinks and closing it by default.
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
     .map_err(|source| -> io::Error { source.into() })?;
@@ -4634,6 +4659,35 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"compiled\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_pinned_host_elf_executable_survives_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestDirectory::new();
+        let program = root.path().join("program");
+        fs::copy(fs::canonicalize("/usr/bin/true").unwrap(), &program).unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let executable = compile_host_executable(
+            "test ELF program",
+            &program,
+            ExecutableSourceBinding::DescriptorPinned,
+        )
+        .unwrap();
+        let retired = root.path().join("program-retired");
+        fs::rename(&program, retired).unwrap();
+        create_script_executable(&program, "#!/bin/sh\nexit 99\n");
+
+        let (command_path, descriptor) = executable.prepare_for_execution().unwrap();
+        let status = Command::new(command_path).status().unwrap();
+        drop(descriptor);
+
+        assert!(status.success());
     }
 
     #[cfg(not(target_os = "linux"))]

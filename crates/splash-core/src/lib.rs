@@ -17,10 +17,11 @@ pub use makepad_script as vm;
 #[cfg(any(fuzzing, test))]
 use profile::check_canonical_profile;
 use profile::{
-    collect_lexical_completions, collect_lexical_symbols, collect_module_imports,
-    collect_static_record_shapes, collect_tool_call_hints, collect_top_level_declarations,
-    format_canonical_source, is_canonical_identifier as profile_is_canonical_identifier,
-    lower_canonical_source_for_vm, ProfileFormatError, ProfileReport,
+    canonical_parser_prefix_end_byte, collect_lexical_completions, collect_lexical_symbols,
+    collect_module_imports, collect_static_record_shapes, collect_tool_call_hints,
+    collect_top_level_declarations, format_canonical_source,
+    is_canonical_identifier as profile_is_canonical_identifier, lower_canonical_source_for_vm,
+    ProfileFormatError, ProfileReport,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -1228,7 +1229,7 @@ pub fn lexical_completion_report_named(
     limits: ExecutionLimits,
 ) -> Result<LexicalCompletionReport, RuntimeError> {
     let syntax = check_syntax_named(file, source, limits)?;
-    let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
+    let valid_prefix_end_byte = source_metadata_prefix_end_byte(source, &syntax, limits);
 
     Ok(collect_lexical_completions(
         source,
@@ -1253,7 +1254,7 @@ pub fn module_import_report_named(
     limits: ExecutionLimits,
 ) -> Result<ModuleImportReport, RuntimeError> {
     let syntax = check_syntax_named(file, source, limits)?;
-    let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
+    let valid_prefix_end_byte = source_metadata_prefix_end_byte(source, &syntax, limits);
 
     Ok(collect_module_imports(
         source,
@@ -1277,7 +1278,7 @@ pub fn static_record_shape_report_named(
     limits: ExecutionLimits,
 ) -> Result<StaticRecordShapeReport, RuntimeError> {
     let syntax = check_syntax_named(file, source, limits)?;
-    let valid_prefix_end_byte = valid_prefix_end_byte(source, &syntax);
+    let valid_prefix_end_byte = source_metadata_prefix_end_byte(source, &syntax, limits);
 
     Ok(collect_static_record_shapes(
         source,
@@ -1460,6 +1461,27 @@ fn valid_prefix_end_byte(source: &str, syntax: &SyntaxReport) -> usize {
                 .map(|byte| first_byte.min(byte))
         })
         .unwrap_or(0)
+}
+
+fn source_metadata_prefix_end_byte(
+    source: &str,
+    syntax: &SyntaxReport,
+    limits: ExecutionLimits,
+) -> usize {
+    if syntax.valid {
+        return source.len();
+    }
+
+    let syntax_prefix_end_byte = valid_prefix_end_byte(source, syntax);
+    if syntax_prefix_end_byte == 0 {
+        return 0;
+    }
+
+    syntax_prefix_end_byte.min(canonical_parser_prefix_end_byte(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+    ))
 }
 
 fn source_byte_at_position(source: &str, line: usize, column: usize) -> Option<usize> {
@@ -3038,6 +3060,36 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
         assert_eq!(
             &source[import.binding.start_byte..import.binding.end_byte],
             "worker"
+        );
+    }
+
+    #[test]
+    fn source_metadata_stops_at_parser_diagnostics_masked_by_later_lexer_errors() {
+        let source = "let before = {value: 1}\n\
+                      use mod.before\n\
+                      use mod. . worker\n\
+                      let after = {value: 2}\n\
+                      \u{001d}";
+        let expected_prefix = source
+            .find(". .")
+            .expect("source contains the malformed path")
+            + 2;
+
+        let completions =
+            lexical_completion_report(source).expect("source is within default limits");
+        assert_eq!(completions.valid_prefix_end_byte, expected_prefix);
+
+        let imports = module_import_report(source).expect("source is within default limits");
+        assert_eq!(imports.valid_prefix_end_byte, expected_prefix);
+        assert_eq!(imports.imports.len(), 1);
+        assert_eq!(imports.imports[0].path, ["mod", "before"]);
+
+        let shapes = static_record_shape_report(source).expect("source is within default limits");
+        assert_eq!(shapes.valid_prefix_end_byte, expected_prefix);
+        assert_eq!(shapes.shapes.len(), 1);
+        assert_eq!(
+            &source[shapes.shapes[0].binding.start_byte..shapes.shapes[0].binding.end_byte],
+            "before"
         );
     }
 

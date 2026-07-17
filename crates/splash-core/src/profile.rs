@@ -140,6 +140,21 @@ pub(super) fn collect_lexical_completions(
     }
 }
 
+/// Finds the earliest canonical-parser diagnostic in the bounded token stream.
+///
+/// The lexer reports invalid characters before the parser runs during normal
+/// syntax admission. Source metadata still needs the earliest boundary when a
+/// later lexer error would otherwise hide an earlier parser error.
+pub(super) fn canonical_parser_prefix_end_byte(
+    source: &str,
+    max_tokens: usize,
+    max_nesting: usize,
+) -> usize {
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    CanonicalParser::new(tokens, max_nesting).prefix_end_byte(source.len())
+}
+
 /// Extracts complete import declarations from the bounded canonical token
 /// stream. The caller supplies the syntax-safe prefix boundary so this can
 /// support incomplete editor snapshots without treating later recovery tokens
@@ -1630,6 +1645,7 @@ struct CanonicalParser {
     maximum_nesting: usize,
     diagnostics: Vec<SyntaxDiagnostic>,
     diagnostics_truncated: bool,
+    first_diagnostic_byte: Option<usize>,
     symbols: Option<SymbolCollector>,
     imports: Option<ModuleImportCollector>,
     static_record_shapes: Option<StaticRecordShapeCollector>,
@@ -1645,6 +1661,7 @@ impl CanonicalParser {
             maximum_nesting,
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
+            first_diagnostic_byte: None,
             symbols: None,
             imports: None,
             static_record_shapes: None,
@@ -1658,6 +1675,11 @@ impl CanonicalParser {
             diagnostics: self.diagnostics,
             diagnostics_truncated: self.diagnostics_truncated,
         }
+    }
+
+    fn prefix_end_byte(mut self, source_end_byte: usize) -> usize {
+        self.parse_program();
+        self.first_diagnostic_byte.unwrap_or(source_end_byte)
     }
 
     fn lower_for_vm(mut self, source: &str) -> Result<LoweredCanonicalSource, ProfileReport> {
@@ -2590,19 +2612,35 @@ impl CanonicalParser {
     }
 
     fn report_current(&mut self, message: impl Into<String>) {
-        let token = self.current();
-        self.report(token.line, token.column, message);
+        let (line, column, start_byte) = {
+            let token = self.current();
+            (token.line, token.column, token.start_byte)
+        };
+        self.report(line, column, start_byte, message);
     }
 
     fn report_previous(&mut self, message: impl Into<String>) {
-        let token = self
-            .tokens
-            .get(self.index.saturating_sub(1))
-            .unwrap_or(self.current());
-        self.report(token.line, token.column, message);
+        let (line, column, start_byte) = {
+            let token = self
+                .tokens
+                .get(self.index.saturating_sub(1))
+                .unwrap_or(self.current());
+            (token.line, token.column, token.start_byte)
+        };
+        self.report(line, column, start_byte, message);
     }
 
-    fn report(&mut self, line: usize, column: usize, message: impl Into<String>) {
+    fn report(
+        &mut self,
+        line: usize,
+        column: usize,
+        start_byte: usize,
+        message: impl Into<String>,
+    ) {
+        self.first_diagnostic_byte = Some(
+            self.first_diagnostic_byte
+                .map_or(start_byte, |current| current.min(start_byte)),
+        );
         if self.diagnostics.len() < MAX_SYNTAX_DIAGNOSTICS {
             self.diagnostics.push(SyntaxDiagnostic {
                 line,
