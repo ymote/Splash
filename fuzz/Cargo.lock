@@ -343,6 +343,7 @@ dependencies = [
  "splash-core",
  "splash-protocol",
  "splash-schema",
+ "splash-storage",
 ]
 
 [[package]]

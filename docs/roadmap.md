@@ -43,7 +43,8 @@
   binding, host-owned input/per-step output schema contracts, context and
   contract digest-only checkpoints, and a sealed mobile/embedded facade.
 - Deny-by-default, audited string-tool bridge with a bounded in-memory audit
-  view, contiguous cursor-safe host export, and explicit eviction count.
+  view, contiguous cursor-safe host export, explicit eviction count, and an
+  opt-in authenticated durable audit journal for host-owned replay.
 - Bounded, host-pumped deferred tool promises.
 - Bounded host-owned fixed-file catalog capability for descriptor-pinned,
   regular UTF-8 text files selected at setup and addressed only by opaque IDs;
@@ -213,6 +214,6 @@
   type-aware field semantics.
 - Sustained parser/VM differential fuzzing, expanded resource-exhaustion
   coverage, and corpus triage.
-- Centralized event retention/aggregation and product-specific compensation
+- Cross-stream event retention/aggregation and product-specific compensation
   action policies.
 - Independent security review of effectful adapters.

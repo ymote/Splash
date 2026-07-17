@@ -20,6 +20,7 @@ splash-core = { path = "../splash-core" }
 splash-protocol = { version = "0.1.0", path = "../splash-protocol" }
 splash-sandbox = { version = "0.1.0", path = "../splash-sandbox", optional = true }
 splash-schema = { version = "0.1.0", path = "../splash-schema" }
+splash-storage = { version = "0.1.0", path = "../splash-storage", optional = true }
 splash-worker = { version = "0.1.0", path = "../splash-worker", optional = true }
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"], optional = true }
 zeroize = { version = "1.9.0", optional = true }
@@ -30,3 +31,4 @@ in-process-worker = ["dep:splash-worker"]
 json-line-worker = []
 http-endpoint-catalog = ["dep:ureq", "dep:zeroize"]
 platform-keyring-secret-resolver = ["http-endpoint-catalog", "dep:keyring"]
+durable-audit-journal = ["dep:splash-storage"]

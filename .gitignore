@@ -20,6 +20,9 @@ vendor/makepad/target/
 !/fuzz/corpus/workflow_event_journal/
 /fuzz/corpus/workflow_event_journal/*
 !/fuzz/corpus/workflow_event_journal/*.json
+!/fuzz/corpus/capability_audit_journal/
+/fuzz/corpus/capability_audit_journal/*
+!/fuzz/corpus/capability_audit_journal/*.json
 /fuzz/target/
 *.swp
 .DS_Store

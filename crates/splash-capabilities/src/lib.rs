@@ -19,7 +19,7 @@ use makepad_script::{
     LiveId, ScriptHandle, ScriptHandleGc, ScriptHandleType, ScriptIp, ScriptThreadId, ScriptValue,
     NIL,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
 pub use splash_protocol::{
@@ -43,6 +43,13 @@ pub mod bounded_worker;
 
 /// Bounded host-owned text files exposed only through opaque identifiers.
 pub mod fixed_file_catalog;
+
+/// Authenticated bounded persistence for exported capability audit telemetry.
+///
+/// The journal is host-only observability. It never grants a capability,
+/// recreates an external operation, or proves an adapter effect.
+#[cfg(feature = "durable-audit-journal")]
+pub mod durable_audits;
 
 /// Bounded host-owned HTTP endpoints exposed only through opaque identifiers.
 #[cfg(feature = "http-endpoint-catalog")]
@@ -109,6 +116,24 @@ pub const DEFAULT_MAX_AUDIT_EVENTS: usize = 1_024;
 /// Use a smaller host-selected value on constrained targets and export entries
 /// to durable storage when retention beyond this in-process window is needed.
 pub const MAX_AUDIT_EVENTS: usize = 8_192;
+/// Format version for persisted capability-audit journals.
+#[cfg(feature = "durable-audit-journal")]
+pub const CAPABILITY_AUDIT_JOURNAL_FORMAT_VERSION: u8 = 1;
+/// Maximum audit records retained by one durable capability-audit journal.
+///
+/// The separate serialized-byte cap can retain fewer records when an audit
+/// record has the largest permitted tool label and numeric fields.
+#[cfg(feature = "durable-audit-journal")]
+pub const MAX_DURABLE_CAPABILITY_AUDIT_EVENTS: usize = 1_024;
+/// Maximum serialized payload for one durable capability-audit journal.
+///
+/// This leaves headroom below one authenticated storage payload and prevents
+/// audit telemetry from consuming a host record's entire capacity.
+#[cfg(feature = "durable-audit-journal")]
+pub const MAX_DURABLE_CAPABILITY_AUDIT_JOURNAL_BYTES: usize = 192 * 1024;
+/// Bounded optimistic compare-and-swap retries for a capability-audit store.
+#[cfg(feature = "durable-audit-journal")]
+pub const MAX_DURABLE_CAPABILITY_AUDIT_STORE_RETRIES: usize = 4;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 32 * 1024;
 pub const DEFAULT_MAX_STREAM_CHUNKS: usize = 64;
@@ -180,7 +205,7 @@ pub enum ToolDispatch {
 }
 
 /// Host-side classification for a failure that may be retried externally.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryClass {
     /// A temporary transport or service failure.
@@ -1175,7 +1200,7 @@ impl Display for ToolRegistrationError {
 
 impl std::error::Error for ToolRegistrationError {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditOutcome {
     Allowed,

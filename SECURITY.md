@@ -501,11 +501,19 @@ range, ordered by a distinct per-record `event_sequence`; it rejects a cursor
 overtaken by eviction or `clear_audit` rather than silently returning a partial
 history. The older `sequence` field correlates one invocation and can repeat
 across retries, cancellation, or streaming, so it is not an export cursor.
-Hosts that need complete retention must export batches to a separate
-authenticated durable sink and surface an export gap. A retained view, its
-sequences, its loss counter, and a successful export are not an authorization
-decision, durable record, effect proof, or permission to resume a workflow.
-See [capability audit export](docs/capability-audits.md).
+Hosts that need complete retention must surface an export gap and use a
+separate authenticated durable sink. The optional
+`splash_capabilities::durable_audits::CapabilityAuditStore` supplies one
+bounded sink for runtime-exported batches: it validates the data-only audit
+shape, requires contiguous source sequences, deduplicates exact retained
+overlap, rejects retention gaps and conflicts, and writes through the supplied
+rollback-protected store's compare-and-swap boundary. Its 1,024-event and
+192 KiB limits are independent of the in-memory view. `VolatileMemoryStore`
+is development-only; an ordinary key-value store that cannot prevent rollback
+does not meet this contract. A retained view, its sequences, its loss counter,
+and a successful export are not an authorization decision, durable record,
+effect proof, or permission to resume a workflow. See [capability audit
+export](docs/capability-audits.md).
 
 `splash_workflow::durable_events::WorkflowEventStore` provides one bounded
 authenticated workflow-telemetry journal for host-owned operator/audit replay.

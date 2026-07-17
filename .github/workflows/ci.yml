@@ -65,6 +65,10 @@ jobs:
           -runs=128 -max_len=196608
         working-directory: fuzz
       - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none capability_audit_journal --
+          -runs=128 -max_len=196608
+        working-directory: fuzz
+      - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none json_line_worker --
           -runs=128 -max_len=1048578
         working-directory: fuzz

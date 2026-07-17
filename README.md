@@ -45,9 +45,10 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded LLM-facing tool catalog with aggregate descriptor-count and
   serialized-byte limits in addition to per-tool metadata and schema bounds.
 - Cursor-safe bounded capability-audit export and workflow-event views with
-  explicit eviction counters, plus an authenticated durable workflow-event
-  journal for host-owned operator/audit replay that remains separate from
-  workflow authority.
+  explicit eviction counters, plus an opt-in authenticated durable
+  capability-audit journal and authenticated workflow-event journal for
+  host-owned operator/audit replay that remain separate from workflow
+  authority.
 - Audited tool calls with input/output and call-count limits.
 - Bounded executable JSON contracts for structured tool inputs and outputs.
 - Schema-required Serde bridges for reviewed Rust input and output types.
@@ -440,11 +441,11 @@ a partial set.
 ## Workspace
 
 - `splash-core`: bounded VM wrapper and diagnostics.
-- `splash-capabilities`: explicit tool policy, cursor-safe bounded audit export,
-  deferred promises, LLM-facing host catalog, approval-bound capability leases,
-  JSON contracts, fixed-file and feature-gated fixed-endpoint catalogs,
-  aggregate catalog limits, safe host bridge, and a sealed static-catalog
-  mobile/embedded profile.
+- `splash-capabilities`: explicit tool policy, cursor-safe bounded audit export
+  with a feature-gated authenticated durable journal, deferred promises,
+  LLM-facing host catalog, approval-bound capability leases, JSON contracts,
+  fixed-file and feature-gated fixed-endpoint catalogs, aggregate catalog
+  limits, safe host bridge, and a sealed static-catalog mobile/embedded profile.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
@@ -499,7 +500,8 @@ telemetry replay boundary, which deliberately remains separate from recovery
 authority.
 
 [Capability audit export](docs/capability-audits.md) defines the contiguous
-host-export cursor and its explicit observability-gap behavior.
+host-export cursor, optional authenticated durable journal, and explicit
+observability-gap behavior.
 
 [Workflow drafts](docs/workflow-drafts.md) define the untrusted LLM-plan
 interchange and review boundary before a host-owned approval.

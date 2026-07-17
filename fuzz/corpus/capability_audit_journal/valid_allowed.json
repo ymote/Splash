@@ -1,0 +1,1 @@
+{"format_version":1,"stream_id":"release-42-attempt-1","segment_start_event_sequence":1,"first_event_sequence":1,"next_event_sequence":2,"dropped_audit_events":0,"events":[{"event_sequence":1,"sequence":0,"tool":"text.echo","input_bytes":5,"output_bytes":5,"outcome":"allowed"}]}

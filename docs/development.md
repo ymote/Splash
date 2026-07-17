@@ -246,13 +246,20 @@ one fixed valid event at the decoded cursor and verifies the bounded retention
 and current-format encoding remain valid. It never creates a capability host,
 runs an adapter, or treats telemetry as execution authority. Its tracked JSON
 seeds cover a valid journal and an invalid sequence boundary.
+`capability_audit_journal` feeds bounded UTF-8 documents into the optional
+durable capability-audit journal decoder. Every accepted journal must re-encode
+and round-trip under its maximum retention capacity; a second data-derived
+capacity exercises the decoder's bounded-retention rejection path. It never
+creates a capability runtime, runs an adapter, or treats telemetry as execution
+authority. Its tracked JSON seeds cover a valid allowed audit event and an
+inconsistent retention boundary.
 `json_line_worker` feeds bounded arbitrary bytes through small, variable
 `BufReader` capacities, optionally appends a line terminator, and attempts two
 successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all seven targets and performs a short 128-run coverage-only smoke pass
+CI compiles all eight targets and performs a short 128-run coverage-only smoke pass
 with `--sanitizer none`. Run the longer local commands below with the default
 sanitizer whenever the platform supports it.
 
@@ -267,6 +274,7 @@ cargo +nightly fuzz run workflow_draft -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run capability_lease -- -max_total_time=60 -max_len=8192
 cargo +nightly fuzz run workflow_external_operation -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run workflow_event_journal -- -max_total_time=60 -max_len=196608
+cargo +nightly fuzz run capability_audit_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run json_line_worker -- -max_total_time=60 -max_len=1048578
 ```
 
@@ -282,6 +290,7 @@ cargo +nightly fuzz run --sanitizer none workflow_draft -- -max_total_time=60 -m
 cargo +nightly fuzz run --sanitizer none capability_lease -- -max_total_time=60 -max_len=8192
 cargo +nightly fuzz run --sanitizer none workflow_external_operation -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run --sanitizer none workflow_event_journal -- -max_total_time=60 -max_len=196608
+cargo +nightly fuzz run --sanitizer none capability_audit_journal -- -max_total_time=60 -max_len=196608
 cargo +nightly fuzz run --sanitizer none json_line_worker -- -max_total_time=60 -max_len=1048578
 ```
 
@@ -294,5 +303,6 @@ cargo +nightly fuzz run workflow_draft artifacts/workflow_draft/<artifact>
 cargo +nightly fuzz run capability_lease artifacts/capability_lease/<artifact>
 cargo +nightly fuzz run workflow_external_operation artifacts/workflow_external_operation/<artifact>
 cargo +nightly fuzz run workflow_event_journal artifacts/workflow_event_journal/<artifact>
+cargo +nightly fuzz run capability_audit_journal artifacts/capability_audit_journal/<artifact>
 cargo +nightly fuzz run json_line_worker artifacts/json_line_worker/<artifact>
 ```

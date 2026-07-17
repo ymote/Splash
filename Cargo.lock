@@ -681,6 +681,7 @@ dependencies = [
  "splash-protocol",
  "splash-sandbox",
  "splash-schema",
+ "splash-storage",
  "splash-worker",
  "ureq",
  "zeroize",

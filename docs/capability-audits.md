@@ -34,9 +34,54 @@ if !batch.is_empty() {
 ```
 
 An exact retry by the host can safely export the same batch again when its own
-sink supports idempotency. Splash does not supply a generic durable audit
-store because authenticating storage, selecting retention, and binding an
-operator-visible stream identity are host policy.
+sink supports idempotency. The opt-in
+`splash-capabilities/durable-audit-journal` feature supplies
+`durable_audits::CapabilityAuditStore` for one authenticated, host-owned
+stream. The host still selects the rollback-protected storage backend, record
+key, stream identity, and retention capacity. A host enabling this feature
+also declares a direct `splash-storage` dependency; the storage backend and
+keys are intentionally not re-exported through the scripting crate.
+
+```rust
+use std::num::NonZeroUsize;
+
+use splash_capabilities::durable_audits::{
+    CapabilityAuditStore, CapabilityAuditStreamId,
+};
+use splash_storage::StorageRecordKey;
+
+let stream_id = CapabilityAuditStreamId::new("release-42-attempt-1")?;
+let mut audits = CapabilityAuditStore::new(
+    authenticated_store,
+    StorageRecordKey::new("capability-audits", "release-42-attempt-1")?,
+    stream_id,
+    NonZeroUsize::new(1_024).unwrap(),
+)?;
+let mut cursor = audits
+    .load()?
+    .map_or(1, |persisted| persisted.journal().next_event_sequence());
+
+let batch = runtime.audit_since(cursor)?;
+if !batch.is_empty() {
+    let persisted = audits.append_batch(&batch)?;
+    cursor = persisted.journal().next_event_sequence();
+}
+```
+
+`CapabilityAuditStore` accepts only a nonempty contiguous `AuditEventBatch`.
+It compares a retained exact overlap before writing, so an exact retry is
+idempotent; a source gap, a replay older than its retention window, or a
+contradictory overlap fails closed. Writes use the configured authenticated
+store's compare-and-swap boundary with four bounded retries. Retention is
+bounded to the smaller host-selected event capacity (at most 1,024) and a
+192 KiB serialized document. Store the returned `next_event_sequence` only
+after `append_batch` succeeds.
+
+Use an `AuthenticatedStore<B>` whose `B` genuinely implements the
+rollback-protected storage contract. `VolatileMemoryStore` is only suitable
+for tests and local development. Authentication proves neither that a record
+is secret nor that an external effect completed; encrypt telemetry separately
+when its metadata needs confidentiality.
 
 `AuditEventCursorError::Evicted` means the requested history is no longer
 retained, including after `clear_audit`. Treat that as an observability gap:
@@ -45,6 +90,14 @@ if retention needs to continue. Do not silently advance to the reported
 `earliest_available` value. `AuditEventCursorError::Ahead` means the host
 cursor does not describe the current runtime history; it is not permission to
 invent records. Cursor zero is invalid.
+
+When a fresh durable segment begins at an explicit post-eviction source cursor,
+give it a fresh stream identity and record key, then construct the store with
+`CapabilityAuditStore::new_from_event_sequence` and that nonzero cursor. The
+journal persists this `segment_start_event_sequence` separately from
+`dropped_audit_events`, so missing source history is visible as a segment gap
+rather than being misreported as journal retention eviction. Do not use this
+constructor to skip records in an existing stream.
 
 The bounded `audit()` view and `dropped_audit_events()` remain useful for
 local inspection. They cannot repair an export gap, and neither counter nor
@@ -70,5 +123,6 @@ or compensation action.
 `splash_workflow::mobile::MobileWorkflowRuntime::audit_since` forward the
 same read-only export after setup. They do not expose mutable catalog
 registration, external operation control, or an adapter escape hatch. The
-embedding application remains responsible for its storage, I/O, and platform
-containment policy.
+embedding application may persist the exported batch through the optional
+journal outside the sealed runtime API, and remains responsible for storage,
+I/O, and platform containment policy.

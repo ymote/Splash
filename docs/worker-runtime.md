@@ -385,9 +385,10 @@ adapter is registered. `with_max_audit_events(NonZeroUsize)` sets the bounded
 in-memory audit capacity during setup, up to 8,192 entries. Its ordered audit
 view exposes an eviction counter; `MobileRuntime::audit_since(cursor)` exports
 only contiguous retained records and rejects a cursor overtaken by eviction.
-Export entries to a host-owned durable sink when complete retention is
-required, and treat rejection as an observability gap rather than silently
-skipping history. See [capability audit export](capability-audits.md).
+For durable audit retention, an embedding application can send that export to
+the optional host-owned `CapabilityAuditStore` outside the sealed mobile API.
+Treat a rejected export as an observability gap rather than silently skipping
+history. See [capability audit export](capability-audits.md).
 
 ```rust
 use splash_capabilities::{
