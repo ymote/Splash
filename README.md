@@ -465,7 +465,8 @@ one projected current step and its prior projected output prefix, which filters
 output completion and hover. It may later replace a complete catalog/context
 pair through `workspace/didChangeConfiguration`; a relevant malformed or
 partial refresh makes workflow metadata unavailable rather than retaining a
-stale projection. See [editor workflow-data projection](docs/workflow-data-catalog.md).
+stale projection. A terminal or unavailable runtime state can atomically clear
+both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-data-catalog.md).
 
 ## Workspace
 

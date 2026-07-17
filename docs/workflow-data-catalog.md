@@ -23,12 +23,17 @@ from host-reconstructed counters. A durable host can use
 its separately retained dataflow context.
 
 ```rust
-let Some(projection) = engine.suspended_dataflow_lsp_projection(&plan)? else {
-    return Ok(());
+let splash = if let Some(projection) = engine.suspended_dataflow_lsp_projection(&plan)? {
+    serde_json::to_value(projection)?
+} else {
+    serde_json::json!({
+        "workflowDataCatalog": null,
+        "workflowDataStepContext": null
+    })
 };
 let settings = serde_json::json!({
     "settings": {
-        "splash": projection
+        "splash": splash
     }
 });
 ```
@@ -164,6 +169,25 @@ or partial pair discards the full workflow projection and returns incomplete
 empty workflow matches rather than retaining stale fields. A well-formed
 configuration update with neither workflow key is ignored, so unrelated editor
 settings do not change the current projection.
+
+To explicitly clear a previous projection after a terminal workflow, a
+non-dataflow suspension, or a failed projection build, send both keys with JSON
+`null`. This is a valid atomic clear rather than a malformed replacement:
+
+```json
+{
+  "settings": {
+    "splash": {
+      "workflowDataCatalog": null,
+      "workflowDataStepContext": null
+    }
+  }
+}
+```
+
+One `null` with a non-null or absent peer remains a partial update and fails
+closed. The clear state intentionally returns incomplete empty `workflow`
+matches instead of retaining stale metadata.
 
 The notification is only a delivery path for host metadata. The server does not
 read a workflow engine, plan, checkpoint, or runtime data and cannot verify

@@ -166,6 +166,7 @@ checkpoint, or suspended continuation, but the editor still cannot inspect or
 authorize runtime state. Invalid context discards the full workflow projection.
 A host can atomically replace both values through `workspace/didChangeConfiguration`;
 a partial or malformed relevant refresh also discards the workflow projection.
+Sending both values as JSON `null` explicitly clears a terminal projection.
 See [Editor workflow-data projection](workflow-data-catalog.md) for the exact
 wire shape, limits, and non-authority boundary.
 

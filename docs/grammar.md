@@ -377,7 +377,8 @@ that pair from an exact suspended continuation or validated checkpoint, but the
 LSP remains unable to inspect or authorize runtime state. A host can replace the
 complete pair through `workspace/didChangeConfiguration`; partial or malformed
 relevant updates fail closed instead of retaining stale fields. See [Editor
-workflow-data projection](workflow-data-catalog.md).
+workflow-data projection](workflow-data-catalog.md). Sending both workflow keys
+as JSON `null` explicitly clears a prior projection after terminal state.
 
 Rename does not edit the final segment of a `use` path. For another indexed
 binding it accepts exactly one non-reserved canonical identifier, rewrites the

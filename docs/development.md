@@ -217,7 +217,9 @@ relevant partial or malformed refresh likewise discards the workflow projection
 instead of retaining prior data. The LSP never validates data, loads a schema or
 checkpoint, approves a plan, issues a lease, or authorizes a tool. See [Editor
 workflow-data projection](workflow-data-catalog.md) for the exact wire shape
-and bounds.
+and bounds. A host may explicitly clear a terminal or unavailable projection by
+sending both workflow keys as JSON `null`; one null or a partial pair fails
+closed.
 
 Rename is advertised only when the editor supports versioned
 `documentChanges`. It refuses import path edits and truncated reports, validates

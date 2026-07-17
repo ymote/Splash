@@ -33,7 +33,8 @@
   a validated checkpoint, or exact suspended engine state without serializing
   values, source, approvals, leases, or schema source. The LSP itself remains
   advisory: it does not load schemas/checkpoints, validate values, approve a
-  plan, or grant a capability.
+  plan, or grant a capability. A complete JSON-null pair atomically clears
+  terminal or unavailable metadata instead of retaining stale fields.
 - Bounded direct literal-record field metadata for exact visible
   `let binding = { ... }` initializers, with same-document completion, hover,
   and definition. It is advisory and does not infer aliases, mutation, control

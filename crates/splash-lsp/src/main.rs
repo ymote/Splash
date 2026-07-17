@@ -229,12 +229,14 @@ struct WorkflowDataStepContext {
     unavailable: bool,
 }
 
-/// One optional replacement of the advisory workflow-data metadata received
-/// through `workspace/didChangeConfiguration`. A host must provide a complete
-/// catalog and a structurally valid current-step context together; partial or
-/// malformed relevant settings poison only this advisory projection.
+/// One workflow-data metadata transition received through
+/// `workspace/didChangeConfiguration`. A host must provide a complete catalog
+/// and a structurally valid current-step context together, or explicitly clear
+/// both with `null`; partial or malformed relevant settings poison only this
+/// advisory projection.
 enum WorkflowDataConfigurationUpdate {
     Keep,
+    Clear,
     Replace {
         catalog: WorkflowDataCompletionCatalog,
         step_context: WorkflowDataStepContext,
@@ -343,19 +345,21 @@ impl SplashLanguageServer {
         }
     }
 
-    /// Replaces workflow-only editor metadata after a host configuration
+    /// Refreshes workflow-only editor metadata after a host configuration
     /// update. The parsed value is fully validated before either field changes,
     /// so a reader never observes a mixed catalog/context pair.
     fn refresh_workflow_data_configuration(&mut self, settings: &serde_json::Value) {
-        let WorkflowDataConfigurationUpdate::Replace {
-            catalog,
-            step_context,
-        } = workflow_data_configuration_update_from_settings(settings)
-        else {
-            return;
-        };
-        self.workflow_data_catalog = catalog;
-        self.workflow_data_step_context = step_context;
+        match workflow_data_configuration_update_from_settings(settings) {
+            WorkflowDataConfigurationUpdate::Keep => {}
+            WorkflowDataConfigurationUpdate::Clear => self.invalidate_workflow_data_configuration(),
+            WorkflowDataConfigurationUpdate::Replace {
+                catalog,
+                step_context,
+            } => {
+                self.workflow_data_catalog = catalog;
+                self.workflow_data_step_context = step_context;
+            }
+        }
     }
 
     /// A malformed configuration notification must not leave potentially stale
@@ -1385,6 +1389,12 @@ fn workflow_data_configuration_update_from_settings(
             WorkflowDataConfigurationUpdate::Keep
         };
     };
+    if catalog.is_null() && context.is_null() {
+        return WorkflowDataConfigurationUpdate::Clear;
+    }
+    if catalog.is_null() || context.is_null() {
+        return unavailable_workflow_data_configuration_update();
+    }
 
     let mut catalog = parse_workflow_data_completion_catalog(catalog)
         .unwrap_or_else(unavailable_workflow_data_completion_catalog);
@@ -4712,6 +4722,122 @@ mod tests {
             malformed_params_server
                 .workflow_data_step_context
                 .unavailable
+        );
+    }
+
+    #[test]
+    fn explicit_workflow_data_configuration_clear_is_atomic() {
+        let catalog = workflow_data_catalog(serde_json::json!({
+            "inputFields": [{"name": "left", "type": "integer"}],
+            "outputs": [{"stepId": "prepare", "fields": []}]
+        }));
+        let step_context = workflow_data_step_context_for(
+            serde_json::json!({
+                "currentStepId": "prepare",
+                "completedOutputStepIds": []
+            }),
+            &catalog,
+        );
+        let clear_settings = serde_json::json!({
+            "splash": {
+                "workflowDataCatalog": null,
+                "workflowDataStepContext": null
+            }
+        });
+        assert!(matches!(
+            workflow_data_configuration_update_from_settings(&clear_settings),
+            WorkflowDataConfigurationUpdate::Clear
+        ));
+
+        let partial_clear_settings = serde_json::json!({
+            "splash": {
+                "workflowDataCatalog": null,
+                "workflowDataStepContext": {
+                    "currentStepId": "prepare",
+                    "completedOutputStepIds": []
+                }
+            }
+        });
+        let WorkflowDataConfigurationUpdate::Replace {
+            catalog: partial_catalog,
+            step_context: partial_context,
+        } = workflow_data_configuration_update_from_settings(&partial_clear_settings)
+        else {
+            panic!("a partial clear must fail closed");
+        };
+        assert!(partial_catalog.unavailable);
+        assert!(partial_context.unavailable);
+
+        let source = "workflow.input.";
+        let mut server = SplashLanguageServer::with_workflow_data_catalog_and_step_context(
+            catalog,
+            step_context,
+        );
+        server.open_document(document(1, source));
+        assert_eq!(
+            server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("configured workflow completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["left"]
+        );
+
+        let (server_connection, _client_connection) = Connection::memory();
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: clear_settings,
+                },
+            ),
+        )
+        .expect("explicit workflow clear notification is handled");
+        assert!(server.workflow_data_catalog.unavailable);
+        assert!(server.workflow_data_step_context.unavailable);
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("cleared workflow completion succeeds");
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
+
+        handle_notification(
+            &server_connection,
+            &mut server,
+            Notification::new(
+                DidChangeConfiguration::METHOD.to_owned(),
+                DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "splash": {
+                            "workflowDataCatalog": {
+                                "inputFields": [{"name": "right", "type": "integer"}],
+                                "outputs": [{"stepId": "calculate", "fields": []}]
+                            },
+                            "workflowDataStepContext": {
+                                "currentStepId": "calculate",
+                                "completedOutputStepIds": []
+                            }
+                        }
+                    }),
+                },
+            ),
+        )
+        .expect("replacement after workflow clear is handled");
+        let recovered_completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("recovered workflow completion succeeds");
+        assert!(!recovered_completion.is_incomplete);
+        assert_eq!(
+            recovered_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["right"]
         );
     }
 
