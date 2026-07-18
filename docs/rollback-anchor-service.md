@@ -66,20 +66,42 @@ oversized, noncanonical, or unsupported-version requests, calls the supplied
 redact request bytes, storage keys, states, and backend diagnostics.
 
 It is deliberately not an HTTP/RPC listener, authentication layer,
-authorization policy, cache policy, concurrency primitive, or durable backend.
-The deployment must authenticate and authorize a caller before passing its
-body to `handle_request`, cap the body before buffering it, serialize access as
-required by the chosen backend, and translate handler failures to generic
-non-success responses without exposing backend diagnostics. Successful
-responses must not be cached. `VolatileRollbackAnchor` is suitable for tests
-and local development only; wrapping it in this dispatcher does not create
-durability or rollback protection.
+cache policy, concurrency primitive, or durable backend. A deployment must cap
+the body before buffering it, serialize access as required by the chosen
+backend, and translate handler failures to generic non-success responses
+without exposing backend diagnostics. Successful responses must not be cached.
+`VolatileRollbackAnchor` is suitable for tests and local development only;
+wrapping it in this dispatcher does not create durability or rollback
+protection.
+
+### Authorization Gate
+
+`AuthorizedRollbackAnchorService<A, Z>` wraps the dispatcher with a
+host-owned `RollbackAnchorServiceRequestAuthorizer`. It first decodes the
+bounded canonical request, then asks `Z` to authorize the exact operation and
+record key before it can call the anchor. An authorizer error or denial is a
+generic `Unauthorized` result and never reaches the backend.
+
+`FixedRollbackAnchorServiceAuthorizer` is the built-in static capability
+policy. It accepts at most 128 configured caller IDs and 1,024 exact
+`(caller, operation, record)` grants. A `load` grant does not grant
+`compare_and_swap`; there are no namespace wildcards or implicit write rights.
+The service's authentication middleware must map a successfully authenticated
+principal to `RollbackAnchorServiceCallerId` before invoking
+`handle_authenticated_request`. Caller IDs are host-only opaque identifiers,
+not request fields or bearer credentials.
+
+Dynamic-tenancy services can provide their own authorizer, but it must fail
+closed and must derive the supplied caller from already authenticated transport
+or session state. The gate does not authenticate a caller, provide replay
+protection, select a TLS route, serialize concurrent callers, or make the
+anchor durable.
 
 For a network deployment, terminate TLS and enforce the exact service route in
 trusted server configuration, then place a real atomic, rollback-resistant CAS
 authority behind the dispatcher. A globally authenticated service still needs
 an explicit per-tenant key-authorization policy when more than one tenant can
-address it. The dispatcher cannot infer either policy from a record key.
+address it; the dispatcher cannot infer that policy from a record key.
 
 ## Wire Protocol
 

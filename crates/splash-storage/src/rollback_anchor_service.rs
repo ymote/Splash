@@ -3,16 +3,18 @@
 //! [`TrustedServiceRollbackAnchor`] turns a host-owned
 //! [`RollbackAnchorServiceTransport`] into a [`crate::RollbackAnchor`], while
 //! [`RollbackAnchorService`] dispatches the same bounded wire protocol on a
-//! trusted service. The transport and dispatcher must reach or wrap one
-//! separately trusted authority that durably enforces the documented per-record
-//! compare-and-swap contract. This module validates the wire format, bounds
-//! messages, rejects invalid requested transitions, and detects state
-//! regressions observed during one process lifetime. It does not make an
-//! ordinary HTTPS endpoint, keyring, local cache, or volatile backend rollback
-//! resistant by itself.
+//! trusted service. [`AuthorizedRollbackAnchorService`] can add a host-owned
+//! exact request-authorization gate around that dispatcher. The transport and
+//! dispatcher must reach or wrap one separately trusted authority that durably
+//! enforces the documented per-record compare-and-swap contract. This module
+//! validates the wire format, bounds messages, rejects invalid requested
+//! transitions, and detects state regressions observed during one process
+//! lifetime. It does not make an ordinary HTTPS endpoint, authentication
+//! protocol, keyring, local cache, or volatile backend rollback resistant by
+//! itself.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,8 +22,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    RollbackAnchor, RollbackAnchorCompareAndSwapOutcome, RollbackAnchorState, StorageRecordKey,
-    ROLLBACK_ANCHOR_COMMITMENT_BYTES,
+    is_valid_token, RollbackAnchor, RollbackAnchorCompareAndSwapOutcome, RollbackAnchorState,
+    StorageRecordKey, ROLLBACK_ANCHOR_COMMITMENT_BYTES,
 };
 
 /// Protocol version used by the client and server-side dispatcher.
@@ -30,6 +32,13 @@ pub const ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION: u8 = 1;
 pub const MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES: usize = 4 * 1024;
 /// Maximum JSON bytes accepted for one service response.
 pub const MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES: usize = 4 * 1024;
+/// Maximum byte length of one host-authenticated service caller identifier.
+pub const MAX_ROLLBACK_ANCHOR_SERVICE_CALLER_ID_BYTES: usize = 64;
+/// Maximum callers accepted by [`FixedRollbackAnchorServiceAuthorizer`].
+pub const MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_CALLERS: usize = 128;
+/// Maximum exact operation-and-record grants accepted by
+/// [`FixedRollbackAnchorServiceAuthorizer`].
+pub const MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_GRANTS: usize = 1024;
 
 /// Host-owned transport for one transactional rollback-anchor service request.
 ///
@@ -202,6 +211,271 @@ where
     }
 }
 
+/// One rollback-anchor operation that a service caller may be authorized to
+/// perform for an exact record.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RollbackAnchorServiceOperation {
+    Load,
+    CompareAndSwap,
+}
+
+/// Opaque host-authenticated identity supplied to a rollback-anchor service.
+///
+/// This is a host-side identifier, not a bearer credential or protocol field.
+/// A network deployment must map a successfully authenticated caller to this
+/// value before it calls
+/// [`AuthorizedRollbackAnchorService::handle_authenticated_request`]. Do not
+/// construct it directly from an untrusted request header, path, or body.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RollbackAnchorServiceCallerId(String);
+
+impl RollbackAnchorServiceCallerId {
+    /// Creates a bounded opaque caller identity for trusted service setup.
+    pub fn new(value: impl Into<String>) -> Result<Self, RollbackAnchorServiceCallerIdError> {
+        let value = value.into();
+        if !is_valid_token(&value, MAX_ROLLBACK_ANCHOR_SERVICE_CALLER_ID_BYTES) {
+            return Err(RollbackAnchorServiceCallerIdError::Invalid);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the host-side opaque caller identity.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RollbackAnchorServiceCallerId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RollbackAnchorServiceCallerId([REDACTED])")
+    }
+}
+
+/// Rejection from [`RollbackAnchorServiceCallerId::new`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollbackAnchorServiceCallerIdError {
+    Invalid,
+}
+
+impl Display for RollbackAnchorServiceCallerIdError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("rollback-anchor service caller ID must be a bounded lowercase token")
+    }
+}
+
+impl std::error::Error for RollbackAnchorServiceCallerIdError {}
+
+/// One exact capability grant for the fixed service authorizer.
+///
+/// Each grant covers one authenticated caller, one protocol operation, and one
+/// host-selected durable record. It is configuration data only and never
+/// appears in a client request or response.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RollbackAnchorServiceAccessGrant {
+    caller: RollbackAnchorServiceCallerId,
+    operation: RollbackAnchorServiceOperation,
+    key: StorageRecordKey,
+}
+
+impl RollbackAnchorServiceAccessGrant {
+    /// Creates one exact rollback-anchor service capability grant.
+    pub fn new(
+        caller: RollbackAnchorServiceCallerId,
+        operation: RollbackAnchorServiceOperation,
+        key: StorageRecordKey,
+    ) -> Self {
+        Self {
+            caller,
+            operation,
+            key,
+        }
+    }
+
+    /// Returns the host-authenticated caller selected for this grant.
+    pub fn caller(&self) -> &RollbackAnchorServiceCallerId {
+        &self.caller
+    }
+
+    /// Returns the exact authorized rollback-anchor operation.
+    pub const fn operation(&self) -> RollbackAnchorServiceOperation {
+        self.operation
+    }
+
+    /// Returns the host-selected durable record selected for this grant.
+    pub fn key(&self) -> &StorageRecordKey {
+        &self.key
+    }
+}
+
+impl fmt::Debug for RollbackAnchorServiceAccessGrant {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RollbackAnchorServiceAccessGrant")
+            .field("operation", &self.operation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Host-owned authorization hook for one parsed service request.
+///
+/// `caller` must already be authenticated by the embedding service. The hook
+/// receives only the canonical operation and record identity, never raw wire
+/// bytes or anchor state. Returning any error denies the request; the wrapper
+/// deliberately redacts that error before it reaches an untrusted caller.
+pub trait RollbackAnchorServiceRequestAuthorizer {
+    type AuthenticatedCaller;
+    type Error;
+
+    fn authorize(
+        &self,
+        caller: &Self::AuthenticatedCaller,
+        operation: RollbackAnchorServiceOperation,
+        key: &StorageRecordKey,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Bounded static authorizer for exact `(caller, operation, record)` grants.
+///
+/// This is suitable when all service identities and record capabilities are
+/// selected during trusted setup. Deployments with dynamic tenancy can provide
+/// their own [`RollbackAnchorServiceRequestAuthorizer`] instead, but must keep
+/// authentication and policy evaluation outside untrusted request data.
+pub struct FixedRollbackAnchorServiceAuthorizer {
+    grants: BTreeMap<
+        RollbackAnchorServiceCallerId,
+        BTreeMap<StorageRecordKey, BTreeSet<RollbackAnchorServiceOperation>>,
+    >,
+    grant_count: usize,
+}
+
+impl FixedRollbackAnchorServiceAuthorizer {
+    /// Creates a fixed, bounded exact-grant authorizer.
+    pub fn new(
+        grants: impl IntoIterator<Item = RollbackAnchorServiceAccessGrant>,
+    ) -> Result<Self, FixedRollbackAnchorServiceAuthorizerError> {
+        let mut configured = BTreeMap::new();
+        let mut grant_count = 0;
+        for grant in grants {
+            let RollbackAnchorServiceAccessGrant {
+                caller,
+                operation,
+                key,
+            } = grant;
+            if !configured.contains_key(&caller)
+                && configured.len() == MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_CALLERS
+            {
+                return Err(
+                    FixedRollbackAnchorServiceAuthorizerError::CallerLimitExceeded {
+                        maximum: MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_CALLERS,
+                    },
+                );
+            }
+            let operations = configured
+                .entry(caller)
+                .or_insert_with(BTreeMap::new)
+                .entry(key)
+                .or_insert_with(BTreeSet::new);
+            if operations.contains(&operation) {
+                return Err(FixedRollbackAnchorServiceAuthorizerError::DuplicateGrant);
+            }
+            if grant_count == MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_GRANTS {
+                return Err(
+                    FixedRollbackAnchorServiceAuthorizerError::GrantLimitExceeded {
+                        maximum: MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_GRANTS,
+                    },
+                );
+            }
+            operations.insert(operation);
+            grant_count += 1;
+        }
+        if grant_count == 0 {
+            return Err(FixedRollbackAnchorServiceAuthorizerError::EmptyGrantSet);
+        }
+        Ok(Self {
+            grants: configured,
+            grant_count,
+        })
+    }
+
+    /// Returns the number of configured callers without exposing their IDs.
+    pub fn caller_count(&self) -> usize {
+        self.grants.len()
+    }
+
+    /// Returns the number of exact operation-and-record grants.
+    pub const fn grant_count(&self) -> usize {
+        self.grant_count
+    }
+}
+
+impl fmt::Debug for FixedRollbackAnchorServiceAuthorizer {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FixedRollbackAnchorServiceAuthorizer")
+            .field("caller_count", &self.grants.len())
+            .field("grant_count", &self.grant_count)
+            .finish()
+    }
+}
+
+impl RollbackAnchorServiceRequestAuthorizer for FixedRollbackAnchorServiceAuthorizer {
+    type AuthenticatedCaller = RollbackAnchorServiceCallerId;
+    type Error = ();
+
+    fn authorize(
+        &self,
+        caller: &Self::AuthenticatedCaller,
+        operation: RollbackAnchorServiceOperation,
+        key: &StorageRecordKey,
+    ) -> Result<(), Self::Error> {
+        if self
+            .grants
+            .get(caller)
+            .and_then(|records| records.get(key))
+            .is_some_and(|operations| operations.contains(&operation))
+        {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// Invalid fixed service-authorizer configuration.
+///
+/// These errors intentionally omit caller IDs and record keys so trusted setup
+/// code can report a configuration class without copying policy data into a
+/// broad log sink.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixedRollbackAnchorServiceAuthorizerError {
+    EmptyGrantSet,
+    DuplicateGrant,
+    CallerLimitExceeded { maximum: usize },
+    GrantLimitExceeded { maximum: usize },
+}
+
+impl Display for FixedRollbackAnchorServiceAuthorizerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyGrantSet => formatter
+                .write_str("rollback-anchor service authorizer requires at least one grant"),
+            Self::DuplicateGrant => {
+                formatter.write_str("rollback-anchor service authorizer has a duplicate grant")
+            }
+            Self::CallerLimitExceeded { maximum } => write!(
+                formatter,
+                "rollback-anchor service authorizer exceeds the {maximum}-caller limit"
+            ),
+            Self::GrantLimitExceeded { maximum } => write!(
+                formatter,
+                "rollback-anchor service authorizer exceeds the {maximum}-grant limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FixedRollbackAnchorServiceAuthorizerError {}
+
 /// Bounded server-side dispatcher for the transactional rollback-anchor
 /// protocol.
 ///
@@ -250,20 +524,13 @@ where
         &mut self,
         request: &[u8],
     ) -> Result<Vec<u8>, RollbackAnchorServiceError> {
-        if request.len() > MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES {
-            return Err(RollbackAnchorServiceError::RequestTooLarge {
-                maximum: MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES,
-            });
-        }
-        let request = serde_json::from_slice::<WireRequest>(request)
-            .map_err(|_| RollbackAnchorServiceError::InvalidRequest)?;
-        if request.version() != ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION {
-            return Err(RollbackAnchorServiceError::UnsupportedRequestVersion);
-        }
-        let request = request
-            .into_domain()
-            .map_err(|_| RollbackAnchorServiceError::InvalidRequest)?;
+        self.handle_decoded_request(decode_service_request(request)?)
+    }
 
+    fn handle_decoded_request(
+        &mut self,
+        request: DecodedWireRequest,
+    ) -> Result<Vec<u8>, RollbackAnchorServiceError> {
         let response = match request {
             DecodedWireRequest::Load { key } => WireResponse::State {
                 version: ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION,
@@ -297,16 +564,98 @@ where
                 }
             }
         };
-        let response =
-            serde_json::to_vec(&response).map_err(|_| RollbackAnchorServiceError::Encoding)?;
-        if response.len() > MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES {
-            return Err(RollbackAnchorServiceError::ResponseTooLarge {
-                maximum: MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES,
-            });
-        }
-        Ok(response)
+        encode_service_response(response)
     }
 }
+
+/// Server dispatcher with an explicit authenticated-caller authorization gate.
+///
+/// The embedding service must authenticate a caller before passing it to
+/// [`Self::handle_authenticated_request`]. This wrapper parses and validates a
+/// bounded request, asks its host-owned authorizer to approve the exact
+/// operation and record, and invokes the anchor only after that check passes.
+/// It is not itself an authentication protocol, network listener, concurrency
+/// primitive, or durable backend.
+pub struct AuthorizedRollbackAnchorService<A, Z> {
+    service: RollbackAnchorService<A>,
+    authorizer: Z,
+}
+
+impl<A, Z> AuthorizedRollbackAnchorService<A, Z> {
+    /// Wraps one service dispatcher with a host-owned authorization policy.
+    pub fn new(service: RollbackAnchorService<A>, authorizer: Z) -> Self {
+        Self {
+            service,
+            authorizer,
+        }
+    }
+
+    /// Consumes this wrapper and returns its dispatcher and authorization
+    /// policy to trusted host code.
+    pub fn into_parts(self) -> (RollbackAnchorService<A>, Z) {
+        (self.service, self.authorizer)
+    }
+}
+
+impl<A, Z> fmt::Debug for AuthorizedRollbackAnchorService<A, Z> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedRollbackAnchorService")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A, Z> AuthorizedRollbackAnchorService<A, Z>
+where
+    A: RollbackAnchor,
+    Z: RollbackAnchorServiceRequestAuthorizer,
+{
+    /// Handles one request from an already authenticated caller.
+    ///
+    /// A malformed or oversized request is rejected before policy evaluation.
+    /// Any authorizer denial or failure becomes a generic authorization error,
+    /// and the rollback-anchor backend is not called. Network wrappers should
+    /// still return generic non-success responses and avoid exposing this
+    /// error's variant or timing details to untrusted callers.
+    pub fn handle_authenticated_request(
+        &mut self,
+        caller: &Z::AuthenticatedCaller,
+        request: &[u8],
+    ) -> Result<Vec<u8>, AuthorizedRollbackAnchorServiceError> {
+        let request = decode_service_request(request)
+            .map_err(AuthorizedRollbackAnchorServiceError::Service)?;
+        self.authorizer
+            .authorize(caller, request.operation(), request.key())
+            .map_err(|_| AuthorizedRollbackAnchorServiceError::Unauthorized)?;
+        self.service
+            .handle_decoded_request(request)
+            .map_err(AuthorizedRollbackAnchorServiceError::Service)
+    }
+}
+
+/// Failure while handling an authenticated rollback-anchor service request.
+///
+/// Authorization failures deliberately omit the caller identity, record key,
+/// and authorizer diagnostic. Service failures retain only the core dispatcher's
+/// already-redacted error class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorizedRollbackAnchorServiceError {
+    Unauthorized,
+    Service(RollbackAnchorServiceError),
+}
+
+impl Display for AuthorizedRollbackAnchorServiceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unauthorized => {
+                formatter.write_str("rollback-anchor service request is not authorized")
+            }
+            Self::Service(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for AuthorizedRollbackAnchorServiceError {}
 
 /// Failure while dispatching one rollback-anchor service request.
 ///
@@ -534,6 +883,50 @@ enum DecodedWireRequest {
     },
 }
 
+impl DecodedWireRequest {
+    fn operation(&self) -> RollbackAnchorServiceOperation {
+        match self {
+            Self::Load { .. } => RollbackAnchorServiceOperation::Load,
+            Self::CompareAndSwap { .. } => RollbackAnchorServiceOperation::CompareAndSwap,
+        }
+    }
+
+    fn key(&self) -> &StorageRecordKey {
+        match self {
+            Self::Load { key } | Self::CompareAndSwap { key, .. } => key,
+        }
+    }
+}
+
+fn decode_service_request(
+    request: &[u8],
+) -> Result<DecodedWireRequest, RollbackAnchorServiceError> {
+    if request.len() > MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES {
+        return Err(RollbackAnchorServiceError::RequestTooLarge {
+            maximum: MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES,
+        });
+    }
+    let request = serde_json::from_slice::<WireRequest>(request)
+        .map_err(|_| RollbackAnchorServiceError::InvalidRequest)?;
+    if request.version() != ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION {
+        return Err(RollbackAnchorServiceError::UnsupportedRequestVersion);
+    }
+    request
+        .into_domain()
+        .map_err(|_| RollbackAnchorServiceError::InvalidRequest)
+}
+
+fn encode_service_response(response: WireResponse) -> Result<Vec<u8>, RollbackAnchorServiceError> {
+    let response =
+        serde_json::to_vec(&response).map_err(|_| RollbackAnchorServiceError::Encoding)?;
+    if response.len() > MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES {
+        return Err(RollbackAnchorServiceError::ResponseTooLarge {
+            maximum: MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES,
+        });
+    }
+    Ok(response)
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireKey {
@@ -631,6 +1024,7 @@ fn decode_commitment(encoded: String) -> Result<[u8; ROLLBACK_ANCHOR_COMMITMENT_
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::VecDeque;
 
     use serde_json::{json, Value};
@@ -713,6 +1107,47 @@ mod tests {
             _replacement: RollbackAnchorState,
         ) -> Result<RollbackAnchorCompareAndSwapOutcome, Self::Error> {
             Err("backend-secret-metadata")
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingAnchor {
+        load_calls: Cell<usize>,
+        compare_and_swap_calls: usize,
+    }
+
+    impl RollbackAnchor for CountingAnchor {
+        type Error = ();
+
+        fn load(&self, _key: &StorageRecordKey) -> Result<RollbackAnchorState, Self::Error> {
+            self.load_calls.set(self.load_calls.get() + 1);
+            Ok(RollbackAnchorState::initial())
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            _key: &StorageRecordKey,
+            _expected: RollbackAnchorState,
+            _replacement: RollbackAnchorState,
+        ) -> Result<RollbackAnchorCompareAndSwapOutcome, Self::Error> {
+            self.compare_and_swap_calls += 1;
+            Ok(RollbackAnchorCompareAndSwapOutcome::Stored)
+        }
+    }
+
+    struct FailingAuthorizer;
+
+    impl RollbackAnchorServiceRequestAuthorizer for FailingAuthorizer {
+        type AuthenticatedCaller = ();
+        type Error = &'static str;
+
+        fn authorize(
+            &self,
+            _caller: &Self::AuthenticatedCaller,
+            _operation: RollbackAnchorServiceOperation,
+            _key: &StorageRecordKey,
+        ) -> Result<(), Self::Error> {
+            Err("authorizer-secret-metadata")
         }
     }
 
@@ -843,6 +1278,169 @@ mod tests {
         assert_eq!(error, RollbackAnchorServiceError::Backend);
         assert!(!error.to_string().contains("backend-secret-metadata"));
         assert!(!format!("{error:?}").contains("backend-secret-metadata"));
+    }
+
+    #[test]
+    fn fixed_authorizer_requires_unique_bounded_exact_grants() {
+        let reader = RollbackAnchorServiceCallerId::new("reader-a").unwrap();
+        let grant = RollbackAnchorServiceAccessGrant::new(
+            reader.clone(),
+            RollbackAnchorServiceOperation::Load,
+            key(),
+        );
+        let authorizer = FixedRollbackAnchorServiceAuthorizer::new([grant.clone()]).unwrap();
+
+        assert_eq!(authorizer.caller_count(), 1);
+        assert_eq!(authorizer.grant_count(), 1);
+        assert!(authorizer
+            .authorize(&reader, RollbackAnchorServiceOperation::Load, &key())
+            .is_ok());
+        assert!(authorizer
+            .authorize(
+                &reader,
+                RollbackAnchorServiceOperation::CompareAndSwap,
+                &key(),
+            )
+            .is_err());
+        assert!(authorizer
+            .authorize(
+                &reader,
+                RollbackAnchorServiceOperation::Load,
+                &StorageRecordKey::new("workflow-ledger", "release-43").unwrap(),
+            )
+            .is_err());
+        assert_eq!(
+            FixedRollbackAnchorServiceAuthorizer::new([grant.clone(), grant.clone()]).unwrap_err(),
+            FixedRollbackAnchorServiceAuthorizerError::DuplicateGrant
+        );
+        assert_eq!(
+            FixedRollbackAnchorServiceAuthorizer::new([]).unwrap_err(),
+            FixedRollbackAnchorServiceAuthorizerError::EmptyGrantSet
+        );
+        assert_eq!(
+            RollbackAnchorServiceCallerId::new("Reader-A"),
+            Err(RollbackAnchorServiceCallerIdError::Invalid)
+        );
+        assert!(!format!("{reader:?}").contains("reader-a"));
+        assert!(!format!("{grant:?}").contains("reader-a"));
+        assert!(!format!("{authorizer:?}").contains("release-42"));
+
+        let caller_limit_grants = (0..=MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_CALLERS).map(|index| {
+            RollbackAnchorServiceAccessGrant::new(
+                RollbackAnchorServiceCallerId::new(format!("caller-{index}")).unwrap(),
+                RollbackAnchorServiceOperation::Load,
+                key(),
+            )
+        });
+        assert_eq!(
+            FixedRollbackAnchorServiceAuthorizer::new(caller_limit_grants).unwrap_err(),
+            FixedRollbackAnchorServiceAuthorizerError::CallerLimitExceeded {
+                maximum: MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_CALLERS,
+            }
+        );
+
+        let writer = RollbackAnchorServiceCallerId::new("writer-a").unwrap();
+        let grant_limit_grants = (0..=MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_GRANTS).map(|index| {
+            RollbackAnchorServiceAccessGrant::new(
+                writer.clone(),
+                RollbackAnchorServiceOperation::CompareAndSwap,
+                StorageRecordKey::new("workflow-ledger", format!("record-{index}")).unwrap(),
+            )
+        });
+        assert_eq!(
+            FixedRollbackAnchorServiceAuthorizer::new(grant_limit_grants).unwrap_err(),
+            FixedRollbackAnchorServiceAuthorizerError::GrantLimitExceeded {
+                maximum: MAX_FIXED_ROLLBACK_ANCHOR_SERVICE_GRANTS,
+            }
+        );
+    }
+
+    #[test]
+    fn authorized_service_requires_an_exact_grant_before_the_backend_runs() {
+        let reader = RollbackAnchorServiceCallerId::new("reader-a").unwrap();
+        let other = RollbackAnchorServiceCallerId::new("reader-b").unwrap();
+        let authorizer =
+            FixedRollbackAnchorServiceAuthorizer::new([RollbackAnchorServiceAccessGrant::new(
+                reader.clone(),
+                RollbackAnchorServiceOperation::Load,
+                key(),
+            )])
+            .unwrap();
+        let mut service = AuthorizedRollbackAnchorService::new(
+            RollbackAnchorService::new(CountingAnchor::default()),
+            authorizer,
+        );
+
+        let load = serde_json::to_vec(&WireRequest::load(&key())).unwrap();
+        assert!(service.handle_authenticated_request(&reader, &load).is_ok());
+
+        assert_eq!(
+            service
+                .handle_authenticated_request(&other, &load)
+                .unwrap_err(),
+            AuthorizedRollbackAnchorServiceError::Unauthorized
+        );
+        let other_key = StorageRecordKey::new("workflow-ledger", "release-43").unwrap();
+        let foreign_key_load = serde_json::to_vec(&WireRequest::load(&other_key)).unwrap();
+        assert_eq!(
+            service
+                .handle_authenticated_request(&reader, &foreign_key_load)
+                .unwrap_err(),
+            AuthorizedRollbackAnchorServiceError::Unauthorized
+        );
+        let compare = serde_json::to_vec(&WireRequest::compare_and_swap(
+            &key(),
+            RollbackAnchorState::initial(),
+            state(1, 7, 1),
+        ))
+        .unwrap();
+        assert_eq!(
+            service
+                .handle_authenticated_request(&reader, &compare)
+                .unwrap_err(),
+            AuthorizedRollbackAnchorServiceError::Unauthorized
+        );
+        assert_eq!(
+            service
+                .handle_authenticated_request(&reader, b"not-json")
+                .unwrap_err(),
+            AuthorizedRollbackAnchorServiceError::Service(
+                RollbackAnchorServiceError::InvalidRequest
+            )
+        );
+
+        let (service, _) = service.into_parts();
+        let anchor = service.into_inner();
+        assert_eq!(anchor.load_calls.get(), 1);
+        assert_eq!(anchor.compare_and_swap_calls, 0);
+    }
+
+    #[test]
+    fn authorized_service_redacts_authorizer_failures_before_backend_use() {
+        let mut service = AuthorizedRollbackAnchorService::new(
+            RollbackAnchorService::new(CountingAnchor::default()),
+            FailingAuthorizer,
+        );
+        assert_eq!(
+            service
+                .handle_authenticated_request(&(), b"not-json")
+                .unwrap_err(),
+            AuthorizedRollbackAnchorServiceError::Service(
+                RollbackAnchorServiceError::InvalidRequest
+            )
+        );
+        let request = serde_json::to_vec(&WireRequest::load(&key())).unwrap();
+        let error = service
+            .handle_authenticated_request(&(), &request)
+            .unwrap_err();
+
+        assert_eq!(error, AuthorizedRollbackAnchorServiceError::Unauthorized);
+        assert!(!error.to_string().contains("authorizer-secret-metadata"));
+        assert!(!format!("{error:?}").contains("authorizer-secret-metadata"));
+        let (service, _) = service.into_parts();
+        let anchor = service.into_inner();
+        assert_eq!(anchor.load_calls.get(), 0);
+        assert_eq!(anchor.compare_and_swap_calls, 0);
     }
 
     #[test]

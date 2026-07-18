@@ -112,13 +112,16 @@ failover.
 `rollback_anchor_service::TrustedServiceRollbackAnchor` is a bounded
 host-owned client adapter for a separately trusted transactional service, and
 `RollbackAnchorService<A>` is its matching embeddable server-side dispatcher.
-Their generic transport contract and optional fixed HTTPS client transport are
-documented in [transactional rollback-anchor service](rollback-anchor-service.md).
-The client validates canonical states, bounds the exchange, rejects regressing
-responses observed during one process lifetime, and returns generic errors
-without service metadata. The server dispatcher does not listen, authenticate,
-authorize keys, serialize concurrent callers, or make its `A` durable; those
-remain deployment responsibilities.
+`AuthorizedRollbackAnchorService<A, Z>` can add a host-owned exact request
+authorization gate before the dispatcher calls its anchor. Their generic
+transport contract and optional fixed HTTPS client transport are documented in
+[transactional rollback-anchor service](rollback-anchor-service.md). The client
+validates canonical states, bounds the exchange, rejects regressing responses
+observed during one process lifetime, and returns generic errors without
+service metadata. The server dispatcher does not listen, authenticate callers,
+serialize concurrent callers, or make its `A` durable. The authorization gate
+also does not authenticate a caller or make its policy a durable authority;
+those remain deployment responsibilities.
 
 The optional `https-rollback-anchor` feature is a fixed HTTPS transport only.
 It does not make a generic endpoint, TLS connection, platform keyring, or

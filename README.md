@@ -133,10 +133,10 @@ and keeps UI support optional rather than making UI the language boundary.
 - Optional SQLite payload storage paired with an explicit trusted rollback
   anchor, including durable revision and fencing commitments.
 - Bounded transactional rollback-anchor service protocol with an embeddable
-  server-side dispatcher and optional fixed HTTPS client transport. It rejects
-  malformed or regressing protocol data and disables client redirects and
-  proxies, but the separately deployed service remains the rollback-resistant
-  CAS authority.
+  server-side dispatcher, optional exact caller/operation/record authorization
+  gate, and optional fixed HTTPS client transport. It rejects malformed or
+  regressing protocol data and disables client redirects and proxies, but the
+  separately deployed service remains the rollback-resistant CAS authority.
 - Fenced authenticated worker-journal storage that binds durable worker state
   to a host-selected record, revision, and current writer lease.
 - Feature-gated authenticated in-process worker transport for app-provided
