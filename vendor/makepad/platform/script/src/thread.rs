@@ -87,13 +87,24 @@ impl ScriptThreadId {
 #[allow(unused)]
 pub struct ScriptThread {
     pub(crate) is_paused: bool,
+    /// Maximum live operand values for this thread. The raw Makepad VM keeps
+    /// its historical one-million-value ceiling; constrained hosts can lower
+    /// it for one evaluation through `ScriptVm::with_stack_value_limit`.
     pub(crate) stack_limit: usize,
+    /// Optional maximum number of active VM call frames, including a root
+    /// evaluation frame. The raw VM leaves this unbounded; constrained hosts
+    /// install a limit for their evaluation.
+    pub(crate) call_frame_limit: Option<usize>,
     pub(crate) tries: Vec<TryFrame>,
     pub(crate) loops: Vec<LoopFrame>,
     pub(crate) scopes: Vec<ScriptObject>,
     pub(crate) stack: Vec<ScriptValue>,
     pub(crate) calls: Vec<CallFrame>,
     pub(crate) mes: Vec<ScriptMe>,
+    /// Resource-limit signals are consumed by the VM loop so these failures
+    /// cannot enter script-level `try` recovery.
+    pub(crate) stack_limit_exceeded: bool,
+    pub(crate) call_frame_limit_exceeded: bool,
     pub(crate) instruction_limit_remaining: Option<usize>,
     pub trap: ScriptTrapInner,
     //pub(crate) last_err: ScriptValue,
@@ -110,10 +121,13 @@ impl ScriptThread {
             scopes: vec![],
             tries: vec![],
             stack_limit: 1_000_000,
+            call_frame_limit: None,
             loops: vec![],
             stack: vec![],
             calls: vec![],
             mes: vec![],
+            stack_limit_exceeded: false,
+            call_frame_limit_exceeded: false,
             instruction_limit_remaining: None,
             trap: ScriptTrapInner::default(),
             json_parser: Default::default(),
@@ -226,16 +240,43 @@ impl ScriptThread {
     }
 
     pub fn push_stack_value(&mut self, value: ScriptValue) {
-        if self.stack.len() > self.stack_limit {
-            script_err_stack!(self.trap, "stack exceeded limit {}", self.stack_limit);
-        } else {
-            self.stack.push(value);
-        }
+        self.push_stack_unchecked(value);
     }
 
     #[inline]
     pub fn push_stack_unchecked(&mut self, value: ScriptValue) {
+        // This is the common operand-push path used by opcode handlers. Its
+        // historical name distinguishes it from identifier resolution, not
+        // from resource accounting.
+        if self.stack.len() >= self.stack_limit {
+            self.stack_limit_exceeded = true;
+            return;
+        }
         self.stack.push(value);
+    }
+
+    pub(crate) fn push_call_frame(&mut self, call: CallFrame) -> bool {
+        if self
+            .call_frame_limit
+            .is_some_and(|limit| self.calls.len() >= limit)
+        {
+            self.call_frame_limit_exceeded = true;
+            return false;
+        }
+        self.calls.push(call);
+        true
+    }
+
+    pub(crate) fn take_stack_limit_exceeded(&mut self) -> bool {
+        std::mem::take(&mut self.stack_limit_exceeded)
+    }
+
+    pub(crate) fn take_call_frame_limit_exceeded(&mut self) -> bool {
+        std::mem::take(&mut self.call_frame_limit_exceeded)
+    }
+
+    pub(crate) fn has_execution_limit_exceeded(&self) -> bool {
+        self.stack_limit_exceeded || self.call_frame_limit_exceeded
     }
 
     pub fn call_has_me(&self) -> bool {

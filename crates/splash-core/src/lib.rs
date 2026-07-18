@@ -51,6 +51,14 @@ pub const DEFAULT_MAX_SCRIPT_STRING_BYTES: usize = 256 * 1024;
 /// intern tables. It is not an operating-system process memory limit and does
 /// not account for opaque trusted Rust adapter allocations.
 pub const DEFAULT_MAX_SCRIPT_HEAP_BYTES: usize = 8 * 1024 * 1024;
+/// Default maximum live operand values in one Splash VM thread.
+///
+/// This bounds the VM execution stack independently from retained heap data.
+pub const DEFAULT_MAX_SCRIPT_STACK_VALUES: usize = 32 * 1024;
+/// Default maximum active Splash VM call frames, including the root frame.
+///
+/// This bounds recursive execution state independently from instruction fuel.
+pub const DEFAULT_MAX_SCRIPT_CALL_FRAMES: usize = 1_024;
 const FORMAT_OUTPUT_MULTIPLIER: usize = 4;
 /// Maximum formatted output size under the default source budget.
 pub const DEFAULT_MAX_FORMATTED_SOURCE_BYTES: usize =
@@ -132,6 +140,14 @@ pub struct ExecutionLimits {
     /// construction fails when it is below the required baseline. Hosts that
     /// need OS-level containment must layer it separately.
     pub max_heap_bytes: usize,
+    /// Maximum live operand values in the VM execution stack.
+    ///
+    /// This does not bound native Rust stacks or opaque host adapter state.
+    pub max_stack_values: usize,
+    /// Maximum active VM call frames, including the root evaluation frame.
+    ///
+    /// This limits recursive script calls but does not bound host recursion.
+    pub max_call_frames: usize,
     pub max_syntax_tokens: usize,
     pub max_syntax_nesting: usize,
     pub instruction_limit: usize,
@@ -146,6 +162,8 @@ impl Default for ExecutionLimits {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_string_bytes: DEFAULT_MAX_SCRIPT_STRING_BYTES,
             max_heap_bytes: DEFAULT_MAX_SCRIPT_HEAP_BYTES,
+            max_stack_values: DEFAULT_MAX_SCRIPT_STACK_VALUES,
+            max_call_frames: DEFAULT_MAX_SCRIPT_CALL_FRAMES,
             max_syntax_tokens: DEFAULT_MAX_SYNTAX_TOKENS,
             max_syntax_nesting: DEFAULT_MAX_SYNTAX_NESTING,
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
@@ -171,6 +189,16 @@ impl ExecutionLimits {
         if self.max_heap_bytes == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_heap_bytes must be greater than zero",
+            ));
+        }
+        if self.max_stack_values == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_stack_values must be greater than zero",
+            ));
+        }
+        if self.max_call_frames == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_call_frames must be greater than zero",
             ));
         }
         if self.max_syntax_tokens == 0 {
@@ -1007,6 +1035,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
             // manage several threads, but evaluating new source into a paused
             // frame would make its module/body lifecycle ambiguous.
             vm.bx.threads.set_current_to_first_unpaused_thread();
+            vm.clear_execution_limit_failures();
             Ok(evaluate_with_limits(vm, limits, |vm| {
                 vm.eval(vm::ScriptMod {
                     file: "inline.splash".to_owned(),
@@ -2183,7 +2212,11 @@ fn evaluate_with_limits(
         limits.budget_sample_interval,
     ));
 
-    let value = vm.with_instruction_limit(limits.instruction_limit, operation);
+    let value = vm.with_stack_value_limit(limits.max_stack_values, |vm| {
+        vm.with_call_frame_limit(limits.max_call_frames, |vm| {
+            vm.with_instruction_limit(limits.instruction_limit, operation)
+        })
+    });
     let diagnostics = vm.take_errors();
     let suspended = vm.bx.threads.cur_ref().is_paused();
     vm.bx.run_budget = None;
@@ -5033,6 +5066,32 @@ compute(outer, 2)
     }
 
     #[test]
+    fn rejects_zero_stack_value_limit() {
+        let limits = ExecutionLimits {
+            max_stack_values: 0,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("stack.splash", "true", limits).unwrap_err(),
+            RuntimeError::InvalidLimits("max_stack_values must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_call_frame_limit() {
+        let limits = ExecutionLimits {
+            max_call_frames: 0,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("frames.splash", "true", limits).unwrap_err(),
+            RuntimeError::InvalidLimits("max_call_frames must be greater than zero")
+        );
+    }
+
+    #[test]
     fn runtime_rejects_a_heap_limit_below_live_vm_storage() {
         let mut runtime = Runtime::default();
         let actual = runtime.accounted_heap_bytes();
@@ -5130,6 +5189,94 @@ compute(outer, 2)
         let recovered = runtime.eval("2").unwrap();
         assert!(recovered.completed(), "{:?}", recovered.diagnostics);
         assert_eq!(recovered.value.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn runtime_bounds_operand_stack_growth_without_catch_recovery() {
+        let limits = ExecutionLimits {
+            max_stack_values: 1,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+
+        let exceeded = runtime.eval("try (1 + 2) catch 99").unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("operand stack limit exceeded")));
+
+        let recovered = runtime.eval("2").unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(recovered.value.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn runtime_bounds_recursive_call_frames_without_catch_recovery() {
+        let limits = ExecutionLimits {
+            max_call_frames: 4,
+            instruction_limit: 1_024,
+            budget_sample_interval: 64,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+
+        let exceeded = runtime
+            .eval(
+                "fn recurse(value) {\n\
+                 recurse(value + 1)\n\
+                 }\n\
+                 try recurse(0) catch 99",
+            )
+            .unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("call frame limit exceeded")));
+
+        let recovered = runtime.eval("2").unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(recovered.value.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn call_frame_limit_includes_the_root_evaluation_frame() {
+        let limits = ExecutionLimits {
+            max_call_frames: 1,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+
+        let root_only = runtime.eval("2").unwrap();
+        assert!(root_only.completed(), "{:?}", root_only.diagnostics);
+
+        let exceeded = runtime
+            .eval("fn one() {\n1\n}\ntry one() catch 99")
+            .unwrap();
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("call frame limit exceeded")));
+    }
+
+    #[test]
+    fn fresh_evaluation_discards_stale_vm_execution_limit_signals() {
+        let mut runtime = Runtime::default();
+        runtime.configure(|vm| {
+            vm.with_stack_value_limit(1, |vm| {
+                vm.thread_mut().push_stack_unchecked(1.into());
+                vm.thread_mut().push_stack_unchecked(2.into());
+                vm.thread_mut().pop_stack_value();
+            });
+        });
+
+        let evaluation = runtime.eval("2").unwrap();
+        assert!(evaluation.completed(), "{:?}", evaluation.diagnostics);
+        assert_eq!(evaluation.value.as_u40(), Some(2));
     }
 
     #[test]

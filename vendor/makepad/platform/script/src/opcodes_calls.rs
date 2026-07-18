@@ -174,8 +174,10 @@ impl<'a> ScriptVm<'a> {
                             body: self.bx.threads.cur_ref().trap.ip.body,
                         }),
                     };
+                    if !self.bx.threads.cur().push_call_frame(call) {
+                        return false;
+                    }
                     self.bx.threads.cur().scopes.push(args);
-                    self.bx.threads.cur().calls.push(call);
                     self.bx.threads.cur().trap.ip = sip;
                     return false; // Script: skip pop_to_me, RETURN will handle it via call.args
                 }

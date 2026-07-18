@@ -28,6 +28,8 @@ fuzz_target!(|data: &[u8]| {
         max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_string_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_heap_bytes: DEFAULT_MAX_SCRIPT_HEAP_BYTES,
+        max_stack_values: MAX_FUZZ_SYNTAX_TOKENS,
+        max_call_frames: MAX_FUZZ_SYNTAX_NESTING * 4,
         max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
         max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
         instruction_limit: FUZZ_INSTRUCTION_LIMIT,

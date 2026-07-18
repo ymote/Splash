@@ -296,17 +296,18 @@ catalogs only: the target never starts stdio, reads the URI, resolves modules,
 evaluates Splash, creates a capability host, or invokes an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
-cap, 8 KiB individual-string cap, 4,096 instruction cap, one-instruction
-deadline sampling, and a 32 ms terminal execution deadline. Script-level errors from
+cap, 8 KiB individual-string cap, 1,024 live operand values, 256 active call
+frames, 4,096 instruction cap, one-instruction deadline sampling, and a 32 ms
+terminal execution deadline. Script-level errors from
 unavailable modules are expected. It creates `Runtime<(), ()>`, so no
 capability or Rust adapter can run; a panic or hang is a fuzz failure.
 `execution` explicitly collects its fresh VM after evaluation so retained heap
 state cannot mask resource behavior. Their tracked `.splash` seeds cover
 canonical dataflow, deferred tools, loops, lambdas, recoverable error control
 flow, intentional instruction-limit behavior, and exponential string growth.
-`execution_limits` rotates valid source, individual-string, syntax,
-instruction, sampling, and deadline profiles through a fresh capability-free
-runtime. Equal soft and hard deadlines must terminate rather than leave a
+`execution_limits` rotates valid source, individual-string, retained-heap,
+operand-stack, call-frame, syntax, instruction, sampling, and deadline profiles
+through a fresh capability-free runtime. Equal soft and hard deadlines must terminate rather than leave a
 resumable evaluation. Its cooperative one-nanosecond soft-budget profile may
 yield, but it must then refuse a later `set_limits` request so the continuation
 keeps its original resource contract. A completed evaluation must accept the

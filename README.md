@@ -41,8 +41,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
-  retained-heap, instruction, and deadline limits. The heap ceiling is not an
-  OS process-memory quota and excludes opaque trusted Rust adapter allocations.
+  retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
+  limits. These VM ceilings are not an OS process-memory quota and exclude
+  opaque trusted Rust adapter allocations.
 - Direct `Runtime` JSON conversion: strict, byte- and depth-bounded
   `.parse_json()` input plus cycle-aware, byte- and depth-bounded `.to_json()`
   output, with ordinary script errors rather than unbounded VM work.

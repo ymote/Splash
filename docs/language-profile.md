@@ -49,7 +49,10 @@ The default preflight budget is 256 KiB of source, 32,768 lexical tokens, and
 `ExecutionLimits`. Evaluation additionally limits each newly constructed
 script string to 256 KiB by default through `ExecutionLimits::max_string_bytes`
 and tracked retained Splash VM storage to 8 MiB by default through
-`ExecutionLimits::max_heap_bytes`.
+`ExecutionLimits::max_heap_bytes`. It also caps live VM operand values at
+32,768 through `ExecutionLimits::max_stack_values` and active VM call frames,
+including the root frame, at 1,024 through
+`ExecutionLimits::max_call_frames`.
 
 `splash format <file>` applies the same profile and compatibility checks, then
 writes canonical whitespace to standard output without evaluating source or
@@ -330,8 +333,12 @@ Makepad VM owns its upstream JSON behavior. Separately,
 conversion or JSON reconstruction. Exceeding that per-string limit is an
 uncatchable resource failure. `ExecutionLimits::max_heap_bytes` separately
 caps retained script strings, arrays, object storage, slots, and intern tables;
-it is still not a process-memory, code/stack, opaque-adapter, or aggregate
-workflow-data quota.
+`ExecutionLimits::max_stack_values` separately caps live operand values, and
+`ExecutionLimits::max_call_frames` caps active VM call frames, including the
+root evaluation frame. Each is an uncatchable resource failure and both reset
+cleanly for a later evaluation. These are still not process-memory, parser or
+code-storage, native-Rust-stack, opaque-adapter, other VM-control-vector, or
+aggregate-workflow-data quotas.
 
 Hosts can register a `JsonToolContract` to enforce bounded schemas for those
 JSON envelopes. Contract checks run before the handler and before output
@@ -423,7 +430,8 @@ or mutate its keys, input digest, worker observation, or restart policy.
 - Import `mod.tool` before calling a tool.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
   fallback cannot inspect the error, and hard string-allocation,
-  heap-allocation, instruction/deadline termination remains uncatchable. End each block branch
+  heap-allocation, operand-stack, call-frame, instruction, or deadline
+  termination remains uncatchable. End each block branch
   with a value-producing expression; use `nil` when the branch has no other
   result. Parenthesize a record literal used as the whole protected or fallback
   branch.

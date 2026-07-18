@@ -233,6 +233,56 @@ impl<'a> ScriptVm<'a> {
         result
     }
 
+    /// Runs an operation with a cap on live VM operand values.
+    ///
+    /// Nested caps can only narrow the current limit. A paused continuation
+    /// retains the cap that began its evaluation, matching instruction-limit
+    /// behavior.
+    pub fn with_stack_value_limit<R>(
+        &mut self,
+        stack_value_limit: usize,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_limit = self.bx.threads.cur_ref().stack_limit;
+        self.bx.threads.cur().stack_limit = previous_limit.min(stack_value_limit);
+        let result = f(self);
+        if !self.bx.threads.cur_ref().is_paused() {
+            self.bx.threads.cur().stack_limit = previous_limit;
+        }
+        result
+    }
+
+    /// Runs an operation with a cap on active VM call frames.
+    ///
+    /// The count includes a root evaluation frame. The raw Makepad VM has no
+    /// call-frame cap, while nested bounded executions retain the narrower
+    /// cap. A paused continuation retains its starting cap.
+    pub fn with_call_frame_limit<R>(
+        &mut self,
+        call_frame_limit: usize,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous_limit = self.bx.threads.cur_ref().call_frame_limit;
+        self.bx.threads.cur().call_frame_limit = Some(
+            previous_limit
+                .map(|previous| previous.min(call_frame_limit))
+                .unwrap_or(call_frame_limit),
+        );
+        let result = f(self);
+        if !self.bx.threads.cur_ref().is_paused() {
+            self.bx.threads.cur().call_frame_limit = previous_limit;
+        }
+        result
+    }
+
+    /// Clears resource-limit signals that did not belong to an active VM
+    /// instruction. Hosts normally do not need this: `run_core` consumes its
+    /// own failures, and Splash clears stale signals before a fresh eval.
+    pub fn clear_execution_limit_failures(&mut self) {
+        self.bx.threads.cur().take_stack_limit_exceeded();
+        self.bx.threads.cur().take_call_frame_limit_exceeded();
+    }
+
     pub fn heap(&self) -> &ScriptHeap {
         &self.bx.heap
     }
@@ -362,8 +412,12 @@ impl<'a> ScriptVm<'a> {
                         args: OpcodeArgs::default(),
                         return_ip: None,
                     };
+                    if !self.bx.threads.cur().push_call_frame(call) {
+                        return self
+                            .handle_execution_limit_failure()
+                            .expect("a rejected call frame raises a limit failure");
+                    }
                     self.bx.threads.cur().scopes.push(scope);
-                    self.bx.threads.cur().calls.push(call);
                     if let Some(me) = self.script_me_from_value(me) {
                         self.bx.threads.cur().mes.push(me);
                     }
@@ -652,6 +706,35 @@ impl<'a> ScriptVm<'a> {
         None
     }
 
+    #[inline(never)]
+    #[cold]
+    fn bail_resource_limit(&mut self, message: &'static str) -> ScriptValue {
+        let err = script_err_limit!(self.bx.threads.cur_ref().trap, "{message}");
+        // Resource-limit failures are uncatchable. Drain pre-existing script
+        // errors before the Bail unwinds to a clean root state.
+        self.drain_errors();
+        self.bx
+            .threads
+            .cur()
+            .trap
+            .on
+            .set(Some(ScriptTrapOn::Bail(err)));
+        self.handle_trap_on()
+            .expect("resource-limit Bail must return a VM value")
+    }
+
+    fn handle_execution_limit_failure(&mut self) -> Option<ScriptValue> {
+        let stack_limit_exceeded = self.bx.threads.cur().take_stack_limit_exceeded();
+        let call_frame_limit_exceeded = self.bx.threads.cur().take_call_frame_limit_exceeded();
+        if stack_limit_exceeded {
+            return Some(self.bail_resource_limit("script operand stack limit exceeded"));
+        }
+        if call_frame_limit_exceeded {
+            return Some(self.bail_resource_limit("script call frame limit exceeded"));
+        }
+        None
+    }
+
     fn handle_trap_on(&mut self) -> Option<ScriptValue> {
         if self.bx.threads.cur().trap.on.get().is_none() {
             return None;
@@ -686,6 +769,10 @@ impl<'a> ScriptVm<'a> {
 
     pub fn run_core(&mut self) -> ScriptValue {
         loop {
+            if let Some(value) = self.handle_execution_limit_failure() {
+                return value;
+            }
+
             if self.bx.heap.take_heap_limit_exceeded() {
                 let err = script_err_limit!(
                     self.bx.threads.cur_ref().trap,
@@ -810,6 +897,9 @@ impl<'a> ScriptVm<'a> {
 
             if let Some((opcode, args)) = opcode.as_opcode() {
                 self.opcode(opcode, args);
+                if let Some(value) = self.handle_execution_limit_failure() {
+                    return value;
+                }
                 // if exception tracing - is_empty() is faster than len()>0
                 if !self.bx.threads.cur().trap.err.borrow().is_empty() {
                     self.handle_errors();
@@ -835,7 +925,7 @@ impl<'a> ScriptVm<'a> {
             )
         };
 
-        self.bx.threads.cur().calls.push(CallFrame {
+        if !self.bx.threads.cur().push_call_frame(CallFrame {
             bases: StackBases {
                 tries: 0,
                 loops: 0,
@@ -845,7 +935,11 @@ impl<'a> ScriptVm<'a> {
             },
             args: Default::default(),
             return_ip: None,
-        });
+        }) {
+            return self
+                .handle_execution_limit_failure()
+                .expect("a rejected root frame raises a limit failure");
+        }
 
         self.bx.threads.cur().scopes.push(scope);
         self.bx.threads.cur().mes.push(ScriptMe::Object(me));
@@ -1644,6 +1738,51 @@ mod tests {
             .take_errors()
             .iter()
             .any(|diagnostic| diagnostic.contains("script heap allocation limit exceeded")));
+    }
+
+    #[test]
+    fn return_does_not_pop_to_me_after_an_operand_stack_limit() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        let receiver = vm.heap_mut().new_object();
+        let pop_to_me = OpcodeArgs(OpcodeArgs::POP_TO_ME_FLAG);
+
+        {
+            let thread = vm.thread_mut();
+            thread.stack.push(7.into());
+            thread.mes.push(ScriptMe::Object(receiver));
+            assert!(thread.push_call_frame(CallFrame {
+                bases: StackBases::default(),
+                args: OpcodeArgs::NONE,
+                return_ip: None,
+            }));
+            assert!(thread.push_call_frame(CallFrame {
+                bases: StackBases {
+                    stack: 1,
+                    mes: 1,
+                    ..Default::default()
+                },
+                args: pop_to_me,
+                return_ip: Some(ScriptIp::default()),
+            }));
+        }
+
+        vm.with_stack_value_limit(1, |vm| {
+            vm.opcode(
+                Opcode::RETURN,
+                OpcodeArgs(OpcodeArgs::NIL.0 | OpcodeArgs::POP_TO_ME_FLAG),
+            );
+        });
+
+        assert!(vm.thread().has_execution_limit_exceeded());
+        assert_eq!(vm.thread().stack.len(), 1);
+        assert_eq!(vm.thread().stack[0].as_f64(), Some(7.0));
+        assert_eq!(vm.bx.heap.vec_len(receiver), 0);
     }
 
     #[test]

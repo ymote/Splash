@@ -101,16 +101,24 @@ strings, arrays, object storage, slot tables, and intern tables. Sparse array
 and object writes, plus conservative object-map rehashes, are rejected before
 they request their backing allocation; other normal script allocations raise
 the same uncatchable hard resource failure when retained storage crosses the
-cap. This is not a process allocator quota: VM parser/code/stack work,
-allocator metadata, compiled regex internals, and opaque trusted Rust adapter
-allocations remain outside the accounting.
+cap. This heap-only accounting is not a process allocator quota: VM parser/code
+storage, other VM control vectors, allocator metadata, compiled regex internals,
+and opaque trusted Rust adapter allocations remain outside it.
+
+`ExecutionLimits::max_stack_values` caps live VM operand values at 32,768 by
+default, and `ExecutionLimits::max_call_frames` caps active VM call frames,
+including the root frame, at 1,024 by default. Both terminate the current
+evaluation as uncatchable hard resource failures. They do not account for
+native Rust stacks, parser or code storage, other VM control vectors, allocator
+metadata, or opaque trusted adapter allocations.
 Targets that need process-wide memory or effect containment must layer an
 operating-system boundary around the worker.
 
 Canonical `try/catch` handles ordinary script and native-binding errors and
 unwinds Splash function calls, but it is not a sandbox or transaction. It
-cannot catch string-allocation, heap-allocation, instruction-limit, or hard-deadline
-termination, inspect an error object, widen a capability lease, refund a call,
+cannot catch string-allocation, heap-allocation, operand-stack, call-frame,
+instruction-limit, or hard-deadline termination, inspect an error object, widen a
+capability lease, refund a call,
 erase an audit outcome, or bypass a workflow data contract. A caught error is
 discarded before the fallback runs and does not appear in the evaluation
 diagnostics. An uncaught native error is host-facing and may contain

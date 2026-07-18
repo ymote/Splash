@@ -173,8 +173,9 @@ to disambiguate it from the separator.
 
 The language deliberately exposes no error object, message, stack, or pattern
 binding to the fallback. Assertions, type and lookup errors, denied or failed
-tool calls, and a failed deferred tool after `await()` are catchable. An
-instruction-limit stop, hard evaluation deadline, or internal VM bail is not
+tool calls, and a failed deferred tool after `await()` are catchable. A hard
+string-allocation, heap-allocation, operand-stack, call-frame,
+instruction-limit, hard evaluation deadline, or internal VM bail is not
 catchable.
 
 Recovery is control flow, not a transaction. It does not roll back a Rust

@@ -4,7 +4,8 @@
 
 - Standalone VM workspace with upstream provenance.
 - Bounded evaluation and canonical grammar diagnostics, including
-  host-configurable per-string and tracked Splash-owned aggregate-heap ceilings.
+  host-configurable per-string, tracked Splash-owned aggregate-heap,
+  operand-stack, and active-call-frame ceilings.
 - Canonical source formatting that preserves comments and literal spellings.
 - Host-only LSP diagnostics and full-document canonical formatting for the
   published v0.2 grammar.
