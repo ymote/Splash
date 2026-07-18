@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::ops::Index;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use makepad_script::{
     id, id_lut, script_args_def, script_err_not_allowed, script_err_unexpected, script_value,
@@ -140,6 +140,14 @@ pub const DEFAULT_MAX_STREAM_CHUNKS: usize = 64;
 pub const DEFAULT_MAX_STREAM_CHUNK_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_STREAM_TOTAL_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_STREAM_EMITTED_BYTES: usize = 64 * 1024;
+/// Minimum byte length of a host-supplied external idempotency session nonce.
+///
+/// The host must make this value unique across runtime sessions that share a
+/// downstream deduplication scope. It is host configuration, not script data
+/// or an authorization credential.
+pub const MIN_CAPABILITY_SESSION_NONCE_BYTES: usize = 16;
+/// Maximum byte length of a host-supplied external idempotency session nonce.
+pub const MAX_CAPABILITY_SESSION_NONCE_BYTES: usize = 64;
 
 const CAPABILITY_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"splash-capability-catalog-v1";
 const CAPABILITY_SESSION_NONCE_DOMAIN: &[u8] = b"splash-capability-session-nonce-v1";
@@ -148,24 +156,82 @@ const UNRECOGNIZED_AUDIT_TOOL_PREFIX: &str = "unrecognized:";
 
 static NEXT_CAPABILITY_SESSION: AtomicU64 = AtomicU64::new(1);
 
-fn capability_session_nonce(session_id: u64) -> String {
-    let mut entropy = [0_u8; 32];
+/// A bounded host-supplied source for external-operation idempotency keys.
+///
+/// Splash hashes this value with a domain separator and its process-local
+/// runtime ID before it places the result in an external invocation. The raw
+/// bytes are never exposed by this type. A caller that supplies a nonce is
+/// responsible for making it unique across restarts that can reach the same
+/// downstream worker or provider deduplication scope.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CapabilitySessionNonce(Vec<u8>);
+
+impl CapabilitySessionNonce {
+    /// Creates a bounded host-supplied nonce for external idempotency keys.
+    pub fn new(value: impl AsRef<[u8]>) -> Result<Self, CapabilitySessionNonceError> {
+        let value = value.as_ref();
+        if value.len() < MIN_CAPABILITY_SESSION_NONCE_BYTES {
+            return Err(CapabilitySessionNonceError::TooShort {
+                actual: value.len(),
+                minimum: MIN_CAPABILITY_SESSION_NONCE_BYTES,
+            });
+        }
+        if value.len() > MAX_CAPABILITY_SESSION_NONCE_BYTES {
+            return Err(CapabilitySessionNonceError::TooLong {
+                actual: value.len(),
+                maximum: MAX_CAPABILITY_SESSION_NONCE_BYTES,
+            });
+        }
+        Ok(Self(value.to_vec()))
+    }
+
+    fn from_os_entropy() -> Option<Self> {
+        let mut value = [0_u8; 32];
+        getrandom::fill(&mut value).ok()?;
+        Some(Self(value.to_vec()))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CapabilitySessionNonce {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapabilitySessionNonce([REDACTED])")
+    }
+}
+
+/// Rejection from [`CapabilitySessionNonce::new`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CapabilitySessionNonceError {
+    TooShort { actual: usize, minimum: usize },
+    TooLong { actual: usize, maximum: usize },
+}
+
+impl Display for CapabilitySessionNonceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooShort { actual, minimum } => write!(
+                formatter,
+                "capability session nonce is {actual} bytes; minimum is {minimum} bytes"
+            ),
+            Self::TooLong { actual, maximum } => write!(
+                formatter,
+                "capability session nonce is {actual} bytes; maximum is {maximum} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapabilitySessionNonceError {}
+
+fn capability_session_nonce(session_id: u64, source: &CapabilitySessionNonce) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CAPABILITY_SESSION_NONCE_DOMAIN);
     hasher.update(&session_id.to_be_bytes());
-    if getrandom::fill(&mut entropy).is_ok() {
-        hasher.update(&entropy);
-    } else {
-        // Keep distinct live runtimes separate when a constrained target has
-        // no OS entropy source. Durable hosts should still use their own
-        // workflow operation key across a process restart.
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        hasher.update(&timestamp.to_be_bytes());
-        hasher.update(&std::process::id().to_be_bytes());
-    }
+    hasher.update(&(source.as_bytes().len() as u64).to_be_bytes());
+    hasher.update(source.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -1166,6 +1232,7 @@ pub enum ToolRegistrationError {
     InvalidName(String),
     InvalidPolicy(&'static str),
     InvalidMetadata(&'static str),
+    ExternalIdempotencyNonceUnavailable,
     CatalogToolLimitExceeded { maximum: usize },
     CatalogByteLimitExceeded { actual: usize, maximum: usize },
     IncompatibleWorkerGrant(String),
@@ -1179,6 +1246,9 @@ impl Display for ToolRegistrationError {
             Self::InvalidName(name) => write!(formatter, "invalid tool name: {name}"),
             Self::InvalidPolicy(message) => formatter.write_str(message),
             Self::InvalidMetadata(message) => formatter.write_str(message),
+            Self::ExternalIdempotencyNonceUnavailable => formatter.write_str(
+                "externally dispatched tools require operating-system entropy or a host-supplied capability session nonce",
+            ),
             Self::CatalogToolLimitExceeded { maximum } => {
                 write!(
                     formatter,
@@ -1638,7 +1708,7 @@ impl ScriptHandleGc for ToolPromiseGc {
 
 pub struct CapabilityHost {
     session_id: u64,
-    session_nonce: String,
+    session_nonce: Option<String>,
     catalog_limits: CapabilityCatalogLimits,
     tools: BTreeMap<String, RegisteredTool>,
     active_lease: Option<Rc<RefCell<CapabilityLeaseState>>>,
@@ -1662,15 +1732,44 @@ impl Default for CapabilityHost {
 impl CapabilityHost {
     /// Creates a host with explicit aggregate bounds for its capability
     /// catalog. Individual tool registration still validates each policy,
-    /// description, and schema independently.
+    /// description, and schema independently. If operating-system entropy is
+    /// unavailable, local tools remain usable but external-tool registration
+    /// fails closed. Use [`Self::with_catalog_limits_and_session_nonce`] when
+    /// the host has a trusted unique nonce source of its own.
     pub fn with_catalog_limits(
         catalog_limits: CapabilityCatalogLimits,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_catalog_limits_and_optional_session_nonce(
+            catalog_limits,
+            CapabilitySessionNonce::from_os_entropy(),
+        )
+    }
+
+    /// Creates a host with a host-provided source for external idempotency
+    /// keys.
+    ///
+    /// `session_nonce` must be unique across every runtime session that can
+    /// reach the same downstream deduplication scope, including after a device
+    /// restart. It does not authorize a tool and does not replace a durable
+    /// workflow operation identity.
+    pub fn with_catalog_limits_and_session_nonce(
+        catalog_limits: CapabilityCatalogLimits,
+        session_nonce: CapabilitySessionNonce,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_catalog_limits_and_optional_session_nonce(catalog_limits, Some(session_nonce))
+    }
+
+    fn with_catalog_limits_and_optional_session_nonce(
+        catalog_limits: CapabilityCatalogLimits,
+        session_nonce: Option<CapabilitySessionNonce>,
     ) -> Result<Self, RuntimeError> {
         let catalog_limits = catalog_limits.validate()?;
         let session_id = NEXT_CAPABILITY_SESSION.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             session_id,
-            session_nonce: capability_session_nonce(session_id),
+            session_nonce: session_nonce
+                .as_ref()
+                .map(|session_nonce| capability_session_nonce(session_id, session_nonce)),
             catalog_limits,
             tools: BTreeMap::new(),
             active_lease: None,
@@ -1941,6 +2040,9 @@ impl CapabilityHost {
         }
         policy.validate()?;
         metadata.validate_for(policy.data_format)?;
+        if dispatch == ToolDispatch::External && self.session_nonce.is_none() {
+            return Err(ToolRegistrationError::ExternalIdempotencyNonceUnavailable);
+        }
         if self.tools.contains_key(&policy.name) {
             return Err(ToolRegistrationError::Duplicate(policy.name));
         }
@@ -2245,7 +2347,17 @@ impl CapabilityHost {
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(CAPABILITY_AUDIT_LABEL_DOMAIN);
-        hasher.update(self.session_nonce.as_bytes());
+        hasher.update(&self.session_id.to_be_bytes());
+        match &self.session_nonce {
+            Some(session_nonce) => {
+                hasher.update(&[1]);
+                hasher.update(&(session_nonce.len() as u64).to_be_bytes());
+                hasher.update(session_nonce.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
         hasher.update(&(name.len() as u64).to_be_bytes());
         hasher.update(name.as_bytes());
         format!(
@@ -2707,7 +2819,12 @@ impl CapabilityHost {
     }
 
     fn idempotency_key(&self, ticket: &ToolTicket) -> String {
-        format!("splash-{}-{}", self.session_nonce, ticket.sequence)
+        match &self.session_nonce {
+            Some(session_nonce) => format!("splash-{session_nonce}-{}", ticket.sequence),
+            // External registration is rejected when no session nonce exists.
+            // Host-pumped promises never expose this local correlation value.
+            None => format!("local-{}-{}", self.session_id, ticket.sequence),
+        }
     }
 
     fn allocate_pending_id(
@@ -3356,12 +3473,53 @@ impl CapabilityRuntime {
         max_pending_tools: usize,
         catalog_limits: CapabilityCatalogLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::with_limits_pending_catalog_and_optional_session_nonce(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+            None,
+        )
+    }
+
+    /// Creates a runtime with explicit pending-promise and catalog bounds plus
+    /// a host-provided source for external idempotency keys.
+    ///
+    /// Use this constructor on entropy-constrained targets only when the host
+    /// can provide a nonce that is unique across every runtime session sharing
+    /// a downstream deduplication scope. It does not replace a durable
+    /// workflow operation key.
+    pub fn with_limits_pending_catalog_and_session_nonce(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+        session_nonce: CapabilitySessionNonce,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_limits_pending_catalog_and_optional_session_nonce(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+            Some(session_nonce),
+        )
+    }
+
+    fn with_limits_pending_catalog_and_optional_session_nonce(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+        session_nonce: Option<CapabilitySessionNonce>,
+    ) -> Result<Self, RuntimeError> {
         if max_pending_tools == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_pending_tools must be greater than zero",
             ));
         }
-        let host = CapabilityHost::with_catalog_limits(catalog_limits)?;
+        let host = match session_nonce {
+            Some(session_nonce) => CapabilityHost::with_catalog_limits_and_session_nonce(
+                catalog_limits,
+                session_nonce,
+            )?,
+            None => CapabilityHost::with_catalog_limits(catalog_limits)?,
+        };
         let mut runtime = Runtime::with_limits(host, (), limits)?;
         install_tool_module(&mut runtime, max_pending_tools);
         Ok(Self {
@@ -4954,6 +5112,113 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 0]
         );
+    }
+
+    #[test]
+    fn capability_session_nonce_is_bounded_and_redacted() {
+        assert_eq!(
+            CapabilitySessionNonce::new(vec![7; MIN_CAPABILITY_SESSION_NONCE_BYTES - 1])
+                .unwrap_err(),
+            CapabilitySessionNonceError::TooShort {
+                actual: MIN_CAPABILITY_SESSION_NONCE_BYTES - 1,
+                minimum: MIN_CAPABILITY_SESSION_NONCE_BYTES,
+            }
+        );
+        assert_eq!(
+            CapabilitySessionNonce::new(vec![7; MAX_CAPABILITY_SESSION_NONCE_BYTES + 1])
+                .unwrap_err(),
+            CapabilitySessionNonceError::TooLong {
+                actual: MAX_CAPABILITY_SESSION_NONCE_BYTES + 1,
+                maximum: MAX_CAPABILITY_SESSION_NONCE_BYTES,
+            }
+        );
+
+        let nonce = CapabilitySessionNonce::new([7; MIN_CAPABILITY_SESSION_NONCE_BYTES]).unwrap();
+        assert_eq!(format!("{nonce:?}"), "CapabilitySessionNonce([REDACTED])");
+    }
+
+    #[test]
+    fn entropyless_hosts_keep_local_tools_but_reject_external_registration() {
+        let host = CapabilityHost::with_catalog_limits_and_optional_session_nonce(
+            CapabilityCatalogLimits::default(),
+            None,
+        )
+        .unwrap();
+        assert!(host.session_nonce.is_none());
+
+        let mut inner = Runtime::with_limits(host, (), ExecutionLimits::default()).unwrap();
+        install_tool_module(&mut inner, 1);
+        let mut runtime = CapabilityRuntime {
+            runtime: inner,
+            max_pending_tools: 1,
+        };
+        runtime
+            .register_tool(ToolPolicy::new("text.local"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+
+        let initial = runtime
+            .eval(
+                "use mod.tool\nuse mod.std.assert\nlet value = tool.start(\"text.local\", \"hello\").await()\nassert(value == \"hello\")",
+            )
+            .unwrap();
+        assert!(initial.suspended);
+        let pumped = runtime.pump().unwrap();
+        assert_eq!(pumped.completed, 1);
+        assert!(
+            pumped.resumed[0].completed(),
+            "{:?}",
+            pumped.resumed[0].diagnostics
+        );
+
+        assert_eq!(
+            runtime
+                .register_external_tool(ToolPolicy::new("text.remote"))
+                .unwrap_err(),
+            ToolRegistrationError::ExternalIdempotencyNonceUnavailable
+        );
+        assert_eq!(
+            runtime
+                .register_external_json_tool(ToolPolicy::json("json.remote"))
+                .unwrap_err(),
+            ToolRegistrationError::ExternalIdempotencyNonceUnavailable
+        );
+
+        let rejected = runtime
+            .eval("use mod.tool\ntool.call(\"invalid/name\", \"input\")")
+            .unwrap();
+        assert!(!rejected.succeeded());
+        let audit = runtime.audit();
+        let label = &audit[audit.len() - 1].tool;
+        assert!(label.starts_with(UNRECOGNIZED_AUDIT_TOOL_PREFIX));
+        assert!(!label.contains("invalid/name"));
+        assert_eq!(
+            label.len(),
+            UNRECOGNIZED_AUDIT_TOOL_PREFIX.len() + blake3::OUT_LEN * 2
+        );
+    }
+
+    #[test]
+    fn host_session_nonce_enables_external_idempotency_keys_without_os_entropy() {
+        let nonce = CapabilitySessionNonce::new([9; MIN_CAPABILITY_SESSION_NONCE_BYTES]).unwrap();
+        let mut runtime = CapabilityRuntime::with_limits_pending_catalog_and_session_nonce(
+            ExecutionLimits::default(),
+            DEFAULT_MAX_PENDING_TOOLS,
+            CapabilityCatalogLimits::default(),
+            nonce,
+        )
+        .unwrap();
+        runtime
+            .register_external_tool(ToolPolicy::new("text.remote"))
+            .unwrap();
+
+        let initial = runtime
+            .eval("use mod.tool\ntool.start(\"text.remote\", \"hello\").await()")
+            .unwrap();
+        assert!(initial.suspended);
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        assert!(invocation.idempotency_key.starts_with("splash-"));
     }
 
     #[test]

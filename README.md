@@ -84,7 +84,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
   outcomes.
 - Host-only bounded retries for external tools, with stable non-authorizing
-  idempotency keys for each deferred operation.
+  idempotency keys for each deferred operation. External registration fails
+  closed when OS entropy is unavailable unless the host supplies a bounded
+  session nonce with a documented uniqueness scope.
 - Bounded, optionally redacted external output chunks released only to the
   trusted host, never directly to Splash source.
 - Keyed, directional, replay-checked worker protocol frames and authenticated

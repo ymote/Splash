@@ -102,13 +102,17 @@ deadline returns `DeadlineElapsed`; the event loop should resolve it through
 
 `idempotency_key` is safe to pass to an authenticated worker as a downstream
 deduplication key. It is stable for all attempts of one operation and includes
-a runtime session nonce sourced from operating-system entropy when available,
-with a process-local time/PID fallback otherwise. This avoids reuse by normal
-new host processes. It is not an authorization credential or durable operation
-identity. Retain the opaque `ExternalToolId` locally. Durable workflows should
-use a persisted workflow or operation identity in addition to this per-runtime
-key. Do not retry a non-idempotent worker unless the worker deduplicates
-requests using that key or another durable operation identity.
+a runtime session nonce sourced from operating-system entropy. When that source
+is unavailable, Splash refuses to register an externally dispatched tool rather
+than emitting a time- or PID-derived fallback. A host that has a separately
+trusted unique source can construct `CapabilitySessionNonce` and pass it to
+`CapabilityRuntime::with_limits_pending_catalog_and_session_nonce`; that nonce
+must be unique across runtime sessions sharing the downstream deduplication
+scope, including after restart. It is not an authorization credential or
+durable operation identity. Retain the opaque `ExternalToolId` locally. Durable
+workflows should use a persisted workflow or operation identity in addition to
+this per-runtime key. Do not retry a non-idempotent worker unless the worker
+deduplicates requests using that key or another durable operation identity.
 `splash-workflow` provides a plan-bound
 [durable operation ledger](workflow-operations.md) for that host-owned
 identity and restart policy. A contained worker can accept that identity in an

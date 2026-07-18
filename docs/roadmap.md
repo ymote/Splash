@@ -103,6 +103,10 @@
   promise pending until host-confirmed acknowledgement.
 - Per-tool deferred deadlines with host-driven expiration.
 - Host-only bounded external retries with stable idempotency keys.
+- External deferred-tool registration fails closed when operating-system
+  entropy is unavailable. A host may explicitly provide a bounded session
+  nonce with a documented cross-restart uniqueness scope; Splash never falls
+  back to time/PID-derived downstream idempotency keys.
 - Bounded, redactor-hooked external output streaming outside Splash source.
 - Keyed, replay-checked worker frames and authenticated live-operation
   reconciliation.

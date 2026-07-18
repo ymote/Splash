@@ -105,11 +105,15 @@ sequence numbers are durable storage or authorization state.
 
 ## Data and Boundaries
 
-Audit records retain a registered tool identifier, or a fixed-length
-session-scoped digest label for an invalid dynamic name, along with input and
-output byte counts, a finite outcome, and an optional retry class. They do not
-retain Splash source, tool input/output, external stream chunks, credentials,
-approval objects, leases, worker keys, or VM promise state.
+Audit records retain a registered tool identifier, or a fixed-length BLAKE3
+digest label for an invalid dynamic name, along with input and output byte
+counts, a finite outcome, and an optional retry class. The label is scoped to a
+live runtime session when operating-system entropy or a host-supplied capability
+session nonce is available. In a no-entropy local-only runtime it uses only a
+process-local session counter, so it can repeat after restart and must not be
+treated as confidential or cross-restart unlinkable. Audit records do not retain
+Splash source, tool input/output, external stream chunks, credentials, approval
+objects, leases, worker keys, or VM promise state.
 
 An `allowed` audit outcome is not proof that a remote effect completed or can
 be replayed. Hosts still need idempotency, authenticated worker reconciliation,

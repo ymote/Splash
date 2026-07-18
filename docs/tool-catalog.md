@@ -19,8 +19,11 @@ Registered names are lowercase ASCII identifiers containing letters, digits,
 `.`, `_`, or `-`, and are limited to 128 bytes. This keeps catalog entries,
 leases, deferred handles, and retained audit labels bounded. An unrecognized
 script-provided name that is invalid or oversized is represented in the audit
-view by a fixed-length, session-scoped BLAKE3 digest label rather than copied
-verbatim.
+view by a fixed-length BLAKE3 digest label rather than copied verbatim. The
+label is scoped to a live runtime session when operating-system entropy or a
+host-supplied capability session nonce is available. A no-entropy local-only
+runtime uses only a process-local session counter, so its labels can repeat
+after restart and are not a confidentiality boundary.
 
 For a UI or LLM review step, a host may pair the catalog with
 `splash_core::tool_call_hint_report` or `splash tool-calls <file>`. That
