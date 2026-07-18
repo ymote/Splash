@@ -158,10 +158,11 @@
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of
   uncommitted candidates; it requires a host-provided rollback anchor.
-- Bounded transactional rollback-anchor service protocol with optional fixed
-  HTTPS transport, canonical `u64` wire values, bounded exchange, generic
-  diagnostics, and process-lifetime state-regression detection. The separately
-  deployed service remains the rollback-resistant CAS authority.
+- Bounded transactional rollback-anchor service protocol with an embeddable
+  server-side dispatcher and optional fixed HTTPS client transport, canonical
+  `u64` wire values, bounded exchange, generic diagnostics, and
+  process-lifetime state-regression detection. The separately deployed service
+  remains the rollback-resistant CAS authority.
 - Feature-gated read-only native credential-store loading for pre-provisioned
   storage keys on macOS, iOS, and Windows; it never falls back to an
   in-process mock store or claims rollback protection.

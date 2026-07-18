@@ -57,6 +57,30 @@ service, or make a service correct merely because TLS succeeds. HTTPS provides
 transport authentication for the configured host name; the service's durable
 state and deployment trust model remain separate requirements.
 
+## Service Core
+
+`RollbackAnchorService<A>` is an embeddable server-side dispatcher for the
+same wire protocol. It accepts one complete request body, rejects malformed,
+oversized, noncanonical, or unsupported-version requests, calls the supplied
+`RollbackAnchor`, and returns only a bounded canonical response. Its errors
+redact request bytes, storage keys, states, and backend diagnostics.
+
+It is deliberately not an HTTP/RPC listener, authentication layer,
+authorization policy, cache policy, concurrency primitive, or durable backend.
+The deployment must authenticate and authorize a caller before passing its
+body to `handle_request`, cap the body before buffering it, serialize access as
+required by the chosen backend, and translate handler failures to generic
+non-success responses without exposing backend diagnostics. Successful
+responses must not be cached. `VolatileRollbackAnchor` is suitable for tests
+and local development only; wrapping it in this dispatcher does not create
+durability or rollback protection.
+
+For a network deployment, terminate TLS and enforce the exact service route in
+trusted server configuration, then place a real atomic, rollback-resistant CAS
+authority behind the dispatcher. A globally authenticated service still needs
+an explicit per-tenant key-authorization policy when more than one tenant can
+address it. The dispatcher cannot infer either policy from a record key.
+
 ## Wire Protocol
 
 Every request and response is a UTF-8 JSON object no larger than 4 KiB. The

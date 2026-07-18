@@ -327,7 +327,13 @@ For a successful plan it verifies exact manifest retention, the fixed
 networkless/cleared-environment/capability-drop arguments, and selection of
 only the requested roots. Its reviewed `.seed` corpus covers ordinary,
 bounded, accepted and rejected aggregate, and unsupported-resource
-configurations. `workflow_draft` feeds
+configurations. `rollback_anchor_service` sends each bounded fuzz input both
+through the trusted client response decoder and through the embeddable service
+request dispatcher backed by a process-local test anchor. It never starts a
+listener or claims that the test backend is durable; every accepted server
+response must remain within the fixed protocol response limit. Its reviewed
+JSON seeds include valid load and compare-and-swap requests as well as client
+response shapes. `workflow_draft` feeds
 bounded UTF-8 JSON into the data-only `WorkflowDraft` decoder, then checks that
 every accepted draft
 round-trips through the current wire format and produces exactly one review

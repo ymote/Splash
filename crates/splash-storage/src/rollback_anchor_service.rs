@@ -1,12 +1,14 @@
 //! Bounded transactional-service protocol for rollback anchors.
 //!
 //! [`TrustedServiceRollbackAnchor`] turns a host-owned
-//! [`RollbackAnchorServiceTransport`] into a [`crate::RollbackAnchor`]. The
-//! transport must reach one separately trusted service that durably enforces
-//! the documented per-record compare-and-swap contract. This module validates
-//! the wire format, bounds messages, rejects invalid requested transitions,
-//! and detects state regressions observed during one process lifetime. It does
-//! not make an ordinary HTTPS endpoint, keyring, or local cache rollback
+//! [`RollbackAnchorServiceTransport`] into a [`crate::RollbackAnchor`], while
+//! [`RollbackAnchorService`] dispatches the same bounded wire protocol on a
+//! trusted service. The transport and dispatcher must reach or wrap one
+//! separately trusted authority that durably enforces the documented per-record
+//! compare-and-swap contract. This module validates the wire format, bounds
+//! messages, rejects invalid requested transitions, and detects state
+//! regressions observed during one process lifetime. It does not make an
+//! ordinary HTTPS endpoint, keyring, local cache, or volatile backend rollback
 //! resistant by itself.
 
 use std::cell::RefCell;
@@ -22,7 +24,7 @@ use crate::{
     ROLLBACK_ANCHOR_COMMITMENT_BYTES,
 };
 
-/// Protocol version used by [`TrustedServiceRollbackAnchor`].
+/// Protocol version used by the client and server-side dispatcher.
 pub const ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION: u8 = 1;
 /// Maximum JSON bytes accepted for one service request.
 pub const MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES: usize = 4 * 1024;
@@ -200,6 +202,162 @@ where
     }
 }
 
+/// Bounded server-side dispatcher for the transactional rollback-anchor
+/// protocol.
+///
+/// This type is an embeddable request handler, not an HTTP listener or an
+/// authentication mechanism. A deployment must authenticate and authorize a
+/// caller before it passes request bytes here, serialize access to the handler
+/// as appropriate for its backend, and provide an `A` that is a real durable,
+/// rollback-resistant compare-and-swap authority. In particular,
+/// [`crate::VolatileRollbackAnchor`] is suitable only for tests and local
+/// development.
+pub struct RollbackAnchorService<A> {
+    anchor: A,
+}
+
+impl<A> RollbackAnchorService<A> {
+    /// Creates a server-side dispatcher over one host-owned anchor backend.
+    pub fn new(anchor: A) -> Self {
+        Self { anchor }
+    }
+
+    /// Consumes this dispatcher and returns its host-owned anchor backend.
+    pub fn into_inner(self) -> A {
+        self.anchor
+    }
+}
+
+impl<A> fmt::Debug for RollbackAnchorService<A> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RollbackAnchorService")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<A> RollbackAnchorService<A>
+where
+    A: RollbackAnchor,
+{
+    /// Validates, dispatches, and encodes one complete protocol request.
+    ///
+    /// Request and response bodies are independently capped at 4 KiB. All
+    /// malformed request, unsupported-version, and backend failures are
+    /// represented by redacted errors; this type never embeds request bytes,
+    /// record keys, anchor states, or backend diagnostics in an error.
+    pub fn handle_request(
+        &mut self,
+        request: &[u8],
+    ) -> Result<Vec<u8>, RollbackAnchorServiceError> {
+        if request.len() > MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES {
+            return Err(RollbackAnchorServiceError::RequestTooLarge {
+                maximum: MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES,
+            });
+        }
+        let request = serde_json::from_slice::<WireRequest>(request)
+            .map_err(|_| RollbackAnchorServiceError::InvalidRequest)?;
+        if request.version() != ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION {
+            return Err(RollbackAnchorServiceError::UnsupportedRequestVersion);
+        }
+        let request = request
+            .into_domain()
+            .map_err(|_| RollbackAnchorServiceError::InvalidRequest)?;
+
+        let response = match request {
+            DecodedWireRequest::Load { key } => WireResponse::State {
+                version: ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION,
+                state: self
+                    .anchor
+                    .load(&key)
+                    .map_err(|_| RollbackAnchorServiceError::Backend)?
+                    .into(),
+            },
+            DecodedWireRequest::CompareAndSwap {
+                key,
+                expected,
+                replacement,
+            } => {
+                validate_state_transition(expected, replacement)
+                    .map_err(RollbackAnchorServiceError::InvalidRequestedTransition)?;
+                match self
+                    .anchor
+                    .compare_and_swap(&key, expected, replacement)
+                    .map_err(|_| RollbackAnchorServiceError::Backend)?
+                {
+                    RollbackAnchorCompareAndSwapOutcome::Stored => WireResponse::Stored {
+                        version: ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION,
+                    },
+                    RollbackAnchorCompareAndSwapOutcome::Conflict { actual } => {
+                        WireResponse::Conflict {
+                            version: ROLLBACK_ANCHOR_SERVICE_PROTOCOL_VERSION,
+                            actual: actual.into(),
+                        }
+                    }
+                }
+            }
+        };
+        let response =
+            serde_json::to_vec(&response).map_err(|_| RollbackAnchorServiceError::Encoding)?;
+        if response.len() > MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES {
+            return Err(RollbackAnchorServiceError::ResponseTooLarge {
+                maximum: MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES,
+            });
+        }
+        Ok(response)
+    }
+}
+
+/// Failure while dispatching one rollback-anchor service request.
+///
+/// Values deliberately redact request bytes, record identities, anchor states,
+/// and backend diagnostics. An HTTP or RPC wrapper may map the variants to
+/// status classes, but must not expose richer backend failure details to an
+/// untrusted caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollbackAnchorServiceError {
+    RequestTooLarge { maximum: usize },
+    InvalidRequest,
+    UnsupportedRequestVersion,
+    InvalidRequestedTransition(RollbackAnchorStateTransitionError),
+    Backend,
+    Encoding,
+    ResponseTooLarge { maximum: usize },
+}
+
+impl Display for RollbackAnchorServiceError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestTooLarge { maximum } => write!(
+                formatter,
+                "rollback-anchor service request exceeds the {maximum}-byte limit"
+            ),
+            Self::InvalidRequest => {
+                formatter.write_str("rollback-anchor service request is invalid")
+            }
+            Self::UnsupportedRequestVersion => {
+                formatter.write_str("rollback-anchor service request uses an unsupported version")
+            }
+            Self::InvalidRequestedTransition(error) => {
+                write!(
+                    formatter,
+                    "rollback-anchor service request is invalid: {error}"
+                )
+            }
+            Self::Backend => formatter.write_str("rollback-anchor service backend failed"),
+            Self::Encoding => {
+                formatter.write_str("rollback-anchor service response encoding failed")
+            }
+            Self::ResponseTooLarge { maximum } => write!(
+                formatter,
+                "rollback-anchor service response exceeds the {maximum}-byte limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RollbackAnchorServiceError {}
+
 /// Invalid monotonic state transition requested from or observed at a service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RollbackAnchorStateTransitionError {
@@ -304,8 +462,8 @@ fn validate_state_transition(
     Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum WireRequest {
     Load {
         version: u8,
@@ -339,9 +497,45 @@ impl WireRequest {
             replacement: WireState::from(replacement),
         }
     }
+
+    fn version(&self) -> u8 {
+        match self {
+            Self::Load { version, .. } | Self::CompareAndSwap { version, .. } => *version,
+        }
+    }
+
+    fn into_domain(self) -> Result<DecodedWireRequest, ()> {
+        match self {
+            Self::Load { key, .. } => Ok(DecodedWireRequest::Load {
+                key: key.into_domain()?,
+            }),
+            Self::CompareAndSwap {
+                key,
+                expected,
+                replacement,
+                ..
+            } => Ok(DecodedWireRequest::CompareAndSwap {
+                key: key.into_domain()?,
+                expected: expected.into_domain()?,
+                replacement: replacement.into_domain()?,
+            }),
+        }
+    }
 }
 
-#[derive(Serialize)]
+enum DecodedWireRequest {
+    Load {
+        key: StorageRecordKey,
+    },
+    CompareAndSwap {
+        key: StorageRecordKey,
+        expected: RollbackAnchorState,
+        replacement: RollbackAnchorState,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct WireKey {
     namespace: String,
     name: String,
@@ -353,6 +547,12 @@ impl From<&StorageRecordKey> for WireKey {
             namespace: key.namespace().to_owned(),
             name: key.name().to_owned(),
         }
+    }
+}
+
+impl WireKey {
+    fn into_domain(self) -> Result<StorageRecordKey, ()> {
+        StorageRecordKey::new(self.namespace, self.name).map_err(|_| ())
     }
 }
 
@@ -436,6 +636,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::VolatileRollbackAnchor;
 
     #[derive(Default)]
     struct ScriptedTransport {
@@ -468,6 +669,53 @@ mod tests {
         }
     }
 
+    struct LoopbackTransport {
+        service: RollbackAnchorService<VolatileRollbackAnchor>,
+    }
+
+    impl LoopbackTransport {
+        fn new(anchor: VolatileRollbackAnchor) -> Self {
+            Self {
+                service: RollbackAnchorService::new(anchor),
+            }
+        }
+    }
+
+    impl RollbackAnchorServiceTransport for LoopbackTransport {
+        type Error = ();
+
+        fn exchange(
+            &mut self,
+            request: &[u8],
+            maximum_response_bytes: usize,
+        ) -> Result<Vec<u8>, Self::Error> {
+            let response = self.service.handle_request(request).map_err(|_| ())?;
+            if response.len() > maximum_response_bytes {
+                return Err(());
+            }
+            Ok(response)
+        }
+    }
+
+    struct FailingAnchor;
+
+    impl RollbackAnchor for FailingAnchor {
+        type Error = &'static str;
+
+        fn load(&self, _key: &StorageRecordKey) -> Result<RollbackAnchorState, Self::Error> {
+            Err("backend-secret-metadata")
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            _key: &StorageRecordKey,
+            _expected: RollbackAnchorState,
+            _replacement: RollbackAnchorState,
+        ) -> Result<RollbackAnchorCompareAndSwapOutcome, Self::Error> {
+            Err("backend-secret-metadata")
+        }
+    }
+
     fn key() -> StorageRecordKey {
         StorageRecordKey::new("workflow-ledger", "release-42").unwrap()
     }
@@ -479,6 +727,122 @@ mod tests {
             fencing_token,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn server_core_round_trips_with_the_trusted_client_protocol() {
+        let expected = RollbackAnchorState::initial();
+        let replacement = state(1, 7, 3);
+        let transport = LoopbackTransport::new(VolatileRollbackAnchor::default());
+        let mut anchor = TrustedServiceRollbackAnchor::new(transport);
+
+        assert_eq!(
+            anchor
+                .compare_and_swap(&key(), expected, replacement)
+                .unwrap(),
+            RollbackAnchorCompareAndSwapOutcome::Stored
+        );
+        assert_eq!(anchor.load(&key()).unwrap(), replacement);
+    }
+
+    #[test]
+    fn server_core_returns_the_exact_conflict_state() {
+        let current = state(1, 7, 2);
+        let mut backing = VolatileRollbackAnchor::default();
+        assert_eq!(
+            backing
+                .compare_and_swap(&key(), RollbackAnchorState::initial(), current)
+                .unwrap(),
+            RollbackAnchorCompareAndSwapOutcome::Stored
+        );
+        let transport = LoopbackTransport::new(backing);
+        let mut anchor = TrustedServiceRollbackAnchor::new(transport);
+
+        assert_eq!(
+            anchor
+                .compare_and_swap(&key(), RollbackAnchorState::initial(), state(2, 8, 3),)
+                .unwrap(),
+            RollbackAnchorCompareAndSwapOutcome::Conflict { actual: current }
+        );
+    }
+
+    #[test]
+    fn server_core_rejects_invalid_requests_without_mutating_its_backend() {
+        let mut service = RollbackAnchorService::new(VolatileRollbackAnchor::default());
+        let unsupported_version = br#"{"version":2,"operation":"load","key":{"namespace":"workflow-ledger","name":"release-42"}}"#;
+        assert_eq!(
+            service.handle_request(unsupported_version).unwrap_err(),
+            RollbackAnchorServiceError::UnsupportedRequestVersion
+        );
+
+        let unknown_field = br#"{"version":1,"operation":"load","key":{"namespace":"workflow-ledger","name":"release-42"},"host_metadata":"secret-metadata"}"#;
+        let error = service.handle_request(unknown_field).unwrap_err();
+        assert_eq!(error, RollbackAnchorServiceError::InvalidRequest);
+        assert!(!error.to_string().contains("secret-metadata"));
+        assert!(!format!("{error:?}").contains("secret-metadata"));
+
+        let invalid_key = br#"{"version":1,"operation":"load","key":{"namespace":"../host","name":"release-42"}}"#;
+        assert_eq!(
+            service.handle_request(invalid_key).unwrap_err(),
+            RollbackAnchorServiceError::InvalidRequest
+        );
+
+        let invalid_state = br#"{"version":1,"operation":"compare_and_swap","key":{"namespace":"workflow-ledger","name":"release-42"},"expected":{"revision_floor":"1","record_commitment":null,"fencing_token":"0"},"replacement":{"revision_floor":"1","record_commitment":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","fencing_token":"0"}}"#;
+        assert_eq!(
+            service.handle_request(invalid_state).unwrap_err(),
+            RollbackAnchorServiceError::InvalidRequest
+        );
+
+        let invalid_transition = serde_json::to_vec(&WireRequest::compare_and_swap(
+            &key(),
+            state(2, 7, 2),
+            state(1, 7, 2),
+        ))
+        .unwrap();
+        assert_eq!(
+            service.handle_request(&invalid_transition).unwrap_err(),
+            RollbackAnchorServiceError::InvalidRequestedTransition(
+                RollbackAnchorStateTransitionError::RevisionRegressed
+            )
+        );
+
+        let oversized = vec![b'x'; MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES + 1];
+        assert_eq!(
+            service.handle_request(&oversized).unwrap_err(),
+            RollbackAnchorServiceError::RequestTooLarge {
+                maximum: MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES,
+            }
+        );
+        let load = serde_json::to_vec(&WireRequest::load(&key())).unwrap();
+        let response = service.handle_request(&load).unwrap();
+        let WireResponse::State { state, .. } = serde_json::from_slice(&response).unwrap() else {
+            panic!("load must produce a state response");
+        };
+        assert_eq!(state.into_domain().unwrap(), RollbackAnchorState::initial());
+    }
+
+    #[test]
+    fn server_core_redacts_backend_failures() {
+        let mut service = RollbackAnchorService::new(FailingAnchor);
+        let invalid_transition = serde_json::to_vec(&WireRequest::compare_and_swap(
+            &key(),
+            state(2, 7, 2),
+            state(1, 7, 2),
+        ))
+        .unwrap();
+        assert_eq!(
+            service.handle_request(&invalid_transition).unwrap_err(),
+            RollbackAnchorServiceError::InvalidRequestedTransition(
+                RollbackAnchorStateTransitionError::RevisionRegressed
+            )
+        );
+
+        let request = serde_json::to_vec(&WireRequest::load(&key())).unwrap();
+        let error = service.handle_request(&request).unwrap_err();
+
+        assert_eq!(error, RollbackAnchorServiceError::Backend);
+        assert!(!error.to_string().contains("backend-secret-metadata"));
+        assert!(!format!("{error:?}").contains("backend-secret-metadata"));
     }
 
     #[test]

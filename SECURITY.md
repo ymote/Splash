@@ -231,6 +231,14 @@ must stop new admissions, reserve a fresh opaque recovery fence, then discard
 only unanchored candidates through the backend API. Never recover by deleting
 the SQLite file or by rebuilding anchor state from it.
 
+`RollbackAnchorService<A>` is only a bounded, canonical protocol dispatcher
+around a host-owned `RollbackAnchor`. It does not authenticate or authorize a
+caller, listen on a socket, serialize concurrent callers, select tenant scope,
+or improve `A`'s durability. A network service must enforce those boundaries
+outside the handler and return generic failures without backend details. A
+volatile or rollbackable backend remains unsuitable after being wrapped by the
+dispatcher.
+
 The optional `splash-storage` `keyring` feature retrieves a host-provisioned
 32-byte storage key from native credential stores on macOS, iOS, and Windows.
 It reads an existing binary credential only, rejects unsupported targets rather

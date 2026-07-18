@@ -3,13 +3,19 @@
 use libfuzzer_sys::fuzz_target;
 use splash_storage::{
     rollback_anchor_service::{
-        RollbackAnchorServiceTransport, TrustedServiceRollbackAnchor,
-        MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES,
+        RollbackAnchorService, RollbackAnchorServiceTransport, TrustedServiceRollbackAnchor,
+        MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES, MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES,
     },
-    RollbackAnchor, RollbackAnchorState, StorageRecordKey, ROLLBACK_ANCHOR_COMMITMENT_BYTES,
+    RollbackAnchor, RollbackAnchorState, StorageRecordKey, VolatileRollbackAnchor,
+    ROLLBACK_ANCHOR_COMMITMENT_BYTES,
 };
 
-const MAX_FUZZ_RESPONSE_BYTES: usize = MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES * 2;
+const MAX_FUZZ_MESSAGE_BYTES: usize =
+    if MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES > MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES {
+        MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES * 2
+    } else {
+        MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES * 2
+    };
 
 struct ReplayTransport {
     response: Vec<u8>,
@@ -28,8 +34,13 @@ impl RollbackAnchorServiceTransport for ReplayTransport {
 }
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() > MAX_FUZZ_RESPONSE_BYTES {
+    if data.len() > MAX_FUZZ_MESSAGE_BYTES {
         return;
+    }
+
+    let mut service = RollbackAnchorService::new(VolatileRollbackAnchor::default());
+    if let Ok(response) = service.handle_request(data) {
+        assert!(response.len() <= MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES);
     }
 
     let key =

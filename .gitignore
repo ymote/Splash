@@ -38,6 +38,9 @@ vendor/makepad/target/
 !/fuzz/corpus/http_origin_policy/
 /fuzz/corpus/http_origin_policy/*
 !/fuzz/corpus/http_origin_policy/*.seed
+!/fuzz/corpus/rollback_anchor_service/
+/fuzz/corpus/rollback_anchor_service/*
+!/fuzz/corpus/rollback_anchor_service/*.json
 /fuzz/target/
 *.swp
 .DS_Store

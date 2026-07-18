@@ -1,0 +1,1 @@
+{"version":1,"operation":"compare_and_swap","key":{"namespace":"workflow-ledger","name":"release-42"},"expected":{"revision_floor":"0","record_commitment":null,"fencing_token":"0"},"replacement":{"revision_floor":"1","record_commitment":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","fencing_token":"1"}}

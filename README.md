@@ -132,10 +132,11 @@ and keeps UI support optional rather than making UI the language boundary.
   rollback-protected compare-and-swap backend contract.
 - Optional SQLite payload storage paired with an explicit trusted rollback
   anchor, including durable revision and fencing commitments.
-- Bounded transactional rollback-anchor service protocol with an optional
-  fixed HTTPS transport. It rejects malformed or regressing responses and
-  disables redirects and proxies, but the separately deployed service remains
-  the rollback-resistant CAS authority.
+- Bounded transactional rollback-anchor service protocol with an embeddable
+  server-side dispatcher and optional fixed HTTPS client transport. It rejects
+  malformed or regressing protocol data and disables client redirects and
+  proxies, but the separately deployed service remains the rollback-resistant
+  CAS authority.
 - Fenced authenticated worker-journal storage that binds durable worker state
   to a host-selected record, revision, and current writer lease.
 - Feature-gated authenticated in-process worker transport for app-provided
@@ -596,8 +597,8 @@ records and safely reconciles uncertain external effects across a restart.
 record boundary used to persist those host-owned records.
 
 [Transactional rollback-anchor service](docs/rollback-anchor-service.md)
-defines the bounded client protocol for a separately trusted durable CAS
-authority.
+defines the bounded client protocol and embeddable server dispatcher for a
+separately trusted durable CAS authority.
 
 [Worker durable operations](docs/worker-operations.md) define the contained
 worker-side replay and persistence boundary for effectful operation keys.
