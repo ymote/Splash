@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
 
     let limits = ExecutionLimits {
         max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
+        max_string_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
         max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
         instruction_limit: FUZZ_INSTRUCTION_LIMIT,

@@ -373,6 +373,7 @@ mod tests {
         let mut builder = MobileRuntimeBuilder::with_limits(
             ExecutionLimits {
                 max_source_bytes: 32 * 1024,
+                max_string_bytes: 32 * 1024,
                 max_syntax_tokens: 4 * 1024,
                 max_syntax_nesting: 64,
                 instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
@@ -409,6 +410,7 @@ mod tests {
 
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(runtime.limits().max_source_bytes, 32 * 1024);
+        assert_eq!(runtime.limits().max_string_bytes, 32 * 1024);
         assert_eq!(runtime.limits().max_syntax_nesting, 64);
         assert_eq!(runtime.max_pending_tools(), 4);
         assert_eq!(runtime.pending_tools(), 0);

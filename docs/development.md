@@ -296,20 +296,21 @@ catalogs only: the target never starts stdio, reads the URI, resolves modules,
 evaluates Splash, creates a capability host, or invokes an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
-cap, 4,096 instruction cap, one-instruction deadline sampling, and a 32 ms
-terminal execution deadline. Script-level errors from
+cap, 8 KiB individual-string cap, 4,096 instruction cap, one-instruction
+deadline sampling, and a 32 ms terminal execution deadline. Script-level errors from
 unavailable modules are expected. It creates `Runtime<(), ()>`, so no
 capability or Rust adapter can run; a panic or hang is a fuzz failure.
 `execution` explicitly collects its fresh VM after evaluation so retained heap
 state cannot mask resource behavior. Their tracked `.splash` seeds cover
 canonical dataflow, deferred tools, loops, lambdas, recoverable error control
-flow, and an intentional instruction-limit case.
-`execution_limits` rotates valid source, syntax, instruction, sampling, and
-deadline profiles through a fresh capability-free runtime. Equal soft and hard
-deadlines must terminate rather than leave a resumable evaluation. Its
-cooperative one-nanosecond soft-budget profile may yield, but it must then
-refuse a later `set_limits` request so the continuation keeps its original
-resource contract. A completed evaluation must accept the replacement profile.
+flow, intentional instruction-limit behavior, and exponential string growth.
+`execution_limits` rotates valid source, individual-string, syntax,
+instruction, sampling, and deadline profiles through a fresh capability-free
+runtime. Equal soft and hard deadlines must terminate rather than leave a
+resumable evaluation. Its cooperative one-nanosecond soft-budget profile may
+yield, but it must then refuse a later `set_limits` request so the continuation
+keeps its original resource contract. A completed evaluation must accept the
+replacement profile.
 The target collects the VM after each case and never installs an adapter or
 capability. Its reviewed `.splash` seeds cover a cooperative budget yield and a
 tight instruction limit. `bubblewrap_policy` maps at most 64 fuzz bytes onto

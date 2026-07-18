@@ -7,6 +7,7 @@ use crate::object::*;
 use crate::pod::*;
 use crate::regex::*;
 use crate::string::*;
+use crate::string_heap::ScriptStringSink;
 use crate::traits::*;
 use crate::trap::*;
 use crate::value::*;
@@ -38,6 +39,8 @@ pub struct ScriptHeap {
     pub(crate) strings_reuse: Vec<String>,
     pub(crate) strings: GenVec<Option<ScriptStringData>>,
     pub(crate) strings_free: Vec<ScriptString>,
+    pub(crate) max_string_bytes: Option<usize>,
+    pub(crate) string_limit_exceeded: bool,
 
     pub(crate) arrays: GenVec<ScriptArrayData>,
     pub(crate) arrays_free: Vec<ScriptArray>,
@@ -714,51 +717,69 @@ impl ScriptHeap {
     }
 
     pub fn to_json(&mut self, value: ScriptValue) -> ScriptValue {
-        self.new_string_with(|heap, s| {
+        self.new_bounded_string_with(|heap, s| {
             heap.to_json_inner(value, s);
         })
     }
 
-    pub fn to_json_inner(&self, value: ScriptValue, out: &mut String) {
-        fn escape_str(inp: &str, out: &mut String) {
+    pub fn to_json_inner<S: ScriptStringSink>(&self, value: ScriptValue, out: &mut S) {
+        fn escape_str<S: ScriptStringSink>(inp: &str, out: &mut S) {
             for c in inp.chars() {
                 match c {
-                    '\x08' => out.push_str("\\b"),
-                    '\x0c' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\"),
+                    '\x08' => out.append_str("\\b"),
+                    '\x0c' => out.append_str("\\f"),
+                    '\n' => out.append_str("\\n"),
+                    '\r' => out.append_str("\\r"),
+                    '"' => out.append_str("\\\""),
+                    '\\' => out.append_str("\\"),
                     c => {
-                        out.push(c);
+                        out.append_char(c);
                     }
                 }
+                if out.is_full() {
+                    break;
+                }
             }
+        }
+        if out.is_full() {
+            return;
         }
         if let Some(obj) = value.as_object() {
             let mut ptr = obj;
             // scan up the chain to set the proto value
-            out.push('{');
+            out.append_char('{');
             let mut first = true;
             loop {
                 let object = &self.objects[ptr];
                 object.map_iter(|key, value| {
+                    if out.is_full() {
+                        return;
+                    }
                     if !first {
-                        out.push(',')
+                        out.append_char(',')
                     }
                     self.to_json_inner(key, out);
-                    out.push(':');
+                    out.append_char(':');
                     self.to_json_inner(value, out);
                     first = false;
                 });
+                if out.is_full() {
+                    break;
+                }
                 for kv in object.vec.iter() {
+                    if out.is_full() {
+                        break;
+                    }
                     if !first {
-                        out.push(',')
+                        out.append_char(',')
                     }
                     first = false;
                     self.to_json_inner(kv.key, out);
-                    out.push(':');
+                    out.append_char(':');
                     self.to_json_inner(kv.value, out);
+                }
+                if out.is_full() {
+                    break;
                 }
                 if let Some(next_ptr) = object.proto.as_object() {
                     ptr = next_ptr
@@ -766,30 +787,39 @@ impl ScriptHeap {
                     break;
                 }
             }
-            out.push('}');
+            if !out.is_full() {
+                out.append_char('}');
+            }
         } else if let Some(arr) = value.as_array() {
             let array = &self.arrays[arr];
             let len = array.storage.len();
             let mut first = true;
-            out.push('[');
+            out.append_char('[');
             for i in 0..len {
                 if let Some(value) = array.storage.index(i) {
                     if !first {
-                        out.push(',')
+                        out.append_char(',')
                     }
                     first = false;
                     self.to_json_inner(value, out);
+                    if out.is_full() {
+                        break;
+                    }
                 }
             }
-            out.push(']');
+            if !out.is_full() {
+                out.append_char(']');
+            }
         } else if let Some(id) = value.as_id() {
-            out.push('"');
+            out.append_char('"');
             id.as_string(|s| {
                 if let Some(s) = s {
                     escape_str(s, out);
                 }
             });
-            out.push('"');
+            if !out.is_full() {
+                out.append_char('"');
+            }
             // alright. sself is json eh. so.
         } else if let Some(s) = value.as_string() {
             let s = if let Some(s) = &self.strings[s] {
@@ -797,29 +827,33 @@ impl ScriptHeap {
             } else {
                 ""
             };
-            out.push('"');
+            out.append_char('"');
             escape_str(s, out);
-            out.push('"');
+            if !out.is_full() {
+                out.append_char('"');
+            }
         } else if value
             .as_inline_string(|s| {
-                out.push('"');
+                out.append_char('"');
                 escape_str(s, out);
-                out.push('"');
+                if !out.is_full() {
+                    out.append_char('"');
+                }
             })
             .is_some()
         {
         } else if let Some(v) = value.as_bool() {
             if v {
-                out.push_str("true")
+                out.append_str("true")
             } else {
-                out.push_str("false")
+                out.append_str("false")
             }
         } else if let Some(v) = value.as_number() {
             write!(out, "{}", v).ok();
         } else if let Some(v) = value.as_handle() {
             write!(out, "Handle{:?}", v).ok();
         } else {
-            out.push_str("null");
+            out.append_str("null");
         }
     }
 

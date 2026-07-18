@@ -3,7 +3,8 @@
 ## Baseline complete
 
 - Standalone VM workspace with upstream provenance.
-- Bounded evaluation and canonical grammar diagnostics.
+- Bounded evaluation and canonical grammar diagnostics, including a
+  host-configurable per-string allocation ceiling.
 - Canonical source formatting that preserves comments and literal spellings.
 - Host-only LSP diagnostics and full-document canonical formatting for the
   published v0.2 grammar.

@@ -90,9 +90,10 @@ the Rust application that already owns the device or service.
 
 There are three distinct boundaries. They must not be conflated.
 
-1. The canonical grammar and evaluator bound source, syntax work,
-   instructions, and evaluation time. They reduce interpreter resource risk;
-   they do not authorize effects.
+1. The canonical grammar and evaluator bound source, syntax work, individual
+   string construction, instructions, and evaluation time. They reduce
+   interpreter resource risk; they do not authorize effects or establish an
+   aggregate VM-heap quota.
 2. The capability runtime registers a finite catalog, validates every dynamic
    tool name at reservation time, and uses approval-bound leases that survive
    `await`. Approval-bound workflow data can influence a call but cannot widen
@@ -118,10 +119,10 @@ target:
 
 1. Freeze a tool catalog and test that generated scripts cannot widen it,
    including across deferred completion and workflow resume.
-2. Define bounded input, output, pending-work, source, instruction, and event
-   retention budgets from the target device's memory and latency limits,
-   including the aggregate dataflow context and contract schemas when
-   workflows pass JSON results.
+2. Define bounded input, output, pending-work, source, individual-string,
+   aggregate-heap, instruction, and event-retention budgets from the target
+   device's memory and latency limits, including the aggregate dataflow context
+   and contract schemas when workflows pass JSON results.
 3. Run effectful adapters in a target-specific containment backend, or prove
    that each in-process adapter has no harmful ambient authority.
 4. Provide a durable checkpoint, idempotency, and reconciliation policy for

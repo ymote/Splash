@@ -242,6 +242,7 @@ fn profile_output() -> JsonValue {
             "lexical_completion_sites": MAX_LEXICAL_COMPLETION_SITES,
         },
         "evaluation_limits": {
+            "string_bytes": limits.max_string_bytes,
             "instruction_limit": limits.instruction_limit,
             "soft_timeout_ms": soft_timeout_ms,
             "hard_timeout_ms": hard_timeout_ms,
@@ -1160,6 +1161,10 @@ mod tests {
             json!(CANONICAL_PROFILE_GRAMMAR_PATH)
         );
         assert_eq!(output["profile"]["canonical_only"], json!(true));
+        assert_eq!(
+            output["evaluation_limits"]["string_bytes"],
+            json!(limits.max_string_bytes)
+        );
         assert_eq!(
             output["preflight_limits"]["source_bytes"],
             json!(limits.max_source_bytes)

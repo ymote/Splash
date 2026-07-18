@@ -46,7 +46,8 @@ resolves imports, creates a host, or grants a tool capability. A source that
 the canonical profile rejects never enters the inherited tokenizer or parser.
 The default preflight budget is 256 KiB of source, 32,768 lexical tokens, and
 128 syntax-nesting levels; an embedded host can lower all three through
-`ExecutionLimits`.
+`ExecutionLimits`. Evaluation additionally limits each newly constructed
+script string to 256 KiB by default through `ExecutionLimits::max_string_bytes`.
 
 `splash format <file>` applies the same profile and compatibility checks, then
 writes canonical whitespace to standard output without evaluating source or
@@ -249,8 +250,9 @@ core and capability-host fixtures exercise that path with real execution and
 tool bindings. The `syntax` fuzz target differentially
 checks canonical preflight, VM parsing, and formatting. The separate
 capability-free `execution` target runs accepted programs under strict source,
-token, instruction, and wall-clock bounds. This is regression coverage, not a
-claim that the two parsers are formally equivalent. Sustained parser/VM
+token, individual-string, instruction, and wall-clock bounds. This is
+regression coverage, not a claim that the two parsers are formally equivalent.
+Sustained parser/VM
 differential fuzzing and corpus triage remain release requirements before the
 language profile is stable.
 
@@ -321,7 +323,11 @@ default execution limits, direct conversion is capped at 64 KiB and 64
 container levels; a host can lower those caps through
 `ExecutionLimits::max_source_bytes` and `max_syntax_nesting`. This applies to
 both `Runtime::eval` and `Runtime::eval_vm_compatibility`; a host using the raw
-Makepad VM owns its upstream JSON behavior.
+Makepad VM owns its upstream JSON behavior. Separately,
+`ExecutionLimits::max_string_bytes` caps the script string produced by a direct
+conversion or JSON reconstruction. Exceeding that per-string limit is an
+uncatchable resource failure, not a complete VM-heap or aggregate-dataflow
+memory limit.
 
 Hosts can register a `JsonToolContract` to enforce bounded schemas for those
 JSON envelopes. Contract checks run before the handler and before output
@@ -412,10 +418,11 @@ or mutate its keys, input digest, worker observation, or restart policy.
   members; `splash check` rejects it.
 - Import `mod.tool` before calling a tool.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
-  fallback cannot inspect the error, and hard instruction/deadline termination
-  remains uncatchable. End each block branch with a value-producing expression;
-  use `nil` when the branch has no other result. Parenthesize a record literal
-  used as the whole protected or fallback branch.
+  fallback cannot inspect the error, and hard string-allocation,
+  instruction/deadline termination remains uncatchable. End each block branch
+  with a value-producing expression; use `nil` when the branch has no other
+  result. Parenthesize a record literal used as the whole protected or fallback
+  branch.
 - Treat a denied tool call as a catchable runtime error that is still audited.
   Do not retry by attempting filesystem, process, or network imports.
 - Do not assume a caught tool failure rolled back an effect or refunded its

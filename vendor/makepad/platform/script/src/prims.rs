@@ -353,11 +353,7 @@ script_primitive!(
         vm.bx.heap.cast_to_string(value, self);
     },
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
-        if let Some(val) = ScriptValue::from_inline_string(&self) {
-            return val;
-        } else {
-            vm.bx.heap.new_string_from_str(self).into()
-        }
+        vm.bx.heap.new_string_from_str(self).into()
     }
 );
 impl ScriptDeriveMarker for String {}
@@ -379,11 +375,7 @@ script_primitive!(
     ) {
     },
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
-        if let Some(val) = ScriptValue::from_inline_string(&self) {
-            return val;
-        } else {
-            vm.bx.heap.new_string_from_str(self).into()
-        }
+        vm.bx.heap.new_string_from_str(self).into()
     }
 );
 impl ScriptDeriveMarker for &'static str {}

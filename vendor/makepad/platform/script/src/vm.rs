@@ -686,6 +686,23 @@ impl<'a> ScriptVm<'a> {
 
     pub fn run_core(&mut self) -> ScriptValue {
         loop {
+            if self.bx.heap.take_string_limit_exceeded() {
+                let err = script_err_limit!(
+                    self.bx.threads.cur_ref().trap,
+                    "script string allocation limit exceeded"
+                );
+                self.drain_errors();
+                self.bx
+                    .threads
+                    .cur()
+                    .trap
+                    .on
+                    .set(Some(ScriptTrapOn::Bail(err)));
+                if let Some(value) = self.handle_trap_on() {
+                    return value;
+                }
+            }
+
             let instruction_limit_exceeded = if let Some(remaining) =
                 self.bx.threads.cur().instruction_limit_remaining.as_mut()
             {
@@ -1539,6 +1556,166 @@ mod tests {
             .take_errors()
             .iter()
             .any(|diagnostic| diagnostic.contains("script time budget exceeded")));
+    }
+
+    #[test]
+    fn string_limit_bails_instead_of_entering_a_try_fallback() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        vm.bx.heap.set_max_string_bytes(Some(8));
+        vm.bx.captured_errors = Some(Vec::new());
+
+        let result = vm.eval(ScriptMod {
+            file: "string-limit.splash".to_owned(),
+            code: "let payload = \"x\"\n\
+                   let index = 0\n\
+                   while (index < 3) {\n\
+                       payload += payload\n\
+                       index += 1\n\
+                   }\n\
+                   try { payload + payload } { \"ok\" }\n\
+                   ;"
+                .to_owned(),
+            ..Default::default()
+        });
+
+        assert!(result.is_err());
+        assert!(vm.bx.threads.cur_ref().trap.err.borrow().is_empty());
+        assert!(vm
+            .take_errors()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("script string allocation limit exceeded")));
+    }
+
+    #[test]
+    fn byte_array_string_conversion_stops_at_the_string_limit() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        vm.bx.heap.set_max_string_bytes(Some(8));
+        vm.bx.captured_errors = Some(Vec::new());
+
+        let bytes = vm.bx.heap.new_array_from_vec_u8(vec![0xFF; 16]);
+        vm.set_injected_global(id!(bytes), bytes.into());
+
+        let result = vm.eval(ScriptMod {
+            file: "byte-array-string-limit.splash".to_owned(),
+            code: "try { bytes.to_string() } { \"ok\" }\n;".to_owned(),
+            ..Default::default()
+        });
+
+        assert!(result.is_err());
+        assert!(vm
+            .take_errors()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("script string allocation limit exceeded")));
+    }
+
+    #[test]
+    fn byte_array_string_conversion_preserves_lossy_utf8_without_a_limit() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+
+        let bytes = vm
+            .bx
+            .heap
+            .new_array_from_vec_u8(vec![b'a', 0xFF, b'b']);
+        vm.set_injected_global(id!(bytes), bytes.into());
+
+        let result = vm.eval(ScriptMod {
+            file: "byte-array-lossy-utf8.splash".to_owned(),
+            code: "bytes.to_string()\n;".to_owned(),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            vm.bx.heap.string_with(result, |_, value| value.to_owned()),
+            Some("a\u{FFFD}b".to_owned())
+        );
+    }
+
+    #[test]
+    fn bounded_string_helpers_preserve_their_normal_results() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+
+        for (file, code, expected) in [
+            (
+                "string-replace.splash",
+                "\"abcd\".replace(\"b\", \"XX\")\n;",
+                "aXXcd",
+            ),
+            (
+                "string-url-encode.splash",
+                "\"a b!\".url_encode()\n;",
+                "a%20b%21",
+            ),
+            (
+                "string-url-decode.splash",
+                "\"a%20b%21\".url_decode()\n;",
+                "a b!",
+            ),
+        ] {
+            let result = vm.eval(ScriptMod {
+                file: file.to_owned(),
+                code: code.to_owned(),
+                ..Default::default()
+            });
+            assert_eq!(
+                vm.bx.heap.string_with(result, |_, value| value.to_owned()),
+                Some(expected.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn byte_array_json_input_stops_at_the_string_limit() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        vm.bx.heap.set_max_string_bytes(Some(8));
+        vm.bx.captured_errors = Some(Vec::new());
+
+        let bytes = vm
+            .bx
+            .heap
+            .new_array_from_vec_u8(br#"{"value": 12345}"#.to_vec());
+        vm.set_injected_global(id!(bytes), bytes.into());
+
+        let result = vm.eval(ScriptMod {
+            file: "byte-array-json-limit.splash".to_owned(),
+            code: "try { bytes.parse_json() } { \"ok\" }\n;".to_owned(),
+            ..Default::default()
+        });
+
+        assert!(result.is_err());
+        assert!(vm
+            .take_errors()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("script string allocation limit exceeded")));
     }
 
     #[test]

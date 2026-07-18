@@ -58,7 +58,7 @@ impl<'a> ScriptVm<'a> {
         let a = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
 
         if a.is_string_like() || b.is_string_like() {
-            let ptr = self.bx.heap.new_string_with(|heap, out| {
+            let ptr = self.bx.heap.new_bounded_string_with(|heap, out| {
                 heap.cast_to_string(a, out);
                 heap.cast_to_string(b, out);
             });
@@ -93,7 +93,7 @@ impl<'a> ScriptVm<'a> {
     pub(crate) fn handle_concat(&mut self) {
         let op1 = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let op2 = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
-        let ptr = self.bx.heap.new_string_with(|heap, out| {
+        let ptr = self.bx.heap.new_bounded_string_with(|heap, out| {
             heap.cast_to_string(op1, out);
             heap.cast_to_string(op2, out);
         });

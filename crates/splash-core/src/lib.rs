@@ -40,6 +40,11 @@ pub const CANONICAL_PROFILE_VERSION: &str = "0.2";
 /// Repository-relative location of the normative portable grammar.
 pub const CANONICAL_PROFILE_GRAMMAR_PATH: &str = "docs/grammar.md";
 pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024;
+/// Default maximum byte length for one newly constructed Splash string.
+///
+/// This is an individual-string limit, not a complete VM heap accounting
+/// limit. Hosts with smaller memory budgets should lower it explicitly.
+pub const DEFAULT_MAX_SCRIPT_STRING_BYTES: usize = 256 * 1024;
 const FORMAT_OUTPUT_MULTIPLIER: usize = 4;
 /// Maximum formatted output size under the default source budget.
 pub const DEFAULT_MAX_FORMATTED_SOURCE_BYTES: usize =
@@ -110,6 +115,10 @@ pub const MAX_STATIC_RECORD_FIELDS: usize = 4_096;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionLimits {
     pub max_source_bytes: usize,
+    /// Maximum byte length for one newly constructed script string.
+    ///
+    /// This is not aggregate VM heap accounting.
+    pub max_string_bytes: usize,
     pub max_syntax_tokens: usize,
     pub max_syntax_nesting: usize,
     pub instruction_limit: usize,
@@ -122,6 +131,7 @@ impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
+            max_string_bytes: DEFAULT_MAX_SCRIPT_STRING_BYTES,
             max_syntax_tokens: DEFAULT_MAX_SYNTAX_TOKENS,
             max_syntax_nesting: DEFAULT_MAX_SYNTAX_NESTING,
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
@@ -137,6 +147,11 @@ impl ExecutionLimits {
         if self.max_source_bytes == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_source_bytes must be greater than zero",
+            ));
+        }
+        if self.max_string_bytes == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_string_bytes must be greater than zero",
             ));
         }
         if self.max_syntax_tokens == 0 {
@@ -206,6 +221,7 @@ impl ScriptJsonMethodLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
     SourceTooLarge { actual: usize, maximum: usize },
+    StringLimitExceeded { maximum: usize },
     FormattedSourceTooLarge { actual: usize, maximum: usize },
     InvalidLimits(&'static str),
     SyntaxRejected(SyntaxReport),
@@ -221,6 +237,12 @@ impl Display for RuntimeError {
                 write!(
                     formatter,
                     "source is {actual} bytes; maximum is {maximum} bytes"
+                )
+            }
+            Self::StringLimitExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "script string allocation exceeds {maximum} bytes"
                 )
             }
             Self::FormattedSourceTooLarge { actual, maximum } => {
@@ -648,7 +670,12 @@ impl<H: Any, S: Any> Runtime<H, S> {
             limits,
             json_method_limits,
         };
-        runtime.with_vm(|vm| install_bounded_json_methods(vm, installed_limits));
+        runtime.with_vm(|vm| {
+            vm.bx
+                .heap
+                .set_max_string_bytes(Some(limits.max_string_bytes));
+            install_bounded_json_methods(vm, installed_limits);
+        });
         Ok(runtime)
     }
 
@@ -667,6 +694,11 @@ impl<H: Any, S: Any> Runtime<H, S> {
         if self.with_vm(|vm| has_paused_thread(vm)) {
             return Err(RuntimeError::EvaluationInProgress);
         }
+        self.with_vm(|vm| {
+            vm.bx
+                .heap
+                .set_max_string_bytes(Some(limits.max_string_bytes));
+        });
         self.limits = limits;
         self.json_method_limits
             .set(ScriptJsonMethodLimits::from_execution_limits(limits));
@@ -685,6 +717,10 @@ impl<H: Any, S: Any> Runtime<H, S> {
     /// effectful bindings must apply their own capability policy.
     pub fn configure(&mut self, configure: impl FnOnce(&mut vm::ScriptVm)) {
         self.with_vm(configure);
+        let max_string_bytes = self.limits.max_string_bytes;
+        self.with_vm(|vm| {
+            vm.bx.heap.set_max_string_bytes(Some(max_string_bytes));
+        });
     }
 
     /// Injects a host-owned JSON value under one identifier for later Splash
@@ -705,12 +741,18 @@ impl<H: Any, S: Any> Runtime<H, S> {
         }
         let encoded =
             serialize_bounded_json(value, max_bytes, max_depth).map_err(RuntimeError::JsonData)?;
+        let max_string_bytes = self.limits.max_string_bytes;
         self.with_vm(|vm| {
             if has_paused_thread(vm) {
                 return Err(RuntimeError::EvaluationInProgress);
             }
             let mut parser = vm::json::JsonParserThread::default();
             let value = parser.read_json(&encoded, &mut vm.bx.heap);
+            if vm.bx.heap.take_string_limit_exceeded() {
+                return Err(RuntimeError::StringLimitExceeded {
+                    maximum: max_string_bytes,
+                });
+            }
             vm.set_injected_global(vm::LiveId::from_str(name), value);
             Ok(())
         })
@@ -4860,6 +4902,162 @@ compute(outer, 2)
             check_syntax_named("nesting.splash", "let value = 1", limits).unwrap_err(),
             RuntimeError::InvalidLimits("max_syntax_nesting must be greater than zero")
         );
+    }
+
+    #[test]
+    fn rejects_zero_string_limit() {
+        let limits = ExecutionLimits {
+            max_string_bytes: 0,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("strings.splash", "true", limits).unwrap_err(),
+            RuntimeError::InvalidLimits("max_string_bytes must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn runtime_bounds_new_string_values_without_catch_recovery() {
+        let limits = ExecutionLimits {
+            max_string_bytes: 32,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+        let exact_limit = runtime
+            .eval(
+                "let payload = \"x\"\n\
+                 let index = 0\n\
+                 while (index < 5) {\n\
+                     payload += payload\n\
+                     index += 1\n\
+                 }\n\
+                 payload",
+            )
+            .unwrap();
+
+        assert!(exact_limit.completed(), "{:?}", exact_limit.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    exact_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+        );
+
+        let exceeded = runtime
+            .eval(
+                "let payload = \"x\"\n\
+                 let index = 0\n\
+                 while (index < 5) {\n\
+                     payload += payload\n\
+                     index += 1\n\
+                 }\n\
+                 try payload + payload catch \"recovered\"",
+            )
+            .unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("string allocation limit")));
+    }
+
+    #[test]
+    fn runtime_bounds_literal_strings_before_execution() {
+        let limits = ExecutionLimits {
+            max_string_bytes: 4,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = Runtime::with_limits((), (), limits).unwrap();
+        let exceeded = runtime.eval("\"fives\"").unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("string allocation limit")));
+    }
+
+    #[test]
+    fn string_limit_updates_and_bounds_host_json_globals() {
+        let mut runtime = Runtime::default();
+        let mut limits = runtime.limits();
+        limits.max_string_bytes = 4;
+        runtime.set_limits(limits).unwrap();
+
+        runtime
+            .set_json_global(
+                "workflow",
+                &serde_json::json!({"v": "four"}),
+                DEFAULT_MAX_JSON_DATA_BYTES,
+                DEFAULT_MAX_JSON_DATA_DEPTH,
+            )
+            .unwrap();
+        let injected = runtime.eval("workflow.v").unwrap();
+        assert!(injected.completed(), "{:?}", injected.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    injected.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("four")
+        );
+
+        assert_eq!(
+            runtime
+                .set_json_global(
+                    "workflow",
+                    &serde_json::json!({"v": "fives"}),
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap_err(),
+            RuntimeError::StringLimitExceeded { maximum: 4 }
+        );
+
+        runtime.configure(|vm| {
+            let encoded = vm.bx.heap.new_array_from_vec_u8(b"\"fives\"".to_vec());
+            vm.set_injected_global(vm::LiveId::from_str("encoded"), encoded.into());
+        });
+        let parsed = runtime.eval("encoded.parse_json()").unwrap();
+        assert!(!parsed.completed());
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("string allocation limit")),
+            "{:?}",
+            parsed.diagnostics
+        );
+
+        let exceeded = runtime
+            .eval(
+                "let payload = \"x\"\n\
+                 let index = 0\n\
+                 while (index < 3) {\n\
+                     payload += payload\n\
+                     index += 1\n\
+                 }\n\
+                 payload",
+            )
+            .unwrap();
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("string allocation limit")));
+
+        let recovered = runtime.eval("2").unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(recovered.value.as_u40(), Some(2));
     }
 
     #[test]

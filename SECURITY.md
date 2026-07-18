@@ -89,14 +89,24 @@ protects Splash `Runtime` evaluation, including the explicit
 compatibility-evaluation entry point; it does not alter a host that directly
 embeds the raw Makepad VM.
 
+`Runtime` also caps every newly constructed script string at 256 KiB by
+default through `ExecutionLimits::max_string_bytes`; a host can lower that
+limit for its target. An attempted overflow terminates the current evaluation
+as an uncatchable hard resource failure, including during compatibility
+evaluation and bounded JSON reconstruction. This is an individual-string
+length limit, not aggregate VM heap accounting: arrays, objects, many
+individually valid strings, and trusted Rust adapter allocations still need
+host-selected memory budgets and, where required, operating-system containment.
+
 Canonical `try/catch` handles ordinary script and native-binding errors and
 unwinds Splash function calls, but it is not a sandbox or transaction. It
-cannot catch instruction-limit or hard-deadline termination, inspect an error
-object, widen a capability lease, refund a call, erase an audit outcome, or
-bypass a workflow data contract. A caught error is discarded before the
-fallback runs and does not appear in the evaluation diagnostics. An uncaught
-native error is host-facing and may contain adapter-provided text, so adapters
-must return disclosure-safe messages and keep private detail in trusted logs.
+cannot catch string-allocation, instruction-limit, or hard-deadline
+termination, inspect an error object, widen a capability lease, refund a call,
+erase an audit outcome, or bypass a workflow data contract. A caught error is
+discarded before the fallback runs and does not appear in the evaluation
+diagnostics. An uncaught native error is host-facing and may contain
+adapter-provided text, so adapters must return disclosure-safe messages and
+keep private detail in trusted logs.
 
 `splash-lsp` is a host-only helper for a trusted local editor client. It never
 reads a document URI, evaluates source, creates a capability host, resolves an

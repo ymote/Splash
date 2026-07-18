@@ -71,9 +71,9 @@ pub fn define_std_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
                 })
                 .is_none()
             {
-                vm.bx.heap.temp_string_with(|heap, temp| {
+                vm.bx.heap.temp_bounded_string_with(|heap, temp| {
                     heap.cast_to_string(what, temp);
-                    print!("{}", temp)
+                    print!("{}", temp.as_str())
                 });
             }
             NIL
@@ -93,12 +93,12 @@ pub fn define_std_module(heap: &mut ScriptHeap, native: &mut ScriptNative) {
                 })
                 .is_none()
             {
-                let is_empty = vm.bx.heap.temp_string_with(|heap, temp| {
+                let is_empty = vm.bx.heap.temp_bounded_string_with(|heap, temp| {
                     heap.cast_to_string(what, temp);
                     if temp.is_empty() {
                         return true;
                     }
-                    println!("{}", temp);
+                    println!("{}", temp.as_str());
                     false
                 });
                 if is_empty {

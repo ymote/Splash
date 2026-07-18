@@ -432,7 +432,7 @@ impl ScriptNative {
                     if sself.is_string_like() {
                         return sself;
                     }
-                    vm.bx.heap.new_string_with(|heap, out| {
+                    vm.bx.heap.new_bounded_string_with(|heap, out| {
                         heap.cast_to_string(sself, out);
                     })
                 });

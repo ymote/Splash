@@ -425,34 +425,45 @@ impl ScriptStringData {
 
                 // Regex path
                 if let Some(re_ptr) = pat.as_regex() {
-                    // Get the replacement string
-                    let rep_str = if let Some(r) = vm.bx.heap.string_with(rep, |_, s| s.to_string())
-                    {
-                        r
-                    } else {
-                        return script_err_type_mismatch!(
-                            vm.bx.threads.cur_ref().trap,
-                            "replace: replacement must be a string"
-                        );
-                    };
-
-                    let result = vm.bx.heap.string_mut_self_with(sself, |heap, s| {
-                        regex_replace(heap, s, re_ptr, &rep_str)
+                    let result = vm.bx.heap.string_mut_self_with(rep, |heap, replacement| {
+                        heap.string_mut_self_with(sself, |heap, input| {
+                            regex_replace(heap, input, re_ptr, replacement)
+                        })
                     });
-                    if let Some(val) = result {
-                        return val;
+                    match result {
+                        Some(Some(value)) => return value,
+                        Some(None) => {
+                            return script_err_unexpected!(
+                                vm.bx.threads.cur_ref().trap,
+                                "replace: self must be a string"
+                            );
+                        }
+                        None => {
+                            return script_err_type_mismatch!(
+                                vm.bx.threads.cur_ref().trap,
+                                "replace: replacement must be a string"
+                            );
+                        }
                     }
-                    return script_err_unexpected!(
-                        vm.bx.threads.cur_ref().trap,
-                        "replace: self must be a string"
-                    );
                 }
 
                 // String path: replace first occurrence
                 if let Some(Some(result)) = vm.bx.heap.string_mut_self_with(sself, |heap, sself| {
                     heap.string_mut_self_with(pat, |heap, pat| {
                         heap.string_mut_self_with(rep, |heap, rep| {
-                            heap.new_string_from_str(&sself.replacen(pat, rep, 1))
+                            heap.new_bounded_string_with(|_, out| {
+                                if let Some(index) = sself.find(pat) {
+                                    out.append_str(&sself[..index]);
+                                    if !out.is_full() {
+                                        out.append_str(rep);
+                                    }
+                                    if !out.is_full() {
+                                        out.append_str(&sself[index + pat.len()..]);
+                                    }
+                                } else {
+                                    out.append_str(sself);
+                                }
+                            })
                         })
                     })
                 }) {
@@ -476,8 +487,7 @@ impl ScriptStringData {
             |vm, args| {
                 let sself = script_value!(vm, args.self);
                 if let Some(s) = vm.bx.heap.string_mut_self_with(sself, |heap, sself| {
-                    let decoded = percent_decode(sself);
-                    heap.new_string_from_str(&decoded)
+                    heap.new_bounded_string_with(|_, out| percent_decode(sself, out))
                 }) {
                     return s.into();
                 }
@@ -497,8 +507,7 @@ impl ScriptStringData {
             |vm, args| {
                 let sself = script_value!(vm, args.self);
                 if let Some(s) = vm.bx.heap.string_mut_self_with(sself, |heap, sself| {
-                    let encoded = percent_encode(sself);
-                    heap.new_string_from_str(&encoded)
+                    heap.new_bounded_string_with(|_, out| percent_encode(sself, out))
                 }) {
                     return s.into();
                 }
@@ -511,26 +520,24 @@ impl ScriptStringData {
     }
 }
 
-fn percent_decode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+fn percent_decode<S: ScriptStringSink>(input: &str, out: &mut S) {
     let bytes = input.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
+    while i < bytes.len() && !out.is_full() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4 | lo) as char);
+                out.append_char((hi << 4 | lo) as char);
                 i += 3;
                 continue;
             }
         } else if bytes[i] == b'+' {
-            out.push(' ');
+            out.append_char(' ');
             i += 1;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.append_char(bytes[i] as char);
         i += 1;
     }
-    out
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -542,21 +549,26 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-fn percent_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() * 3);
+fn percent_encode<S: ScriptStringSink>(input: &str, out: &mut S) {
     for b in input.bytes() {
+        if out.is_full() {
+            break;
+        }
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
+                out.append_char(b as char);
             }
             _ => {
-                out.push('%');
-                out.push(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
-                out.push(char::from(b"0123456789ABCDEF"[(b & 0xf) as usize]));
+                out.append_char('%');
+                if !out.is_full() {
+                    out.append_char(char::from(b"0123456789ABCDEF"[(b >> 4) as usize]));
+                }
+                if !out.is_full() {
+                    out.append_char(char::from(b"0123456789ABCDEF"[(b & 0xf) as usize]));
+                }
             }
         }
     }
-    out
 }
 
 // ---- Regex helper functions ----
@@ -788,20 +800,25 @@ fn regex_replace(
         return heap.new_string_from_str(input);
     }
 
-    heap.new_string_with(|_heap, out| {
+    heap.new_bounded_string_with(|_heap, out| {
         let mut last_end = 0;
         for (start, end, caps) in &matches {
-            out.push_str(&input[last_end..*start]);
+            out.append_str(&input[last_end..*start]);
             expand_replacement(out, replacement, &input[*start..*end], input, caps);
+            if out.is_full() {
+                break;
+            }
             last_end = *end;
         }
-        out.push_str(&input[last_end..]);
+        if !out.is_full() {
+            out.append_str(&input[last_end..]);
+        }
     })
 }
 
 /// Expand replacement string patterns ($&, $1, $$, etc.)
-fn expand_replacement(
-    out: &mut String,
+fn expand_replacement<S: ScriptStringSink>(
+    out: &mut S,
     replacement: &str,
     matched: &str,
     input: &str,
@@ -813,11 +830,11 @@ fn expand_replacement(
         if bytes[i] == b'$' && i + 1 < bytes.len() {
             match bytes[i + 1] {
                 b'$' => {
-                    out.push('$');
+                    out.append_char('$');
                     i += 2;
                 }
                 b'&' => {
-                    out.push_str(matched);
+                    out.append_str(matched);
                     i += 2;
                 }
                 b'0'..=b'9' => {
@@ -830,20 +847,23 @@ fn expand_replacement(
                     let num: usize = replacement[start..end].parse().unwrap_or(0);
                     if num >= 1 && num <= caps.len() {
                         if let Some((s, e)) = caps[num - 1] {
-                            out.push_str(&input[s..e]);
+                            out.append_str(&input[s..e]);
                         }
                     }
                     i = end;
                 }
                 _ => {
-                    out.push('$');
+                    out.append_char('$');
                     i += 1;
                 }
             }
         } else {
             let ch = replacement[i..].chars().next().unwrap();
-            out.push(ch);
+            out.append_char(ch);
             i += ch.len_utf8();
+        }
+        if out.is_full() {
+            break;
         }
     }
 }
