@@ -1,0 +1,7 @@
+use mod.std.assert
+
+let value = {}
+value.self = value
+let recovered = try value.to_json() catch "cycle rejected"
+
+assert(recovered == "cycle rejected")

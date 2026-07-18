@@ -307,6 +307,17 @@ strings that generated code must turn back into values with `parse_json()`.
 This preserves a simple Rust bridge through `serde_json::Value` without
 allowing scripts to import crates directly.
 
+`Runtime` replaces the inherited direct `value.to_json()` dispatch with the
+same cycle-aware bounded serializer used at the Rust data boundary. It returns
+a JSON string only for JSON-safe values. Cycles, unsupported values, non-finite
+numbers, duplicate object keys, excessive container depth, and excessive
+serialized output fail as ordinary native errors that canonical `try/catch` can
+recover from. With default execution limits, direct serialization is capped at
+64 KiB and 64 container levels; a host can lower those caps through
+`ExecutionLimits::max_source_bytes` and `max_syntax_nesting`. This applies to
+both `Runtime::eval` and `Runtime::eval_vm_compatibility`; a host using the raw
+Makepad VM owns its upstream serialization behavior.
+
 Hosts can register a `JsonToolContract` to enforce bounded schemas for those
 JSON envelopes. Contract checks run before the handler and before output
 returns to Splash; metadata-only schemas in the catalog do not enforce input

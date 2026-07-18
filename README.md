@@ -41,6 +41,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, instruction, and deadline limits.
+- Direct `Runtime` `.to_json()` serialization with cycle, depth, and
+  serialized-byte bounds, returning a normal script error instead of recursively
+  exhausting the process stack.
 - Recoverable `try ... catch ...` control flow across Splash function calls,
   with hard resource stops kept uncatchable and no implicit effect rollback.
 - A deny-by-default tool host: scripts can call only explicitly registered

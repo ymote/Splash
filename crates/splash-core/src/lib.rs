@@ -9,8 +9,10 @@
 mod profile;
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
+use std::rc::Rc;
 use std::time::Duration;
 
 pub use makepad_script as vm;
@@ -26,6 +28,9 @@ use profile::{
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
+use vm::{
+    id, script_err_limit, script_err_unexpected, script_value, LiveId, ScriptIp, ScriptValue,
+};
 
 /// Stable identifier for the portable source contract enforced before normal
 /// Splash evaluation.
@@ -172,6 +177,29 @@ impl ExecutionLimits {
             ));
         }
         Ok(self)
+    }
+}
+
+/// Bounds applied to direct Splash [`Runtime`] `.to_json()` calls.
+///
+/// The inherited Makepad serializer is appropriate for trusted UI hosts but
+/// recursively walks script collections without a cycle or size bound. The
+/// Splash runtime replaces that dispatch with the same bounded JSON
+/// writer used at the Rust data boundary. A host can lower these limits by
+/// lowering its normal source or syntax-nesting limits; they never exceed the
+/// standalone JSON defaults.
+#[derive(Clone, Copy)]
+struct ScriptJsonSerializationLimits {
+    max_bytes: usize,
+    max_depth: usize,
+}
+
+impl ScriptJsonSerializationLimits {
+    fn from_execution_limits(limits: ExecutionLimits) -> Self {
+        Self {
+            max_bytes: limits.max_source_bytes.min(DEFAULT_MAX_JSON_DATA_BYTES),
+            max_depth: limits.max_syntax_nesting.min(DEFAULT_MAX_JSON_DATA_DEPTH),
+        }
     }
 }
 
@@ -599,6 +627,7 @@ pub struct Runtime<H: Any = (), S: Any = ()> {
     std: S,
     vm: Box<vm::ScriptVmBase>,
     limits: ExecutionLimits,
+    json_serialization_limits: Rc<Cell<ScriptJsonSerializationLimits>>,
 }
 
 impl<H: Any, S: Any> Runtime<H, S> {
@@ -607,12 +636,20 @@ impl<H: Any, S: Any> Runtime<H, S> {
     }
 
     pub fn with_limits(host: H, std: S, limits: ExecutionLimits) -> Result<Self, RuntimeError> {
-        Ok(Self {
+        let limits = limits.validate()?;
+        let json_serialization_limits = Rc::new(Cell::new(
+            ScriptJsonSerializationLimits::from_execution_limits(limits),
+        ));
+        let installed_limits = json_serialization_limits.clone();
+        let mut runtime = Self {
             host,
             std,
             vm: Box::new(vm::ScriptVmBase::new()),
-            limits: limits.validate()?,
-        })
+            limits,
+            json_serialization_limits,
+        };
+        runtime.with_vm(|vm| install_bounded_json_serialization(vm, installed_limits));
+        Ok(runtime)
     }
 
     pub fn limits(&self) -> ExecutionLimits {
@@ -631,6 +668,8 @@ impl<H: Any, S: Any> Runtime<H, S> {
             return Err(RuntimeError::EvaluationInProgress);
         }
         self.limits = limits;
+        self.json_serialization_limits
+            .set(ScriptJsonSerializationLimits::from_execution_limits(limits));
         Ok(())
     }
 
@@ -2012,6 +2051,55 @@ fn evaluate_with_limits(
     }
 }
 
+fn install_bounded_json_serialization(
+    vm: &mut vm::ScriptVm,
+    limits: Rc<Cell<ScriptJsonSerializationLimits>>,
+) {
+    let types = [
+        vm::ScriptValueType::REDUX_NUMBER,
+        vm::ScriptValueType::REDUX_NAN,
+        vm::ScriptValueType::REDUX_BOOL,
+        vm::ScriptValueType::REDUX_NIL,
+        vm::ScriptValueType::REDUX_COLOR,
+        vm::ScriptValueType::REDUX_STRING,
+        vm::ScriptValueType::REDUX_OBJECT,
+        vm::ScriptValueType::REDUX_ARRAY,
+        vm::ScriptValueType::REDUX_REGEX,
+        vm::ScriptValueType::REDUX_OPCODE,
+        vm::ScriptValueType::REDUX_ERR,
+        vm::ScriptValueType::REDUX_ID,
+    ];
+
+    let mut native = vm.bx.code.native.borrow_mut();
+    for value_type in types {
+        let limits = limits.clone();
+        native.add_type_method(
+            &mut vm.bx.heap,
+            value_type,
+            id!(to_json),
+            &[],
+            move |vm, args| {
+                let value = script_value!(vm, args.self);
+                let limits = limits.get();
+                let mut writer = BoundedJsonWriter::new(limits.max_bytes);
+                match write_script_json(vm, value, limits.max_depth, &mut Vec::new(), &mut writer) {
+                    Ok(()) => vm.bx.heap.new_string_from_str(&writer.into_string()),
+                    Err(RuntimeJsonError::TooLarge { .. } | RuntimeJsonError::TooDeep { .. }) => {
+                        script_err_limit!(
+                            vm.bx.threads.cur_ref().trap,
+                            "JSON serialization exceeded Splash runtime limits"
+                        )
+                    }
+                    Err(_) => script_err_unexpected!(
+                        vm.bx.threads.cur_ref().trap,
+                        "value cannot be serialized as bounded JSON"
+                    ),
+                }
+            },
+        );
+    }
+}
+
 fn has_paused_thread(vm: &vm::ScriptVm) -> bool {
     (0..vm.bx.threads.len()).any(|index| {
         vm.bx
@@ -2118,6 +2206,148 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn direct_to_json_uses_bounded_cycle_aware_serialization() {
+        let mut runtime = Runtime::default();
+        let encoded = runtime
+            .eval("let value = {answer: 42}\nvalue.to_json()")
+            .unwrap();
+
+        assert!(encoded.completed(), "{:?}", encoded.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    encoded.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("{\"answer\":42}")
+        );
+
+        let recovered = runtime
+            .eval(
+                "let value = {}\n\
+                 value.self = value\n\
+                 try value.to_json() catch \"cycle rejected\"",
+            )
+            .unwrap();
+
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("cycle rejected")
+        );
+    }
+
+    #[test]
+    fn direct_to_json_rejects_excess_runtime_depth_and_output() {
+        let mut depth_source = String::from("let value = 0\n");
+        for _ in 0..=DEFAULT_MAX_JSON_DATA_DEPTH {
+            depth_source.push_str("value = [value]\n");
+        }
+        depth_source.push_str("try value.to_json() catch \"depth rejected\"");
+
+        let mut runtime = Runtime::default();
+        let depth_recovered = runtime.eval(&depth_source).unwrap();
+        assert!(
+            depth_recovered.completed(),
+            "{:?}",
+            depth_recovered.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    depth_recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("depth rejected")
+        );
+
+        let mut output_source = String::from("let value = \"x\"\n");
+        for _ in 0..17 {
+            output_source.push_str("value += value\n");
+        }
+        output_source.push_str("try value.to_json() catch \"output rejected\"");
+
+        let output_recovered = runtime.eval(&output_source).unwrap();
+        assert!(
+            output_recovered.completed(),
+            "{:?}",
+            output_recovered.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    output_recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("output rejected")
+        );
+    }
+
+    #[test]
+    fn direct_to_json_tracks_lowered_runtime_limits() {
+        let mut source = String::from("let value = \"x\"\n");
+        for _ in 0..9 {
+            source.push_str("value += value\n");
+        }
+        source.push_str("try value.to_json() catch \"lowered limit applied\"");
+
+        let mut runtime = Runtime::default();
+        let mut limits = runtime.limits();
+        limits.max_source_bytes = source.len();
+        runtime.set_limits(limits).unwrap();
+
+        let recovered = runtime.eval(&source).unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("lowered limit applied")
+        );
+    }
+
+    #[test]
+    fn direct_to_json_is_bounded_for_compatibility_evaluation() {
+        let mut runtime = Runtime::default();
+        let recovered = runtime
+            .eval_vm_compatibility(
+                "var value = {}\n\
+                 value.self = value\n\
+                 var recovered = try { value.to_json() } { \"cycle rejected\" }\n\
+                 recovered",
+            )
+            .unwrap();
+
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("cycle rejected")
+        );
     }
 
     #[test]
