@@ -61,7 +61,12 @@ pub const MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS: usize = 512;
 /// Access mode for a host-selected file-root binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileRootAccess {
+    /// Expose the selected host directory read-only.
     ReadOnly,
+    /// Expose the selected host directory read-write.
+    ///
+    /// An active binding with this access mode is rejected unless host code
+    /// explicitly calls [`BubblewrapWorkerPolicy::allow_unbounded_host_file_root_writes`].
     ReadWrite,
 }
 
@@ -686,6 +691,7 @@ pub struct BubblewrapWorkerPolicy {
     private_tmpfs: PrivateTmpfs,
     maximum_aggregate_ephemeral_tmpfs_bytes: Option<NonZeroUsize>,
     maximum_active_file_roots: usize,
+    unbounded_host_file_root_writes_allowed: bool,
     bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
@@ -720,6 +726,7 @@ impl BubblewrapWorkerPolicy {
             private_tmpfs: PrivateTmpfs::Disabled,
             maximum_aggregate_ephemeral_tmpfs_bytes: None,
             maximum_active_file_roots: DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS,
+            unbounded_host_file_root_writes_allowed: false,
             bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
@@ -843,17 +850,42 @@ impl BubblewrapWorkerPolicy {
         Ok(self)
     }
 
-    /// Requires every active writable data mount configured by this policy to
-    /// have an aggregate data-block allocation ceiling.
+    /// Explicitly permits active unbounded host-backed writable file roots.
     ///
-    /// Compilation then rejects host-backed read-write file roots and an
-    /// unbounded private `/tmp`. Read-only host roots, bounded ephemeral roots,
-    /// and a bounded private `/tmp` remain valid. Compilation also requires
-    /// [`UserNamespacePolicy::RequireNoFurtherUserNamespaces`] so the worker
-    /// cannot reacquire namespace-scoped mount authority. `/proc`, `/dev`, and
-    /// the empty namespace root are remounted read-only after all selected
-    /// mounts are created. This does not constrain process memory, device or
-    /// proc semantics, or downstream effects performed by a trusted adapter.
+    /// This is an escape hatch for a trusted deployment that enforces an
+    /// aggregate persistent-storage quota outside Splash. Splash cannot verify
+    /// that external quota, so this method deliberately makes the policy's
+    /// weaker storage boundary visible in host code. The stricter
+    /// [`Self::require_bounded_file_root_writes`] mode still rejects every
+    /// host-backed writable root.
+    pub fn allow_unbounded_host_file_root_writes(&mut self) -> &mut Self {
+        self.unbounded_host_file_root_writes_allowed = true;
+        self
+    }
+
+    /// Returns whether this policy explicitly permits active unbounded
+    /// host-backed writable file roots.
+    ///
+    /// The default is `false`, so an untrusted worker cannot consume
+    /// persistent host storage unless host code acknowledges an independently
+    /// enforced quota boundary.
+    pub const fn unbounded_host_file_root_writes_allowed(&self) -> bool {
+        self.unbounded_host_file_root_writes_allowed
+    }
+
+    /// Adds Linux namespace hardening for policies that use bounded writable
+    /// data mounts.
+    ///
+    /// Active host-backed read-write roots are already rejected by default;
+    /// this mode also rejects an unbounded private `/tmp`, requires
+    /// [`UserNamespacePolicy::RequireNoFurtherUserNamespaces`], and remounts
+    /// `/proc`, `/dev`, and the empty namespace root read-only after all
+    /// selected mounts are created. It overrides
+    /// [`Self::allow_unbounded_host_file_root_writes`], so that escape hatch
+    /// cannot weaken this mode. Read-only host roots, bounded ephemeral roots,
+    /// and a bounded private `/tmp` remain valid. This does not constrain
+    /// process memory, device or proc semantics, or downstream effects
+    /// performed by a trusted adapter.
     pub fn require_bounded_file_root_writes(&mut self) -> &mut Self {
         self.bounded_file_root_writes_required = true;
         self
@@ -1136,8 +1168,9 @@ impl BubblewrapWorkerPolicy {
                     })?;
                     match root {
                         RegisteredFileRoot::Host(binding) => {
-                            if self.bounded_file_root_writes_required
-                                && binding.access == FileRootAccess::ReadWrite
+                            if binding.access == FileRootAccess::ReadWrite
+                                && (self.bounded_file_root_writes_required
+                                    || !self.unbounded_host_file_root_writes_allowed)
                             {
                                 return Err(
                                     BubblewrapPolicyError::UnboundedFileRootWriteForbidden {
@@ -2853,7 +2886,7 @@ impl Display for BubblewrapPolicyError {
             ),
             Self::UnboundedFileRootWriteForbidden { id } => write!(
                 formatter,
-                "file-root selector {id:?} is a host-backed writable mount, but bounded file-root writes are required"
+                "file-root selector {id:?} is a host-backed writable mount, but this policy does not permit unbounded persistent storage"
             ),
             Self::UnboundedPrivateTmpfsForbidden => formatter.write_str(
                 "private /tmp is unbounded, but bounded file-root writes are required",
@@ -4680,6 +4713,7 @@ mod tests {
     fn compiles_a_networkless_allowlisted_worker_plan() {
         let root = TestDirectory::new();
         let mut policy = base_policy(&root).with_worker_arguments(["--json-lines"]);
+        policy.allow_unbounded_host_file_root_writes();
         let input = binding(&root, "input", "/workspace/input", FileRootAccess::ReadOnly);
         let output = binding(
             &root,
@@ -4740,6 +4774,7 @@ mod tests {
         let root = TestDirectory::new();
         let mut policy = base_policy(&root);
         policy.pin_mount_sources();
+        policy.allow_unbounded_host_file_root_writes();
         policy
             .add_file_root(
                 "input",
@@ -5994,6 +6029,7 @@ print("seccomp-active")
                 ),
             )
             .unwrap();
+        policy.allow_unbounded_host_file_root_writes();
         policy.require_no_further_user_namespaces();
         policy.require_bounded_file_root_writes();
         assert!(policy.bounded_file_root_writes_required());
@@ -6014,6 +6050,36 @@ print("seccomp-active")
             private_tmp.compile(&manifest([])),
             Err(BubblewrapPolicyError::UnboundedPrivateTmpfsForbidden)
         ));
+    }
+
+    #[test]
+    fn rejects_persistent_writes_until_host_code_explicitly_allows_them() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy
+            .add_file_root(
+                "output",
+                binding(
+                    &root,
+                    "output",
+                    "/workspace/output",
+                    FileRootAccess::ReadWrite,
+                ),
+            )
+            .unwrap();
+
+        assert!(!policy.unbounded_host_file_root_writes_allowed());
+        assert!(policy.compile(&manifest([])).is_ok());
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+            Err(BubblewrapPolicyError::UnboundedFileRootWriteForbidden { id }) if id == "output"
+        ));
+
+        policy.allow_unbounded_host_file_root_writes();
+        assert!(policy.unbounded_host_file_root_writes_allowed());
+        assert!(policy
+            .compile(&manifest([selector(ResourceKind::FileRoot, "output")]))
+            .is_ok());
     }
 
     #[test]

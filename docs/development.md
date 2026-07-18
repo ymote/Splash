@@ -319,10 +319,10 @@ only host-derived Bubblewrap and runtime paths, host-authored file-root
 registrations, private tmpfs modes, aggregate tmpfs limits, and opaque manifest
 selectors. It never calls `spawn` or launches Bubblewrap. The target asserts
 that every modeled unsafe configuration fails compilation: an unknown or
-unsupported resource, an active writable host root under bounded-write mode,
-missing user-namespace lockdown for that mode, unbounded private `/tmp` where
-a bound is required, or bounded tmpfs capacity above the selected aggregate
-maximum.
+unsupported resource, an active writable host root without explicit
+unbounded-write acknowledgement or under bounded-write mode, missing
+user-namespace lockdown for that mode, unbounded private `/tmp` where a bound
+is required, or bounded tmpfs capacity above the selected aggregate maximum.
 For a successful plan it verifies exact manifest retention, the fixed
 networkless/cleared-environment/capability-drop arguments, and selection of
 only the requested roots. Its reviewed `.seed` corpus covers ordinary,

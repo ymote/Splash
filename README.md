@@ -161,7 +161,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Linux Bubblewrap worker-policy compiler and launcher for a fixed,
   host-selected worker and manifest-selected file roots; it rejects network,
   executable, and secret selectors rather than claiming unsupported policy,
-  and drops every Linux capability before worker execution.
+  denies persistent writable host roots unless host code explicitly
+  acknowledges an external quota boundary, and drops every Linux capability
+  before worker execution.
 - Optional Linux descriptor-pinned executable identity for the fixed
   Bubblewrap, worker, and resource-limit-runner files, with no path-launch
   fallback. It requires descriptor-pinned runtime roots and does not replace
@@ -174,17 +176,18 @@ and keeps UI support optional rather than making UI the language boundary.
   force-terminates and reaps a Bubblewrap worker without treating termination
   as an adapter-effect result.
 - Manifest-selected bounded ephemeral `file_root` mounts at host-chosen worker
-  paths, with an opt-in policy that rejects active writable host binds and an
-  unbounded private `/tmp`, requires further-user-namespace lockdown, and
-  remounts the base namespace filesystems read-only. Each root has its own
-  `tmpfs` allocation ceiling, and hosts can reject a configured aggregate
-  potential capacity before launch. This remains independent per-mount tmpfs
-  accounting, not a shared runtime quota; it does not independently cap inodes
-  and is not persistent storage, a `noexec` guarantee, or a host-filesystem
-  quota. A worker plan also defaults to at most 64 unique active `file_root`
-  selections; a host can lower that bound, including to zero, or explicitly
-  raise it only to the fixed 256-root maximum, bounding mount-plan expansion
-  rather than disk use.
+  paths. Active persistent host-backed writable roots fail closed unless host
+  code explicitly acknowledges an independently enforced quota; an opt-in
+  stricter policy also rejects an unbounded private `/tmp`, requires
+  further-user-namespace lockdown, and remounts the base namespace filesystems
+  read-only. Each root has its own `tmpfs` allocation ceiling, and hosts can
+  reject a configured aggregate potential capacity before launch. This remains
+  independent per-mount tmpfs accounting, not a shared runtime quota; it does
+  not independently cap inodes and is not persistent storage, a `noexec`
+  guarantee, or a host-filesystem quota. A worker plan also defaults to at most
+  64 unique active `file_root` selections; a host can lower that bound,
+  including to zero, or explicitly raise it only to the fixed 256-root maximum,
+  bounding mount-plan expansion rather than disk use.
 - Optional Linux cgroup-v2 worker sessions with host-delegated CPU bandwidth,
   memory, swap, task, and per-device I/O limits; a fixed runner joins the
   cgroup before Bubblewrap starts, and managed lifecycle teardown kills the

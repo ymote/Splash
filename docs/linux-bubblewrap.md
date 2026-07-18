@@ -6,6 +6,13 @@ Splash. The policy accepts a fixed worker program, fixed worker arguments,
 read-only runtime mounts, and opaque host-backed or bounded ephemeral
 `file_root` entries selected by an active `CapabilityManifest`.
 
+An active host-backed read-write root is denied by default. Host code can call
+`allow_unbounded_host_file_root_writes` only when an independently managed OS
+or filesystem quota already constrains that persistent storage; Splash neither
+creates nor validates such a quota. This default does not bound an explicitly
+enabled private `/tmp`, which remains an ephemeral mount with its own selected
+policy.
+
 It is deliberately not a general command runner. Splash source, tool payloads,
 and resource selector IDs never become a host path, command line, origin, or
 session key.
@@ -415,15 +422,14 @@ explicitly raise it with `set_maximum_active_file_roots`, but never above 256.
 This does not limit inactive registered roots, trusted runtime mounts, manifest
 or wire size, filesystem data blocks, inode use, or persistent storage.
 
-`require_bounded_file_root_writes` is an opt-in compile-time hardening mode. It
-allows read-only host roots and bounded ephemeral roots, but rejects every
-active host-backed read-write root. It also rejects an enabled unbounded
-private `/tmp`; a disabled or explicitly bounded `/tmp` remains valid. The mode
-requires `require_no_further_user_namespaces`, preventing the worker from
-creating a user namespace in which it could reacquire namespace-scoped mount
-authority. It then non-recursively remounts `/proc`, `/dev`, and `/` read-only
-after constructing the selected mounts, preventing regular-file writes outside
-bounded data tmpfs mounts. Device and proc interfaces remain available under
+`require_bounded_file_root_writes` is an additional compile-time hardening
+mode. The default already rejects active host-backed read-write roots; this
+mode also rejects an enabled unbounded private `/tmp`, requires
+`require_no_further_user_namespaces`, and non-recursively remounts `/proc`,
+`/dev`, and `/` read-only after constructing the selected mounts. A disabled or
+explicitly bounded `/tmp` remains valid. The mode overrides
+`allow_unbounded_host_file_root_writes`, so it cannot be weakened by a later
+host configuration call. Device and proc interfaces remain available under
 their kernel semantics. The mode does not constrain process memory or
 downstream adapter effects. Any unsupported Bubblewrap lockdown option is a
 launch failure; there is no weaker fallback.
@@ -625,10 +631,12 @@ boundary:
 
 - `file_root`: allowed only when its opaque ID is registered in the trusted
   policy. A host-backed source must be a directory, and its access mode is
-  selected by the host binding. A bounded ephemeral entry has no host source;
-  it creates an empty writable `tmpfs` for that worker session. Both kinds
-  share one selector namespace, so a duplicate ID is rejected rather than
-  resolved ambiguously. Hosts should use distinct opaque IDs for read-only and
+  selected by the host binding. An active read-write host binding is rejected
+  unless host configuration explicitly acknowledges an independently enforced
+  persistent-storage quota. A bounded ephemeral entry has no host source; it
+  creates an empty writable `tmpfs` for that worker session. Both kinds share
+  one selector namespace, so a duplicate ID is rejected rather than resolved
+  ambiguously. Hosts should use distinct opaque IDs for read-only and
   read-write views of the same host source.
 - `executable`: rejected. The worker program is fixed by host configuration;
   scripts cannot choose a second executable.

@@ -125,6 +125,7 @@ struct FuzzControl {
     select_executable: bool,
     select_network_origin: bool,
     select_secret: bool,
+    allow_unbounded_host_writes: bool,
     require_bounded_writes: bool,
     namespace_lockdown: bool,
     private_tmpfs: PrivateTmpfs,
@@ -138,7 +139,7 @@ impl FuzzControl {
     fn from_bytes(data: &[u8]) -> Self {
         let file_roots = byte(data, 0) % 32;
         let unsupported_resources = byte(data, 1) % 8;
-        let policy = byte(data, 2) % 16;
+        let policy = byte(data, 2);
         let aggregate = byte(data, 3);
         Self {
             select_readonly: file_roots & 1 != 0,
@@ -149,6 +150,7 @@ impl FuzzControl {
             select_executable: unsupported_resources & 1 != 0,
             select_network_origin: unsupported_resources & 2 != 0,
             select_secret: unsupported_resources & 4 != 0,
+            allow_unbounded_host_writes: policy & 16 != 0,
             require_bounded_writes: policy & 1 != 0,
             namespace_lockdown: policy & 2 != 0,
             private_tmpfs: PrivateTmpfs::from_bits(policy >> 2),
@@ -179,7 +181,8 @@ impl FuzzControl {
             || self.selects_unsupported_resource()
             || self.select_active_file_root_limit_overflow
             || self.policy_configuration_must_fail()
-            || (self.require_bounded_writes && self.select_writable)
+            || (self.select_writable
+                && (!self.allow_unbounded_host_writes || self.require_bounded_writes))
             || self.aggregate_limit.is_some_and(|maximum_bytes| {
                 self.private_tmpfs == PrivateTmpfs::Unbounded
                     || self.aggregate_requested_bytes() > maximum_bytes
@@ -289,6 +292,9 @@ fn configured_policy(control: FuzzControl) -> (BubblewrapWorkerPolicy, Capabilit
     }
     if control.namespace_lockdown {
         policy.require_no_further_user_namespaces();
+    }
+    if control.allow_unbounded_host_writes {
+        policy.allow_unbounded_host_file_root_writes();
     }
     if control.require_bounded_writes {
         policy.require_bounded_file_root_writes();

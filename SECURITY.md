@@ -476,13 +476,17 @@ The tmpfs mounts are `nosuid,nodev`, but Splash does not claim they are
 root and invoke it when the runtime and syscall policy allow. Denying an
 `executable` capability selector prevents generated source from selecting a
 host command; it does not mediate native `execve` calls inside the worker.
-`require_bounded_file_root_writes` rejects active host-backed read-write roots
-and an enabled unbounded private `/tmp`, then non-recursively remounts the empty
-namespace root, `/proc`, and `/dev` read-only after all selected submounts are
-created. It also requires mandatory further-user-namespace lockdown; otherwise
-a worker could reacquire namespace-scoped mount authority after capabilities
-were dropped. Device and proc interfaces retain their kernel-defined semantics,
-and the mode does not constrain downstream adapter effects. After transport
+Active host-backed read-write roots are rejected by default. Host code can
+explicitly allow one only when it already enforces an independent persistent
+storage quota; Splash cannot validate that quota.
+`require_bounded_file_root_writes` adds rejection of an enabled unbounded
+private `/tmp`, non-recursive read-only remounts of the empty namespace root,
+`/proc`, and `/dev` after all selected submounts are created, and mandatory
+further-user-namespace lockdown. It overrides the explicit unbounded-write
+acknowledgement. Without that lockdown, a worker could reacquire
+namespace-scoped mount authority after capabilities were dropped. Device and
+proc interfaces retain their kernel-defined semantics, and the mode does not
+constrain downstream adapter effects. After transport
 pipes move out of the startup handle,
 `BubblewrapWorkerLifecycle::terminate` force-terminates and reaps the worker. It
 is process control only: the host must drop the session and reconcile a durable
@@ -491,10 +495,11 @@ effect rather than infer that process termination cancelled or rolled it back.
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no aggregate quota for persistent host-backed storage, no
 device quota, per-origin network proxy, D-Bus mediation, executable-path
-policy, secret broker, or universal cancellation for arbitrary or durable
-adapters. Protocol v5 can layer an exact
-ordinary-call request over its private pipes only for reviewed cancellable
-adapters. Its optional strict allowlist is a target-specific
+policy, direct secret-selector handling, or universal cancellation for
+arbitrary or durable adapters. Its separate endpoint-bound secret broker is
+not a general credential or worker-secret delivery mechanism. Protocol v5 can
+layer an exact ordinary-call request over its private pipes only for reviewed
+cancellable adapters. Its optional strict allowlist is a target-specific
 syscall boundary, not a replacement for those missing controls. The optional
 `splash-workflow/bubblewrap-recovery` coordinator adds a narrow post-exit path:
 it requires a session-bound reaping proof, reloads a fenced authenticated host

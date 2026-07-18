@@ -212,18 +212,23 @@
   lifecycle handle that force-terminates and reaps a worker. Neither is a
   general resource quota or proof that an adapter effect was cancelled.
 - Manifest-selected bounded ephemeral `file_root` mounts at arbitrary
-  host-configured worker paths, with common overlap validation and an opt-in
-  policy that rejects active read-write host bindings and an unbounded private
+  host-configured worker paths, with common overlap validation. Active
+  persistent host-backed writable roots fail closed by default; host code must
+  explicitly acknowledge an independently enforced filesystem quota before
+  mounting one. An opt-in stricter policy also rejects an unbounded private
   `/tmp`, requires further-user-namespace lockdown, and remounts the namespace
   root, `/proc`, and `/dev` read-only. Each mount has a kernel-enforced `tmpfs`
   data-block ceiling; an optional policy rejects a selected set of bounded
   tmpfs mounts whose potential aggregate capacity exceeds a host maximum. The
   mounts still have independent runtime ceilings rather than a shared quota,
   have no independent inode cap, and are neither durable storage, an
-  executable-path policy, nor a persistent-filesystem quota. A worker plan
-  defaults to 64 unique active file-root selectors; trusted configuration can
-  lower that bound, including to zero, or explicitly raise it only to the fixed
-  256-root maximum, constraining mount-plan expansion before source resolution.
+  executable-path policy, nor a persistent-filesystem quota. Splash neither
+  creates nor validates the external persistent-storage quota, and the stricter
+  bounded-write policy still rejects every host-backed writable root. A worker
+  plan defaults to 64 unique active file-root selectors; trusted configuration
+  can lower that bound, including to zero, or explicitly raise it only to the
+  fixed 256-root maximum, constraining mount-plan expansion before source
+  resolution.
 - Optional Bubblewrap user-namespace hardening that requires a usable user
   namespace and prevents further user namespace creation, with no compatibility
   fallback to a weaker worker policy.
