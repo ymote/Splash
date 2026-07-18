@@ -62,6 +62,7 @@ policy.set_resource_limit_runner(ResourceLimitRunner::new(
     "/opt/splash/bin/splash-limit-runner",
     limits,
 )?);
+policy.require_resource_limit_runner();
 
 let command = policy.compile(&attenuated_manifest)?;
 // `trusted_session_key` comes from the host's CSPRNG/key authority.
@@ -77,6 +78,12 @@ let bootstrap = PrivatePipeWorkerBootstrap::new(
 let worker = command.spawn_with_bootstrap(&bootstrap)?;
 let (lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
 ```
+
+`require_resource_limit_runner` makes a missing runner a compile-time policy
+failure. It is useful when an application treats its selected `RLIMIT_*`
+ceilings as required defense in depth rather than a best-effort deployment
+choice. It does not turn those per-process limits into a cgroup, disk quota, or
+wall-clock deadline.
 
 `MountSourceBinding::DescriptorPinned` is optional Linux hardening for host
 paths selected by this policy. At `compile`, Splash opens each selected runtime
@@ -158,6 +165,13 @@ let cgroup_policy = CgroupV2Policy::new(
 let worker = command.spawn_with_bootstrap_in_cgroup(&cgroup_policy, &bootstrap)?;
 let (lifecycle, worker_stdin, worker_stdout) = worker.into_lifecycle_parts();
 ```
+
+When a deployment requires this launch path, set
+`policy.require_cgroup_v2()` before `compile`. The resulting command rejects
+the uncgrouped `spawn` and `spawn_with_bootstrap` methods on Linux; only
+`spawn_in_cgroup` and `spawn_with_bootstrap_in_cgroup` can start it. The
+requirement does not select limits itself: the trusted `CgroupV2Policy` above
+must still contain at least one finite controller limit.
 
 Build the bundled host-side runner on the target Linux platform with:
 

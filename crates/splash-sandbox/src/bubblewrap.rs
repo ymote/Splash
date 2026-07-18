@@ -689,6 +689,8 @@ pub struct BubblewrapWorkerPolicy {
     bounded_file_root_writes_required: bool,
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
+    resource_limit_runner_required: bool,
+    cgroup_v2_required: bool,
     seccomp_profile: WorkerSeccompProfile,
     seccomp_allowlist: Option<WorkerSeccompAllowlist>,
 }
@@ -721,6 +723,8 @@ impl BubblewrapWorkerPolicy {
             bounded_file_root_writes_required: false,
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
+            resource_limit_runner_required: false,
+            cgroup_v2_required: false,
             seccomp_profile: WorkerSeccompProfile::Disabled,
             seccomp_allowlist: None,
         })
@@ -984,6 +988,40 @@ impl BubblewrapWorkerPolicy {
         self
     }
 
+    /// Requires this policy to include a typed resource-limit runner.
+    ///
+    /// This is an opt-in admission check for hosts whose security policy
+    /// depends on the selected `RLIMIT_*` ceilings. Compilation fails rather
+    /// than producing a command that could launch the fixed worker directly.
+    /// It does not make rlimits a cgroup, aggregate disk, or deadline policy.
+    pub fn require_resource_limit_runner(&mut self) -> &mut Self {
+        self.resource_limit_runner_required = true;
+        self
+    }
+
+    /// Returns whether compilation requires a typed resource-limit runner.
+    pub const fn resource_limit_runner_required(&self) -> bool {
+        self.resource_limit_runner_required
+    }
+
+    /// Requires this policy to launch through [`CgroupV2Policy`].
+    ///
+    /// A command compiled with this option rejects [`BubblewrapCommand::spawn`]
+    /// and [`BubblewrapCommand::spawn_with_bootstrap`] on Linux. The host must
+    /// use the corresponding cgroup-backed launch method, which prepares and
+    /// verifies a fresh child cgroup before the worker handle is returned.
+    /// The selected cgroup policy still defines which finite controller limits
+    /// apply; this option does not invent default limits.
+    pub fn require_cgroup_v2(&mut self) -> &mut Self {
+        self.cgroup_v2_required = true;
+        self
+    }
+
+    /// Returns whether this policy requires a cgroup-v2-backed launch.
+    pub const fn cgroup_v2_required(&self) -> bool {
+        self.cgroup_v2_required
+    }
+
     /// Returns the selected seccomp hardening profile.
     pub const fn seccomp_profile(&self) -> WorkerSeccompProfile {
         self.seccomp_profile
@@ -1055,6 +1093,9 @@ impl BubblewrapWorkerPolicy {
             && self.user_namespace_policy != UserNamespacePolicy::RequireNoFurtherUserNamespaces
         {
             return Err(BubblewrapPolicyError::BoundedFileRootWritesRequireUserNamespaceLockdown);
+        }
+        if self.resource_limit_runner_required && self.resource_limit_runner.is_none() {
+            return Err(BubblewrapPolicyError::ResourceLimitRunnerRequired);
         }
 
         let resources = manifest
@@ -1232,6 +1273,7 @@ impl BubblewrapWorkerPolicy {
             mount_suffix_arguments,
             manifest: manifest.clone(),
             seccomp_program,
+            cgroup_v2_required: self.cgroup_v2_required,
         })
     }
 }
@@ -1253,6 +1295,7 @@ pub struct BubblewrapCommand {
     mount_suffix_arguments: Vec<OsString>,
     manifest: CapabilityManifest,
     seccomp_program: Option<SeccompProgram>,
+    cgroup_v2_required: bool,
 }
 
 impl BubblewrapCommand {
@@ -1292,6 +1335,16 @@ impl BubblewrapCommand {
         &self.manifest
     }
 
+    /// Returns whether this command must launch through a cgroup-v2 policy.
+    ///
+    /// When true, [`Self::spawn`] and [`Self::spawn_with_bootstrap`] fail
+    /// closed on Linux. Use [`Self::spawn_in_cgroup`] or
+    /// [`Self::spawn_with_bootstrap_in_cgroup`] with a trusted finite
+    /// [`CgroupV2Policy`] instead.
+    pub const fn requires_cgroup_v2(&self) -> bool {
+        self.cgroup_v2_required
+    }
+
     /// Returns the selected host-owned seccomp hardening profile.
     ///
     /// The profile's descriptor is created only while spawning the worker, so
@@ -1318,6 +1371,9 @@ impl BubblewrapCommand {
 
         #[cfg(target_os = "linux")]
         {
+            if self.cgroup_v2_required {
+                return Err(BubblewrapSpawnError::CgroupV2Required);
+            }
             self.spawn_with_stderr(Stdio::null(), None, None)
                 .map(|(worker, _)| worker)
         }
@@ -1484,6 +1540,9 @@ impl BubblewrapCommand {
     fn spawn_capturing_stderr(
         &self,
     ) -> Result<(SpawnedBubblewrapWorker, ChildStderr), BubblewrapSpawnError> {
+        if self.cgroup_v2_required {
+            return Err(BubblewrapSpawnError::CgroupV2Required);
+        }
         let (worker, stderr) = self.spawn_with_stderr(Stdio::piped(), None, None)?;
         let Some(stderr) = stderr else {
             unreachable!("a piped Bubblewrap standard-error stream must be available")
@@ -2686,6 +2745,7 @@ pub enum BubblewrapPolicyError {
     DescriptorPinnedExecutablesUnsupportedPlatform,
     DescriptorPinnedExecutablesRequirePinnedMountSources,
     EmptyResourceLimits,
+    ResourceLimitRunnerRequired,
     MissingSeccompAllowlist,
     MissingSeccompExecve,
     SeccompAllowlistConflictsWithHardening {
@@ -2812,6 +2872,9 @@ impl Display for BubblewrapPolicyError {
             ),
             Self::EmptyResourceLimits => {
                 formatter.write_str("resource limit runner requires at least one finite limit")
+            }
+            Self::ResourceLimitRunnerRequired => {
+                formatter.write_str("worker policy requires a typed resource-limit runner")
             }
             Self::MissingSeccompAllowlist => formatter.write_str(
                 "strict seccomp profile requires a host-selected syscall allowlist",
@@ -2942,6 +3005,7 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::DescriptorPinnedExecutablesUnsupportedPlatform
             | Self::DescriptorPinnedExecutablesRequirePinnedMountSources
             | Self::EmptyResourceLimits
+            | Self::ResourceLimitRunnerRequired
             | Self::MissingSeccompAllowlist
             | Self::MissingSeccompExecve
             | Self::SeccompAllowlistConflictsWithHardening { .. }
@@ -2970,6 +3034,7 @@ impl std::error::Error for BubblewrapPolicyError {
 #[derive(Debug)]
 pub enum BubblewrapSpawnError {
     UnsupportedPlatform,
+    CgroupV2Required,
     SeccompTransport(io::Error),
     PinnedMountTransport(io::Error),
     PinnedExecutableTransport(io::Error),
@@ -3127,6 +3192,9 @@ impl Display for BubblewrapSpawnError {
             Self::UnsupportedPlatform => {
                 formatter.write_str("Bubblewrap workers are supported only on Linux")
             }
+            Self::CgroupV2Required => formatter.write_str(
+                "compiled worker requires a cgroup-v2-backed launch; use spawn_in_cgroup",
+            ),
             Self::SeccompTransport(error) => {
                 write!(
                     formatter,
@@ -3172,7 +3240,10 @@ impl std::error::Error for BubblewrapSpawnError {
             | Self::PinnedExecutableTransport(error)
             | Self::Spawn(error) => Some(error),
             Self::CgroupMembership(error) => Some(error),
-            Self::UnsupportedPlatform | Self::MissingStdin | Self::MissingStdout => None,
+            Self::UnsupportedPlatform
+            | Self::CgroupV2Required
+            | Self::MissingStdin
+            | Self::MissingStdout => None,
             Self::CgroupJoinTimeout(_) | Self::CgroupRunnerExited(_) => None,
         }
     }
@@ -5591,6 +5662,53 @@ print("seccomp-active")
             ]
         ));
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+    }
+
+    #[test]
+    fn required_resource_limit_runner_fails_closed_until_one_is_configured() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert!(!policy.resource_limit_runner_required());
+        policy.require_resource_limit_runner();
+        assert!(policy.resource_limit_runner_required());
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::ResourceLimitRunnerRequired)
+        ));
+
+        policy.set_resource_limit_runner(resource_limit_runner(&root));
+        assert!(policy.compile(&manifest([])).is_ok());
+    }
+
+    #[test]
+    fn cgroup_v2_launch_requirement_is_bound_into_the_compiled_command() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert!(!policy.cgroup_v2_required());
+        policy.require_cgroup_v2();
+        assert!(policy.cgroup_v2_required());
+
+        let command = policy.compile(&manifest([])).unwrap();
+        assert!(command.requires_cgroup_v2());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_launch_requirement_rejects_plain_spawn_before_process_creation() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.require_cgroup_v2();
+        let command = policy.compile(&manifest([])).unwrap();
+
+        assert!(matches!(
+            command.spawn(),
+            Err(BubblewrapSpawnError::CgroupV2Required)
+        ));
+        assert!(matches!(
+            command.spawn_capturing_stderr(),
+            Err(BubblewrapSpawnError::CgroupV2Required)
+        ));
     }
 
     #[test]

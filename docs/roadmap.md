@@ -173,6 +173,10 @@
   executable, and secret selectors, and does not fall back to unrestricted
   process launch. It unconditionally drops every Linux capability before the
   worker executes, including when the host invokes Bubblewrap as root.
+- Optional per-policy launch requirements for a typed resource-limit runner
+  and a cgroup-v2-backed launch. A missing required runner rejects compilation,
+  and a cgroup-required compiled command rejects uncgrouped launch APIs rather
+  than silently dropping its selected controller boundary.
 - Optional Linux descriptor-pinned Bubblewrap mount roots. After successful
   compilation, runtime and host-backed file-root bindings use launch-only
   `--ro-bind-fd` or `--bind-fd` handles with no path-bind fallback, preventing
