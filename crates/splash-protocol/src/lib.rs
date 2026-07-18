@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use constant_time_eq::constant_time_eq;
 use serde::{Deserialize, Serialize};
@@ -2215,10 +2216,19 @@ fn hex_nibble(byte: u8) -> Result<u8, ProtocolError> {
 }
 
 /// An invocation the policy host has accepted for dispatch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AuthorizedInvocation {
     invocation: ToolInvocation,
     grant: CapabilityGrant,
+    provenance: Arc<SessionAuthorizerProvenance>,
+}
+
+impl PartialEq for AuthorizedInvocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.invocation == other.invocation
+            && self.grant == other.grant
+            && Arc::ptr_eq(&self.provenance, &other.provenance)
+    }
 }
 
 impl AuthorizedInvocation {
@@ -2232,10 +2242,19 @@ impl AuthorizedInvocation {
 }
 
 /// A cancellation request bound to one previously authorized invocation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AuthorizedWorkerCancellation {
     request: WorkerCancellationRequest,
     target: ToolInvocation,
+    provenance: Arc<SessionAuthorizerProvenance>,
+}
+
+impl PartialEq for AuthorizedWorkerCancellation {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.target == other.target
+            && Arc::ptr_eq(&self.provenance, &other.provenance)
+    }
 }
 
 impl AuthorizedWorkerCancellation {
@@ -2249,10 +2268,19 @@ impl AuthorizedWorkerCancellation {
 }
 
 /// A durable operation dispatch the policy host has accepted for a worker.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AuthorizedOperationInvocation {
     request: OperationDispatchRequest,
     grant: CapabilityGrant,
+    provenance: Arc<SessionAuthorizerProvenance>,
+}
+
+impl PartialEq for AuthorizedOperationInvocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.grant == other.grant
+            && Arc::ptr_eq(&self.provenance, &other.provenance)
+    }
 }
 
 impl AuthorizedOperationInvocation {
@@ -2270,10 +2298,19 @@ impl AuthorizedOperationInvocation {
 /// Reconciliation does not consume a normal capability call budget. Hosts must
 /// apply a separate bounded reconciliation policy because a status lookup may
 /// still perform adapter work.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AuthorizedOperationReconciliation {
     request: OperationReconcileRequest,
     grant: CapabilityGrant,
+    provenance: Arc<SessionAuthorizerProvenance>,
+}
+
+impl PartialEq for AuthorizedOperationReconciliation {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.grant == other.grant
+            && Arc::ptr_eq(&self.provenance, &other.provenance)
+    }
 }
 
 impl AuthorizedOperationReconciliation {
@@ -2287,10 +2324,19 @@ impl AuthorizedOperationReconciliation {
 }
 
 /// A compensation request the host has validated against its active grant.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct AuthorizedOperationCompensation {
     request: OperationCompensationRequest,
     grant: CapabilityGrant,
+    provenance: Arc<SessionAuthorizerProvenance>,
+}
+
+impl PartialEq for AuthorizedOperationCompensation {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.grant == other.grant
+            && Arc::ptr_eq(&self.provenance, &other.provenance)
+    }
 }
 
 impl AuthorizedOperationCompensation {
@@ -2337,6 +2383,7 @@ impl CompensationRequestIdentity {
 /// prevents a timed-out or crashed worker from allowing a caller to retry past
 /// its grant by reusing a request budget.
 pub struct SessionAuthorizer {
+    provenance: Arc<SessionAuthorizerProvenance>,
     manifest: CapabilityManifest,
     calls_by_tool: BTreeMap<String, u32>,
     compensations_by_tool: BTreeMap<String, u32>,
@@ -2347,10 +2394,19 @@ pub struct SessionAuthorizer {
     cancelled_request_ids: BTreeSet<String>,
 }
 
+/// Private process-local provenance for authorization tokens.
+///
+/// This is not serialized or a wire credential. It only prevents a caller from
+/// passing a token issued by one [`SessionAuthorizer`] instance into another
+/// instance that happens to carry the same manifest.
+#[derive(Debug)]
+struct SessionAuthorizerProvenance;
+
 impl SessionAuthorizer {
     pub fn new(manifest: CapabilityManifest) -> Result<Self, ProtocolError> {
         manifest.validate()?;
         Ok(Self {
+            provenance: Arc::new(SessionAuthorizerProvenance),
             manifest,
             calls_by_tool: BTreeMap::new(),
             compensations_by_tool: BTreeMap::new(),
@@ -2389,7 +2445,11 @@ impl SessionAuthorizer {
             &invocation.payload,
         )?;
 
-        Ok(AuthorizedInvocation { invocation, grant })
+        Ok(AuthorizedInvocation {
+            invocation,
+            grant,
+            provenance: Arc::clone(&self.provenance),
+        })
     }
 
     /// Validates one cooperative-cancellation request against an exact active
@@ -2403,6 +2463,7 @@ impl SessionAuthorizer {
         request: WorkerCancellationRequest,
         target: &AuthorizedInvocation,
     ) -> Result<AuthorizedWorkerCancellation, ProtocolError> {
+        self.ensure_local_authorization(&target.provenance)?;
         request.validate()?;
         if request.session_id != self.manifest.session_id {
             return Err(ProtocolError::UnknownSession(request.session_id));
@@ -2434,6 +2495,7 @@ impl SessionAuthorizer {
         Ok(AuthorizedWorkerCancellation {
             request,
             target: invocation.clone(),
+            provenance: Arc::clone(&self.provenance),
         })
     }
 
@@ -2450,7 +2512,11 @@ impl SessionAuthorizer {
             &request.tool,
             &request.payload,
         )?;
-        Ok(AuthorizedOperationInvocation { request, grant })
+        Ok(AuthorizedOperationInvocation {
+            request,
+            grant,
+            provenance: Arc::clone(&self.provenance),
+        })
     }
 
     /// Validates and reserves one bounded operation-reconciliation request.
@@ -2477,7 +2543,11 @@ impl SessionAuthorizer {
             return Err(ProtocolError::DuplicateRequest(request.request_id));
         }
         self.reserve_request_id(&request.request_id)?;
-        Ok(AuthorizedOperationReconciliation { request, grant })
+        Ok(AuthorizedOperationReconciliation {
+            request,
+            grant,
+            provenance: Arc::clone(&self.provenance),
+        })
     }
 
     /// Validates and reserves one host-approved compensation request.
@@ -2539,7 +2609,11 @@ impl SessionAuthorizer {
                 .or_default();
             *compensations = compensations.saturating_add(1);
         }
-        Ok(AuthorizedOperationCompensation { request, grant })
+        Ok(AuthorizedOperationCompensation {
+            request,
+            grant,
+            provenance: Arc::clone(&self.provenance),
+        })
     }
 
     pub fn validate_result(
@@ -2547,6 +2621,7 @@ impl SessionAuthorizer {
         authorized: &AuthorizedInvocation,
         result: &ToolResult,
     ) -> Result<(), ProtocolError> {
+        self.ensure_local_authorization(&authorized.provenance)?;
         result.validate_header()?;
         if result.session_id != self.manifest.session_id {
             return Err(ProtocolError::UnknownSession(result.session_id.clone()));
@@ -2586,6 +2661,7 @@ impl SessionAuthorizer {
         authorized: &AuthorizedWorkerCancellation,
         result: &WorkerCancellationResult,
     ) -> Result<(), ProtocolError> {
+        self.ensure_local_authorization(&authorized.provenance)?;
         result.validate()?;
         if result.session_id != self.manifest.session_id {
             return Err(ProtocolError::UnknownSession(result.session_id.clone()));
@@ -2635,6 +2711,7 @@ impl SessionAuthorizer {
         authorized: &AuthorizedOperationInvocation,
         result: &OperationReconcileResult,
     ) -> Result<(), ProtocolError> {
+        self.ensure_local_authorization(&authorized.provenance)?;
         result.validate()?;
         if result.session_id != self.manifest.session_id {
             return Err(ProtocolError::UnknownSession(result.session_id.clone()));
@@ -2656,6 +2733,7 @@ impl SessionAuthorizer {
         authorized: &AuthorizedOperationReconciliation,
         result: &OperationReconcileResult,
     ) -> Result<(), ProtocolError> {
+        self.ensure_local_authorization(&authorized.provenance)?;
         result.validate()?;
         if result.session_id != self.manifest.session_id {
             return Err(ProtocolError::UnknownSession(result.session_id.clone()));
@@ -2677,6 +2755,7 @@ impl SessionAuthorizer {
         authorized: &AuthorizedOperationCompensation,
         result: &OperationCompensationResult,
     ) -> Result<(), ProtocolError> {
+        self.ensure_local_authorization(&authorized.provenance)?;
         result.validate()?;
         if result.session_id != self.manifest.session_id {
             return Err(ProtocolError::UnknownSession(result.session_id.clone()));
@@ -2689,6 +2768,16 @@ impl SessionAuthorizer {
         }
         validate_operation_status_for_grant(&result.status, &authorized.grant)?;
         self.completed_request_ids.insert(result.request_id.clone());
+        Ok(())
+    }
+
+    fn ensure_local_authorization(
+        &self,
+        provenance: &Arc<SessionAuthorizerProvenance>,
+    ) -> Result<(), ProtocolError> {
+        if !Arc::ptr_eq(&self.provenance, provenance) {
+            return Err(ProtocolError::AuthorizationProvenanceMismatch);
+        }
         Ok(())
     }
 
@@ -2811,6 +2900,7 @@ pub enum ProtocolError {
         actual: u64,
     },
     InvalidAuthenticationTag,
+    AuthorizationProvenanceMismatch,
     DuplicateRequest(String),
     SessionRequestLimitExceeded {
         maximum: usize,
@@ -2954,6 +3044,9 @@ impl Display for ProtocolError {
             }
             Self::InvalidAuthenticationTag => {
                 formatter.write_str("worker frame authentication tag is invalid")
+            }
+            Self::AuthorizationProvenanceMismatch => {
+                formatter.write_str("worker authorization belongs to another session authorizer")
             }
             Self::DuplicateRequest(request_id) => {
                 write!(formatter, "duplicate worker request: {request_id}")
@@ -4170,6 +4263,230 @@ mod tests {
                 .unwrap_err(),
             ProtocolError::CancellationAlreadyRequested("request-1".to_owned())
         );
+    }
+
+    #[test]
+    fn authorization_tokens_are_bound_to_their_originating_authorizer() {
+        let mut issuer = SessionAuthorizer::new(manifest()).unwrap();
+        let mut recipient = SessionAuthorizer::new(manifest()).unwrap();
+        let ordinary = issuer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-1",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let cancellation_request =
+            WorkerCancellationRequest::new("session-1", "cancel-1", "request-1", "math.add")
+                .unwrap();
+
+        assert_eq!(
+            recipient
+                .authorize_cancellation(cancellation_request.clone(), &ordinary)
+                .unwrap_err(),
+            ProtocolError::AuthorizationProvenanceMismatch
+        );
+        assert_eq!(
+            recipient
+                .validate_result(
+                    &ordinary,
+                    &ToolResult::new(
+                        "session-1",
+                        "request-1",
+                        ToolPayload::Json(json!({"total": 42})),
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            ProtocolError::AuthorizationProvenanceMismatch
+        );
+
+        let cancellation = issuer
+            .authorize_cancellation(cancellation_request.clone(), &ordinary)
+            .unwrap();
+        assert_eq!(
+            recipient
+                .validate_cancellation_result(
+                    &cancellation,
+                    &WorkerCancellationResult::new(
+                        &cancellation_request,
+                        WorkerCancellationOutcome::Unsupported,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            ProtocolError::AuthorizationProvenanceMismatch
+        );
+
+        let operation = issuer
+            .authorize_operation(operation_request(
+                "operation-request-1",
+                "operation-1",
+                ToolPayload::Json(json!({"left": 20, "right": 22})),
+            ))
+            .unwrap();
+        assert_eq!(
+            recipient
+                .validate_operation_result(
+                    &operation,
+                    &OperationReconcileResult::new(
+                        "session-1",
+                        "operation-request-1",
+                        "math.add",
+                        "operation-1",
+                        OperationStatus::Running,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            ProtocolError::AuthorizationProvenanceMismatch
+        );
+
+        let reconciliation = issuer
+            .authorize_reconciliation(
+                OperationReconcileRequest::new(
+                    "session-1",
+                    "reconcile-request-1",
+                    "math.add",
+                    "operation-1",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            recipient
+                .validate_reconciliation_result(
+                    &reconciliation,
+                    &OperationReconcileResult::new(
+                        "session-1",
+                        "reconcile-request-1",
+                        "math.add",
+                        "operation-1",
+                        OperationStatus::Running,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            ProtocolError::AuthorizationProvenanceMismatch
+        );
+
+        let grant = compensation_grant();
+        let binding = compensation_binding(&grant);
+        let mut compensation_issuer =
+            SessionAuthorizer::new(CapabilityManifest::new("session-1", vec![grant]).unwrap())
+                .unwrap();
+        let mut compensation_recipient = SessionAuthorizer::new(
+            CapabilityManifest::new("session-1", vec![compensation_grant()]).unwrap(),
+        )
+        .unwrap();
+        let compensation = compensation_issuer
+            .authorize_compensation(compensation_request(
+                "compensation-request-1",
+                binding.clone(),
+                ToolPayload::Json(json!({"undo": "release"})),
+            ))
+            .unwrap();
+        assert_eq!(
+            compensation_recipient
+                .validate_compensation_result(
+                    &compensation,
+                    &OperationCompensationResult::new(
+                        "session-1",
+                        "compensation-request-1",
+                        binding,
+                        OperationStatus::Succeeded {
+                            payload: ToolPayload::Json(json!({"undone": true})),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            ProtocolError::AuthorizationProvenanceMismatch
+        );
+
+        assert_eq!(recipient.calls_for("math.add"), 0);
+        assert!(recipient.seen_request_ids.is_empty());
+        assert!(recipient.completed_request_ids.is_empty());
+        assert!(recipient.cancellation_requested_ids.is_empty());
+        assert!(recipient.cancelled_request_ids.is_empty());
+        assert_eq!(compensation_recipient.compensations_for("math.add"), 0);
+        assert!(compensation_recipient.seen_request_ids.is_empty());
+        assert!(compensation_recipient.completed_request_ids.is_empty());
+    }
+
+    #[test]
+    fn authorization_token_clones_preserve_their_origin_provenance() {
+        let mut authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let authorized = authorizer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-1",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let clone = authorized.clone();
+        assert_eq!(authorized, clone);
+        authorizer
+            .validate_result(
+                &clone,
+                &ToolResult::new(
+                    "session-1",
+                    "request-1",
+                    ToolPayload::Json(json!({"total": 42})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mut other_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let foreign = other_authorizer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-1",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_ne!(authorized, foreign);
+
+        let mut cancellation_authorizer = SessionAuthorizer::new(manifest()).unwrap();
+        let target = cancellation_authorizer
+            .authorize(
+                ToolInvocation::new(
+                    "session-1",
+                    "request-1",
+                    "math.add",
+                    ToolPayload::Json(json!({"left": 20, "right": 22})),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let request =
+            WorkerCancellationRequest::new("session-1", "cancel-1", "request-1", "math.add")
+                .unwrap();
+        let cancellation = cancellation_authorizer
+            .authorize_cancellation(request.clone(), &target)
+            .unwrap();
+        let cancellation_clone = cancellation.clone();
+        assert_eq!(cancellation, cancellation_clone);
+        cancellation_authorizer
+            .validate_cancellation_result(
+                &cancellation_clone,
+                &WorkerCancellationResult::new(&request, WorkerCancellationOutcome::Acknowledged)
+                    .unwrap(),
+            )
+            .unwrap();
     }
 
     fn operation_request(

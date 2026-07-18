@@ -46,6 +46,12 @@ or adapter-effect quota. A fresh session cannot cancel an invocation from an
 exhausted session; the cancellation rule below requires one unused identity
 slot for each invocation that may need cooperative cancellation.
 
+The `Authorized*` Rust values returned by `SessionAuthorizer` are nonserialized
+in-process proof objects. A result or cancellation validator accepts one only
+from the same authorizer instance that issued it, even if another instance has
+an identical session manifest. This local provenance check complements, but
+does not replace, authenticated worker frames.
+
 Resource selectors have a kind (`file_root`, `executable`, `network_origin`,
 or `secret`) plus an opaque identifier. They are not paths, command lines, DNS
 names, or secret values. The policy host maps each selector to a real resource
@@ -161,7 +167,10 @@ Protocol v5 defines `cancel` and `cancellation_result` for one active ordinary
 repeats the exact session, target request ID, and tool. It contains no tool
 input, `ExternalToolId`, path, executable, origin, secret, or new capability.
 The host and worker independently bind it to the already authorized invocation.
-Only one cancellation request is admitted for a target.
+Each side requires that Rust authorization token to originate from its own
+`SessionAuthorizer`; one from another local authorizer instance is rejected
+even when the manifests are identical. Only one cancellation request is
+admitted for a target.
 
 The cancellation ID consumes one of the same 1,024 retained identity slots. A
 host that may cancel an in-flight invocation must preserve one unused slot
@@ -269,6 +278,12 @@ adapter run an effect. A new admission permits one dispatch. An exact duplicate
 returns its existing `pending`, `running`, or terminal state and must not run
 the adapter again. Reusing the same key with a different tool or canonical
 input is rejected.
+
+The local `Authorized*` provenance boundary deliberately does not apply to
+`WorkerOperationJournal` admission or observation. Durable recovery must accept
+an authenticated request through a fresh `SessionAuthorizer`; journal scope,
+operation identity, canonical input, and active-grant checks provide that
+cross-session recovery binding instead.
 
 `splash-worker` returns `PendingOperation` for an existing `pending` record;
 it never turns an unconfirmed effect into success. A `running` or terminal
