@@ -180,21 +180,21 @@ impl ExecutionLimits {
     }
 }
 
-/// Bounds applied to direct Splash [`Runtime`] `.to_json()` calls.
+/// Bounds applied to direct Splash [`Runtime`] JSON methods.
 ///
-/// The inherited Makepad serializer is appropriate for trusted UI hosts but
-/// recursively walks script collections without a cycle or size bound. The
-/// Splash runtime replaces that dispatch with the same bounded JSON
-/// writer used at the Rust data boundary. A host can lower these limits by
-/// lowering its normal source or syntax-nesting limits; they never exceed the
-/// standalone JSON defaults.
+/// The inherited Makepad JSON methods are appropriate for trusted UI hosts but
+/// do not apply Splash's byte, depth, or cycle rules. The Splash runtime
+/// replaces their dispatch with the same bounded JSON reader and writer used
+/// at the Rust data boundary. A host can lower these limits by lowering its
+/// normal source or syntax-nesting limits; they never exceed the standalone
+/// JSON defaults.
 #[derive(Clone, Copy)]
-struct ScriptJsonSerializationLimits {
+struct ScriptJsonMethodLimits {
     max_bytes: usize,
     max_depth: usize,
 }
 
-impl ScriptJsonSerializationLimits {
+impl ScriptJsonMethodLimits {
     fn from_execution_limits(limits: ExecutionLimits) -> Self {
         Self {
             max_bytes: limits.max_source_bytes.min(DEFAULT_MAX_JSON_DATA_BYTES),
@@ -627,7 +627,7 @@ pub struct Runtime<H: Any = (), S: Any = ()> {
     std: S,
     vm: Box<vm::ScriptVmBase>,
     limits: ExecutionLimits,
-    json_serialization_limits: Rc<Cell<ScriptJsonSerializationLimits>>,
+    json_method_limits: Rc<Cell<ScriptJsonMethodLimits>>,
 }
 
 impl<H: Any, S: Any> Runtime<H, S> {
@@ -637,18 +637,18 @@ impl<H: Any, S: Any> Runtime<H, S> {
 
     pub fn with_limits(host: H, std: S, limits: ExecutionLimits) -> Result<Self, RuntimeError> {
         let limits = limits.validate()?;
-        let json_serialization_limits = Rc::new(Cell::new(
-            ScriptJsonSerializationLimits::from_execution_limits(limits),
-        ));
-        let installed_limits = json_serialization_limits.clone();
+        let json_method_limits = Rc::new(Cell::new(ScriptJsonMethodLimits::from_execution_limits(
+            limits,
+        )));
+        let installed_limits = json_method_limits.clone();
         let mut runtime = Self {
             host,
             std,
             vm: Box::new(vm::ScriptVmBase::new()),
             limits,
-            json_serialization_limits,
+            json_method_limits,
         };
-        runtime.with_vm(|vm| install_bounded_json_serialization(vm, installed_limits));
+        runtime.with_vm(|vm| install_bounded_json_methods(vm, installed_limits));
         Ok(runtime)
     }
 
@@ -668,8 +668,8 @@ impl<H: Any, S: Any> Runtime<H, S> {
             return Err(RuntimeError::EvaluationInProgress);
         }
         self.limits = limits;
-        self.json_serialization_limits
-            .set(ScriptJsonSerializationLimits::from_execution_limits(limits));
+        self.json_method_limits
+            .set(ScriptJsonMethodLimits::from_execution_limits(limits));
         Ok(())
     }
 
@@ -2051,10 +2051,7 @@ fn evaluate_with_limits(
     }
 }
 
-fn install_bounded_json_serialization(
-    vm: &mut vm::ScriptVm,
-    limits: Rc<Cell<ScriptJsonSerializationLimits>>,
-) {
+fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJsonMethodLimits>>) {
     let types = [
         vm::ScriptValueType::REDUX_NUMBER,
         vm::ScriptValueType::REDUX_NAN,
@@ -2084,19 +2081,100 @@ fn install_bounded_json_serialization(
                 let mut writer = BoundedJsonWriter::new(limits.max_bytes);
                 match write_script_json(vm, value, limits.max_depth, &mut Vec::new(), &mut writer) {
                     Ok(()) => vm.bx.heap.new_string_from_str(&writer.into_string()),
-                    Err(RuntimeJsonError::TooLarge { .. } | RuntimeJsonError::TooDeep { .. }) => {
-                        script_err_limit!(
-                            vm.bx.threads.cur_ref().trap,
-                            "JSON serialization exceeded Splash runtime limits"
-                        )
-                    }
-                    Err(_) => script_err_unexpected!(
-                        vm.bx.threads.cur_ref().trap,
-                        "value cannot be serialized as bounded JSON"
-                    ),
+                    Err(error) => bounded_json_method_error(vm, error),
                 }
             },
         );
+    }
+
+    let string_limits = limits.clone();
+    native.add_type_method(
+        &mut vm.bx.heap,
+        vm::ScriptValueType::REDUX_STRING,
+        id!(parse_json),
+        &[],
+        move |vm, args| {
+            let value = script_value!(vm, args.self);
+            let limits = string_limits.get();
+            let document = vm
+                .bx
+                .heap
+                .string_with(value, |_, document| {
+                    if document.len() > limits.max_bytes {
+                        Err(RuntimeJsonError::TooLarge {
+                            actual: document.len(),
+                            maximum: limits.max_bytes,
+                        })
+                    } else {
+                        Ok(document.to_owned())
+                    }
+                })
+                .unwrap_or(Err(RuntimeJsonError::UnsupportedScriptValue));
+
+            match document.and_then(|document| parse_bounded_script_json(vm, &document, limits)) {
+                Ok(value) => value,
+                Err(error) => bounded_json_method_error(vm, error),
+            }
+        },
+    );
+
+    native.add_type_method(
+        &mut vm.bx.heap,
+        vm::ScriptValueType::REDUX_ARRAY,
+        id!(parse_json),
+        &[],
+        move |vm, args| {
+            let value = script_value!(vm, args.self);
+            let limits = limits.get();
+            let document = match value.as_array() {
+                Some(array) => match vm.bx.heap.array_storage(array) {
+                    vm::ScriptArrayStorage::U8(bytes) => {
+                        if bytes.len() > limits.max_bytes {
+                            Err(RuntimeJsonError::TooLarge {
+                                actual: bytes.len(),
+                                maximum: limits.max_bytes,
+                            })
+                        } else {
+                            String::from_utf8(bytes.clone())
+                                .map_err(|_| RuntimeJsonError::InvalidEncoding)
+                        }
+                    }
+                    _ => Err(RuntimeJsonError::UnsupportedScriptValue),
+                },
+                None => Err(RuntimeJsonError::UnsupportedScriptValue),
+            };
+
+            match document.and_then(|document| parse_bounded_script_json(vm, &document, limits)) {
+                Ok(value) => value,
+                Err(error) => bounded_json_method_error(vm, error),
+            }
+        },
+    );
+}
+
+fn parse_bounded_script_json(
+    vm: &mut vm::ScriptVm,
+    document: &str,
+    limits: ScriptJsonMethodLimits,
+) -> Result<vm::ScriptValue, RuntimeJsonError> {
+    let value = parse_bounded_json(document, limits.max_bytes, limits.max_depth)?;
+    let encoded = serialize_bounded_json(&value, limits.max_bytes, limits.max_depth)?;
+    let mut parser = vm::json::JsonParserThread::default();
+    Ok(parser.read_json(&encoded, &mut vm.bx.heap))
+}
+
+fn bounded_json_method_error(vm: &mut vm::ScriptVm, error: RuntimeJsonError) -> vm::ScriptValue {
+    match error {
+        RuntimeJsonError::TooLarge { .. } | RuntimeJsonError::TooDeep { .. } => {
+            script_err_limit!(
+                vm.bx.threads.cur_ref().trap,
+                "JSON operation exceeded Splash runtime limits"
+            )
+        }
+        _ => script_err_unexpected!(
+            vm.bx.threads.cur_ref().trap,
+            "value cannot cross Splash's bounded JSON boundary"
+        ),
     }
 }
 
@@ -2347,6 +2425,183 @@ mod tests {
                 )
                 .unwrap(),
             serde_json::json!("cycle rejected")
+        );
+    }
+
+    #[test]
+    fn direct_parse_json_uses_bounded_standard_json() {
+        let mut runtime = Runtime::default();
+        let parsed_string = runtime
+            .eval("let value = \"{\\\"answer\\\":42}\".parse_json()\nvalue.answer")
+            .unwrap();
+
+        assert!(parsed_string.completed(), "{:?}", parsed_string.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    parsed_string.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+
+        let parsed_bytes = runtime
+            .eval(
+                "let value = \"{\\\"answer\\\":42}\".to_bytes().parse_json()\n\
+                 value.answer",
+            )
+            .unwrap();
+
+        assert!(parsed_bytes.completed(), "{:?}", parsed_bytes.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    parsed_bytes.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(42)
+        );
+
+        let invalid = runtime
+            .eval("try \"{unquoted: true}\".parse_json() catch \"invalid JSON\"")
+            .unwrap();
+
+        assert!(invalid.completed(), "{:?}", invalid.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid JSON")
+        );
+
+        let invalid_bytes = runtime
+            .eval(
+                "let bytes = \"x\".to_bytes()\n\
+                 bytes[0] = 255\n\
+                 try bytes.parse_json() catch \"invalid UTF-8\"",
+            )
+            .unwrap();
+
+        assert!(invalid_bytes.completed(), "{:?}", invalid_bytes.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_bytes.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid UTF-8")
+        );
+    }
+
+    #[test]
+    fn direct_parse_json_rejects_excess_runtime_depth_and_input() {
+        let mut depth_source = String::from("let document = \"0\"\nlet index = 0\n");
+        depth_source.push_str("while (index < 65) {\n");
+        depth_source.push_str("document = \"[\" + document + \"]\"\n");
+        depth_source.push_str("index += 1\n}\n");
+        depth_source.push_str("try document.parse_json() catch \"depth rejected\"");
+
+        let mut runtime = Runtime::default();
+        let depth_recovered = runtime.eval(&depth_source).unwrap();
+        assert!(
+            depth_recovered.completed(),
+            "{:?}",
+            depth_recovered.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    depth_recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("depth rejected")
+        );
+
+        let mut input_source = String::from("let payload = \"x\"\n");
+        for _ in 0..17 {
+            input_source.push_str("payload += payload\n");
+        }
+        input_source.push_str("let document = \"\\\"\" + payload + \"\\\"\"\n");
+        input_source.push_str("try document.parse_json() catch \"input rejected\"");
+
+        let input_recovered = runtime.eval(&input_source).unwrap();
+        assert!(
+            input_recovered.completed(),
+            "{:?}",
+            input_recovered.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    input_recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("input rejected")
+        );
+    }
+
+    #[test]
+    fn direct_parse_json_tracks_lowered_runtime_limits() {
+        let mut source = String::from("let payload = \"x\"\n");
+        for _ in 0..9 {
+            source.push_str("payload += payload\n");
+        }
+        source.push_str("let document = \"\\\"\" + payload + \"\\\"\"\n");
+        source.push_str("try document.parse_json() catch \"lowered limit applied\"");
+
+        let mut runtime = Runtime::default();
+        let mut limits = runtime.limits();
+        limits.max_source_bytes = source.len();
+        runtime.set_limits(limits).unwrap();
+
+        let recovered = runtime.eval(&source).unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("lowered limit applied")
+        );
+    }
+
+    #[test]
+    fn direct_parse_json_is_bounded_for_compatibility_evaluation() {
+        let mut runtime = Runtime::default();
+        let recovered = runtime
+            .eval_vm_compatibility(
+                "var recovered = try { \"{unquoted: true}\".parse_json() } { \"invalid JSON\" }\n\
+                 recovered",
+            )
+            .unwrap();
+
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    recovered.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid JSON")
         );
     }
 

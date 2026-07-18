@@ -76,14 +76,18 @@ before evaluation. The runtime carries executable canonical-fixture regression
 coverage, but the two parsers are not formally proven equivalent. Parser/VM
 differential fuzzing is required before a stable language release.
 
-`Runtime` replaces the inherited direct `value.to_json()` dispatch with its
-cycle-aware bounded JSON writer. The default direct-serialization ceiling is
-64 KiB and 64 container levels, and a host may lower it through execution
-limits. Cycles, unsupported values, non-finite numbers, duplicate object keys,
-depth exhaustion, and output exhaustion become ordinary native errors rather
-than unbounded recursive serialization. This protects Splash `Runtime`
-evaluation, including the explicit compatibility-evaluation entry point; it
-does not alter a host that directly embeds the raw Makepad VM.
+`Runtime` replaces inherited direct `value.to_json()` and
+`document.parse_json()` dispatches with bounded JSON methods. The default
+direct-conversion ceiling is 64 KiB and 64 container levels, and a host may
+lower it through execution limits. Parsing accepts only strict JSON strings or
+UTF-8 byte arrays; it is bounded before the value is copied into the VM.
+Cycles, unsupported values, non-finite numbers, and duplicate object keys are
+rejected on serialization; malformed or non-UTF-8 input is rejected on parsing.
+Either direction rejects depth exhaustion and input or output exhaustion as
+ordinary native errors rather than unbounded parser or serializer work. This
+protects Splash `Runtime` evaluation, including the explicit
+compatibility-evaluation entry point; it does not alter a host that directly
+embeds the raw Makepad VM.
 
 Canonical `try/catch` handles ordinary script and native-binding errors and
 unwinds Splash function calls, but it is not a sandbox or transaction. It

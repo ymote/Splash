@@ -1,0 +1,11 @@
+use mod.std.assert
+
+let document = "0"
+let index = 0
+while (index < 65) {
+    document = "[" + document + "]"
+    index += 1
+}
+
+let recovered = try document.parse_json() catch "depth rejected"
+assert(recovered == "depth rejected")

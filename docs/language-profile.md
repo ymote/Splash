@@ -307,16 +307,21 @@ strings that generated code must turn back into values with `parse_json()`.
 This preserves a simple Rust bridge through `serde_json::Value` without
 allowing scripts to import crates directly.
 
-`Runtime` replaces the inherited direct `value.to_json()` dispatch with the
-same cycle-aware bounded serializer used at the Rust data boundary. It returns
-a JSON string only for JSON-safe values. Cycles, unsupported values, non-finite
-numbers, duplicate object keys, excessive container depth, and excessive
-serialized output fail as ordinary native errors that canonical `try/catch` can
-recover from. With default execution limits, direct serialization is capped at
-64 KiB and 64 container levels; a host can lower those caps through
+`Runtime` replaces inherited direct `value.to_json()` and
+`document.parse_json()` dispatch with the same bounded JSON reader and writer
+used at the Rust data boundary. `parse_json()` accepts only strict JSON from a
+string or UTF-8 byte array, then reconstructs a Splash value from bounded
+canonical JSON; it does not accept Makepad's nonstandard JSON extensions.
+`to_json()` returns a JSON string only for JSON-safe values. Cycles,
+unsupported values, non-finite numbers, and duplicate object keys are rejected
+on serialization; malformed or non-UTF-8 input is rejected on parsing. Either
+direction rejects excessive container depth and excessive input or output as
+ordinary native errors that canonical `try/catch` can recover from. With
+default execution limits, direct conversion is capped at 64 KiB and 64
+container levels; a host can lower those caps through
 `ExecutionLimits::max_source_bytes` and `max_syntax_nesting`. This applies to
 both `Runtime::eval` and `Runtime::eval_vm_compatibility`; a host using the raw
-Makepad VM owns its upstream serialization behavior.
+Makepad VM owns its upstream JSON behavior.
 
 Hosts can register a `JsonToolContract` to enforce bounded schemas for those
 JSON envelopes. Contract checks run before the handler and before output
