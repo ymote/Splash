@@ -2,11 +2,13 @@
 
 //! A deny-by-default, auditable bridge from Splash to trusted Rust tools.
 //!
-//! A tool is registered for one runtime instance. A script receives no native
-//! access by naming a tool: the host must register it with an explicit policy.
+//! A tool is registered for one runtime instance. A script receives no ambient
+//! native access by naming a tool: the host must register it with an explicit
+//! policy. Optional direct capability modules are only syntax facades over
+//! those already-registered policies.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::num::NonZeroUsize;
 use std::ops::Index;
@@ -21,7 +23,11 @@ use makepad_script::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub use serde_json::{json, Value as JsonValue};
-use splash_core::{vm, Evaluation, ExecutionLimits, Runtime, RuntimeError};
+use splash_core::{
+    decode_bounded_script_json, encode_bounded_script_json, is_canonical_identifier, vm,
+    Evaluation, ExecutionLimits, Runtime, RuntimeError, DEFAULT_MAX_JSON_DATA_BYTES,
+    DEFAULT_MAX_JSON_DATA_DEPTH,
+};
 pub use splash_protocol::{
     canonical_operation_input_bytes, AuthenticatedWorkerMessage, CapabilityManifest,
     OperationCompensationBinding, OperationCompensationRequest, OperationCompensationResult,
@@ -112,6 +118,30 @@ pub const DEFAULT_MAX_PENDING_TOOLS: usize = 64;
 pub const DEFAULT_MAX_REGISTERED_TOOLS: usize = 128;
 /// Default maximum byte length of the serialized host-visible tool catalog.
 pub const DEFAULT_MAX_TOOL_CATALOG_BYTES: usize = 512 * 1024;
+/// Default maximum number of setup-defined direct capability modules.
+pub const DEFAULT_MAX_CAPABILITY_MODULES: usize = 32;
+/// Default maximum number of methods across every direct capability module.
+pub const DEFAULT_MAX_CAPABILITY_MODULE_METHODS: usize = 128;
+/// Default maximum byte length of the host-visible direct module interface
+/// catalog.
+pub const DEFAULT_MAX_CAPABILITY_MODULE_CATALOG_BYTES: usize = 256 * 1024;
+/// Fixed upper bound for direct capability modules in one runtime.
+pub const MAX_CAPABILITY_MODULES: usize = 128;
+/// Fixed upper bound for methods across direct capability modules in one
+/// runtime.
+pub const MAX_CAPABILITY_MODULE_METHODS: usize = 256;
+/// Fixed upper bound for methods on one direct capability module.
+pub const MAX_CAPABILITY_MODULE_METHODS_PER_MODULE: usize = 64;
+/// Fixed upper bound for host-facing direct module and method interface
+/// descriptors. This matches the LSP module-catalog entry ceiling.
+pub const MAX_CAPABILITY_MODULE_INTERFACE_ENTRIES: usize = 256;
+/// Fixed upper bound for the serialized host-visible direct module interface
+/// catalog.
+pub const MAX_CAPABILITY_MODULE_CATALOG_BYTES: usize = 512 * 1024;
+/// Maximum UTF-8 byte length of one direct capability module or method name.
+pub const MAX_CAPABILITY_MODULE_IDENTIFIER_BYTES: usize = 64;
+/// Maximum UTF-8 byte length of a direct capability module description.
+pub const MAX_CAPABILITY_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 byte length of a registered capability name.
 pub const MAX_TOOL_NAME_BYTES: usize = 128;
 /// Default number of recent capability audit events retained in memory.
@@ -453,6 +483,264 @@ impl Default for CapabilityCatalogLimits {
         }
     }
 }
+
+/// Aggregate bounds for setup-defined direct capability modules.
+///
+/// A direct capability module is a host-reviewed, flat `mod.<name>` binding
+/// whose methods route only to existing validated synchronous JSON tools. Its
+/// limits are independent of [`CapabilityCatalogLimits`] so an embedded host
+/// can bound both its LLM tool catalog and its script-visible module interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CapabilityModuleLimits {
+    pub max_modules: usize,
+    pub max_methods: usize,
+    pub max_serialized_bytes: usize,
+}
+
+impl CapabilityModuleLimits {
+    fn validate(self) -> Result<Self, RuntimeError> {
+        if self.max_modules == 0 || self.max_modules > MAX_CAPABILITY_MODULES {
+            return Err(RuntimeError::InvalidLimits(
+                "max_capability_modules must be between one and the hard limit",
+            ));
+        }
+        if self.max_methods == 0 || self.max_methods > MAX_CAPABILITY_MODULE_METHODS {
+            return Err(RuntimeError::InvalidLimits(
+                "max_capability_module_methods must be between one and the hard limit",
+            ));
+        }
+        if self.max_serialized_bytes == 0
+            || self.max_serialized_bytes > MAX_CAPABILITY_MODULE_CATALOG_BYTES
+        {
+            return Err(RuntimeError::InvalidLimits(
+                "max_capability_module_catalog_bytes must be between one and the hard limit",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for CapabilityModuleLimits {
+    fn default() -> Self {
+        Self {
+            max_modules: DEFAULT_MAX_CAPABILITY_MODULES,
+            max_methods: DEFAULT_MAX_CAPABILITY_MODULE_METHODS,
+            max_serialized_bytes: DEFAULT_MAX_CAPABILITY_MODULE_CATALOG_BYTES,
+        }
+    }
+}
+
+/// One setup-defined direct `mod.<name>` capability binding.
+///
+/// Each method must reference exactly one existing synchronous JSON tool with
+/// an executable input/output contract. The binding is syntax only: every call
+/// continues through the target tool's policy, audit trail, output contract,
+/// and active capability lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityModule {
+    pub name: String,
+    pub description: String,
+    pub methods: Vec<CapabilityModuleMethod>,
+}
+
+impl CapabilityModule {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            methods: Vec::new(),
+        }
+    }
+
+    pub fn with_method(mut self, name: impl Into<String>, tool: impl Into<String>) -> Self {
+        self.methods.push(CapabilityModuleMethod::new(name, tool));
+        self
+    }
+}
+
+/// One direct module method mapped to one registered capability name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityModuleMethod {
+    pub name: String,
+    pub tool: String,
+}
+
+impl CapabilityModuleMethod {
+    pub fn new(name: impl Into<String>, tool: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            tool: tool.into(),
+        }
+    }
+}
+
+/// Stable host-facing description of one setup-defined direct capability
+/// module.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapabilityModuleDescriptor {
+    pub name: String,
+    pub description: String,
+    pub methods: Vec<CapabilityModuleMethodDescriptor>,
+}
+
+/// Stable host-facing description of one direct capability module method.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapabilityModuleMethodDescriptor {
+    pub name: String,
+    pub tool: String,
+    pub description: String,
+}
+
+/// One entry in the advisory `splash-lsp` `moduleCatalog` wire shape.
+///
+/// This data describes a runtime interface selected by the host. It does not
+/// query a live runtime from the editor or grant the referenced tool.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModuleInterfaceDescriptor {
+    pub path: String,
+    pub description: String,
+}
+
+/// Rejection while a host configures a direct capability module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapabilityModuleRegistrationError {
+    CatalogSealed,
+    InvalidModuleName(String),
+    InvalidMethodName {
+        module: String,
+        method: String,
+    },
+    DescriptionTooLong {
+        module: String,
+        maximum: usize,
+    },
+    EmptyModule(String),
+    MethodsPerModuleExceeded {
+        module: String,
+        maximum: usize,
+    },
+    DuplicateModule(String),
+    ModuleNameOccupied(String),
+    DuplicateMethod {
+        module: String,
+        method: String,
+    },
+    MethodIdentifierCollision {
+        module: String,
+        first: String,
+        second: String,
+    },
+    UnknownTool(String),
+    ToolIsNotJson(String),
+    ToolIsDeferred(String),
+    ToolContractNotEnforced(String),
+    ToolByteLimitExceedsBridge {
+        tool: String,
+        maximum: usize,
+    },
+    ToolAlreadyBound(String),
+    ModuleLimitExceeded {
+        maximum: usize,
+    },
+    MethodLimitExceeded {
+        maximum: usize,
+    },
+    InterfaceEntryLimitExceeded {
+        maximum: usize,
+    },
+    CatalogEncoding,
+    CatalogByteLimitExceeded {
+        actual: usize,
+        maximum: usize,
+    },
+}
+
+impl Display for CapabilityModuleRegistrationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CatalogSealed => formatter.write_str(
+                "direct capability modules must be configured before a capability lease is issued or source is evaluated",
+            ),
+            Self::InvalidModuleName(name) => {
+                write!(formatter, "invalid direct capability module name: {name}")
+            }
+            Self::InvalidMethodName { module, method } => {
+                write!(formatter, "invalid direct capability method name {module}.{method}")
+            }
+            Self::DescriptionTooLong { module, maximum } => write!(
+                formatter,
+                "direct capability module {module} description exceeds {maximum} bytes"
+            ),
+            Self::EmptyModule(name) => {
+                write!(formatter, "direct capability module has no methods: {name}")
+            }
+            Self::MethodsPerModuleExceeded { module, maximum } => write!(
+                formatter,
+                "direct capability module {module} exceeds {maximum} methods"
+            ),
+            Self::DuplicateModule(name) => {
+                write!(formatter, "direct capability module already registered: {name}")
+            }
+            Self::ModuleNameOccupied(name) => write!(
+                formatter,
+                "direct capability module conflicts with an existing runtime module: {name}"
+            ),
+            Self::DuplicateMethod { module, method } => {
+                write!(formatter, "duplicate direct capability method {module}.{method}")
+            }
+            Self::MethodIdentifierCollision {
+                module,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "direct capability methods {module}.{first} and {module}.{second} collide in the VM"
+            ),
+            Self::UnknownTool(name) => {
+                write!(formatter, "direct capability module references unknown tool: {name}")
+            }
+            Self::ToolIsNotJson(name) => write!(
+                formatter,
+                "direct capability module requires a JSON tool: {name}"
+            ),
+            Self::ToolIsDeferred(name) => write!(
+                formatter,
+                "direct capability module requires a synchronous host-pump tool: {name}"
+            ),
+            Self::ToolContractNotEnforced(name) => write!(
+                formatter,
+                "direct capability module requires an executable JSON contract: {name}"
+            ),
+            Self::ToolByteLimitExceedsBridge { tool, maximum } => write!(
+                formatter,
+                "direct capability module tool {tool} exceeds the bounded JSON bridge limit of {maximum} bytes"
+            ),
+            Self::ToolAlreadyBound(name) => write!(
+                formatter,
+                "direct capability module already binds tool: {name}"
+            ),
+            Self::ModuleLimitExceeded { maximum } => {
+                write!(formatter, "direct capability module catalog exceeds {maximum} modules")
+            }
+            Self::MethodLimitExceeded { maximum } => {
+                write!(formatter, "direct capability module catalog exceeds {maximum} methods")
+            }
+            Self::InterfaceEntryLimitExceeded { maximum } => write!(
+                formatter,
+                "direct capability module interface exceeds {maximum} module and method entries"
+            ),
+            Self::CatalogEncoding => {
+                formatter.write_str("direct capability module catalog could not be encoded")
+            }
+            Self::CatalogByteLimitExceeded { actual, maximum } => write!(
+                formatter,
+                "direct capability module catalog is {actual} bytes but its maximum is {maximum} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityModuleRegistrationError {}
 
 /// Stable, serializable description of a currently granted capability.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2483,6 +2771,13 @@ impl CapabilityHost {
             .collect()
     }
 
+    /// Returns one host-facing descriptor without exposing it to Splash
+    /// source. Direct capability module setup uses this to prove its target
+    /// stays inside the reviewed tool catalog.
+    pub fn tool_descriptor(&self, name: &str) -> Option<ToolDescriptor> {
+        self.tools.get(name).map(RegisteredTool::descriptor)
+    }
+
     pub fn tool_catalog_json(&self) -> Result<String, ToolError> {
         serde_json::to_string(&self.tool_catalog()).map_err(|error| {
             ToolError::Failed(format!("tool catalog serialization failed: {error}"))
@@ -3512,15 +3807,21 @@ pub struct DeadlineReport {
     pub resumed: Vec<Evaluation>,
 }
 
-/// Runtime with only a single script-visible effect surface: `mod.tool`.
+/// Runtime with one generic script-visible effect surface, `mod.tool`, plus
+/// optional setup-defined direct capability modules.
 ///
 /// `tool.call` executes synchronously. `tool.start` creates an opaque promise
 /// and `promise.await()` suspends the script until a trusted host pump or
-/// external completion supplies its result. No worker, filesystem, process, or
-/// network API is installed by this crate.
+/// external completion supplies its result. A direct capability module is a
+/// schema-bound synchronous JSON facade over one existing host-pump tool; it
+/// does not install a worker, filesystem, process, network, dynamic loader,
+/// or arbitrary Rust-crate API.
 pub struct CapabilityRuntime {
     runtime: Runtime<CapabilityHost, ()>,
     max_pending_tools: usize,
+    capability_module_limits: CapabilityModuleLimits,
+    capability_modules: BTreeMap<String, CapabilityModuleDescriptor>,
+    capability_module_catalog_sealed: Cell<bool>,
 }
 
 impl CapabilityRuntime {
@@ -3551,10 +3852,31 @@ impl CapabilityRuntime {
         max_pending_tools: usize,
         catalog_limits: CapabilityCatalogLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::with_limits_pending_catalog_and_module_limits(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+            CapabilityModuleLimits::default(),
+        )
+    }
+
+    /// Creates a runtime with explicit pending-promise, tool-catalog, and
+    /// direct-module interface bounds.
+    ///
+    /// Direct modules remain a setup-only, flat interface over existing
+    /// contract-enforced synchronous JSON tools. Their metadata is host-facing
+    /// and never gives Splash source a way to discover or mint capabilities.
+    pub fn with_limits_pending_catalog_and_module_limits(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+        capability_module_limits: CapabilityModuleLimits,
+    ) -> Result<Self, RuntimeError> {
         Self::with_limits_pending_catalog_and_optional_session_nonce(
             limits,
             max_pending_tools,
             catalog_limits,
+            capability_module_limits,
             None,
         )
     }
@@ -3572,10 +3894,29 @@ impl CapabilityRuntime {
         catalog_limits: CapabilityCatalogLimits,
         session_nonce: CapabilitySessionNonce,
     ) -> Result<Self, RuntimeError> {
+        Self::with_limits_pending_catalog_and_module_limits_and_session_nonce(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+            CapabilityModuleLimits::default(),
+            session_nonce,
+        )
+    }
+
+    /// Creates a runtime with explicit tool and direct-module bounds plus a
+    /// host-provided external idempotency nonce.
+    pub fn with_limits_pending_catalog_and_module_limits_and_session_nonce(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+        capability_module_limits: CapabilityModuleLimits,
+        session_nonce: CapabilitySessionNonce,
+    ) -> Result<Self, RuntimeError> {
         Self::with_limits_pending_catalog_and_optional_session_nonce(
             limits,
             max_pending_tools,
             catalog_limits,
+            capability_module_limits,
             Some(session_nonce),
         )
     }
@@ -3584,6 +3925,7 @@ impl CapabilityRuntime {
         limits: ExecutionLimits,
         max_pending_tools: usize,
         catalog_limits: CapabilityCatalogLimits,
+        capability_module_limits: CapabilityModuleLimits,
         session_nonce: Option<CapabilitySessionNonce>,
     ) -> Result<Self, RuntimeError> {
         if max_pending_tools == 0 {
@@ -3598,11 +3940,15 @@ impl CapabilityRuntime {
             )?,
             None => CapabilityHost::with_catalog_limits(catalog_limits)?,
         };
+        let capability_module_limits = capability_module_limits.validate()?;
         let mut runtime = Runtime::with_limits(host, (), limits)?;
         install_tool_module(&mut runtime, max_pending_tools);
         Ok(Self {
             runtime,
             max_pending_tools,
+            capability_module_limits,
+            capability_modules: BTreeMap::new(),
+            capability_module_catalog_sealed: Cell::new(false),
         })
     }
 
@@ -3612,11 +3958,19 @@ impl CapabilityRuntime {
         self.runtime.host().catalog_limits()
     }
 
+    /// Returns the immutable direct capability module limits selected at
+    /// runtime setup. Splash source cannot read or alter these host limits.
+    pub const fn capability_module_limits(&self) -> CapabilityModuleLimits {
+        self.capability_module_limits
+    }
+
     /// Returns a stable identity for the complete current capability catalog.
     ///
     /// The fingerprint is suitable for binding host approvals to one runtime's
     /// exact names, limits, dispatch modes, metadata, and contract status. It
-    /// is not an authorization token.
+    /// is not an authorization token. Setup-defined direct module facades are
+    /// intentionally excluded because the runtime freezes that separate
+    /// interface before it issues any lease.
     pub fn capability_catalog_fingerprint(
         &self,
     ) -> Result<CapabilityCatalogFingerprint, CapabilityLeaseError> {
@@ -3635,7 +3989,9 @@ impl CapabilityRuntime {
     where
         I: IntoIterator<Item = CapabilityLeaseGrant>,
     {
-        self.runtime.host().issue_capability_lease(grants, None)
+        let lease = self.runtime.host().issue_capability_lease(grants, None)?;
+        self.capability_module_catalog_sealed.set(true);
+        Ok(lease)
     }
 
     /// Issues an attenuated lease with a trusted per-invocation authorization
@@ -3652,16 +4008,21 @@ impl CapabilityRuntime {
         I: IntoIterator<Item = CapabilityLeaseGrant>,
         A: ToolCallAuthorizer + 'static,
     {
-        self.runtime
+        let lease = self
+            .runtime
             .host()
-            .issue_capability_lease(grants, Some(Box::new(authorizer)))
+            .issue_capability_lease(grants, Some(Box::new(authorizer)))?;
+        self.capability_module_catalog_sealed.set(true);
+        Ok(lease)
     }
 
     /// Issues a lease that covers every currently registered capability at its
     /// current call limit. Prefer [`Self::issue_capability_lease`] for an
     /// operator-reviewed subset.
     pub fn issue_full_capability_lease(&self) -> Result<CapabilityLease, CapabilityLeaseError> {
-        self.runtime.host().issue_full_capability_lease()
+        let lease = self.runtime.host().issue_full_capability_lease()?;
+        self.capability_module_catalog_sealed.set(true);
+        Ok(lease)
     }
 
     /// Verifies that a lease belongs to this runtime and its catalog has not
@@ -3688,6 +4049,7 @@ impl CapabilityRuntime {
             .host_mut()
             .activate_capability_lease(lease)
             .map_err(CapabilityLeaseEvaluationError::Lease)?;
+        self.capability_module_catalog_sealed.set(true);
         let evaluation = self.runtime.eval(source);
         let clear_lease = evaluation.as_ref().map_or(true, |report| !report.suspended);
         if clear_lease {
@@ -3737,6 +4099,245 @@ impl CapabilityRuntime {
     ) -> Result<JsonValue, RuntimeError> {
         self.runtime
             .script_value_as_json(value, max_bytes, max_depth)
+    }
+
+    /// Registers one setup-defined direct `mod.<name>` capability module.
+    ///
+    /// Every method routes synchronously through exactly one already
+    /// registered, contract-enforced synchronous JSON tool. It therefore
+    /// consumes the same tool call budget, capability lease grant, audit entry, and
+    /// executable input/output contract as `tool.call_json`. The method
+    /// accepts one JSON record or array subject to the target contract and
+    /// returns decoded bounded JSON instead of a JSON string.
+    ///
+    /// Module registration is allowed only during runtime setup. The module
+    /// interface freezes when a capability lease is issued or source is first
+    /// evaluated, preventing a later syntactic alias from appearing under an
+    /// existing approval. This API cannot install a dynamic library, select a
+    /// crate, or bind an external/deferred operation.
+    pub fn register_capability_module(
+        &mut self,
+        module: CapabilityModule,
+    ) -> Result<(), CapabilityModuleRegistrationError> {
+        if self.capability_module_catalog_sealed.get() {
+            return Err(CapabilityModuleRegistrationError::CatalogSealed);
+        }
+        if module.name == "mod" {
+            return Err(CapabilityModuleRegistrationError::ModuleNameOccupied(
+                module.name,
+            ));
+        }
+
+        let (descriptor, bindings) = self.prepare_capability_module(&module)?;
+        let module_id = LiveId::from_str(&module.name);
+        let mut occupied = false;
+        self.runtime.configure(|vm| {
+            occupied = vm.module(module_id).index() != 0;
+        });
+        if occupied {
+            return Err(CapabilityModuleRegistrationError::ModuleNameOccupied(
+                module.name,
+            ));
+        }
+
+        install_capability_module(&mut self.runtime, module_id, bindings);
+        self.capability_modules
+            .insert(descriptor.name.clone(), descriptor);
+        Ok(())
+    }
+
+    /// Returns stable host-facing direct module descriptions in name and
+    /// method order. Splash source cannot enumerate this catalog.
+    pub fn capability_module_catalog(&self) -> Vec<CapabilityModuleDescriptor> {
+        self.capability_modules.values().cloned().collect()
+    }
+
+    /// Returns a bounded flat interface projection compatible with the LSP
+    /// `moduleCatalog` configuration shape. This remains host-selected,
+    /// advisory editor metadata; it does not let an editor query or authorize
+    /// a live runtime.
+    pub fn module_interface_catalog(&self) -> Vec<ModuleInterfaceDescriptor> {
+        module_interface_catalog(&self.capability_modules)
+    }
+
+    fn prepare_capability_module(
+        &self,
+        module: &CapabilityModule,
+    ) -> Result<
+        (CapabilityModuleDescriptor, Vec<CapabilityModuleBinding>),
+        CapabilityModuleRegistrationError,
+    > {
+        if !is_valid_capability_module_identifier(&module.name) {
+            return Err(CapabilityModuleRegistrationError::InvalidModuleName(
+                module.name.clone(),
+            ));
+        }
+        if module.description.len() > MAX_CAPABILITY_MODULE_DESCRIPTION_BYTES {
+            return Err(CapabilityModuleRegistrationError::DescriptionTooLong {
+                module: module.name.clone(),
+                maximum: MAX_CAPABILITY_MODULE_DESCRIPTION_BYTES,
+            });
+        }
+        if module.methods.is_empty() {
+            return Err(CapabilityModuleRegistrationError::EmptyModule(
+                module.name.clone(),
+            ));
+        }
+        if module.methods.len() > MAX_CAPABILITY_MODULE_METHODS_PER_MODULE {
+            return Err(
+                CapabilityModuleRegistrationError::MethodsPerModuleExceeded {
+                    module: module.name.clone(),
+                    maximum: MAX_CAPABILITY_MODULE_METHODS_PER_MODULE,
+                },
+            );
+        }
+        if self.capability_modules.contains_key(&module.name) {
+            return Err(CapabilityModuleRegistrationError::DuplicateModule(
+                module.name.clone(),
+            ));
+        }
+        if self.capability_modules.len() >= self.capability_module_limits.max_modules {
+            return Err(CapabilityModuleRegistrationError::ModuleLimitExceeded {
+                maximum: self.capability_module_limits.max_modules,
+            });
+        }
+
+        let runtime_limits = self.runtime.limits();
+        let max_bridge_bytes = runtime_limits
+            .max_source_bytes
+            .min(DEFAULT_MAX_JSON_DATA_BYTES);
+        let max_bridge_depth = runtime_limits
+            .max_syntax_nesting
+            .min(DEFAULT_MAX_JSON_DATA_DEPTH);
+
+        let existing_method_count = self
+            .capability_modules
+            .values()
+            .map(|registered| registered.methods.len())
+            .sum::<usize>();
+        let total_method_count = existing_method_count.saturating_add(module.methods.len());
+        if total_method_count > self.capability_module_limits.max_methods {
+            return Err(CapabilityModuleRegistrationError::MethodLimitExceeded {
+                maximum: self.capability_module_limits.max_methods,
+            });
+        }
+        let interface_entries = self
+            .capability_modules
+            .len()
+            .saturating_add(1)
+            .saturating_add(total_method_count);
+        if interface_entries > MAX_CAPABILITY_MODULE_INTERFACE_ENTRIES {
+            return Err(
+                CapabilityModuleRegistrationError::InterfaceEntryLimitExceeded {
+                    maximum: MAX_CAPABILITY_MODULE_INTERFACE_ENTRIES,
+                },
+            );
+        }
+
+        let mut bound_tools = self
+            .capability_modules
+            .values()
+            .flat_map(|registered| registered.methods.iter().map(|method| method.tool.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut method_ids: Vec<(LiveId, String)> = Vec::with_capacity(module.methods.len());
+        let mut resolved_methods = BTreeMap::new();
+        for method in &module.methods {
+            if !is_valid_capability_module_identifier(&method.name) {
+                return Err(CapabilityModuleRegistrationError::InvalidMethodName {
+                    module: module.name.clone(),
+                    method: method.name.clone(),
+                });
+            }
+            if resolved_methods.contains_key(&method.name) {
+                return Err(CapabilityModuleRegistrationError::DuplicateMethod {
+                    module: module.name.clone(),
+                    method: method.name.clone(),
+                });
+            }
+            let method_id = LiveId::from_str(&method.name);
+            if let Some((_, first)) = method_ids.iter().find(|(id, _)| *id == method_id) {
+                return Err(
+                    CapabilityModuleRegistrationError::MethodIdentifierCollision {
+                        module: module.name.clone(),
+                        first: first.clone(),
+                        second: method.name.clone(),
+                    },
+                );
+            }
+            method_ids.push((method_id, method.name.clone()));
+            if !bound_tools.insert(method.tool.clone()) {
+                return Err(CapabilityModuleRegistrationError::ToolAlreadyBound(
+                    method.tool.clone(),
+                ));
+            }
+            let Some(tool) = self.runtime.host().tool_descriptor(&method.tool) else {
+                return Err(CapabilityModuleRegistrationError::UnknownTool(
+                    method.tool.clone(),
+                ));
+            };
+            if tool.format != ToolDataFormat::Json {
+                return Err(CapabilityModuleRegistrationError::ToolIsNotJson(
+                    method.tool.clone(),
+                ));
+            }
+            if tool.dispatch != ToolDispatch::HostPump {
+                return Err(CapabilityModuleRegistrationError::ToolIsDeferred(
+                    method.tool.clone(),
+                ));
+            }
+            if !tool.contract_enforced {
+                return Err(CapabilityModuleRegistrationError::ToolContractNotEnforced(
+                    method.tool.clone(),
+                ));
+            }
+            if tool.max_input_bytes > max_bridge_bytes || tool.max_output_bytes > max_bridge_bytes {
+                return Err(
+                    CapabilityModuleRegistrationError::ToolByteLimitExceedsBridge {
+                        tool: method.tool.clone(),
+                        maximum: max_bridge_bytes,
+                    },
+                );
+            }
+            resolved_methods.insert(method.name.clone(), tool);
+        }
+
+        let descriptor = CapabilityModuleDescriptor {
+            name: module.name.clone(),
+            description: module.description.clone(),
+            methods: resolved_methods
+                .iter()
+                .map(|(name, tool)| CapabilityModuleMethodDescriptor {
+                    name: name.clone(),
+                    tool: tool.name.clone(),
+                    description: tool.metadata.description.clone(),
+                })
+                .collect(),
+        };
+        let mut candidate_catalog = self.capability_modules.clone();
+        candidate_catalog.insert(descriptor.name.clone(), descriptor.clone());
+        let actual = serde_json::to_vec(&module_interface_catalog(&candidate_catalog))
+            .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?
+            .len();
+        if actual > self.capability_module_limits.max_serialized_bytes {
+            return Err(
+                CapabilityModuleRegistrationError::CatalogByteLimitExceeded {
+                    actual,
+                    maximum: self.capability_module_limits.max_serialized_bytes,
+                },
+            );
+        }
+
+        let bindings = resolved_methods
+            .into_iter()
+            .map(|(method, tool)| CapabilityModuleBinding {
+                method: LiveId::from_str(&method),
+                tool: tool.name,
+                max_input_bytes: tool.max_input_bytes,
+                max_output_bytes: tool.max_output_bytes,
+                max_depth: max_bridge_depth,
+            })
+            .collect();
+        Ok((descriptor, bindings))
     }
 
     pub fn register_tool<F>(
@@ -4076,6 +4677,7 @@ impl CapabilityRuntime {
     /// catalog. Noncanonical Makepad compatibility syntax is rejected before a
     /// capability can be invoked.
     pub fn eval(&mut self, source: &str) -> Result<Evaluation, RuntimeError> {
+        self.capability_module_catalog_sealed.set(true);
         self.runtime.eval(source)
     }
 
@@ -4479,6 +5081,108 @@ impl Default for CapabilityRuntime {
     }
 }
 
+struct CapabilityModuleBinding {
+    method: LiveId,
+    tool: String,
+    max_input_bytes: usize,
+    max_output_bytes: usize,
+    max_depth: usize,
+}
+
+fn is_valid_capability_module_identifier(name: &str) -> bool {
+    name.len() <= MAX_CAPABILITY_MODULE_IDENTIFIER_BYTES && is_canonical_identifier(name)
+}
+
+fn module_interface_catalog(
+    modules: &BTreeMap<String, CapabilityModuleDescriptor>,
+) -> Vec<ModuleInterfaceDescriptor> {
+    let mut entries = Vec::new();
+    for module in modules.values() {
+        let prefix = format!("mod.{}", module.name);
+        entries.push(ModuleInterfaceDescriptor {
+            path: prefix.clone(),
+            description: module.description.clone(),
+        });
+        entries.extend(
+            module
+                .methods
+                .iter()
+                .map(|method| ModuleInterfaceDescriptor {
+                    path: format!("{prefix}.{}", method.name),
+                    description: method.description.clone(),
+                }),
+        );
+    }
+    entries
+}
+
+fn install_capability_module(
+    runtime: &mut Runtime<CapabilityHost, ()>,
+    module_id: LiveId,
+    bindings: Vec<CapabilityModuleBinding>,
+) {
+    runtime.configure(|vm| {
+        let module = vm.new_module(module_id);
+        for binding in bindings {
+            let CapabilityModuleBinding {
+                method,
+                tool,
+                max_input_bytes,
+                max_output_bytes,
+                max_depth,
+            } = binding;
+            vm.add_method(
+                module,
+                method,
+                script_args_def!(input = NIL),
+                move |vm, args| {
+                    let input = match encode_bounded_script_json(
+                        vm,
+                        script_value!(vm, args.input),
+                        max_input_bytes,
+                        max_depth,
+                    ) {
+                        Ok(input) => input,
+                        Err(_) => {
+                            return script_err_not_allowed!(
+                                vm.bx.threads.cur_ref().trap,
+                                "direct capability module expects bounded JSON input"
+                            )
+                        }
+                    };
+                    let output = match vm.host.downcast_mut::<CapabilityHost>() {
+                        Some(host) => host.call_json(&tool, &input),
+                        None => {
+                            return script_err_unexpected!(
+                                vm.bx.threads.cur_ref().trap,
+                                "invalid Splash capability host"
+                            )
+                        }
+                    };
+
+                    match output {
+                        Ok(output) => match decode_bounded_script_json(
+                            vm,
+                            &output,
+                            max_output_bytes,
+                            max_depth,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => script_err_unexpected!(
+                                vm.bx.threads.cur_ref().trap,
+                                "direct capability module returned invalid bounded JSON"
+                            ),
+                        },
+                        Err(error) => {
+                            script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
+                        }
+                    }
+                },
+            );
+        }
+    });
+}
+
 fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_tools: usize) {
     runtime.configure(|vm| {
         let tool = vm.new_module(id!(tool));
@@ -4847,6 +5551,303 @@ mod tests {
         assert_eq!(runtime.audit().len(), 1);
         assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
         assert_eq!(runtime.audit()[0].tool, "text.echo");
+    }
+
+    #[test]
+    fn direct_capability_module_keeps_json_contract_lease_and_audit_checks() {
+        let mut policy = ToolPolicy::json("math.add");
+        policy.max_calls = 2;
+        let calls = Rc::new(Cell::new(0));
+        let observed_calls = Rc::clone(&calls);
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                policy,
+                ToolMetadata::new("Adds two reviewed integers."),
+                add_contract(),
+                move |request| {
+                    calls.set(calls.get() + 1);
+                    let left = request.input["left"]
+                        .as_i64()
+                        .ok_or_else(|| ToolError::Failed("missing left input".to_owned()))?;
+                    let right = request.input["right"]
+                        .as_i64()
+                        .ok_or_else(|| ToolError::Failed("missing right input".to_owned()))?;
+                    Ok(json!({"total": left + right}))
+                },
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime.capability_module_catalog(),
+            vec![CapabilityModuleDescriptor {
+                name: "arithmetic".to_owned(),
+                description: "Reviewed arithmetic adapters.".to_owned(),
+                methods: vec![CapabilityModuleMethodDescriptor {
+                    name: "add".to_owned(),
+                    tool: "math.add".to_owned(),
+                    description: "Adds two reviewed integers.".to_owned(),
+                }],
+            }]
+        );
+        assert_eq!(
+            runtime.module_interface_catalog(),
+            vec![
+                ModuleInterfaceDescriptor {
+                    path: "mod.arithmetic".to_owned(),
+                    description: "Reviewed arithmetic adapters.".to_owned(),
+                },
+                ModuleInterfaceDescriptor {
+                    path: "mod.arithmetic.add".to_owned(),
+                    description: "Adds two reviewed integers.".to_owned(),
+                },
+            ]
+        );
+
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
+            .unwrap();
+        let report = runtime
+            .eval_with_capability_lease(
+                "use mod.arithmetic\nlet result = arithmetic.add({left: 20, right: 22})\nresult.total",
+                &lease,
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime.script_value_as_json(report.value, 64, 4).unwrap(),
+            json!(42)
+        );
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "math.add");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert_eq!(observed_calls.get(), 1);
+
+        let denied_lease = runtime
+            .issue_capability_lease(std::iter::empty::<CapabilityLeaseGrant>())
+            .unwrap();
+        let denied = runtime
+            .eval_with_capability_lease(
+                "use mod.arithmetic\ntry {\n    arithmetic.add({left: 1, right: 2})\n} catch {\n    \"denied\"\n}",
+                &denied_lease,
+            )
+            .unwrap();
+
+        assert!(denied.completed(), "{:?}", denied.diagnostics);
+        assert_eq!(
+            runtime.script_value_as_json(denied.value, 64, 4).unwrap(),
+            json!("denied")
+        );
+        assert_eq!(observed_calls.get(), 1);
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[1].tool, "math.add");
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn direct_capability_module_rejects_schema_invalid_input_before_the_handler() {
+        let calls = Rc::new(Cell::new(0));
+        let observed_calls = Rc::clone(&calls);
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integers."),
+                add_contract(),
+                move |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(json!({"total": 42}))
+                },
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+
+        let report = runtime
+            .eval(
+                "use mod.arithmetic\ntry {\n    arithmetic.add({left: 20})\n} catch {\n    \"rejected\"\n}",
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime.script_value_as_json(report.value, 64, 4).unwrap(),
+            json!("rejected")
+        );
+        assert_eq!(observed_calls.get(), 0);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn direct_capability_module_rejects_unreviewed_or_deferred_targets() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_json_tool(ToolPolicy::json("math.unreviewed"), |_| {
+                Ok(json!({"total": 42}))
+            })
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .register_capability_module(
+                    CapabilityModule::new("unreviewed", "Unreviewed adapter.")
+                        .with_method("add", "math.unreviewed"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::ToolContractNotEnforced(
+                "math.unreviewed".to_owned()
+            )
+        );
+
+        let mut text = CapabilityRuntime::default();
+        text.register_tool(ToolPolicy::new("text.echo"), |request| {
+            Ok(request.input.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            text.register_capability_module(
+                CapabilityModule::new("text", "Text adapter.").with_method("echo", "text.echo"),
+            )
+            .unwrap_err(),
+            CapabilityModuleRegistrationError::ToolIsNotJson("text.echo".to_owned())
+        );
+
+        let mut deferred = CapabilityRuntime::default();
+        deferred
+            .register_validated_external_json_tool(
+                ToolPolicy::json("math.remote"),
+                ToolMetadata::new("Remote add."),
+                add_contract(),
+            )
+            .unwrap();
+        assert_eq!(
+            deferred
+                .register_capability_module(
+                    CapabilityModule::new("remote_math", "Deferred adapter.")
+                        .with_method("add", "math.remote"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::ToolIsDeferred("math.remote".to_owned())
+        );
+
+        let mut oversized = CapabilityRuntime::default();
+        let mut policy = ToolPolicy::json("math.oversized");
+        policy.max_output_bytes = DEFAULT_MAX_JSON_DATA_BYTES + 1;
+        oversized
+            .register_validated_json_tool(
+                policy,
+                ToolMetadata::new("Oversized direct output policy."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        assert_eq!(
+            oversized
+                .register_capability_module(
+                    CapabilityModule::new("oversized_math", "Oversized adapter.")
+                        .with_method("add", "math.oversized"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::ToolByteLimitExceedsBridge {
+                tool: "math.oversized".to_owned(),
+                maximum: DEFAULT_MAX_JSON_DATA_BYTES,
+            }
+        );
+
+        let mut occupied = CapabilityRuntime::default();
+        occupied
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Reviewed add."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        assert_eq!(
+            occupied
+                .register_capability_module(
+                    CapabilityModule::new("math", "Conflicts with the VM math module.")
+                        .with_method("add", "math.add"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::ModuleNameOccupied("math".to_owned())
+        );
+    }
+
+    #[test]
+    fn direct_capability_module_respects_the_runtime_json_bridge_bound() {
+        let limits = ExecutionLimits {
+            max_source_bytes: 1024,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = CapabilityRuntime::with_limits(limits).unwrap();
+        let mut policy = ToolPolicy::json("math.too_large_for_runtime");
+        policy.max_input_bytes = 1025;
+        policy.max_output_bytes = 1025;
+        runtime
+            .register_validated_json_tool(
+                policy,
+                ToolMetadata::new("Exceeds this runtime's direct JSON bridge."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .register_capability_module(
+                    CapabilityModule::new("bounded", "Bounded adapter.")
+                        .with_method("add", "math.too_large_for_runtime"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::ToolByteLimitExceedsBridge {
+                tool: "math.too_large_for_runtime".to_owned(),
+                maximum: 1024,
+            }
+        );
+        assert!(runtime.capability_module_catalog().is_empty());
+    }
+
+    #[test]
+    fn direct_capability_module_catalog_seals_before_execution_or_lease_issuance() {
+        let mut runtime = CapabilityRuntime::default();
+        assert!(runtime.eval("0").unwrap().completed());
+
+        assert_eq!(
+            runtime
+                .register_capability_module(
+                    CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                        .with_method("add", "math.add"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::CatalogSealed
+        );
+
+        let mut leased_runtime = CapabilityRuntime::default();
+        leased_runtime
+            .issue_capability_lease(std::iter::empty::<CapabilityLeaseGrant>())
+            .unwrap();
+        assert_eq!(
+            leased_runtime
+                .register_capability_module(
+                    CapabilityModule::new("other", "Another adapter.")
+                        .with_method("add", "math.add"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::CatalogSealed
+        );
     }
 
     #[test]
@@ -5269,6 +6270,9 @@ mod tests {
         let mut runtime = CapabilityRuntime {
             runtime: inner,
             max_pending_tools: 1,
+            capability_module_limits: CapabilityModuleLimits::default(),
+            capability_modules: BTreeMap::new(),
+            capability_module_catalog_sealed: Cell::new(false),
         };
         runtime
             .register_tool(ToolPolicy::new("text.local"), |request| {
@@ -7451,6 +8455,53 @@ mod tests {
     }
 
     #[test]
+    fn capability_module_limits_bound_setup_before_vm_mutation() {
+        let module_limits = CapabilityModuleLimits {
+            max_modules: 1,
+            max_methods: 1,
+            max_serialized_bytes: 8 * 1024,
+        };
+        let mut runtime = CapabilityRuntime::with_limits_pending_catalog_and_module_limits(
+            ExecutionLimits::default(),
+            1,
+            CapabilityCatalogLimits::default(),
+            module_limits,
+        )
+        .unwrap();
+        assert_eq!(runtime.capability_module_limits(), module_limits);
+
+        for name in ["math.first", "math.second"] {
+            runtime
+                .register_validated_json_tool(
+                    ToolPolicy::json(name),
+                    ToolMetadata::new("Reviewed integer result."),
+                    add_contract(),
+                    |_| Ok(json!({"total": 42})),
+                )
+                .unwrap();
+        }
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("first", "First reviewed adapter.")
+                    .with_method("add", "math.first"),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .register_capability_module(
+                    CapabilityModule::new("second", "Second reviewed adapter.")
+                        .with_method("add", "math.second"),
+                )
+                .unwrap_err(),
+            CapabilityModuleRegistrationError::ModuleLimitExceeded { maximum: 1 }
+        );
+        assert_eq!(
+            runtime.capability_module_catalog()[0].name,
+            "first".to_owned()
+        );
+    }
+
+    #[test]
     fn rejects_zero_catalog_limits() {
         let error = match CapabilityRuntime::with_limits_pending_and_catalog(
             ExecutionLimits::default(),
@@ -7467,6 +8518,26 @@ mod tests {
         assert_eq!(
             error,
             RuntimeError::InvalidLimits("max_catalog_tools must be greater than zero")
+        );
+
+        let error = match CapabilityRuntime::with_limits_pending_catalog_and_module_limits(
+            ExecutionLimits::default(),
+            1,
+            CapabilityCatalogLimits::default(),
+            CapabilityModuleLimits {
+                max_modules: 0,
+                max_methods: 1,
+                max_serialized_bytes: 1,
+            },
+        ) {
+            Ok(_) => panic!("zero direct module limit must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            RuntimeError::InvalidLimits(
+                "max_capability_modules must be between one and the hard limit"
+            )
         );
     }
 

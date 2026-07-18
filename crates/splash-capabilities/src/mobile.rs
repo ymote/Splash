@@ -5,8 +5,8 @@
 //! [`crate::mobile::MobileRuntimeBuilder::build`] consumes that builder and
 //! yields a [`crate::mobile::MobileRuntime`] without any registration or
 //! external-dispatch API. Dynamic Splash source can still use the catalog
-//! through `mod.tool`,
-//! but cannot add tools, claim work, or complete an externally dispatched
+//! through `mod.tool` or setup-defined direct capability modules, but cannot
+//! add tools or modules, claim work, or complete an externally dispatched
 //! operation.
 //!
 //! This is a capability boundary, not operating-system containment. Every
@@ -20,9 +20,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use splash_core::{Evaluation, ExecutionLimits, RuntimeError};
 
 use crate::{
-    fixed_file_catalog::FixedFileCatalog, CapabilityCatalogLimits, CapabilityRuntime,
-    JsonToolContract, JsonValue, PumpReport, ToolError, ToolMetadata, ToolPolicy,
-    ToolRegistrationError, ToolRequest,
+    fixed_file_catalog::FixedFileCatalog, CapabilityCatalogLimits, CapabilityModule,
+    CapabilityModuleDescriptor, CapabilityModuleLimits, CapabilityModuleRegistrationError,
+    CapabilityRuntime, JsonToolContract, JsonValue, ModuleInterfaceDescriptor, PumpReport,
+    ToolError, ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
 };
 
 /// Setup-only builder for a static mobile or embedded capability catalog.
@@ -34,6 +35,7 @@ pub struct MobileRuntimeBuilder {
     runtime: CapabilityRuntime,
     limits: ExecutionLimits,
     catalog_limits: CapabilityCatalogLimits,
+    capability_module_limits: CapabilityModuleLimits,
 }
 
 impl MobileRuntimeBuilder {
@@ -68,15 +70,34 @@ impl MobileRuntimeBuilder {
         max_pending_tools: usize,
         catalog_limits: CapabilityCatalogLimits,
     ) -> Result<Self, RuntimeError> {
-        let runtime = CapabilityRuntime::with_limits_pending_and_catalog(
+        Self::with_limits_catalog_and_module_limits(
             limits,
             max_pending_tools,
             catalog_limits,
+            CapabilityModuleLimits::default(),
+        )
+    }
+
+    /// Creates a builder with explicit bounds for the tool catalog and the
+    /// setup-defined direct module interface. Direct module methods remain
+    /// schema-bound facades over reviewed local JSON tools.
+    pub fn with_limits_catalog_and_module_limits(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+        capability_module_limits: CapabilityModuleLimits,
+    ) -> Result<Self, RuntimeError> {
+        let runtime = CapabilityRuntime::with_limits_pending_catalog_and_module_limits(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+            capability_module_limits,
         )?;
         Ok(Self {
             runtime,
             limits,
             catalog_limits,
+            capability_module_limits,
         })
     }
 
@@ -246,6 +267,17 @@ impl MobileRuntimeBuilder {
             .register_typed_json_tool_with_metadata(policy, metadata, contract, handler)
     }
 
+    /// Registers one setup-defined direct capability module for the sealed
+    /// profile. Every method must map to an existing local JSON tool with an
+    /// executable contract; it retains that tool's policy, audit, and lease
+    /// checks instead of receiving ambient application authority.
+    pub fn register_capability_module(
+        &mut self,
+        module: CapabilityModule,
+    ) -> Result<(), CapabilityModuleRegistrationError> {
+        self.runtime.register_capability_module(module)
+    }
+
     /// Seals the app-provided catalog and returns a dynamic-source runtime.
     ///
     /// The resulting [`MobileRuntime`] has no method that can alter its tool
@@ -255,6 +287,7 @@ impl MobileRuntimeBuilder {
             runtime: self.runtime,
             limits: self.limits,
             catalog_limits: self.catalog_limits,
+            capability_module_limits: self.capability_module_limits,
         }
     }
 }
@@ -269,6 +302,7 @@ pub struct MobileRuntime {
     runtime: CapabilityRuntime,
     limits: ExecutionLimits,
     catalog_limits: CapabilityCatalogLimits,
+    capability_module_limits: CapabilityModuleLimits,
 }
 
 impl MobileRuntime {
@@ -285,6 +319,12 @@ impl MobileRuntime {
     /// Returns the immutable aggregate catalog limits selected during setup.
     pub const fn catalog_limits(&self) -> CapabilityCatalogLimits {
         self.catalog_limits
+    }
+
+    /// Returns the immutable direct module interface limits selected during
+    /// setup.
+    pub const fn capability_module_limits(&self) -> CapabilityModuleLimits {
+        self.capability_module_limits
     }
 
     /// Returns the maximum number of deferred local calls retained at once.
@@ -327,6 +367,19 @@ impl MobileRuntime {
     /// or operator UI. Splash source has no catalog-discovery API.
     pub fn tool_catalog_json(&self) -> Result<String, ToolError> {
         self.runtime.tool_catalog_json()
+    }
+
+    /// Returns the reviewed direct module interface selected before this
+    /// mobile or embedded runtime was sealed.
+    pub fn capability_module_catalog(&self) -> Vec<CapabilityModuleDescriptor> {
+        self.runtime.capability_module_catalog()
+    }
+
+    /// Returns the advisory LSP `moduleCatalog` projection for the sealed
+    /// direct module interface. This data is host-facing and does not grant a
+    /// capability to an editor.
+    pub fn module_interface_catalog(&self) -> Vec<ModuleInterfaceDescriptor> {
+        self.runtime.module_interface_catalog()
     }
 
     /// Returns the bounded ordered audit view accumulated by the sealed host.
@@ -465,6 +518,55 @@ mod tests {
         assert_eq!(runtime.tool_catalog().len(), 1);
         assert_eq!(runtime.tool_catalog()[0].format, ToolDataFormat::Json);
         assert_eq!(runtime.tool_catalog()[0].dispatch, ToolDispatch::HostPump);
+    }
+
+    #[test]
+    fn seals_direct_capability_modules_for_mobile_dataflow() {
+        let mut builder = MobileRuntimeBuilder::new().expect("default limits are valid");
+        builder
+            .register_typed_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integer fields."),
+                add_contract(),
+                |input: AddInput| {
+                    Ok(AddOutput {
+                        total: input.left + input.right,
+                    })
+                },
+            )
+            .expect("static adapter registers");
+        builder
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .expect("static direct module registers");
+
+        let mut runtime = builder.build();
+        let report = runtime
+            .eval(
+                "use mod.arithmetic\n\
+                 use mod.std.assert\n\
+                 let result = arithmetic.add({left: 20, right: 22})\n\
+                 assert(result.total == 42)",
+            )
+            .expect("direct module dataflow succeeds");
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(runtime.capability_module_catalog().len(), 1);
+        assert_eq!(
+            runtime.module_interface_catalog(),
+            vec![
+                ModuleInterfaceDescriptor {
+                    path: "mod.arithmetic".to_owned(),
+                    description: "Reviewed arithmetic adapters.".to_owned(),
+                },
+                ModuleInterfaceDescriptor {
+                    path: "mod.arithmetic.add".to_owned(),
+                    description: "Adds two reviewed integer fields.".to_owned(),
+                },
+            ]
+        );
     }
 
     #[cfg(feature = "http-endpoint-catalog")]

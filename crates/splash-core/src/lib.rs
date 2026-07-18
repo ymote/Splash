@@ -882,11 +882,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
             return Err(RuntimeError::JsonData(RuntimeJsonError::InvalidLimit));
         }
         let encoded = self
-            .with_vm(|vm| {
-                let mut writer = BoundedJsonWriter::new(max_bytes);
-                write_script_json(vm, value, max_depth, &mut Vec::new(), &mut writer)?;
-                Ok::<_, RuntimeJsonError>(writer.into_string())
-            })
+            .with_vm(|vm| encode_bounded_script_json(vm, value, max_bytes, max_depth))
             .map_err(RuntimeError::JsonData)?;
         parse_bounded_json(&encoded, max_bytes, max_depth).map_err(RuntimeError::JsonData)
     }
@@ -1823,6 +1819,44 @@ pub fn serialize_bounded_json(
     Ok(encoded)
 }
 
+/// Encodes a Splash value as bounded JSON for a trusted native binding.
+///
+/// This uses the same finite-number, object-key, cycle, depth, and byte
+/// checks as [`Runtime::script_value_as_json`] without exposing an unbounded
+/// VM serializer. It is data conversion only: callers must still apply their
+/// own capability policy before they use the result for an effect.
+pub fn encode_bounded_script_json(
+    vm: &mut vm::ScriptVm,
+    value: vm::ScriptValue,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<String, RuntimeJsonError> {
+    if max_bytes == 0 || max_depth == 0 {
+        return Err(RuntimeJsonError::InvalidLimit);
+    }
+    let mut writer = BoundedJsonWriter::new(max_bytes);
+    write_script_json(vm, value, max_depth, &mut Vec::new(), &mut writer)?;
+    Ok(writer.into_string())
+}
+
+/// Decodes bounded JSON into a Splash value for a trusted native binding.
+///
+/// The JSON is parsed and re-encoded through Splash's bounded host-data
+/// boundary before the vendored VM materializes it. This prevents a native
+/// binding from bypassing the runtime's JSON byte or nesting limits. Decoding
+/// data does not load a module or grant a capability.
+pub fn decode_bounded_script_json(
+    vm: &mut vm::ScriptVm,
+    document: &str,
+    max_bytes: usize,
+    max_depth: usize,
+) -> Result<vm::ScriptValue, RuntimeJsonError> {
+    let value = parse_bounded_json(document, max_bytes, max_depth)?;
+    let encoded = serialize_bounded_json(&value, max_bytes, max_depth)?;
+    let mut parser = vm::json::JsonParserThread::default();
+    Ok(parser.read_json(&encoded, &mut vm.bx.heap))
+}
+
 fn validate_json_depth(
     value: &JsonValue,
     container_depth: usize,
@@ -2334,10 +2368,7 @@ fn parse_bounded_script_json(
     document: &str,
     limits: ScriptJsonMethodLimits,
 ) -> Result<vm::ScriptValue, RuntimeJsonError> {
-    let value = parse_bounded_json(document, limits.max_bytes, limits.max_depth)?;
-    let encoded = serialize_bounded_json(&value, limits.max_bytes, limits.max_depth)?;
-    let mut parser = vm::json::JsonParserThread::default();
-    Ok(parser.read_json(&encoded, &mut vm.bx.heap))
+    decode_bounded_script_json(vm, document, limits.max_bytes, limits.max_depth)
 }
 
 fn bounded_json_method_error(vm: &mut vm::ScriptVm, error: RuntimeJsonError) -> vm::ScriptValue {

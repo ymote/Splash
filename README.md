@@ -286,6 +286,21 @@ let response = response_json.parse_json()
 assert(response.total == 42)
 ```
 
+For a fixed reviewed adapter, a Rust host can instead register a bounded direct
+capability module and generated source can use decoded data directly:
+
+```splash
+use mod.arithmetic
+use mod.std.assert
+
+let response = arithmetic.add({left: 20, right: 22})
+assert(response.total == 42)
+```
+
+This is host-configured syntax over the same contract-enforced capability, not
+general module loading or direct crate access. It retains the target tool's
+policy, audit, and capability-lease checks. See [Host Tool Catalog](docs/tool-catalog.md).
+
 ```sh
 cargo run -p splash-cli -- eval --allow-echo 'use mod.tool; tool.call("text.echo", "hello")'
 ```

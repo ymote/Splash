@@ -40,6 +40,14 @@ The fixed `mod.tool` namespace is excluded from this metadata format. A path
 whose first segment after `mod` is `tool` is rejected rather than treated as a
 host-defined interface descriptor.
 
+When a host configures a runtime direct capability module, it can pass
+`CapabilityRuntime::module_interface_catalog()` directly as this projection.
+For example, a reviewed runtime binding for `use mod.arithmetic` and
+`arithmetic.add(...)` produces `mod.arithmetic` and `mod.arithmetic.add`
+entries. The runtime module itself is still configured separately during host
+setup; this returned list is only a bounded snapshot for editor completion and
+hover, not runtime discovery or authority.
+
 A host can replace the complete projection later through
 `workspace/didChangeConfiguration` using the same array under
 `settings.splash.moduleCatalog`:

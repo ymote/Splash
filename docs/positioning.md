@@ -27,7 +27,7 @@ separate portable language contract and host model:
 | Effects | Determined by the embedding host | Deny-by-default registered capabilities only |
 | Async behavior | VM-host integration detail | Bounded host-pumped promises and explicit external lifecycle |
 | Error recovery | Inherited frame-local `try` form | Canonical cross-function `try/catch` with uncatchable hard limits and no rollback |
-| Rust integration | Native bindings chosen by app | Schema-checked, policy-bound Rust adapters and typed Serde bridges |
+| Rust integration | Native bindings chosen by app | Schema-checked, policy-bound Rust adapters, typed Serde bridges, and setup-defined direct module facades |
 | Workflow control | Application-specific | Host-owned plans, approvals, bounded JSON dataflow, per-step leases, checkpoints, and ledgers |
 | Generated source | Trusted-host decision | Syntax review, bounded source, direct-call hints, and runtime enforcement |
 | Containment claim | Outside a VM's scope | Explicitly outside the VM; effectful workers need platform containment |
@@ -45,6 +45,10 @@ JavaScript runtime:
 - Mobile application workflows over app-provided local Rust adapters.
 - Embedded gateways that transform bounded JSON, route requests, and coordinate
   sensors or services through fixed adapters.
+- LLM-generated dataflow that uses a fixed direct module such as
+  `use mod.arithmetic; arithmetic.add({left: 20, right: 22})`, where the host
+  maps that method to one contract-enforced capability and still applies its
+  audit and lease checks.
 - Fixed outbound JSON calls to host-selected HTTPS endpoints, addressed only by
   opaque IDs with fixed methods, paths, and queries. This is useful for small
   mobile or edge workflows. A host-held credential can be resolved and injected
@@ -76,8 +80,10 @@ the documented v0.2 profile. The VM and host APIs also use `std`; bare-metal
 Rust ecosystem access is deliberately indirect. The embedding application
 chooses, reviews, and links Rust crates, then exposes a small adapter with an
 explicit name, call budget, input/output bounds, and optional executable JSON
-contract. This preserves Rust reuse without letting generated source select an
-arbitrary crate, executable, file path, URL, or secret.
+contract. It can additionally expose a fixed direct `mod.<name>` facade over
+that exact adapter for less stringly generated dataflow. This preserves Rust
+reuse without letting generated source select an arbitrary crate, executable,
+file path, URL, or secret.
 
 For an application that needs arbitrary packages, browser APIs, extensive data
 science libraries, dynamic module loading, or developer-facing REPL

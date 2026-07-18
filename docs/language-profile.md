@@ -274,6 +274,9 @@ The current profile supports:
   `tool.start(name, input).await()`.
 - JSON envelope tools through `tool.call_json(name, value)` and
   `tool.start_json(name, value).await()`.
+- Setup-defined direct capability modules such as `use mod.arithmetic` and
+  `arithmetic.add(value)`, when a trusted host explicitly maps that method to
+  a reviewed synchronous JSON tool.
 
 Example:
 
@@ -313,6 +316,17 @@ serialize the supplied Splash record or array, while their results remain JSON
 strings that generated code must turn back into values with `parse_json()`.
 This preserves a simple Rust bridge through `serde_json::Value` without
 allowing scripts to import crates directly.
+
+For a fixed, less stringly dataflow interface, a trusted host may additionally
+register a `CapabilityModule` before evaluation or lease issuance. Its flat
+`mod.<name>` methods each route to one existing synchronous JSON tool with an
+executable input/output contract. Calling the method serializes one bounded
+JSON-compatible argument, reserves the same target tool and lease grant, then
+returns decoded bounded JSON. It cannot target a deferred external tool, a text
+tool, an advisory-only schema, an arbitrary crate, or an ambient filesystem,
+process, network, or plugin API. The core language still does not resolve
+modules; the host supplies the binding. See [Host Tool Catalog](tool-catalog.md)
+for setup and bounds.
 
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatch with the same bounded JSON reader and writer

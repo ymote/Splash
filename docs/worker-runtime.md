@@ -388,6 +388,10 @@ with canonical evaluation, bounded host pumping, catalog inspection, audit
 inspection, and explicit garbage collection only. The resulting profile has no
 API to register more tools, claim or complete external work, or attach a worker
 transport. Structured adapters require an executable `JsonToolContract`.
+`MobileRuntimeBuilder::register_capability_module` can also expose one of those
+contract-enforced local JSON adapters as a fixed direct `mod.<name>` method
+before `build()` seals the profile; it retains the adapter's policy and audit
+checks rather than adding ambient application APIs.
 `MobileRuntimeBuilder::with_limits_and_catalog` additionally lets the app set
 an immutable maximum descriptor count and serialized catalog size before any
 adapter is registered. `with_max_audit_events(NonZeroUsize)` sets the bounded

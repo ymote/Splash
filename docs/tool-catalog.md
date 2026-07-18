@@ -31,7 +31,10 @@ outline retains at most 1,024 direct sites and exposes truncation explicitly;
 it is deliberately limited to direct source spelling and does not resolve
 aliases, shadowing, flow, or computed names. It is never sufficient to approve
 a call: the lease and reservation-time policy checks remain the authority
-boundary.
+boundary. It recognizes only direct `mod.tool` calls. A host that uses direct
+capability modules must separately review the fixed module-to-tool mapping and
+grant the target tool name; the runtime still enforces that lease at the
+underlying tool reservation.
 
 `CapabilityCatalogLimits` bounds the whole host-visible catalog, not just an
 individual descriptor. The default permits at most 128 registered tools and a
@@ -100,6 +103,57 @@ shown here is enforced at the tool boundary. See [JSON tool contracts](schema-co
 for the supported keywords and limits. `ToolMetadata::with_input_schema` and
 `with_output_schema` remain available when a host needs non-enforcing prompt
 metadata only.
+
+## Direct Capability Modules
+
+For static, LLM-friendly dataflow, a host can expose a reviewed JSON tool as a
+flat direct module method. This removes the JSON-string round trip from source:
+
+```rust
+use splash_capabilities::CapabilityModule;
+
+runtime.register_capability_module(
+    CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+        .with_method("add", "math.add"),
+)?;
+```
+
+```splash
+use mod.arithmetic
+
+let result = arithmetic.add({left: 20, right: 22})
+result.total
+```
+
+This is not a general import system or Rust package bridge. A direct module is
+setup-only, has one canonical identifier segment, and its methods map one-to-one
+to existing tools. Registration accepts only a synchronous `host_pump` JSON
+tool with an executable input/output contract. The method accepts one bounded
+JSON record or array subject to the target contract, returns decoded bounded
+JSON, and retains the target tool's call limit, metadata, audit entry, JSON
+validation, and active
+capability-lease check. Deferred `external` tools, prompt-only schemas, text
+tools, duplicate target aliases, existing VM module names, dynamic libraries,
+and script-selected crates remain unavailable.
+
+`CapabilityModuleLimits` defaults to 32 modules, 128 methods, and a 256 KiB
+host-facing interface projection, with fixed hard ceilings of 128 modules, 256
+methods, and 512 KiB. The combined module and method projection is also capped
+at 256 entries so it can be passed to the LSP unchanged.
+`CapabilityRuntime::with_limits_pending_catalog_and_module_limits` lets a
+constrained host lower those bounds. Every direct target's configured
+input and output byte limits must fit the runtime JSON bridge: the smaller of
+`ExecutionLimits::max_source_bytes` and 64 KiB. JSON container depth is also
+bounded by the smaller of `max_syntax_nesting` and 64. The module catalog seals
+when a lease is issued or source is first evaluated, so a new syntax alias
+cannot appear under an existing approval.
+
+`CapabilityRuntime::capability_module_catalog()` returns the reviewed mapping
+for a host prompt or operator UI. `module_interface_catalog()` returns the
+bounded flat `{path, description}` entries accepted by the advisory LSP
+`moduleCatalog` projection. Neither API is installed into Splash source or
+gives an editor authority. The sealed mobile and embedded builder exposes the
+same registration path before `build`.
 
 For an approval flow, a host can issue a `CapabilityLease` from a selected
 subset of this catalog and call `eval_with_capability_lease`, or pass that lease
