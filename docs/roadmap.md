@@ -215,18 +215,25 @@
   general resource quota or proof that an adapter effect was cancelled.
 - Manifest-selected bounded ephemeral `file_root` mounts at arbitrary
   host-configured worker paths, with common overlap validation. Active
-  persistent host-backed writable roots fail closed by default; host code must
-  explicitly acknowledge an independently enforced filesystem quota before
-  mounting one. An opt-in stricter policy also rejects an unbounded private
-  `/tmp`, requires further-user-namespace lockdown, and remounts the namespace
-  root, `/proc`, and `/dev` read-only. Each mount has a kernel-enforced `tmpfs`
-  data-block ceiling; an optional policy rejects a selected set of bounded
-  tmpfs mounts whose potential aggregate capacity exceeds a host maximum. The
-  mounts still have independent runtime ceilings rather than a shared quota,
-  have no independent inode cap, and are neither durable storage, an
-  executable-path policy, nor a persistent-filesystem quota. Splash neither
-  creates nor validates the external persistent-storage quota, and the stricter
-  bounded-write policy still rejects every host-backed writable root. A worker
+  persistent host-backed writable roots fail closed by default. On Linux, a
+  host can attach a verified generic filesystem project quota to a
+  descriptor-pinned root and set an aggregate hard byte and inode maximum;
+  Splash validates the project ID, inheritance flag, nonzero hard limits,
+  current usage, configured ceilings, and distinct `(filesystem, project ID)`
+  aggregate before Bubblewrap receives the same retained root descriptor. A
+  selected verified quota root also requires mandatory further-user-namespace
+  lockdown so an owning worker cannot retag its directory in the initial user
+  namespace. The host provisions and retains control of the quota. The old explicit
+  unbounded-write acknowledgement remains only as a visible weaker escape
+  hatch for an external boundary Splash cannot inspect. An opt-in stricter
+  policy rejects unverified persistent roots and an unbounded private `/tmp`,
+  requires further-user-namespace lockdown, and remounts the namespace root,
+  `/proc`, and `/dev` read-only; it accepts verified project-quota roots. Each
+  ephemeral mount has a kernel-enforced `tmpfs` data-block ceiling; an optional
+  policy rejects a selected set of bounded tmpfs mounts whose potential
+  aggregate capacity exceeds a host maximum. The mounts still have independent
+  runtime ceilings rather than a shared tmpfs quota, have no independent inode
+  cap, and are neither durable storage nor an executable-path policy. A worker
   plan defaults to 64 unique active file-root selectors; trusted configuration
   can lower that bound, including to zero, or explicitly raise it only to the
   fixed 256-root maximum, constraining mount-plan expansion before source
@@ -277,10 +284,11 @@
 
 ## Next: contained local effects
 
-- Aggregate-disk quotas for persistent writable host-backed worker storage.
-  Bounded ephemeral file roots now cover scratch output beyond `/tmp`, with an
-  optional aggregate potential-capacity check, but neither mechanism quotas a
-  persistent filesystem.
+- Persistent-storage quota coverage beyond verified Linux generic project
+  quotas: other filesystems, macOS, Windows, mobile, embedded Linux, and
+  device-level quotas. Bounded ephemeral file roots cover scratch output beyond
+  `/tmp`, with an optional aggregate potential-capacity check, but still do not
+  provide a shared tmpfs runtime quota or portable durable-storage boundary.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - An operating-system-enforced dynamic/origin-policy network boundary,

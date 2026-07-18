@@ -1,0 +1,21 @@
+[package]
+name = "splash-linux-project-quota"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Audited Linux project-quota inspection for Splash containment"
+
+# This is the sole workspace crate that contains the syscall boundary needed
+# to inspect Linux project quotas. Its public API is safe and all callers pass
+# owned or borrowed file descriptors rather than raw pointers.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+linux-raw-sys = { version = "0.12.1", features = ["general", "ioctl"] }

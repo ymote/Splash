@@ -6,12 +6,15 @@ Splash. The policy accepts a fixed worker program, fixed worker arguments,
 read-only runtime mounts, and opaque host-backed or bounded ephemeral
 `file_root` entries selected by an active `CapabilityManifest`.
 
-An active host-backed read-write root is denied by default. Host code can call
-`allow_unbounded_host_file_root_writes` only when an independently managed OS
-or filesystem quota already constrains that persistent storage; Splash neither
-creates nor validates such a quota. This default does not bound an explicitly
-enabled private `/tmp`, which remains an ephemeral mount with its own selected
-policy.
+An active host-backed read-write root is denied by default. On Linux, a host
+can instead attach a verified `LinuxProjectQuota` to a descriptor-pinned root
+and configure an aggregate hard byte and inode limit. Splash then checks the
+same directory descriptor that Bubblewrap will mount before launch. For a
+legacy deployment with a separately managed quota that Splash cannot inspect,
+host code may still call `allow_unbounded_host_file_root_writes`; that is an
+explicit weaker escape hatch, not quota enforcement. This default does not
+bound an explicitly enabled private `/tmp`, which remains an ephemeral mount
+with its own selected policy.
 
 It is deliberately not a general command runner. Splash source, tool payloads,
 and resource selector IDs never become a host path, command line, origin, or
@@ -26,8 +29,8 @@ provide it.
 ```rust
 use splash_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, EphemeralFileRoot, ExecutableSourceBinding,
-    FileRootAccess, FileRootBinding, MountSourceBinding, ReadOnlyMount,
-    LandlockExecutableRunner, ResourceLimitRunner, WorkerResourceLimits,
+    FileRootAccess, FileRootBinding, LandlockExecutableRunner, LinuxProjectQuota,
+    MountSourceBinding, ReadOnlyMount, ResourceLimitRunner, WorkerResourceLimits,
     WorkerSeccompProfile,
 };
 use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
@@ -114,6 +117,67 @@ path-based bind. This mode alone does not freeze mutable descendants of a
 pinned directory, the contents of a runtime tree, the Bubblewrap executable
 selected by the host, or an already-open writable file. Those still require
 immutable host ownership or a target-specific design.
+
+## Verified Persistent Storage
+
+`LinuxProjectQuota` is the supported persistent-storage boundary for a Linux
+filesystem that implements generic project quotas and runs a kernel with
+`quotactl_fd` (Linux 5.14 or later). The host provisions that filesystem before
+it compiles a worker policy: assign a nonzero project ID to the exact root,
+enable its project-inheritance flag, and set nonzero hard block and inode
+limits. Splash does not create, resize, or repair the quota.
+
+```rust
+let durable_output = LinuxProjectQuota::new(
+    42,                 // Host-provisioned filesystem project ID.
+    256 * 1024 * 1024,  // Maximum accepted hard allocation limit in bytes.
+    16_384,             // Maximum accepted hard inode limit.
+)?;
+
+policy.pin_mount_sources();
+policy.require_no_further_user_namespaces();
+policy.set_maximum_aggregate_linux_project_quota(
+    256 * 1024 * 1024,
+    16_384,
+)?;
+policy.add_file_root(
+    "durable-output",
+    FileRootBinding::new(
+        "/srv/splash/worker-output",
+        "/workspace/output",
+        FileRootAccess::ReadWrite,
+    )?
+    .with_linux_project_quota(durable_output),
+)?;
+```
+
+At `compile`, Splash opens a read-only directory descriptor relative to the
+retained `O_PATH` mount descriptor, reads `FS_IOC_FSGETXATTR`, and calls
+`quotactl_fd(Q_GETQUOTA, PRJQUOTA)` on that same filesystem. It fails closed
+when the kernel or filesystem does not support either interface, permission is
+missing, the project ID differs, inheritance is absent, a hard byte or inode
+limit is zero or above the binding ceiling, usage already exceeds a hard limit,
+or the kernel does not return complete quota accounting. Bubblewrap receives a
+fresh duplicate of the retained mount descriptor, not the checked pathname.
+
+Every active quota root needs `MountSourceBinding::DescriptorPinned`,
+`require_no_further_user_namespaces`, and an aggregate maximum. The mandatory
+user namespace prevents a worker that owns a mounted directory from changing
+the project ID or inheritance state through the Linux filesystem-attribute
+ioctls. Splash sums the hard limits of distinct `(filesystem, project ID)`
+pairs exactly once, so several worker-visible directories under one project
+consume one shared quota budget. A raw read-write host root is rejected while
+this aggregate policy is enabled, even when
+`allow_unbounded_host_file_root_writes` was called. `require_bounded_file_root_writes`
+also accepts these verified roots when its user-namespace and private-`/tmp`
+requirements are met.
+
+This is filesystem enforcement after launch, but quota administration remains
+trusted host responsibility. A separate privileged actor that can raise,
+disable, or retag the project quota can weaken the boundary after compilation.
+Project quotas are allocation and inode ceilings; they do not limit CPU,
+memory, device access, process creation, network access, code execution,
+downstream tool effects, or data written outside the selected project.
 
 `ExecutableSourceBinding::DescriptorPinned` is a separate Linux opt-in for
 the fixed launch chain. It requires `MountSourceBinding::DescriptorPinned`.
@@ -436,15 +500,16 @@ or wire size, filesystem data blocks, inode use, or persistent storage.
 
 `require_bounded_file_root_writes` is an additional compile-time hardening
 mode. The default already rejects active host-backed read-write roots; this
-mode also rejects an enabled unbounded private `/tmp`, requires
+mode also rejects every unverified persistent root and an enabled unbounded
+private `/tmp`, requires
 `require_no_further_user_namespaces`, and non-recursively remounts `/proc`,
 `/dev`, and `/` read-only after constructing the selected mounts. A disabled or
-explicitly bounded `/tmp` remains valid. The mode overrides
-`allow_unbounded_host_file_root_writes`, so it cannot be weakened by a later
-host configuration call. Device and proc interfaces remain available under
-their kernel semantics. The mode does not constrain process memory or
-downstream adapter effects. Any unsupported Bubblewrap lockdown option is a
-launch failure; there is no weaker fallback.
+explicitly bounded `/tmp` remains valid, as does a verified Linux project-quota
+root. The mode overrides `allow_unbounded_host_file_root_writes`, so it cannot
+be weakened by a later host configuration call. Device and proc interfaces
+remain available under their kernel semantics. The mode does not constrain
+process memory or downstream adapter effects. Any unsupported Bubblewrap
+lockdown option is a launch failure; there is no weaker fallback.
 
 `require_no_further_user_namespaces` is an opt-in hardening mode for Linux
 deployments that require it. It emits `--unshare-user --disable-userns` after
@@ -707,12 +772,13 @@ boundary:
 - `file_root`: allowed only when its opaque ID is registered in the trusted
   policy. A host-backed source must be a directory, and its access mode is
   selected by the host binding. An active read-write host binding is rejected
-  unless host configuration explicitly acknowledges an independently enforced
-  persistent-storage quota. A bounded ephemeral entry has no host source; it
-  creates an empty writable `tmpfs` for that worker session. Both kinds share
-  one selector namespace, so a duplicate ID is rejected rather than resolved
-  ambiguously. Hosts should use distinct opaque IDs for read-only and
-  read-write views of the same host source.
+  unless it is a verified Linux project-quota root or host configuration
+  explicitly acknowledges an independently enforced quota through the weaker
+  escape hatch. A bounded ephemeral entry has no host source; it creates an
+  empty writable `tmpfs` for that worker session. Both kinds share one selector
+  namespace, so a duplicate ID is rejected rather than resolved ambiguously.
+  Hosts should use distinct opaque IDs for read-only and read-write views of
+  the same host source.
 - `executable`: rejected. The worker program is fixed by host configuration;
   scripts cannot choose a second executable.
 - `network_origin`: rejected. The worker has no host network namespace, and
@@ -751,14 +817,17 @@ It does not yet provide:
 - worker attestation, authenticated key exchange, encrypted transport, or
   session-key storage. The private-pipe preamble only transfers a
   host-generated key to a newly launched worker;
-- aggregate quotas for persistent host-backed storage or device quotas. An
-  optional cgroup-v2 policy adds CPU bandwidth, memory, swap, task, and
-  per-device I/O controls; it is not a filesystem quota. An optional runner
-  adds the narrower rlimits. A configured private `/tmp` and each active
-  ephemeral root have independent per-`tmpfs` allocation ceilings; a host can
-  validate their aggregate potential capacity before launch, but there is no
-  shared runtime quota. The watchdog adds a process-lifetime wall-clock
-  deadline;
+- portable aggregate quotas for persistent host-backed storage or device
+  quotas. Linux generic project quotas provide the documented descriptor-pinned
+  boundary only when the host provisions a supporting filesystem and protects
+  quota administration. Other persistent filesystems and every non-Linux
+  target remain without this boundary. An optional cgroup-v2 policy adds CPU
+  bandwidth, memory, swap, task, and per-device I/O controls; it is not a
+  filesystem quota. An optional runner adds the narrower rlimits. A configured
+  private `/tmp` and each active ephemeral root have independent per-`tmpfs`
+  allocation ceilings; a host can validate their aggregate potential capacity
+  before launch, but there is no shared tmpfs runtime quota. The watchdog adds
+  a process-lifetime wall-clock deadline;
 - D-Bus mediation, device-specific policy, an executable-path policy, or a
   network proxy. `DenyKnownEscapeSurface` is a narrow default-allow hardening
   filter, while `StrictAllowlist` is a target-specific syscall boundary, not a

@@ -15,6 +15,8 @@ const FIRST_SCRATCH_BYTES: usize = 16 * KIBIBYTE;
 const SECOND_SCRATCH_BYTES: usize = 32 * KIBIBYTE;
 const SMALL_PRIVATE_TMPFS_BYTES: usize = 16 * KIBIBYTE;
 const LARGE_PRIVATE_TMPFS_BYTES: usize = 64 * KIBIBYTE;
+const LINUX_PROJECT_QUOTA_BYTES: u64 = 64 * KIBIBYTE as u64;
+const LINUX_PROJECT_QUOTA_INODES: u64 = 16;
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_FUZZ_INPUT_BYTES {
@@ -133,6 +135,8 @@ struct FuzzControl {
     try_invalid_aggregate_limit: bool,
     aggregate_before_private_tmpfs: bool,
     select_active_file_root_limit_overflow: bool,
+    linux_project_quota_aggregate: bool,
+    try_invalid_linux_project_quota_aggregate: bool,
 }
 
 impl FuzzControl {
@@ -158,6 +162,8 @@ impl FuzzControl {
             try_invalid_aggregate_limit: !(aggregate / 9).is_multiple_of(2),
             aggregate_before_private_tmpfs: byte(data, 4) & 1 != 0,
             select_active_file_root_limit_overflow: byte(data, 5) & 1 != 0,
+            linux_project_quota_aggregate: byte(data, 6) & 1 != 0,
+            try_invalid_linux_project_quota_aggregate: byte(data, 7) & 1 != 0,
         }
     }
 
@@ -182,7 +188,9 @@ impl FuzzControl {
             || self.select_active_file_root_limit_overflow
             || self.policy_configuration_must_fail()
             || (self.select_writable
-                && (!self.allow_unbounded_host_writes || self.require_bounded_writes))
+                && (!self.allow_unbounded_host_writes
+                    || self.require_bounded_writes
+                    || self.linux_project_quota_aggregate))
             || self.aggregate_limit.is_some_and(|maximum_bytes| {
                 self.private_tmpfs == PrivateTmpfs::Unbounded
                     || self.aggregate_requested_bytes() > maximum_bytes
@@ -290,6 +298,7 @@ fn configured_policy(control: FuzzControl) -> (BubblewrapWorkerPolicy, Capabilit
     if !control.aggregate_before_private_tmpfs {
         configure_aggregate_limit(&mut policy, control);
     }
+    configure_linux_project_quota_aggregate(&mut policy, control);
     if control.namespace_lockdown {
         policy.require_no_further_user_namespaces();
     }
@@ -342,6 +351,34 @@ fn configure_private_tmpfs(policy: &mut BubblewrapWorkerPolicy, private_tmpfs: P
                 .enable_private_tmpfs_with_maximum_bytes(maximum_bytes)
                 .expect("the fixed bounded private tmpfs size is valid");
         }
+    }
+}
+
+fn configure_linux_project_quota_aggregate(
+    policy: &mut BubblewrapWorkerPolicy,
+    control: FuzzControl,
+) {
+    if control.try_invalid_linux_project_quota_aggregate {
+        assert!(matches!(
+            policy.set_maximum_aggregate_linux_project_quota(0, LINUX_PROJECT_QUOTA_INODES),
+            Err(BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaByteLimit {
+                maximum_bytes: 0,
+            })
+        ));
+        assert!(matches!(
+            policy.set_maximum_aggregate_linux_project_quota(LINUX_PROJECT_QUOTA_BYTES, 0),
+            Err(BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaInodeLimit {
+                maximum_inodes: 0,
+            })
+        ));
+    }
+    if control.linux_project_quota_aggregate {
+        policy
+            .set_maximum_aggregate_linux_project_quota(
+                LINUX_PROJECT_QUOTA_BYTES,
+                LINUX_PROJECT_QUOTA_INODES,
+            )
+            .expect("the finite fuzz Linux project-quota aggregate limit is valid");
     }
 }
 

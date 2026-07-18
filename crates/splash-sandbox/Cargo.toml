@@ -17,3 +17,4 @@ close_fds = "0.3.2"
 landlock = "0.4.5"
 linux-raw-sys = { version = "0.12.1", features = ["general", "ioctl", "ptrace"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
+splash-linux-project-quota = { version = "0.1.0", path = "../splash-linux-project-quota" }

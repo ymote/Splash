@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
 use std::sync::{mpsc, Arc, Mutex};
@@ -33,9 +33,11 @@ use std::process::{ChildStderr, Command, Stdio};
 
 #[cfg(target_os = "linux")]
 use rustix::{
-    fs::{fstat, open, FileType, Mode, OFlags},
+    fs::{fstat, open, openat, FileType, Mode, OFlags},
     io::{fcntl_dupfd_cloexec, fcntl_setfd, FdFlags},
 };
+#[cfg(target_os = "linux")]
+use splash_linux_project_quota::inspect_project_quota;
 use splash_protocol::{
     CapabilityManifest, PrivatePipeWorkerBootstrap, PrivatePipeWorkerBootstrapError, ProtocolError,
     ResourceKind, ResourceSelector,
@@ -77,7 +79,8 @@ pub enum FileRootAccess {
     /// Expose the selected host directory read-write.
     ///
     /// An active binding with this access mode is rejected unless host code
-    /// explicitly calls [`BubblewrapWorkerPolicy::allow_unbounded_host_file_root_writes`].
+    /// either configures a verified [`LinuxProjectQuota`] or explicitly calls
+    /// [`BubblewrapWorkerPolicy::allow_unbounded_host_file_root_writes`].
     ReadWrite,
 }
 
@@ -644,12 +647,78 @@ impl ReadOnlyMount {
     }
 }
 
+/// A host-selected upper bound for one Linux filesystem project quota.
+///
+/// A Linux project quota is enforced by the backing filesystem rather than by
+/// Splash. It bounds every directory selected with the same filesystem project
+/// ID, so one project can contain a worker's aggregate durable output across
+/// several file-root mount points. Splash validates the exact mounted directory
+/// at policy compilation through `FS_IOC_FSGETXATTR` and `quotactl_fd`.
+///
+/// The host must provision the project ID, inheritance bit, and hard limits
+/// before compilation. This value is trusted host configuration, never a
+/// manifest, tool payload, or Splash value. Project ID zero is deliberately
+/// rejected because it is normally the filesystem's default/unisolated project.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinuxProjectQuota {
+    project_id: NonZeroU32,
+    maximum_bytes: NonZeroU64,
+    maximum_inodes: NonZeroU64,
+}
+
+impl LinuxProjectQuota {
+    /// Creates the host policy expected for one filesystem project quota.
+    ///
+    /// Compilation requires the filesystem's active hard byte and inode limits
+    /// to be nonzero and no larger than these values. A lower installed limit
+    /// is accepted because it is a stricter containment boundary; an unlimited
+    /// or larger installed limit rejects the worker launch.
+    pub fn new(
+        project_id: u32,
+        maximum_bytes: u64,
+        maximum_inodes: u64,
+    ) -> Result<Self, BubblewrapPolicyError> {
+        let Some(project_id) = NonZeroU32::new(project_id) else {
+            return Err(BubblewrapPolicyError::InvalidLinuxProjectQuotaProjectId { project_id });
+        };
+        let Some(maximum_bytes) = NonZeroU64::new(maximum_bytes) else {
+            return Err(BubblewrapPolicyError::InvalidLinuxProjectQuotaByteLimit { maximum_bytes });
+        };
+        let Some(maximum_inodes) = NonZeroU64::new(maximum_inodes) else {
+            return Err(BubblewrapPolicyError::InvalidLinuxProjectQuotaInodeLimit {
+                maximum_inodes,
+            });
+        };
+        Ok(Self {
+            project_id,
+            maximum_bytes,
+            maximum_inodes,
+        })
+    }
+
+    /// Returns the required nonzero filesystem project ID.
+    pub const fn project_id(self) -> u32 {
+        self.project_id.get()
+    }
+
+    /// Returns the largest accepted filesystem hard disk-allocation limit.
+    pub const fn maximum_bytes(self) -> u64 {
+        self.maximum_bytes.get()
+    }
+
+    /// Returns the largest accepted filesystem hard allocated-inode limit.
+    pub const fn maximum_inodes(self) -> u64 {
+        self.maximum_inodes.get()
+    }
+}
+
 /// One host-selected directory exposed through a `file_root` selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileRootBinding {
     source: PathBuf,
     destination: PathBuf,
     access: FileRootAccess,
+    linux_project_quota: Option<LinuxProjectQuota>,
 }
 
 /// One empty, writable, manifest-selected `tmpfs` file root.
@@ -719,7 +788,23 @@ impl FileRootBinding {
             source,
             destination,
             access,
+            linux_project_quota: None,
         })
+    }
+
+    /// Attaches a Linux filesystem project-quota requirement to this root.
+    ///
+    /// It is valid only for a read-write root. A selected quota root requires
+    /// [`MountSourceBinding::DescriptorPinned`] so the descriptor inspected by
+    /// Splash is the same directory Bubblewrap mounts and
+    /// [`BubblewrapWorkerPolicy::require_no_further_user_namespaces`] so a
+    /// worker cannot alter project-quota metadata from the initial Linux user
+    /// namespace. Non-Linux compilation, missing project inheritance, an
+    /// unlimited quota, a quota above this binding's ceiling, or an unavailable
+    /// kernel interface fails closed.
+    pub fn with_linux_project_quota(mut self, quota: LinuxProjectQuota) -> Self {
+        self.linux_project_quota = Some(quota);
+        self
     }
 
     /// Returns the trusted host source path before canonicalization.
@@ -735,6 +820,11 @@ impl FileRootBinding {
     /// Returns the mount access mode.
     pub const fn access(&self) -> FileRootAccess {
         self.access
+    }
+
+    /// Returns the selected Linux project-quota requirement, if any.
+    pub const fn linux_project_quota(&self) -> Option<LinuxProjectQuota> {
+        self.linux_project_quota
     }
 }
 
@@ -758,6 +848,27 @@ impl PrivateTmpfs {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AggregateLinuxProjectQuota {
+    maximum_bytes: NonZeroU64,
+    maximum_inodes: NonZeroU64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LinuxProjectQuotaGroup {
+    filesystem_device: u64,
+    project_id: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedLinuxProjectQuota {
+    group: LinuxProjectQuotaGroup,
+    hard_limit_bytes: u64,
+    hard_limit_inodes: u64,
+}
+
 /// Trusted configuration for one statically selected Bubblewrap worker.
 ///
 /// This configuration is intentionally constructed by host Rust code. It is
@@ -777,6 +888,7 @@ pub struct BubblewrapWorkerPolicy {
     executable_source_binding: ExecutableSourceBinding,
     private_tmpfs: PrivateTmpfs,
     maximum_aggregate_ephemeral_tmpfs_bytes: Option<NonZeroUsize>,
+    maximum_aggregate_linux_project_quota: Option<AggregateLinuxProjectQuota>,
     maximum_active_file_roots: usize,
     unbounded_host_file_root_writes_allowed: bool,
     bounded_file_root_writes_required: bool,
@@ -813,6 +925,7 @@ impl BubblewrapWorkerPolicy {
             executable_source_binding: ExecutableSourceBinding::Path,
             private_tmpfs: PrivateTmpfs::Disabled,
             maximum_aggregate_ephemeral_tmpfs_bytes: None,
+            maximum_aggregate_linux_project_quota: None,
             maximum_active_file_roots: DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS,
             unbounded_host_file_root_writes_allowed: false,
             bounded_file_root_writes_required: false,
@@ -932,6 +1045,15 @@ impl BubblewrapWorkerPolicy {
         let id = id.into();
         ResourceSelector::new(ResourceKind::FileRoot, id.clone())
             .map_err(BubblewrapPolicyError::Protocol)?;
+        if let RegisteredFileRoot::Host(binding) = &root {
+            if binding.linux_project_quota().is_some()
+                && binding.access() != FileRootAccess::ReadWrite
+            {
+                return Err(
+                    BubblewrapPolicyError::LinuxProjectQuotaRequiresWritableFileRoot { id },
+                );
+            }
+        }
         if self.file_roots.contains_key(&id) {
             return Err(BubblewrapPolicyError::DuplicateFileRoot { id });
         }
@@ -946,7 +1068,7 @@ impl BubblewrapWorkerPolicy {
     /// that external quota, so this method deliberately makes the policy's
     /// weaker storage boundary visible in host code. The stricter
     /// [`Self::require_bounded_file_root_writes`] mode still rejects every
-    /// host-backed writable root.
+    /// unverified host-backed writable root.
     pub fn allow_unbounded_host_file_root_writes(&mut self) -> &mut Self {
         self.unbounded_host_file_root_writes_allowed = true;
         self
@@ -971,10 +1093,10 @@ impl BubblewrapWorkerPolicy {
     /// `/proc`, `/dev`, and the empty namespace root read-only after all
     /// selected mounts are created. It overrides
     /// [`Self::allow_unbounded_host_file_root_writes`], so that escape hatch
-    /// cannot weaken this mode. Read-only host roots, bounded ephemeral roots,
-    /// and a bounded private `/tmp` remain valid. This does not constrain
-    /// process memory, device or proc semantics, or downstream effects
-    /// performed by a trusted adapter.
+    /// cannot weaken this mode. Verified [`LinuxProjectQuota`] roots,
+    /// read-only host roots, bounded ephemeral roots, and a bounded private
+    /// `/tmp` remain valid. This does not constrain process memory, device or
+    /// proc semantics, or downstream effects performed by a trusted adapter.
     pub fn require_bounded_file_root_writes(&mut self) -> &mut Self {
         self.bounded_file_root_writes_required = true;
         self
@@ -1044,6 +1166,51 @@ impl BubblewrapWorkerPolicy {
     pub const fn maximum_aggregate_ephemeral_tmpfs_bytes(&self) -> Option<usize> {
         match self.maximum_aggregate_ephemeral_tmpfs_bytes {
             Some(maximum_bytes) => Some(maximum_bytes.get()),
+            None => None,
+        }
+    }
+
+    /// Requires an aggregate hard limit for active Linux project-quota roots.
+    ///
+    /// Each selected persistent read-write root must carry a validated
+    /// [`LinuxProjectQuota`] and use descriptor-pinned mount sources. Splash
+    /// counts each distinct `(filesystem, project ID)` once, then rejects the
+    /// launch when the kernel-reported hard byte or inode ceilings exceed these
+    /// aggregate maxima. A shared project ID across several roots contributes
+    /// one shared hard quota rather than one limit per mount.
+    ///
+    /// This validates existing filesystem enforcement; it does not create,
+    /// repair, or retain administrator control over a project quota. Hosts must
+    /// prevent a separate privileged actor from raising or disabling the quota
+    /// while the worker is active.
+    pub fn set_maximum_aggregate_linux_project_quota(
+        &mut self,
+        maximum_bytes: u64,
+        maximum_inodes: u64,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
+        let Some(maximum_bytes) = NonZeroU64::new(maximum_bytes) else {
+            return Err(
+                BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaByteLimit { maximum_bytes },
+            );
+        };
+        let Some(maximum_inodes) = NonZeroU64::new(maximum_inodes) else {
+            return Err(
+                BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaInodeLimit {
+                    maximum_inodes,
+                },
+            );
+        };
+        self.maximum_aggregate_linux_project_quota = Some(AggregateLinuxProjectQuota {
+            maximum_bytes,
+            maximum_inodes,
+        });
+        Ok(self)
+    }
+
+    /// Returns the aggregate Linux project-quota maxima, if configured.
+    pub const fn maximum_aggregate_linux_project_quota(&self) -> Option<(u64, u64)> {
+        match self.maximum_aggregate_linux_project_quota {
+            Some(quota) => Some((quota.maximum_bytes.get(), quota.maximum_inodes.get())),
             None => None,
         }
     }
@@ -1285,6 +1452,9 @@ impl BubblewrapWorkerPolicy {
             .map(|mount| resolve_runtime_mount(mount, self.mount_source_binding))
             .collect::<Result<Vec<_>, _>>()?;
 
+        #[cfg(target_os = "linux")]
+        let mut active_linux_project_quotas = BTreeMap::new();
+
         for resource in resources {
             match resource.kind {
                 ResourceKind::FileRoot => {
@@ -1295,17 +1465,89 @@ impl BubblewrapWorkerPolicy {
                     })?;
                     match root {
                         RegisteredFileRoot::Host(binding) => {
-                            if binding.access == FileRootAccess::ReadWrite
+                            if let Some(project_quota) = binding.linux_project_quota() {
+                                if self.mount_source_binding != MountSourceBinding::DescriptorPinned
+                                {
+                                    return Err(
+                                        BubblewrapPolicyError::LinuxProjectQuotaRequiresPinnedMountSources {
+                                            id: resource.id,
+                                        },
+                                    );
+                                }
+                                if self.maximum_aggregate_linux_project_quota.is_none() {
+                                    return Err(
+                                        BubblewrapPolicyError::LinuxProjectQuotaAggregateLimitRequired {
+                                            id: resource.id,
+                                        },
+                                    );
+                                }
+                                if self.user_namespace_policy
+                                    != UserNamespacePolicy::RequireNoFurtherUserNamespaces
+                                {
+                                    return Err(
+                                        BubblewrapPolicyError::LinuxProjectQuotaRequiresUserNamespaceLockdown {
+                                            id: resource.id,
+                                        },
+                                    );
+                                }
+
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let mount =
+                                        resolve_file_root(binding, self.mount_source_binding)?;
+                                    let verified = validate_linux_project_quota(
+                                        &resource.id,
+                                        &mount,
+                                        project_quota,
+                                    )?;
+                                    match active_linux_project_quotas.entry(verified.group) {
+                                        std::collections::btree_map::Entry::Vacant(entry) => {
+                                            entry.insert(verified);
+                                        }
+                                        std::collections::btree_map::Entry::Occupied(entry)
+                                            if entry.get().hard_limit_bytes
+                                                != verified.hard_limit_bytes
+                                                || entry.get().hard_limit_inodes
+                                                    != verified.hard_limit_inodes =>
+                                        {
+                                            return Err(
+                                                BubblewrapPolicyError::LinuxProjectQuotaGroupChanged {
+                                                    project_id: verified.group.project_id,
+                                                },
+                                            );
+                                        }
+                                        std::collections::btree_map::Entry::Occupied(_) => {}
+                                    }
+                                    mounts.push(mount);
+                                }
+
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = project_quota;
+                                    return Err(
+                                        BubblewrapPolicyError::LinuxProjectQuotaUnsupportedPlatform,
+                                    );
+                                }
+                            } else if binding.access == FileRootAccess::ReadWrite
                                 && (self.bounded_file_root_writes_required
-                                    || !self.unbounded_host_file_root_writes_allowed)
+                                    || !self.unbounded_host_file_root_writes_allowed
+                                    || self.maximum_aggregate_linux_project_quota.is_some())
                             {
+                                if self.maximum_aggregate_linux_project_quota.is_some() {
+                                    return Err(
+                                        BubblewrapPolicyError::AggregateLinuxProjectQuotaRequiresVerifiedRoot {
+                                            id: resource.id,
+                                        },
+                                    );
+                                }
                                 return Err(
                                     BubblewrapPolicyError::UnboundedFileRootWriteForbidden {
                                         id: resource.id,
                                     },
                                 );
+                            } else {
+                                mounts.push(resolve_file_root(binding, self.mount_source_binding)?);
                             }
-                            mounts.push(resolve_file_root(binding, self.mount_source_binding)?);
                         }
                         RegisteredFileRoot::Ephemeral(root) => {
                             mounts.push(resolve_ephemeral_file_root(root));
@@ -1317,6 +1559,12 @@ impl BubblewrapWorkerPolicy {
                 }
             }
         }
+
+        #[cfg(target_os = "linux")]
+        validate_aggregate_linux_project_quota_limit(
+            self.maximum_aggregate_linux_project_quota,
+            &active_linux_project_quotas,
+        )?;
 
         validate_aggregate_ephemeral_tmpfs_limit(
             self.maximum_aggregate_ephemeral_tmpfs_bytes,
@@ -2983,6 +3231,21 @@ fn invocation_outcome(
 #[derive(Debug)]
 pub enum BubblewrapPolicyError {
     Protocol(ProtocolError),
+    InvalidLinuxProjectQuotaProjectId {
+        project_id: u32,
+    },
+    InvalidLinuxProjectQuotaByteLimit {
+        maximum_bytes: u64,
+    },
+    InvalidLinuxProjectQuotaInodeLimit {
+        maximum_inodes: u64,
+    },
+    InvalidAggregateLinuxProjectQuotaByteLimit {
+        maximum_bytes: u64,
+    },
+    InvalidAggregateLinuxProjectQuotaInodeLimit {
+        maximum_inodes: u64,
+    },
     InvalidPrivateTmpfsSize {
         maximum_bytes: usize,
     },
@@ -3006,6 +3269,85 @@ pub enum BubblewrapPolicyError {
     },
     UnboundedFileRootWriteForbidden {
         id: String,
+    },
+    AggregateLinuxProjectQuotaRequiresVerifiedRoot {
+        id: String,
+    },
+    LinuxProjectQuotaRequiresWritableFileRoot {
+        id: String,
+    },
+    LinuxProjectQuotaRequiresPinnedMountSources {
+        id: String,
+    },
+    LinuxProjectQuotaAggregateLimitRequired {
+        id: String,
+    },
+    LinuxProjectQuotaRequiresUserNamespaceLockdown {
+        id: String,
+    },
+    LinuxProjectQuotaUnsupportedPlatform,
+    LinuxProjectQuotaDirectoryOpen {
+        id: String,
+        source: io::Error,
+    },
+    LinuxProjectQuotaDirectoryInspect {
+        id: String,
+        source: io::Error,
+    },
+    #[cfg(target_os = "linux")]
+    LinuxProjectQuotaRead {
+        id: String,
+        source: splash_linux_project_quota::ProjectQuotaError,
+    },
+    LinuxProjectQuotaProjectIdMismatch {
+        id: String,
+        expected: u32,
+        actual: u32,
+    },
+    LinuxProjectQuotaInheritanceMissing {
+        id: String,
+        project_id: u32,
+    },
+    LinuxProjectQuotaUnboundedByteLimit {
+        id: String,
+        project_id: u32,
+    },
+    LinuxProjectQuotaUnboundedInodeLimit {
+        id: String,
+        project_id: u32,
+    },
+    LinuxProjectQuotaByteLimitExceeded {
+        id: String,
+        project_id: u32,
+        maximum_bytes: u64,
+        actual_bytes: u64,
+    },
+    LinuxProjectQuotaInodeLimitExceeded {
+        id: String,
+        project_id: u32,
+        maximum_inodes: u64,
+        actual_inodes: u64,
+    },
+    LinuxProjectQuotaUsageExceedsByteLimit {
+        id: String,
+        project_id: u32,
+        usage_bytes: u64,
+        hard_limit_bytes: u64,
+    },
+    LinuxProjectQuotaUsageExceedsInodeLimit {
+        id: String,
+        project_id: u32,
+        usage_inodes: u64,
+        hard_limit_inodes: u64,
+    },
+    LinuxProjectQuotaGroupChanged {
+        project_id: u32,
+    },
+    AggregateLinuxProjectQuotaLimitExceeded {
+        maximum_bytes: u64,
+        requested_bytes: u128,
+        maximum_inodes: u64,
+        requested_inodes: u128,
     },
     UnboundedPrivateTmpfsForbidden,
     BoundedFileRootWritesRequireUserNamespaceLockdown,
@@ -3119,6 +3461,26 @@ impl Display for BubblewrapPolicyError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Protocol(error) => write!(formatter, "invalid capability manifest: {error}"),
+            Self::InvalidLinuxProjectQuotaProjectId { project_id } => write!(
+                formatter,
+                "Linux project-quota project ID must be greater than zero; got {project_id}"
+            ),
+            Self::InvalidLinuxProjectQuotaByteLimit { maximum_bytes } => write!(
+                formatter,
+                "Linux project-quota byte maximum must be greater than zero; got {maximum_bytes}"
+            ),
+            Self::InvalidLinuxProjectQuotaInodeLimit { maximum_inodes } => write!(
+                formatter,
+                "Linux project-quota inode maximum must be greater than zero; got {maximum_inodes}"
+            ),
+            Self::InvalidAggregateLinuxProjectQuotaByteLimit { maximum_bytes } => write!(
+                formatter,
+                "aggregate Linux project-quota byte maximum must be greater than zero; got {maximum_bytes}"
+            ),
+            Self::InvalidAggregateLinuxProjectQuotaInodeLimit { maximum_inodes } => write!(
+                formatter,
+                "aggregate Linux project-quota inode maximum must be greater than zero; got {maximum_inodes}"
+            ),
             Self::InvalidPrivateTmpfsSize { maximum_bytes } => write!(
                 formatter,
                 "private tmpfs maximum must be within 1..={MAX_TMPFS_BYTES} bytes; got {maximum_bytes}"
@@ -3154,6 +3516,111 @@ impl Display for BubblewrapPolicyError {
             Self::UnboundedFileRootWriteForbidden { id } => write!(
                 formatter,
                 "file-root selector {id:?} is a host-backed writable mount, but this policy does not permit unbounded persistent storage"
+            ),
+            Self::AggregateLinuxProjectQuotaRequiresVerifiedRoot { id } => write!(
+                formatter,
+                "file-root selector {id:?} is a host-backed writable mount without a verified Linux project quota required by this aggregate quota policy"
+            ),
+            Self::LinuxProjectQuotaRequiresWritableFileRoot { id } => write!(
+                formatter,
+                "file-root selector {id:?} attaches a Linux project quota to a read-only root"
+            ),
+            Self::LinuxProjectQuotaRequiresPinnedMountSources { id } => write!(
+                formatter,
+                "file-root selector {id:?} uses a Linux project quota but does not require descriptor-pinned mount sources"
+            ),
+            Self::LinuxProjectQuotaAggregateLimitRequired { id } => write!(
+                formatter,
+                "file-root selector {id:?} uses a Linux project quota but no aggregate Linux project-quota maximum is configured"
+            ),
+            Self::LinuxProjectQuotaRequiresUserNamespaceLockdown { id } => write!(
+                formatter,
+                "file-root selector {id:?} uses a Linux project quota but does not require further-user-namespace lockdown"
+            ),
+            Self::LinuxProjectQuotaUnsupportedPlatform => {
+                formatter.write_str("Linux project-quota roots are supported only on Linux")
+            }
+            Self::LinuxProjectQuotaDirectoryOpen { id, source } => write!(
+                formatter,
+                "could not open descriptor-pinned file-root selector {id:?} for Linux project-quota inspection: {source}"
+            ),
+            Self::LinuxProjectQuotaDirectoryInspect { id, source } => write!(
+                formatter,
+                "could not inspect descriptor-pinned file-root selector {id:?} for Linux project-quota identity: {source}"
+            ),
+            #[cfg(target_os = "linux")]
+            Self::LinuxProjectQuotaRead { id, source } => write!(
+                formatter,
+                "could not read Linux project quota for descriptor-pinned file-root selector {id:?}: {source}"
+            ),
+            Self::LinuxProjectQuotaProjectIdMismatch {
+                id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "file-root selector {id:?} has Linux project ID {actual}, expected {expected}"
+            ),
+            Self::LinuxProjectQuotaInheritanceMissing { id, project_id } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} does not inherit to newly created descendants"
+            ),
+            Self::LinuxProjectQuotaUnboundedByteLimit { id, project_id } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} has no hard byte limit"
+            ),
+            Self::LinuxProjectQuotaUnboundedInodeLimit { id, project_id } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} has no hard inode limit"
+            ),
+            Self::LinuxProjectQuotaByteLimitExceeded {
+                id,
+                project_id,
+                maximum_bytes,
+                actual_bytes,
+            } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} hard byte limit {actual_bytes} exceeds its configured maximum of {maximum_bytes}"
+            ),
+            Self::LinuxProjectQuotaInodeLimitExceeded {
+                id,
+                project_id,
+                maximum_inodes,
+                actual_inodes,
+            } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} hard inode limit {actual_inodes} exceeds its configured maximum of {maximum_inodes}"
+            ),
+            Self::LinuxProjectQuotaUsageExceedsByteLimit {
+                id,
+                project_id,
+                usage_bytes,
+                hard_limit_bytes,
+            } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} reports {usage_bytes} bytes in use above its {hard_limit_bytes}-byte hard limit"
+            ),
+            Self::LinuxProjectQuotaUsageExceedsInodeLimit {
+                id,
+                project_id,
+                usage_inodes,
+                hard_limit_inodes,
+            } => write!(
+                formatter,
+                "file-root selector {id:?} Linux project ID {project_id} reports {usage_inodes} inodes in use above its {hard_limit_inodes}-inode hard limit"
+            ),
+            Self::LinuxProjectQuotaGroupChanged { project_id } => write!(
+                formatter,
+                "Linux project quota {project_id} changed while Splash compiled one worker policy"
+            ),
+            Self::AggregateLinuxProjectQuotaLimitExceeded {
+                maximum_bytes,
+                requested_bytes,
+                maximum_inodes,
+                requested_inodes,
+            } => write!(
+                formatter,
+                "distinct active Linux project quotas total {requested_bytes} hard bytes and {requested_inodes} hard inodes, exceeding aggregate maximums of {maximum_bytes} bytes and {maximum_inodes} inodes"
             ),
             Self::UnboundedPrivateTmpfsForbidden => formatter.write_str(
                 "private /tmp is unbounded, but bounded file-root writes are required",
@@ -3341,7 +3808,16 @@ impl std::error::Error for BubblewrapPolicyError {
         match self {
             Self::Protocol(error) => Some(error),
             Self::SourceIo { source, .. } => Some(source),
-            Self::InvalidPrivateTmpfsSize { .. }
+            Self::LinuxProjectQuotaDirectoryOpen { source, .. }
+            | Self::LinuxProjectQuotaDirectoryInspect { source, .. } => Some(source),
+            #[cfg(target_os = "linux")]
+            Self::LinuxProjectQuotaRead { source, .. } => Some(source),
+            Self::InvalidLinuxProjectQuotaProjectId { .. }
+            | Self::InvalidLinuxProjectQuotaByteLimit { .. }
+            | Self::InvalidLinuxProjectQuotaInodeLimit { .. }
+            | Self::InvalidAggregateLinuxProjectQuotaByteLimit { .. }
+            | Self::InvalidAggregateLinuxProjectQuotaInodeLimit { .. }
+            | Self::InvalidPrivateTmpfsSize { .. }
             | Self::InvalidAggregateEphemeralTmpfsSize { .. }
             | Self::InvalidMaximumActiveFileRoots { .. }
             | Self::InvalidEphemeralFileRootSize { .. }
@@ -3349,6 +3825,22 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::AggregateEphemeralTmpfsLimitExceeded { .. }
             | Self::ActiveFileRootLimitExceeded { .. }
             | Self::UnboundedFileRootWriteForbidden { .. }
+            | Self::AggregateLinuxProjectQuotaRequiresVerifiedRoot { .. }
+            | Self::LinuxProjectQuotaRequiresWritableFileRoot { .. }
+            | Self::LinuxProjectQuotaRequiresPinnedMountSources { .. }
+            | Self::LinuxProjectQuotaAggregateLimitRequired { .. }
+            | Self::LinuxProjectQuotaRequiresUserNamespaceLockdown { .. }
+            | Self::LinuxProjectQuotaUnsupportedPlatform
+            | Self::LinuxProjectQuotaProjectIdMismatch { .. }
+            | Self::LinuxProjectQuotaInheritanceMissing { .. }
+            | Self::LinuxProjectQuotaUnboundedByteLimit { .. }
+            | Self::LinuxProjectQuotaUnboundedInodeLimit { .. }
+            | Self::LinuxProjectQuotaByteLimitExceeded { .. }
+            | Self::LinuxProjectQuotaInodeLimitExceeded { .. }
+            | Self::LinuxProjectQuotaUsageExceedsByteLimit { .. }
+            | Self::LinuxProjectQuotaUsageExceedsInodeLimit { .. }
+            | Self::LinuxProjectQuotaGroupChanged { .. }
+            | Self::AggregateLinuxProjectQuotaLimitExceeded { .. }
             | Self::UnboundedPrivateTmpfsForbidden
             | Self::BoundedFileRootWritesRequireUserNamespaceLockdown
             | Self::DescriptorPinnedMountsUnsupportedPlatform
@@ -3729,6 +4221,22 @@ impl CompiledBindSource {
             .duplicate_for_child()
             .map_err(BubblewrapSpawnError::PinnedMountTransport)?;
         Ok(Some(descriptor))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_directory_for_inspection(&self) -> io::Result<OwnedFd> {
+        let Some(pinned) = &self.pinned_descriptor else {
+            return Err(io::Error::other(
+                "Linux project-quota inspection requires a descriptor-pinned mount root",
+            ));
+        };
+        openat(
+            pinned.descriptor.as_ref(),
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -4207,6 +4715,142 @@ fn resolve_ephemeral_file_root(root: &EphemeralFileRoot) -> CompiledMount {
             maximum_bytes: root.maximum_bytes,
         },
     }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_project_quota(
+    id: &str,
+    mount: &CompiledMount,
+    expected: LinuxProjectQuota,
+) -> Result<VerifiedLinuxProjectQuota, BubblewrapPolicyError> {
+    let CompiledMountKind::Bind {
+        source,
+        access: FileRootAccess::ReadWrite,
+        source_type: MountSourceType::Directory,
+        ..
+    } = &mount.kind
+    else {
+        unreachable!("Linux project-quota validation only receives writable directory file roots");
+    };
+    let directory = source.open_directory_for_inspection().map_err(|source| {
+        BubblewrapPolicyError::LinuxProjectQuotaDirectoryOpen {
+            id: id.to_owned(),
+            source,
+        }
+    })?;
+    let metadata = fstat(&directory).map_err(|source| {
+        BubblewrapPolicyError::LinuxProjectQuotaDirectoryInspect {
+            id: id.to_owned(),
+            source: source.into(),
+        }
+    })?;
+    let actual = inspect_project_quota(&directory).map_err(|source| {
+        BubblewrapPolicyError::LinuxProjectQuotaRead {
+            id: id.to_owned(),
+            source,
+        }
+    })?;
+    if actual.project_id() != expected.project_id() {
+        return Err(BubblewrapPolicyError::LinuxProjectQuotaProjectIdMismatch {
+            id: id.to_owned(),
+            expected: expected.project_id(),
+            actual: actual.project_id(),
+        });
+    }
+    if !actual.project_inheritance() {
+        return Err(BubblewrapPolicyError::LinuxProjectQuotaInheritanceMissing {
+            id: id.to_owned(),
+            project_id: actual.project_id(),
+        });
+    }
+    if actual.hard_limit_bytes() == 0 {
+        return Err(BubblewrapPolicyError::LinuxProjectQuotaUnboundedByteLimit {
+            id: id.to_owned(),
+            project_id: actual.project_id(),
+        });
+    }
+    if actual.hard_limit_inodes() == 0 {
+        return Err(
+            BubblewrapPolicyError::LinuxProjectQuotaUnboundedInodeLimit {
+                id: id.to_owned(),
+                project_id: actual.project_id(),
+            },
+        );
+    }
+    if actual.hard_limit_bytes() > expected.maximum_bytes() {
+        return Err(BubblewrapPolicyError::LinuxProjectQuotaByteLimitExceeded {
+            id: id.to_owned(),
+            project_id: actual.project_id(),
+            maximum_bytes: expected.maximum_bytes(),
+            actual_bytes: actual.hard_limit_bytes(),
+        });
+    }
+    if actual.hard_limit_inodes() > expected.maximum_inodes() {
+        return Err(BubblewrapPolicyError::LinuxProjectQuotaInodeLimitExceeded {
+            id: id.to_owned(),
+            project_id: actual.project_id(),
+            maximum_inodes: expected.maximum_inodes(),
+            actual_inodes: actual.hard_limit_inodes(),
+        });
+    }
+    if actual.current_bytes() > actual.hard_limit_bytes() {
+        return Err(
+            BubblewrapPolicyError::LinuxProjectQuotaUsageExceedsByteLimit {
+                id: id.to_owned(),
+                project_id: actual.project_id(),
+                usage_bytes: actual.current_bytes(),
+                hard_limit_bytes: actual.hard_limit_bytes(),
+            },
+        );
+    }
+    if actual.current_inodes() > actual.hard_limit_inodes() {
+        return Err(
+            BubblewrapPolicyError::LinuxProjectQuotaUsageExceedsInodeLimit {
+                id: id.to_owned(),
+                project_id: actual.project_id(),
+                usage_inodes: actual.current_inodes(),
+                hard_limit_inodes: actual.hard_limit_inodes(),
+            },
+        );
+    }
+
+    Ok(VerifiedLinuxProjectQuota {
+        group: LinuxProjectQuotaGroup {
+            filesystem_device: metadata.st_dev as u64,
+            project_id: actual.project_id(),
+        },
+        hard_limit_bytes: actual.hard_limit_bytes(),
+        hard_limit_inodes: actual.hard_limit_inodes(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_aggregate_linux_project_quota_limit(
+    maximum: Option<AggregateLinuxProjectQuota>,
+    quotas: &BTreeMap<LinuxProjectQuotaGroup, VerifiedLinuxProjectQuota>,
+) -> Result<(), BubblewrapPolicyError> {
+    let Some(maximum) = maximum else {
+        return Ok(());
+    };
+    let requested_bytes = quotas.values().fold(0_u128, |total, quota| {
+        total + u128::from(quota.hard_limit_bytes)
+    });
+    let requested_inodes = quotas.values().fold(0_u128, |total, quota| {
+        total + u128::from(quota.hard_limit_inodes)
+    });
+    if requested_bytes > u128::from(maximum.maximum_bytes.get())
+        || requested_inodes > u128::from(maximum.maximum_inodes.get())
+    {
+        return Err(
+            BubblewrapPolicyError::AggregateLinuxProjectQuotaLimitExceeded {
+                maximum_bytes: maximum.maximum_bytes.get(),
+                requested_bytes,
+                maximum_inodes: maximum.maximum_inodes.get(),
+                requested_inodes,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn validate_aggregate_ephemeral_tmpfs_limit(
@@ -6658,6 +7302,236 @@ print("seccomp-active")
         assert!(policy
             .compile(&manifest([selector(ResourceKind::FileRoot, "output")]))
             .is_ok());
+    }
+
+    #[test]
+    fn linux_project_quota_configuration_rejects_unbounded_values() {
+        assert!(matches!(
+            LinuxProjectQuota::new(0, 64 * 1024, 16),
+            Err(BubblewrapPolicyError::InvalidLinuxProjectQuotaProjectId { project_id: 0 })
+        ));
+        assert!(matches!(
+            LinuxProjectQuota::new(7, 0, 16),
+            Err(BubblewrapPolicyError::InvalidLinuxProjectQuotaByteLimit { maximum_bytes: 0 })
+        ));
+        assert!(matches!(
+            LinuxProjectQuota::new(7, 64 * 1024, 0),
+            Err(BubblewrapPolicyError::InvalidLinuxProjectQuotaInodeLimit { maximum_inodes: 0 })
+        ));
+
+        let quota = LinuxProjectQuota::new(7, 64 * 1024, 16).unwrap();
+        assert_eq!(quota.project_id(), 7);
+        assert_eq!(quota.maximum_bytes(), 64 * 1024);
+        assert_eq!(quota.maximum_inodes(), 16);
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        assert!(matches!(
+            policy.set_maximum_aggregate_linux_project_quota(0, 16),
+            Err(
+                BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaByteLimit {
+                    maximum_bytes: 0,
+                }
+            )
+        ));
+        assert!(matches!(
+            policy.set_maximum_aggregate_linux_project_quota(64 * 1024, 0),
+            Err(
+                BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaInodeLimit {
+                    maximum_inodes: 0,
+                }
+            )
+        ));
+        policy
+            .set_maximum_aggregate_linux_project_quota(64 * 1024, 16)
+            .unwrap();
+        assert_eq!(
+            policy.maximum_aggregate_linux_project_quota(),
+            Some((64 * 1024, 16))
+        );
+    }
+
+    #[test]
+    fn linux_project_quota_requires_a_writable_root_when_registered() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        let quota = LinuxProjectQuota::new(7, 64 * 1024, 16).unwrap();
+        let root = binding(
+            &root,
+            "readonly-output",
+            "/workspace/readonly-output",
+            FileRootAccess::ReadOnly,
+        )
+        .with_linux_project_quota(quota);
+
+        assert!(matches!(
+            policy.add_file_root("readonly-output", root),
+            Err(BubblewrapPolicyError::LinuxProjectQuotaRequiresWritableFileRoot { id })
+                if id == "readonly-output"
+        ));
+    }
+
+    #[test]
+    fn linux_project_quota_roots_require_pinned_sources_aggregate_limit_and_user_namespace_lockdown(
+    ) {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy
+            .add_file_root(
+                "output",
+                binding(
+                    &root,
+                    "quota-output",
+                    "/workspace/output",
+                    FileRootAccess::ReadWrite,
+                )
+                .with_linux_project_quota(LinuxProjectQuota::new(7, 64 * 1024, 16).unwrap()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+            Err(BubblewrapPolicyError::LinuxProjectQuotaRequiresPinnedMountSources { id })
+                if id == "output"
+        ));
+
+        policy.pin_mount_sources();
+        #[cfg(target_os = "linux")]
+        {
+            assert!(matches!(
+                policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+                Err(BubblewrapPolicyError::LinuxProjectQuotaAggregateLimitRequired { id })
+                    if id == "output"
+            ));
+            policy
+                .set_maximum_aggregate_linux_project_quota(64 * 1024, 16)
+                .unwrap();
+            assert!(matches!(
+                policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+                Err(BubblewrapPolicyError::LinuxProjectQuotaRequiresUserNamespaceLockdown { id })
+                    if id == "output"
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+            Err(BubblewrapPolicyError::DescriptorPinnedMountsUnsupportedPlatform)
+        ));
+    }
+
+    #[test]
+    fn aggregate_linux_project_quota_rejects_an_unverified_persistent_root() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy
+            .add_file_root(
+                "output",
+                binding(
+                    &root,
+                    "output",
+                    "/workspace/output",
+                    FileRootAccess::ReadWrite,
+                ),
+            )
+            .unwrap();
+        policy.allow_unbounded_host_file_root_writes();
+        policy
+            .set_maximum_aggregate_linux_project_quota(64 * 1024, 16)
+            .unwrap();
+
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+            Err(BubblewrapPolicyError::AggregateLinuxProjectQuotaRequiresVerifiedRoot { id })
+                if id == "output"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aggregate_linux_project_quota_counts_one_filesystem_project_only_once() {
+        use std::collections::BTreeMap;
+        use std::num::NonZeroU64;
+
+        let maximum = Some(AggregateLinuxProjectQuota {
+            maximum_bytes: NonZeroU64::new(64 * 1024).unwrap(),
+            maximum_inodes: NonZeroU64::new(16).unwrap(),
+        });
+        let first = VerifiedLinuxProjectQuota {
+            group: LinuxProjectQuotaGroup {
+                filesystem_device: 1,
+                project_id: 7,
+            },
+            hard_limit_bytes: 64 * 1024,
+            hard_limit_inodes: 16,
+        };
+        let same_group = VerifiedLinuxProjectQuota { ..first };
+        let mut quotas = BTreeMap::new();
+        quotas.insert(first.group, first);
+        quotas.insert(same_group.group, same_group);
+        assert_eq!(quotas.len(), 1);
+        assert!(validate_aggregate_linux_project_quota_limit(maximum, &quotas).is_ok());
+
+        let different_filesystem = VerifiedLinuxProjectQuota {
+            group: LinuxProjectQuotaGroup {
+                filesystem_device: 2,
+                project_id: 7,
+            },
+            ..first
+        };
+        quotas.insert(different_filesystem.group, different_filesystem);
+        assert!(matches!(
+            validate_aggregate_linux_project_quota_limit(maximum, &quotas),
+            Err(BubblewrapPolicyError::AggregateLinuxProjectQuotaLimitExceeded {
+                maximum_bytes,
+                requested_bytes,
+                maximum_inodes,
+                requested_inodes,
+            }) if maximum_bytes == 64 * 1024
+                && requested_bytes == 128 * 1024
+                && maximum_inodes == 16
+                && requested_inodes == 32
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_project_quota_fails_closed_for_an_unprovisioned_directory() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.pin_mount_sources();
+        policy.require_no_further_user_namespaces();
+        policy
+            .set_maximum_aggregate_linux_project_quota(u64::MAX, u64::MAX)
+            .unwrap();
+        policy
+            .add_file_root(
+                "output",
+                binding(
+                    &root,
+                    "unprovisioned-output",
+                    "/workspace/output",
+                    FileRootAccess::ReadWrite,
+                )
+                .with_linux_project_quota(
+                    LinuxProjectQuota::new(u32::MAX, u64::MAX, u64::MAX).unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            policy.compile(&manifest([selector(ResourceKind::FileRoot, "output")])),
+            Err(BubblewrapPolicyError::LinuxProjectQuotaDirectoryOpen { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaDirectoryInspect { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaRead { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaProjectIdMismatch { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaInheritanceMissing { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaUnboundedByteLimit { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaUnboundedInodeLimit { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaByteLimitExceeded { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaInodeLimitExceeded { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaUsageExceedsByteLimit { .. })
+                | Err(BubblewrapPolicyError::LinuxProjectQuotaUsageExceedsInodeLimit { .. })
+        ));
     }
 
     #[test]

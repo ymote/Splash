@@ -528,11 +528,25 @@ is process control only: the host must drop the session and reconcile a durable
 effect rather than infer that process termination cancelled or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
-This backend has no aggregate quota for persistent host-backed storage, no
-device quota, per-origin network proxy, D-Bus mediation, complete executable or
-code-loading policy, direct secret-selector handling, or universal cancellation
-for arbitrary or durable adapters. Its separate endpoint-bound secret broker is
-not a general credential or worker-secret delivery mechanism. Protocol v5 can
+This backend has no portable aggregate quota for persistent host-backed storage,
+no device quota, per-origin network proxy, D-Bus mediation, complete executable
+or code-loading policy, direct secret-selector handling, or universal
+cancellation for arbitrary or durable adapters. Linux generic project quotas
+are an opt-in exception only for a descriptor-pinned directory on a supporting
+filesystem and Linux 5.14-or-later kernel. A selected quota root requires the
+mandatory further-user-namespace lockdown, which prevents a worker that owns
+the root from changing the project ID or inheritance state through Linux
+filesystem-attribute ioctls in the initial user namespace. Splash checks the
+provisioned project ID, inheritance bit, nonzero hard block and inode limits,
+current usage, configured per-root ceilings, and aggregate distinct
+`(filesystem, project ID)` hard limits before launch. The filesystem, not
+Splash, enforces those limits after launch. The host must prevent a privileged
+quota administrator from raising, disabling, or retagging the project while
+the worker is active.
+Project quotas do not constrain process memory, device access, network,
+execution, data outside that project, adapter effects, or non-Linux targets.
+Its separate endpoint-bound secret broker is not a general credential or
+worker-secret delivery mechanism. Protocol v5 can
 layer an exact ordinary-call request over its private pipes only for reviewed
 cancellable adapters. Its optional strict allowlist is a target-specific
 syscall boundary, not a replacement for those missing controls. The optional

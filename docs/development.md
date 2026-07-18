@@ -26,6 +26,23 @@ check compiles the explicit unsupported-platform path and prevents Linux-only
 runner dependencies from leaking into non-Linux builds; it does not provide a
 Windows containment backend.
 
+To verify the positive Linux project-quota path, first provision one directory
+on a filesystem with generic project quotas: assign a nonzero project ID, set
+the inheritance bit, and configure nonzero hard byte and inode limits. Then run
+the ignored integration test with that root and its installed hard limits:
+
+```sh
+SPLASH_PROJECT_QUOTA_TEST_ROOT=/srv/splash/quota-test \
+SPLASH_PROJECT_QUOTA_TEST_ID=42 \
+SPLASH_PROJECT_QUOTA_TEST_MAXIMUM_BYTES=268435456 \
+SPLASH_PROJECT_QUOTA_TEST_MAXIMUM_INODES=16384 \
+cargo test --locked -p splash-sandbox --test linux_project_quota -- --ignored
+```
+
+The test only reads and validates quota state; it never enables, changes, or
+disables quota enforcement. It must fail rather than be skipped when that
+explicit host-provisioned fixture is invalid.
+
 The Makepad compatibility import is deliberately outside the workspace lint
 scope. Verify it explicitly after an upstream import or vendor patch:
 
@@ -325,14 +342,16 @@ The target collects the VM after each case and never installs an adapter or
 capability. Its reviewed `.splash` seeds cover a cooperative budget yield and a
 tight instruction limit. `bubblewrap_policy` maps at most 64 fuzz bytes onto
 only host-derived Bubblewrap and runtime paths, host-authored file-root
-registrations, private tmpfs modes, aggregate tmpfs limits, and opaque manifest
-selectors. It never calls `spawn` or launches Bubblewrap. The target asserts
-that every modeled unsafe configuration fails compilation: an unknown or
-unsupported resource, an active writable host root without explicit
-unbounded-write acknowledgement or under bounded-write mode, missing
-user-namespace lockdown for that mode, unbounded private `/tmp` where a bound
-is required, or bounded tmpfs capacity above the selected aggregate maximum.
-For a successful plan it verifies exact manifest retention, the fixed
+registrations, private tmpfs modes, aggregate tmpfs limits, aggregate Linux
+project-quota policy state, and opaque manifest selectors. It never calls
+`spawn`, launches Bubblewrap, or probes a live filesystem quota. The target
+asserts that every modeled unsafe configuration fails compilation: an unknown
+or unsupported resource, an active writable host root without explicit
+unbounded-write acknowledgement, under bounded-write mode, or under an
+aggregate project-quota policy without a verified quota binding; missing
+user-namespace lockdown for bounded-write mode; unbounded private `/tmp` where
+a bound is required; or bounded tmpfs capacity above the selected aggregate
+maximum. For a successful plan it verifies exact manifest retention, the fixed
 networkless/cleared-environment/capability-drop arguments, and selection of
 only the requested roots. Its reviewed `.seed` corpus covers ordinary,
 bounded, accepted and rejected aggregate, and unsupported-resource
