@@ -92,6 +92,11 @@
   resolve only after matching. Dynamic paths and queries are intentional data,
   not path-prefix authorization. It is API-level mediation only, not DNS
   pinning or operating-system egress containment.
+- Bounded worker-side capability secret-broker contract. A host-owned provider
+  can release a bounded zeroizing binary secret only to one exact configured
+  `(tool, secret-id)` binding whose active worker grant includes that opaque
+  `Secret` resource; generated source has no lookup or enumeration API. It is
+  not a platform credential store, secret-delivery sandbox, or OS boundary.
 - Sealed static-catalog mobile and embedded profile for app-provided local
   adapters, with no post-build registration or external-dispatch API.
 - Sealed mobile and embedded workflow facade for static local adapters, with
@@ -259,11 +264,13 @@
   persistent filesystem.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
-- An operating-system-enforced dynamic/origin-policy network boundary, a
-  general secret broker, and an audited executable policy. The exact-origin
-  catalog deliberately mediates only Splash-initiated HTTP requests and does
-  not enforce egress at the operating-system boundary; broader selectors must
-  remain denied until each can be enforced.
+- An operating-system-enforced dynamic/origin-policy network boundary,
+  target-specific credential-provider and secret-delivery backends, and an
+  audited executable policy. The exact-origin catalog deliberately mediates
+  only Splash-initiated HTTP requests and the worker secret broker deliberately
+  mediates only a reviewed adapter's host-owned resolver; neither enforces
+  egress or secret delivery at the operating-system boundary. Broader
+  selectors must remain denied until each can be enforced.
 
 ## Before a stable language release
 

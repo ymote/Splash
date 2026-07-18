@@ -55,12 +55,16 @@ pub mod durable_audits;
 #[cfg(feature = "http-endpoint-catalog")]
 pub mod http_endpoint_catalog;
 
-/// Read-only native credential-store resolver for endpoint-bound HTTPS secrets.
+/// Read-only native credential-store resolver for endpoint-bound HTTPS secrets
+/// and optional capability-bound worker secret delivery.
 ///
 /// This optional integration uses explicit native macOS, iOS, and Windows
 /// credential implementations. It never falls back to keyring-rs's
 /// process-local mock store on unsupported targets.
-#[cfg(feature = "platform-keyring-secret-resolver")]
+#[cfg(any(
+    feature = "platform-keyring-secret-resolver",
+    feature = "platform-keyring-worker-secret-provider"
+))]
 pub mod platform_keyring_secret_resolver;
 
 /// Sealed static-catalog runtime profile for mobile and embedded hosts.

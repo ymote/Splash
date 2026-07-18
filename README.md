@@ -83,6 +83,12 @@ and keeps UI support optional rather than making UI the language boundary.
   performs read-only exact credential lookup on macOS, iOS, and Windows
   without a mock fallback; this is API-level mediation, not egress containment
   or a general secret API.
+- A bounded worker-side capability secret-broker contract for reviewed Rust
+  adapters: a host-owned provider can release a zeroizing binary secret only
+  to one exact preconfigured `(tool, secret-id)` binding whose active worker
+  grant carries that same opaque `Secret` resource. It has no Splash lookup or
+  enumeration API and is not itself a platform credential store or OS secret
+  boundary.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
   policies, checkpoints, and execution, including setup-only fixed-file and
@@ -512,8 +518,9 @@ both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-
   session framing, instance-bound in-process authorization tokens, strict
   ordinary-call cancellation, and host-side invocation/result validation.
 - `splash-worker`: worker-side session runtime, explicit Rust adapter registry,
-  cancellable ordinary-invocation driver, and authenticated journal-store
-  bridge; it is not an OS sandbox or platform storage backend.
+  cancellable ordinary-invocation driver, capability-bound secret-broker
+  contract, and authenticated journal-store bridge; it is not an OS sandbox
+  or platform storage backend.
 - `splash-sandbox`: target-specific worker containment policy; its initial
   Bubblewrap backend is Linux-only and deliberately narrow, with bounded
   manifest-selected ephemeral file roots for scratch data.

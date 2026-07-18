@@ -19,6 +19,8 @@ splash-capabilities = { version = "0.1.0", path = "../crates/splash-capabilities
 splash-core = { path = "../crates/splash-core" }
 splash-protocol = { version = "0.1.0", path = "../crates/splash-protocol" }
 splash-sandbox = { version = "0.1.0", path = "../crates/splash-sandbox" }
+splash-schema = { version = "0.1.0", path = "../crates/splash-schema" }
+splash-worker = { version = "0.1.0", path = "../crates/splash-worker" }
 splash-workflow = { version = "0.1.0", path = "../crates/splash-workflow" }
 
 [workspace]
@@ -105,5 +107,11 @@ doc = false
 [[bin]]
 name = "http_origin_policy"
 path = "fuzz_targets/http_origin_policy.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "secret_broker"
+path = "fuzz_targets/secret_broker.rs"
 test = false
 doc = false

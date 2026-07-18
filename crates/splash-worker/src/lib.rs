@@ -9,6 +9,7 @@
 //! selector resolution, and durable journal storage.
 
 pub mod cancellable;
+pub mod secret_broker;
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};

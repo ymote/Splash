@@ -574,6 +574,8 @@ dependencies = [
  "splash-core",
  "splash-protocol",
  "splash-sandbox",
+ "splash-schema",
+ "splash-worker",
  "splash-workflow",
 ]
 
@@ -614,6 +616,17 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "splash-worker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "splash-protocol",
+ "splash-storage",
  "zeroize",
 ]
 

@@ -79,6 +79,15 @@ reviewed adapters against its chosen crates and exposes only their bounded data
 contracts to scripts. JSON payloads are object/array envelopes with a 32-level
 maximum nesting depth in addition to their grant byte limits.
 
+For a reviewed adapter that needs a credential, use the bounded
+[`secret_broker`](secret-broker.md) contract rather than adding a secret
+identifier to its JSON payload. `CapabilitySecretBroker` checks the exact
+host-configured `(tool, secret-id)` binding and the active
+`ResourceKind::Secret` grant before it calls a host-owned provider. The adapter
+receives bytes only inside a callback and must not return them in a worker
+result. This is a host-side authorization and lifetime boundary; it does not
+replace a platform credential store or process containment.
+
 ## Typed Rust adapters
 
 `TypedJsonWorkerAdapter` adapts a statically linked Rust function with Serde
