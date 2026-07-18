@@ -107,6 +107,22 @@ write a new trusted anchor state through the selected platform authority.
 content commitment, and fence across restart, storage rollback, and anchor
 failover.
 
+## Transactional Service Anchors
+
+`rollback_anchor_service::TrustedServiceRollbackAnchor` is a bounded
+host-owned adapter for a separately trusted transactional service. Its generic
+transport contract and optional fixed HTTPS transport are documented in
+[transactional rollback-anchor service](rollback-anchor-service.md). The
+adapter validates canonical states, bounds the exchange, rejects regressing
+responses observed during one process lifetime, and returns generic errors
+without service metadata.
+
+The optional `https-rollback-anchor` feature is a fixed HTTPS transport only.
+It does not make a generic endpoint, TLS connection, platform keyring, or
+client-side cache into an anti-rollback authority. A deployment must supply a
+service that actually persists atomic monotonic compare-and-swap state outside
+the local payload storage rollback domain.
+
 ## Fenced Writers
 
 `FencedRollbackProtectedStore` extends the rollback contract for a record that

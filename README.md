@@ -132,6 +132,10 @@ and keeps UI support optional rather than making UI the language boundary.
   rollback-protected compare-and-swap backend contract.
 - Optional SQLite payload storage paired with an explicit trusted rollback
   anchor, including durable revision and fencing commitments.
+- Bounded transactional rollback-anchor service protocol with an optional
+  fixed HTTPS transport. It rejects malformed or regressing responses and
+  disables redirects and proxies, but the separately deployed service remains
+  the rollback-resistant CAS authority.
 - Fenced authenticated worker-journal storage that binds durable worker state
   to a host-selected record, revision, and current writer lease.
 - Feature-gated authenticated in-process worker transport for app-provided
@@ -512,7 +516,9 @@ both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
-  payload adapter that requires a platform trust anchor.
+  payload adapter that requires a platform trust anchor and a bounded
+  transactional-service anchor client; neither substitutes for the deployed
+  trust authority.
 - `splash-protocol`: portable worker messages, capability attenuation, fixed
   128-grant manifest and 1,024 retained-request-identity session bounds, keyed
   session framing, instance-bound in-process authorization tokens, strict
@@ -585,6 +591,10 @@ records and safely reconciles uncertain external effects across a restart.
 
 [Authenticated storage](docs/durable-storage.md) defines the trusted durable
 record boundary used to persist those host-owned records.
+
+[Transactional rollback-anchor service](docs/rollback-anchor-service.md)
+defines the bounded client protocol for a separately trusted durable CAS
+authority.
 
 [Worker durable operations](docs/worker-operations.md) define the contained
 worker-side replay and persistence boundary for effectful operation keys.

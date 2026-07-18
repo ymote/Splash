@@ -19,6 +19,16 @@ use zeroize::Zeroize;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+pub mod rollback_anchor_service;
+
+/// Fixed HTTPS transport for a host-owned transactional rollback-anchor service.
+///
+/// This optional adapter authenticates and bounds one configured HTTPS request
+/// endpoint. The remote service, not TLS alone, remains responsible for the
+/// durable monotonic compare-and-swap guarantee required by [`RollbackAnchor`].
+#[cfg(feature = "https-rollback-anchor")]
+pub mod https_rollback_anchor;
+
 /// Read-only platform credential-store loading for host-provisioned keys.
 ///
 /// This feature supports macOS, iOS, and Windows credential stores. It does

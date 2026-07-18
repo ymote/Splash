@@ -575,6 +575,7 @@ dependencies = [
  "splash-protocol",
  "splash-sandbox",
  "splash-schema",
+ "splash-storage",
  "splash-worker",
  "splash-workflow",
 ]

@@ -20,6 +20,7 @@ splash-core = { path = "../crates/splash-core" }
 splash-protocol = { version = "0.1.0", path = "../crates/splash-protocol" }
 splash-sandbox = { version = "0.1.0", path = "../crates/splash-sandbox" }
 splash-schema = { version = "0.1.0", path = "../crates/splash-schema" }
+splash-storage = { version = "0.1.0", path = "../crates/splash-storage" }
 splash-worker = { version = "0.1.0", path = "../crates/splash-worker" }
 splash-workflow = { version = "0.1.0", path = "../crates/splash-workflow" }
 
@@ -113,5 +114,11 @@ doc = false
 [[bin]]
 name = "secret_broker"
 path = "fuzz_targets/secret_broker.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rollback_anchor_service"
+path = "fuzz_targets/rollback_anchor_service.rs"
 test = false
 doc = false
