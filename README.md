@@ -166,9 +166,10 @@ and keeps UI support optional rather than making UI the language boundary.
   acknowledges an external quota boundary, and drops every Linux capability
   before worker execution.
 - Optional Linux descriptor-pinned executable identity for the fixed
-  Bubblewrap, worker, and resource-limit-runner files, with no path-launch
-  fallback. It requires descriptor-pinned runtime roots and does not replace
-  immutable runtime ownership or an executable-path mediation policy.
+  Bubblewrap, worker, pre-exec runners, and explicit Landlock executable
+  targets, with no path-launch fallback. It requires descriptor-pinned runtime
+  roots and does not replace immutable runtime ownership or complete
+  code-execution mediation.
 - A one-shot, versioned private-pipe session bootstrap for Linux Bubblewrap
   workers that is bound to the exact manifest retained by the compiled command
   and precedes JSON worker frames without exposing the key through argv or
@@ -196,6 +197,11 @@ and keeps UI support optional rather than making UI the language boundary.
 - Optional Linux Bubblewrap seccomp profiles: a compatibility-oriented fixed
   deny set and a bounded host-selected strict syscall allowlist that kills
   unlisted syscalls. Neither mediates executable paths or capability grants.
+- Optional Linux Landlock filesystem-backed executable allowlist for exact
+  worker-visible files, installed by a fixed pre-exec runner with no
+  unsupported-kernel fallback. It is not a complete code-loading, network,
+  secret, or capability boundary and is intentionally incompatible with the
+  current strict seccomp ordering.
 - Optional Bubblewrap watchdog and generic bounded worker transport with
   host-selected per-invocation and total-session wall-clock deadlines; expiry
   or host termination poisons the session and remains indeterminate.

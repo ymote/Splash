@@ -58,6 +58,17 @@ pub const MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS: usize = 256;
 /// instruction limit even after Splash's fixed ABI and escape-surface guards.
 pub const MAX_WORKER_SECCOMP_ALLOWLIST_SYSCALLS: usize = 512;
 
+/// Maximum extra worker-visible executable paths selected for one Landlock
+/// pre-exec runner.
+///
+/// The fixed worker and optional resource-limit runner are added during policy
+/// compilation, so the complete Landlock list can contain at most 32 paths.
+pub const MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES: usize = 30;
+/// Maximum complete worker-visible executable paths installed by one Landlock
+/// pre-exec runner.
+pub const MAX_LANDLOCK_EXECUTABLE_RUNNER_EXECUTABLES: usize =
+    MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES + 2;
+
 /// Access mode for a host-selected file-root binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileRootAccess {
@@ -104,7 +115,8 @@ pub enum ExecutableSourceBinding {
     Path,
     /// On Linux, retain the Bubblewrap executable's descriptor at compilation,
     /// launch it through a private `/proc/self/fd` path, and bind retained
-    /// worker and limit-runner file descriptors over their runtime paths.
+    /// worker and reviewed pre-exec executable file descriptors over their
+    /// runtime paths.
     ///
     /// This requires [`MountSourceBinding::DescriptorPinned`] so the runtime
     /// root has the same launch-only binding. It pins the selected executable
@@ -516,6 +528,81 @@ impl ResourceLimitRunner {
     }
 }
 
+/// Fixed Linux pre-exec runner that installs a filesystem-backed Landlock
+/// executable allowlist before it starts the worker.
+///
+/// The runner receives its exact worker-visible executable paths from
+/// [`BubblewrapWorkerPolicy`] after the final mount layout is validated. It
+/// controls only filesystem-backed `execve` paths: it is not a general process
+/// execution, dynamic-loader file-read, memory-file, network, secret, or
+/// capability boundary. Hosts must include the resolved ELF loader, an
+/// interpreter, or another reviewed executable that performs its own `execve`
+/// in [`Self::add_allowed_executable`] when the inner command chain needs it,
+/// and retain a minimal, immutable runtime mount.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandlockExecutableRunner {
+    program: PathBuf,
+    additional_executables: BTreeSet<PathBuf>,
+}
+
+impl LandlockExecutableRunner {
+    /// Creates a typed configuration for the bundled
+    /// `splash-landlock-runner` or an equivalent reviewed executable.
+    ///
+    /// `program` is the worker-visible runner path. Compilation requires it to
+    /// resolve through a read-only runtime mount as a regular executable file.
+    pub fn new(program: impl Into<PathBuf>) -> Result<Self, BubblewrapPolicyError> {
+        let program = program.into();
+        validate_sandbox_path("Landlock executable runner", &program)?;
+        Ok(Self {
+            program,
+            additional_executables: BTreeSet::new(),
+        })
+    }
+
+    /// Returns the worker-visible Landlock runner executable path.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Adds one exact additional worker-visible executable path.
+    ///
+    /// The fixed worker and optional resource-limit runner are added
+    /// automatically. Use this only for an explicitly reviewed resolved ELF
+    /// loader, interpreter, or another required fixed executable; a configured
+    /// path must resolve through a read-only runtime mount as a regular
+    /// executable during policy compilation. Duplicate paths are rejected
+    /// rather than silently deduplicated so a host review sees the complete
+    /// selected policy.
+    pub fn add_allowed_executable(
+        &mut self,
+        program: impl Into<PathBuf>,
+    ) -> Result<&mut Self, BubblewrapPolicyError> {
+        let program = program.into();
+        validate_sandbox_path("Landlock allowed executable", &program)?;
+        if program == self.program {
+            return Err(BubblewrapPolicyError::LandlockAllowedExecutableMatchesRunner { program });
+        }
+        if self.additional_executables.contains(&program) {
+            return Err(BubblewrapPolicyError::DuplicateLandlockAllowedExecutable { program });
+        }
+        if self.additional_executables.len()
+            == MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES
+        {
+            return Err(BubblewrapPolicyError::TooManyLandlockAllowedExecutables {
+                maximum: MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES,
+            });
+        }
+        self.additional_executables.insert(program);
+        Ok(self)
+    }
+
+    /// Iterates additional configured executable paths in deterministic order.
+    pub fn additional_executables(&self) -> impl ExactSizeIterator<Item = &PathBuf> {
+        self.additional_executables.iter()
+    }
+}
+
 /// One trusted host path mounted read-only into a worker runtime.
 ///
 /// Runtime mounts provide the fixed worker executable and the libraries it
@@ -696,6 +783,7 @@ pub struct BubblewrapWorkerPolicy {
     user_namespace_policy: UserNamespacePolicy,
     resource_limit_runner: Option<ResourceLimitRunner>,
     resource_limit_runner_required: bool,
+    landlock_executable_runner: Option<LandlockExecutableRunner>,
     cgroup_v2_required: bool,
     seccomp_profile: WorkerSeccompProfile,
     seccomp_allowlist: Option<WorkerSeccompAllowlist>,
@@ -731,6 +819,7 @@ impl BubblewrapWorkerPolicy {
             user_namespace_policy: UserNamespacePolicy::BestEffort,
             resource_limit_runner: None,
             resource_limit_runner_required: false,
+            landlock_executable_runner: None,
             cgroup_v2_required: false,
             seccomp_profile: WorkerSeccompProfile::Disabled,
             seccomp_allowlist: None,
@@ -1036,6 +1125,36 @@ impl BubblewrapWorkerPolicy {
         self.resource_limit_runner_required
     }
 
+    /// Runs the fixed worker through a Linux Landlock executable-policy runner.
+    ///
+    /// The selected runner installs a bounded filesystem-backed allowlist for
+    /// the fixed worker, an optional resource-limit runner, and explicitly
+    /// configured additional executable paths before it starts the inner
+    /// command. Compilation rejects it on non-Linux targets or when a selected
+    /// executable is missing from a read-only runtime mount; launch never
+    /// falls back to an unrestricted execution path.
+    ///
+    /// This does not control `memfd` or other pathless execution mechanisms,
+    /// dynamic-loader file reads, networking, secrets, or arbitrary runtime
+    /// files. It is a defense-in-depth executable-path boundary, not general
+    /// process containment. It cannot
+    /// currently be combined with [`WorkerSeccompProfile::StrictAllowlist`]:
+    /// Bubblewrap applies that filter before this runner can install Landlock.
+    /// Compilation rejects the combination until Splash has a separate,
+    /// staged pre-exec seccomp policy.
+    pub fn set_landlock_executable_runner(
+        &mut self,
+        runner: LandlockExecutableRunner,
+    ) -> &mut Self {
+        self.landlock_executable_runner = Some(runner);
+        self
+    }
+
+    /// Returns the selected Landlock executable-policy runner, if any.
+    pub fn landlock_executable_runner(&self) -> Option<&LandlockExecutableRunner> {
+        self.landlock_executable_runner.as_ref()
+    }
+
     /// Requires this policy to launch through [`CgroupV2Policy`].
     ///
     /// A command compiled with this option rejects [`BubblewrapCommand::spawn`]
@@ -1111,6 +1230,14 @@ impl BubblewrapWorkerPolicy {
             .map_err(BubblewrapPolicyError::Protocol)?;
         ensure_mount_source_binding_supported(self.mount_source_binding)?;
         ensure_executable_source_binding_supported(self.executable_source_binding)?;
+        if self.landlock_executable_runner.is_some() {
+            ensure_landlock_executable_runner_supported()?;
+            if self.seccomp_profile == WorkerSeccompProfile::StrictAllowlist {
+                return Err(
+                    BubblewrapPolicyError::LandlockExecutableRunnerConflictsWithStrictSeccomp,
+                );
+            }
+        }
         if self.executable_source_binding == ExecutableSourceBinding::DescriptorPinned
             && self.mount_source_binding != MountSourceBinding::DescriptorPinned
         {
@@ -1220,6 +1347,82 @@ impl BubblewrapWorkerPolicy {
         } else {
             None
         };
+        let landlock_executable_runner_source = if let Some(runner) =
+            &self.landlock_executable_runner
+        {
+            if runner.program == self.worker_program {
+                return Err(
+                    BubblewrapPolicyError::LandlockExecutableRunnerMatchesWorker {
+                        program: runner.program.clone(),
+                    },
+                );
+            }
+            if self
+                .resource_limit_runner
+                .as_ref()
+                .is_some_and(|resource_runner| resource_runner.program == runner.program)
+            {
+                return Err(
+                    BubblewrapPolicyError::LandlockExecutableRunnerMatchesResourceLimitRunner {
+                        program: runner.program.clone(),
+                    },
+                );
+            }
+            Some(validate_runtime_program(
+                &mounts,
+                &runner.program,
+                |program| BubblewrapPolicyError::LandlockExecutableRunnerNotMounted { program },
+                |program| BubblewrapPolicyError::LandlockExecutableRunnerNotExecutable { program },
+                "Landlock executable runner source",
+            )?)
+        } else {
+            None
+        };
+        let (landlock_allowed_executables, landlock_additional_executable_sources) =
+            if let Some(runner) = &self.landlock_executable_runner {
+                let mut allowed = BTreeSet::new();
+                let mut additional_sources = Vec::new();
+                allowed.insert(self.worker_program.clone());
+                if let Some(resource_runner) = &self.resource_limit_runner {
+                    allowed.insert(resource_runner.program.clone());
+                }
+                for program in runner.additional_executables() {
+                    if program == &runner.program {
+                        return Err(
+                            BubblewrapPolicyError::LandlockAllowedExecutableMatchesRunner {
+                                program: program.clone(),
+                            },
+                        );
+                    }
+                    if !allowed.insert(program.clone()) {
+                        return Err(
+                            BubblewrapPolicyError::LandlockAllowedExecutableMatchesFixedProgram {
+                                program: program.clone(),
+                            },
+                        );
+                    }
+                    let source = validate_runtime_program(
+                        &mounts,
+                        program,
+                        |program| BubblewrapPolicyError::LandlockAllowedExecutableNotMounted {
+                            program,
+                        },
+                        |program| BubblewrapPolicyError::LandlockAllowedExecutableNotExecutable {
+                            program,
+                        },
+                        "Landlock allowed executable source",
+                    )?;
+                    additional_sources.push((program.clone(), source));
+                }
+                if allowed.len() > MAX_LANDLOCK_EXECUTABLE_RUNNER_EXECUTABLES {
+                    return Err(BubblewrapPolicyError::TooManyLandlockAllowedExecutables {
+                        maximum: MAX_LANDLOCK_EXECUTABLE_RUNNER_EXECUTABLES,
+                    });
+                }
+                (Some(allowed), additional_sources)
+            } else {
+                (None, Vec::new())
+            };
         let mut executable_overlays = Vec::new();
         if self.executable_source_binding == ExecutableSourceBinding::DescriptorPinned {
             if !worker_program_source.is_descriptor_pinned_file {
@@ -1237,6 +1440,27 @@ impl BubblewrapWorkerPolicy {
                         "resource limit runner source",
                         runner_source.source,
                         runner.program.clone(),
+                    )?);
+                }
+            }
+            if let (Some(runner), Some(runner_source)) = (
+                &self.landlock_executable_runner,
+                landlock_executable_runner_source,
+            ) {
+                if !runner_source.is_descriptor_pinned_file {
+                    executable_overlays.push(compile_pinned_program_overlay(
+                        "Landlock executable runner source",
+                        runner_source.source,
+                        runner.program.clone(),
+                    )?);
+                }
+            }
+            for (program, source) in landlock_additional_executable_sources {
+                if !source.is_descriptor_pinned_file {
+                    executable_overlays.push(compile_pinned_program_overlay(
+                        "Landlock allowed executable source",
+                        source.source,
+                        program,
                     )?);
                 }
             }
@@ -1280,6 +1504,17 @@ impl BubblewrapWorkerPolicy {
             }
         }
         mount_suffix_arguments.push(OsString::from("--"));
+        if let (Some(runner), Some(allowed_executables)) = (
+            &self.landlock_executable_runner,
+            &landlock_allowed_executables,
+        ) {
+            mount_suffix_arguments.push(runner.program.clone().into_os_string());
+            for program in allowed_executables {
+                mount_suffix_arguments.push(OsString::from("--allow-exec"));
+                mount_suffix_arguments.push(program.clone().into_os_string());
+            }
+            mount_suffix_arguments.push(OsString::from("--"));
+        }
         if let Some(runner) = &self.resource_limit_runner {
             mount_suffix_arguments.push(runner.program.clone().into_os_string());
             runner
@@ -2779,6 +3014,38 @@ pub enum BubblewrapPolicyError {
     DescriptorPinnedExecutablesRequirePinnedMountSources,
     EmptyResourceLimits,
     ResourceLimitRunnerRequired,
+    DuplicateLandlockAllowedExecutable {
+        program: PathBuf,
+    },
+    TooManyLandlockAllowedExecutables {
+        maximum: usize,
+    },
+    LandlockExecutableRunnerUnsupportedPlatform,
+    LandlockExecutableRunnerConflictsWithStrictSeccomp,
+    LandlockExecutableRunnerMatchesWorker {
+        program: PathBuf,
+    },
+    LandlockExecutableRunnerMatchesResourceLimitRunner {
+        program: PathBuf,
+    },
+    LandlockAllowedExecutableMatchesRunner {
+        program: PathBuf,
+    },
+    LandlockAllowedExecutableMatchesFixedProgram {
+        program: PathBuf,
+    },
+    LandlockExecutableRunnerNotMounted {
+        program: PathBuf,
+    },
+    LandlockExecutableRunnerNotExecutable {
+        program: PathBuf,
+    },
+    LandlockAllowedExecutableNotMounted {
+        program: PathBuf,
+    },
+    LandlockAllowedExecutableNotExecutable {
+        program: PathBuf,
+    },
     MissingSeccompAllowlist,
     MissingSeccompExecve,
     SeccompAllowlistConflictsWithHardening {
@@ -2909,6 +3176,56 @@ impl Display for BubblewrapPolicyError {
             Self::ResourceLimitRunnerRequired => {
                 formatter.write_str("worker policy requires a typed resource-limit runner")
             }
+            Self::DuplicateLandlockAllowedExecutable { program } => write!(
+                formatter,
+                "Landlock executable runner repeats allowed executable {}",
+                program.display()
+            ),
+            Self::TooManyLandlockAllowedExecutables { maximum } => write!(
+                formatter,
+                "Landlock executable runner exceeds the {maximum}-executable limit"
+            ),
+            Self::LandlockExecutableRunnerUnsupportedPlatform => formatter
+                .write_str("Landlock executable runner is supported only on Linux"),
+            Self::LandlockExecutableRunnerConflictsWithStrictSeccomp => formatter.write_str(
+                "Landlock executable runner cannot use Bubblewrap's strict seccomp profile before staged pre-exec filtering is available",
+            ),
+            Self::LandlockExecutableRunnerMatchesWorker { program } => write!(
+                formatter,
+                "Landlock executable runner {program:?} must not be the worker program"
+            ),
+            Self::LandlockExecutableRunnerMatchesResourceLimitRunner { program } => write!(
+                formatter,
+                "Landlock executable runner {program:?} must not be the resource-limit runner"
+            ),
+            Self::LandlockAllowedExecutableMatchesRunner { program } => write!(
+                formatter,
+                "Landlock allowed executable {program:?} must not be the Landlock runner"
+            ),
+            Self::LandlockAllowedExecutableMatchesFixedProgram { program } => write!(
+                formatter,
+                "Landlock allowed executable {program:?} is already selected automatically"
+            ),
+            Self::LandlockExecutableRunnerNotMounted { program } => write!(
+                formatter,
+                "Landlock executable runner {} is not visible through a read-only runtime mount",
+                program.display()
+            ),
+            Self::LandlockExecutableRunnerNotExecutable { program } => write!(
+                formatter,
+                "Landlock executable runner {} must be a regular executable file",
+                program.display()
+            ),
+            Self::LandlockAllowedExecutableNotMounted { program } => write!(
+                formatter,
+                "Landlock allowed executable {} is not visible through a read-only runtime mount",
+                program.display()
+            ),
+            Self::LandlockAllowedExecutableNotExecutable { program } => write!(
+                formatter,
+                "Landlock allowed executable {} must be a regular executable file",
+                program.display()
+            ),
             Self::MissingSeccompAllowlist => formatter.write_str(
                 "strict seccomp profile requires a host-selected syscall allowlist",
             ),
@@ -3039,6 +3356,18 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::DescriptorPinnedExecutablesRequirePinnedMountSources
             | Self::EmptyResourceLimits
             | Self::ResourceLimitRunnerRequired
+            | Self::DuplicateLandlockAllowedExecutable { .. }
+            | Self::TooManyLandlockAllowedExecutables { .. }
+            | Self::LandlockExecutableRunnerUnsupportedPlatform
+            | Self::LandlockExecutableRunnerConflictsWithStrictSeccomp
+            | Self::LandlockExecutableRunnerMatchesWorker { .. }
+            | Self::LandlockExecutableRunnerMatchesResourceLimitRunner { .. }
+            | Self::LandlockAllowedExecutableMatchesRunner { .. }
+            | Self::LandlockAllowedExecutableMatchesFixedProgram { .. }
+            | Self::LandlockExecutableRunnerNotMounted { .. }
+            | Self::LandlockExecutableRunnerNotExecutable { .. }
+            | Self::LandlockAllowedExecutableNotMounted { .. }
+            | Self::LandlockAllowedExecutableNotExecutable { .. }
             | Self::MissingSeccompAllowlist
             | Self::MissingSeccompExecve
             | Self::SeccompAllowlistConflictsWithHardening { .. }
@@ -3929,6 +4258,11 @@ fn ensure_executable_source_binding_supported(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_landlock_executable_runner_supported() -> Result<(), BubblewrapPolicyError> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn ensure_executable_source_binding_supported(
     binding: ExecutableSourceBinding,
@@ -3947,6 +4281,11 @@ fn ensure_mount_source_binding_supported(
         return Err(BubblewrapPolicyError::DescriptorPinnedMountsUnsupportedPlatform);
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_landlock_executable_runner_supported() -> Result<(), BubblewrapPolicyError> {
+    Err(BubblewrapPolicyError::LandlockExecutableRunnerUnsupportedPlatform)
 }
 
 fn canonical_existing_path(
@@ -4682,6 +5021,11 @@ mod tests {
         ResourceLimitRunner::new("/opt/splash/limit-runner", resource_limits()).unwrap()
     }
 
+    fn landlock_executable_runner(root: &TestDirectory) -> LandlockExecutableRunner {
+        create_executable(&root.path().join("runtime/landlock-runner"));
+        LandlockExecutableRunner::new("/opt/splash/landlock-runner").unwrap()
+    }
+
     fn binding(
         root: &TestDirectory,
         source_name: &str,
@@ -4921,6 +5265,36 @@ mod tests {
             })
             .unwrap();
         assert!(runtime_mount_index < worker_overlay_index);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_pinned_executables_overlay_landlock_runner_and_allowed_targets() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.pin_mount_sources();
+        policy.pin_executable_sources();
+        create_executable(&root.path().join("runtime/interpreter"));
+        let mut runner = landlock_executable_runner(&root);
+        runner
+            .add_allowed_executable("/opt/splash/interpreter")
+            .unwrap();
+        policy.set_landlock_executable_runner(runner);
+
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+
+        assert_eq!(plan.executable_overlays.len(), 3);
+        for program in [
+            "/opt/splash/worker",
+            "/opt/splash/landlock-runner",
+            "/opt/splash/interpreter",
+        ] {
+            assert!(has_arguments(
+                &arguments,
+                &["--ro-bind-fd", PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER, program,]
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5697,6 +6071,210 @@ print("seccomp-active")
             ]
         ));
         assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_executable_runner_precedes_fixed_inner_runners() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root).with_worker_arguments(["--json-lines"]);
+        policy.set_resource_limit_runner(resource_limit_runner(&root));
+        create_executable(&root.path().join("runtime/interpreter"));
+        let mut runner = landlock_executable_runner(&root);
+        runner
+            .add_allowed_executable("/opt/splash/interpreter")
+            .unwrap();
+        policy.set_landlock_executable_runner(runner);
+
+        let plan = policy.compile(&manifest([])).unwrap();
+        let arguments = argument_strings(&plan);
+
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--",
+                "/opt/splash/landlock-runner",
+                "--allow-exec",
+                "/opt/splash/interpreter",
+                "--allow-exec",
+                "/opt/splash/limit-runner",
+                "--allow-exec",
+                "/opt/splash/worker",
+                "--",
+                "/opt/splash/limit-runner",
+                "--cpu-seconds",
+                "30",
+                "--address-space-bytes",
+                "8388608",
+                "--process-count",
+                "4",
+                "--open-files",
+                "16",
+                "--file-size-bytes",
+                "65536",
+                "--",
+                "/opt/splash/worker",
+                "--json-lines",
+            ]
+        ));
+        assert!(!has_arguments(
+            &arguments,
+            &["--allow-exec", "/opt/splash/landlock-runner"]
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_executable_runner_rejects_invalid_runtime_targets() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_landlock_executable_runner(
+            LandlockExecutableRunner::new("/opt/other/landlock-runner").unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerNotMounted { program })
+                if program == Path::new("/opt/other/landlock-runner")
+        ));
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_landlock_executable_runner(
+            LandlockExecutableRunner::new("/opt/splash/worker").unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerMatchesWorker { program })
+                if program == Path::new("/opt/splash/worker")
+        ));
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_resource_limit_runner(resource_limit_runner(&root));
+        policy.set_landlock_executable_runner(
+            LandlockExecutableRunner::new("/opt/splash/limit-runner").unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerMatchesResourceLimitRunner {
+                program
+            }) if program == Path::new("/opt/splash/limit-runner")
+        ));
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        File::create(root.path().join("runtime/not-executable")).unwrap();
+        policy.set_landlock_executable_runner(
+            LandlockExecutableRunner::new("/opt/splash/not-executable").unwrap(),
+        );
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerNotExecutable { program })
+                if program == Path::new("/opt/splash/not-executable")
+        ));
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        let mut runner = landlock_executable_runner(&root);
+        runner
+            .add_allowed_executable("/opt/other/interpreter")
+            .unwrap();
+        policy.set_landlock_executable_runner(runner);
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockAllowedExecutableNotMounted { program })
+                if program == Path::new("/opt/other/interpreter")
+        ));
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        File::create(root.path().join("runtime/not-executable")).unwrap();
+        let mut runner = landlock_executable_runner(&root);
+        runner
+            .add_allowed_executable("/opt/splash/not-executable")
+            .unwrap();
+        policy.set_landlock_executable_runner(runner);
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockAllowedExecutableNotExecutable { program })
+                if program == Path::new("/opt/splash/not-executable")
+        ));
+    }
+
+    #[test]
+    fn landlock_executable_runner_rejects_duplicate_and_automatic_targets() {
+        let mut runner = LandlockExecutableRunner::new("/opt/splash/landlock-runner").unwrap();
+        assert!(matches!(
+            runner.add_allowed_executable("/opt/splash/landlock-runner"),
+            Err(BubblewrapPolicyError::LandlockAllowedExecutableMatchesRunner { program })
+                if program == Path::new("/opt/splash/landlock-runner")
+        ));
+        runner
+            .add_allowed_executable("/opt/splash/interpreter")
+            .unwrap();
+        assert!(matches!(
+            runner.add_allowed_executable("/opt/splash/interpreter"),
+            Err(BubblewrapPolicyError::DuplicateLandlockAllowedExecutable { program })
+                if program == Path::new("/opt/splash/interpreter")
+        ));
+
+        let mut bounded = LandlockExecutableRunner::new("/opt/splash/landlock-runner").unwrap();
+        for index in 0..MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES {
+            bounded
+                .add_allowed_executable(format!("/opt/splash/program-{index}"))
+                .unwrap();
+        }
+        assert!(matches!(
+            bounded.add_allowed_executable("/opt/splash/too-many"),
+            Err(BubblewrapPolicyError::TooManyLandlockAllowedExecutables { maximum })
+                if maximum == MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES
+        ));
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        let mut runner = landlock_executable_runner(&root);
+        runner.add_allowed_executable("/opt/splash/worker").unwrap();
+        policy.set_landlock_executable_runner(runner);
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockAllowedExecutableMatchesFixedProgram { program })
+                if program == Path::new("/opt/splash/worker")
+        ));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerUnsupportedPlatform)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_executable_runner_rejects_strict_seccomp_until_staged_filtering_exists() {
+        use linux_raw_sys::general;
+
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_landlock_executable_runner(landlock_executable_runner(&root));
+        policy.set_seccomp_allowlist(WorkerSeccompAllowlist::new([general::__NR_execve]).unwrap());
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerConflictsWithStrictSeccomp)
+        ));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn landlock_executable_runner_fails_closed_off_linux() {
+        let root = TestDirectory::new();
+        let mut policy = base_policy(&root);
+        policy.set_landlock_executable_runner(landlock_executable_runner(&root));
+
+        assert!(matches!(
+            policy.compile(&manifest([])),
+            Err(BubblewrapPolicyError::LandlockExecutableRunnerUnsupportedPlatform)
+        ));
     }
 
     #[test]

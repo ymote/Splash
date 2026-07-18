@@ -422,7 +422,32 @@ without Bubblewrap's required final `execve`; the host must additionally cover
 any fixed pre-exec runner and the exact worker runtime. It is a syscall boundary
 only: because execution must normally remain available, it does not mediate an
 executable path, a network origin, device access, secrets, or capability
-grants.
+grants. A policy selecting `LandlockExecutableRunner` currently rejects this
+strict profile: Bubblewrap would attach it before the Landlock runner could
+create its required ruleset. Do not try to bypass that compile-time rejection
+by launching a worker directly; a staged pre-exec syscall policy is required.
+
+`LandlockExecutableRunner` is an optional Linux-only defense-in-depth boundary
+for exact filesystem-backed executable targets. The host configures a distinct
+read-only runtime runner path; Splash adds the fixed worker, an optional limit
+runner, and bounded explicit additional paths, then the bundled
+`splash-landlock-runner` installs `LANDLOCK_ACCESS_FS_EXECUTE` rules with a
+hard Landlock compatibility requirement before it starts the inner command. It
+rejects unsupported platforms at compilation and unsupported or incomplete
+kernel enforcement at startup rather than falling back to direct worker
+execution. A dynamically linked inner worker or resource-limit runner also
+needs its resolved regular ELF loader listed as an explicit target. Its rules
+are inherited by worker descendants. In descriptor-pinned mode Splash also overlays the Landlock runner
+and every explicit allowed target from retained descriptors, preventing path
+replacement after compilation from changing those selected files.
+
+Do not describe this as a complete executable or code-loading sandbox. It does
+not control dynamic-loader reads, shared libraries, plugins, bytecode engines,
+JITs, networking, device access, secrets, capability grants, special
+filesystems, or already-open descriptors. An allowed interpreter can run code
+it reads. Treat the [Linux Landlock documentation](https://docs.kernel.org/userspace-api/landlock.html)
+as the source of kernel semantics and layer immutable runtime ownership,
+mount/descriptor isolation, cgroups, and a suitable syscall policy around it.
 
 An optional host-configured `splash-limit-runner` can execute the fixed worker
 only after applying selected Linux rlimits and disabling core dumps. The runner,
@@ -504,9 +529,9 @@ effect rather than infer that process termination cancelled or rolled it back.
 
 Bubblewrap is a low-level sandbox constructor, not a complete security policy.
 This backend has no aggregate quota for persistent host-backed storage, no
-device quota, per-origin network proxy, D-Bus mediation, executable-path
-policy, direct secret-selector handling, or universal cancellation for
-arbitrary or durable adapters. Its separate endpoint-bound secret broker is
+device quota, per-origin network proxy, D-Bus mediation, complete executable or
+code-loading policy, direct secret-selector handling, or universal cancellation
+for arbitrary or durable adapters. Its separate endpoint-bound secret broker is
 not a general credential or worker-secret delivery mechanism. Protocol v5 can
 layer an exact ordinary-call request over its private pipes only for reviewed
 cancellable adapters. Its optional strict allowlist is a target-specific

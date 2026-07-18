@@ -12,10 +12,19 @@ cargo check --locked -p splash-sandbox --tests --target x86_64-pc-windows-gnu
 ```
 
 The Linux target checks compile the real Bubblewrap and cgroup paths on the two
-architectures supported by CI. The Windows check compiles the explicit
-unsupported-platform path and prevents Linux-only runner dependencies from
-leaking into non-Linux builds; it does not provide a Windows containment
-backend.
+architectures supported by CI, including the Landlock pre-exec runner. On a
+Linux host with a Landlock-enabled kernel, also run:
+
+```sh
+cargo test --locked -p splash-sandbox --test landlock_runner
+```
+
+That integration test verifies that an allowlisted fixed runner cannot execute
+an unlisted target. It treats a kernel without the hard-required Landlock API
+as an unavailable runtime rather than a passing enforcement result. The Windows
+check compiles the explicit unsupported-platform path and prevents Linux-only
+runner dependencies from leaking into non-Linux builds; it does not provide a
+Windows containment backend.
 
 The Makepad compatibility import is deliberately outside the workspace lint
 scope. Verify it explicitly after an upstream import or vendor patch:

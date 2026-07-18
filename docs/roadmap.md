@@ -202,11 +202,11 @@
   descendants, runtime contents, or the Bubblewrap executable.
 - Optional Linux descriptor-pinned fixed executable identity. Together with
   descriptor-pinned runtime roots, Bubblewrap is executed through its retained
-  launch-only descriptor; fixed worker and resource-limit-runner files are
-  retained and overlaid at their exact worker paths; and a cgroup runner is
-  pinned immediately after fresh cgroup preparation. It does not freeze an
-  interpreter, dynamic loader, shared libraries, runtime contents, or provide
-  general executable-path mediation.
+  launch-only descriptor; fixed worker, resource-limit-runner, Landlock runner,
+  and explicit Landlock executable targets are retained and overlaid at their
+  exact worker paths; and a cgroup runner is pinned immediately after fresh
+  cgroup preparation. It does not freeze shared libraries, runtime contents, or
+  provide complete code-loading mediation.
 - Versioned private-pipe session bootstrap for a compiled Linux Bubblewrap
   worker. It checks the manifest session before launch and never places the
   host-generated key in command-line arguments or environment variables.
@@ -245,6 +245,13 @@
 - Optional Linux Bubblewrap `DenyKnownEscapeSurface` seccomp hardening profile
   with trusted cBPF transport, ABI/x32 checks, and a fixed default-allow deny
   set. It is defense in depth, not a worker-specific syscall allowlist.
+- Optional Linux Landlock filesystem-backed executable allowlist runner. It
+  hard-requires a fully enforced `LANDLOCK_ACCESS_FS_EXECUTE` ruleset for exact
+  host-reviewed worker-visible files, has no unsupported-kernel or direct-worker
+  fallback, and inherits to worker descendants. It does not control dynamic
+  loader reads, plugin/JIT code loading, special filesystems, networking,
+  credentials, or capability grants, and compilation rejects its current
+  ordering conflict with strict seccomp.
 - Optional host-selected Linux Bubblewrap strict seccomp allowlist with a
   bounded deterministic cBPF program, fixed escape-surface guards, and
   default-kill behavior for every unlisted syscall. It remains a
@@ -277,11 +284,12 @@
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - An operating-system-enforced dynamic/origin-policy network boundary,
-  target-specific credential-provider and secret-delivery backends, and an
-  audited executable policy. The exact-origin catalog deliberately mediates
-  only Splash-initiated HTTP requests and the worker secret broker deliberately
-  mediates only a reviewed adapter's host-owned resolver; neither enforces
-  egress or secret delivery at the operating-system boundary. Broader
+  target-specific credential-provider and secret-delivery backends, a staged
+  pre-exec seccomp policy, and a complete audited code-execution policy beyond
+  Landlock's filesystem-execute action. The exact-origin catalog deliberately
+  mediates only Splash-initiated HTTP requests and the worker secret broker
+  deliberately mediates only a reviewed adapter's host-owned resolver; neither
+  enforces egress or secret delivery at the operating-system boundary. Broader
   selectors must remain denied until each can be enforced.
 
 ## Before a stable language release

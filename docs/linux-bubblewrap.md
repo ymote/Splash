@@ -27,7 +27,8 @@ provide it.
 use splash_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, EphemeralFileRoot, ExecutableSourceBinding,
     FileRootAccess, FileRootBinding, MountSourceBinding, ReadOnlyMount,
-    ResourceLimitRunner, WorkerResourceLimits, WorkerSeccompProfile,
+    LandlockExecutableRunner, ResourceLimitRunner, WorkerResourceLimits,
+    WorkerSeccompProfile,
 };
 use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
 
@@ -71,6 +72,16 @@ policy.set_resource_limit_runner(ResourceLimitRunner::new(
 )?);
 policy.require_resource_limit_runner();
 
+let mut executable_runner =
+    LandlockExecutableRunner::new("/opt/splash/bin/splash-landlock-runner")?;
+// The actual resolved regular ELF loader is deployment and ABI specific. Add
+// it for any dynamically linked inner worker or resource-limit runner, plus
+// any fixed intermediary that will itself call execve.
+let deployed_elf_loader = "/opt/splash/lib/ld-linux-aarch64.so.1";
+executable_runner.add_allowed_executable(deployed_elf_loader)?;
+executable_runner.add_allowed_executable("/opt/splash/bin/reviewed-interpreter")?;
+policy.set_landlock_executable_runner(executable_runner);
+
 let command = policy.compile(&attenuated_manifest)?;
 // `trusted_session_key` comes from the host's CSPRNG/key authority.
 let host_authenticator = SessionAuthenticator::new(
@@ -109,23 +120,24 @@ the fixed launch chain. It requires `MountSourceBinding::DescriptorPinned`.
 At `compile`, Splash retains the host Bubblewrap executable descriptor and
 launches it through a fresh private `/proc/self/fd/N` path rather than the
 configured pathname. It also retains each fixed worker and optional
-`splash-limit-runner` file descriptor, then inserts a read-only
-`--ro-bind-fd` file overlay at the exact worker-visible path after the runtime
-root mount. In cgroup-v2 mode, Splash additionally opens and pins the selected
-cgroup runner immediately after preparing the fresh child cgroup, and the
-runner preserves the retained Bubblewrap descriptor while it `exec`s it.
-Replacing those selected executable paths after their descriptors are retained
-cannot substitute a different Bubblewrap, worker, limit runner, or prepared
-cgroup runner. Unsupported descriptor bind or `/proc/self/fd` execution fails
-the launch; there is no path-based retry.
+`splash-limit-runner`, `splash-landlock-runner`, and each explicit Landlock
+allowlist target file descriptor, then inserts a read-only `--ro-bind-fd` file
+overlay at each exact worker-visible path after the runtime root mount. In
+cgroup-v2 mode, Splash additionally opens and pins the selected cgroup runner
+immediately after preparing the fresh child cgroup, and the runner preserves
+the retained Bubblewrap descriptor while it `exec`s it. Replacing those selected
+executable paths after their descriptors are retained cannot substitute a
+different Bubblewrap, worker, pre-exec runner, explicit executable target, or
+prepared cgroup runner. Unsupported descriptor bind or `/proc/self/fd`
+execution fails the launch; there is no path-based retry.
 
-This pins only the selected executable files. It does not pin an interpreter,
-the dynamic loader, shared libraries, configuration, or any other mutable
-runtime descendant. It is not an executable-path policy: a compromised worker
-can still chain to another executable deliberately exposed by its runtime
-mounts, and a worker that can write an executable into an exposed writable
-mount can still invoke it. Hosts must keep runtime trees minimal and immutable
-when that stronger property matters.
+This pins only the selected executable files. It does not pin shared libraries,
+configuration, or any other mutable runtime descendant. It is not complete
+code-loading or executable-path mediation: without the optional Landlock policy,
+a compromised worker can still chain to another executable deliberately exposed
+by its runtime mounts, and a worker that can write an executable into an
+exposed writable mount can still invoke it. Hosts must keep runtime trees
+minimal and immutable when that stronger property matters.
 
 `spawn_with_bootstrap` binds the bootstrap session ID to the manifest used at
 `compile` before it launches Bubblewrap. It then writes and flushes a versioned,
@@ -486,6 +498,68 @@ no-host-network namespace. Bubblewrap requires `no_new_privs` before it
 installs the filter, so a worker cannot weaken it by adding another seccomp
 program; a worker may still add a stricter filter of its own.
 
+### Landlock Filesystem-Backed Executable Allowlist
+
+`LandlockExecutableRunner` is an optional Linux-only pre-exec boundary for a
+fixed worker launch chain. Build the bundled runner on the target platform:
+
+```sh
+cargo build --locked -p splash-sandbox --bin splash-landlock-runner --release
+```
+
+Deploy it in a read-only runtime mount at a path distinct from the worker and
+any `splash-limit-runner`. At compilation, Splash requires the runner and every
+explicit additional target to be a regular executable through that same
+read-only mount. The final command starts `splash-landlock-runner` with a
+deterministic list containing the fixed worker, an optional resource-limit
+runner, and any host-configured additions. For each dynamically linked inner
+worker or resource-limit runner, the host must also add its resolved regular
+ELF loader path from the deployed runtime; the loader itself is executed during
+that inner kernel launch chain.
+Do not add a symlink path: use the resolved regular file that the read-only
+runtime mount exposes. Splash source, tool payloads, selectors, manifests, and
+worker input cannot add a path or choose the inner command. The runner repeats
+the final-component regular-file and executable checks through an
+`O_PATH | O_NOFOLLOW` descriptor before it creates rules.
+
+The runner handles only `LANDLOCK_ACCESS_FS_EXECUTE` and adds one exact
+filesystem object rule per allowed program. It requests Landlock as a hard
+requirement, checks that the resulting ruleset is fully enforced with
+`no_new_privs`, marks nonstandard inherited descriptors close-on-exec, then
+replaces itself only with an allowed inner command. Unsupported or disabled
+Landlock, an incomplete ruleset, a malformed invocation, or a setup failure
+stops worker startup; there is no direct-worker fallback. Landlock rules are
+inherited by descendants. The [Linux Landlock API documentation](https://docs.kernel.org/userspace-api/landlock.html)
+defines this filesystem `EXECUTE` action and its kernel limitations.
+
+With `ExecutableSourceBinding::DescriptorPinned`, Splash also overlays the
+Landlock runner and every explicit allowed target from retained descriptors,
+not merely the fixed worker. This prevents a host-path replacement after policy
+compilation from changing the selected object. It does not freeze libraries or
+other runtime files below a pinned directory, so production deployments still
+need immutable runtime ownership.
+
+This is deliberately narrower than a complete code-execution policy:
+
+- It controls the Landlock filesystem-execute action, not arbitrary process
+  behavior, networking, origin egress, devices, capability grants, or secret
+  delivery.
+- The resolved dynamic loader needs an explicit execute rule for each
+  dynamically linked inner worker or resource-limit runner, but this policy
+  does not restrict its library reads. It also does not restrict reads used by
+  plugins, bytecode engines, or JITs. An allowed interpreter can execute code
+  it reads, and an allowed binary can load code as data. Keep those inputs out
+  of the runtime mount or control them with separate policies.
+- It must not be treated as complete mediation for special filesystems,
+  pre-opened descriptors, or future execution mechanisms; layer mount,
+  descriptor, cgroup, and syscall controls appropriate to the deployment.
+- It cannot currently be combined with
+  `WorkerSeccompProfile::StrictAllowlist`. Bubblewrap attaches that filter
+  before this runner runs, while the runner needs Landlock setup syscalls and a
+  separate pre-exec syscall policy does not exist yet. Compilation rejects the
+  combination. `DenyKnownEscapeSurface` remains compatible because it is
+  default-allow outside its fixed escape-surface deny set.
+
 ### Strict Worker Syscall Allowlist
 
 `WorkerSeccompAllowlist` is the independent strict profile for a particular
@@ -509,12 +583,13 @@ the host lists ordinary `clone` or `ioctl`.
 
 A strict list must cover the entire post-filter execution path: Bubblewrap's
 fixed `execve`, any selected `splash-limit-runner`, the dynamic loader, and the
-exact fixed worker and libraries. Build and test it per target ABI with the
-same immutable runtime mounts deployed to production. Splash does not infer a
-list from source, profile a worker at runtime, or widen a list after launch.
-Policy compilation explicitly rejects a list without Bubblewrap's required
-`execve`; any other incomplete list stops the worker rather than weakening
-containment.
+exact fixed worker and libraries. It cannot currently select a
+`splash-landlock-runner`; policy compilation rejects that ordering conflict.
+Build and test it per target ABI with the same immutable runtime mounts deployed
+to production. Splash does not infer a list from source, profile a worker at
+runtime, or widen a list after launch. Policy compilation explicitly rejects a
+list without Bubblewrap's required `execve`; any other incomplete list stops
+the worker rather than weakening containment.
 
 This is a syscall boundary, not executable-path mediation. A working strict
 profile normally has to allow an execution syscall, so a compromised worker
