@@ -192,6 +192,49 @@ impl MobileWorkflowBuilder {
             )
     }
 
+    /// Registers one setup-selected HTTP origin catalog for the sealed
+    /// workflow catalog.
+    ///
+    /// A workflow can provide a bounded URL only after exact host-owned
+    /// scheme, host, and effective-port matching. It cannot choose a method,
+    /// header, credential, redirect, proxy, or another origin. This is
+    /// API-level mediation, not OS containment.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: splash_capabilities::http_endpoint_catalog::HttpOriginCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .register_http_origin_catalog_tool(policy, metadata, catalog)
+    }
+
+    /// Registers one setup-selected HTTPS origin catalog with a host-owned
+    /// secret resolver for the sealed workflow catalog.
+    ///
+    /// A resolved secret is sent only after exact origin matching, and remains
+    /// unavailable to the workflow source and tool metadata.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: splash_capabilities::http_endpoint_catalog::HttpOriginCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: splash_capabilities::http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        self.runtime
+            .register_http_origin_catalog_tool_with_secret_resolver(
+                policy,
+                metadata,
+                catalog,
+                secret_resolver,
+            )
+    }
+
     /// Registers one reviewed JSON adapter with executable input and output
     /// contracts.
     pub fn register_json_tool<F>(
@@ -570,7 +613,7 @@ mod tests {
     #[cfg(feature = "http-endpoint-catalog")]
     use splash_capabilities::http_endpoint_catalog::{
         HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod, HttpEndpointSecret,
-        HttpEndpointSecretStore,
+        HttpEndpointSecretStore, HttpOrigin, HttpOriginCatalog,
     };
     #[cfg(feature = "platform-keyring-secret-resolver")]
     use splash_capabilities::platform_keyring_secret_resolver::{
@@ -988,6 +1031,69 @@ mod tests {
             .expect("one fixed request reaches the server");
         server.join().expect("server completes");
         assert!(request.starts_with("GET /fixed/status?mode=reviewed HTTP/1.1\r\n"));
+        let lower = request.to_ascii_lowercase();
+        assert!(!lower.contains("authorization:"));
+        assert!(!lower.contains("cookie:"));
+        assert_eq!(runtime.tool_catalog().len(), 1);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "net.status");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert!(!runtime.has_suspended_execution());
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    #[test]
+    fn seals_dynamic_origin_requests_behind_workflow_policy_approval() {
+        let (fixed_url, received, server) = start_fixed_http_server();
+        let origin_url = fixed_url
+            .split("/fixed/status")
+            .next()
+            .expect("fixed test URL contains its host origin");
+        let dynamic_url = format!("{origin_url}/dynamic/status?mode=workflow");
+        let mut catalog = HttpOriginCatalog::default();
+        catalog
+            .insert(
+                HttpOrigin::insecure_http("status", HttpEndpointMethod::Get, origin_url)
+                    .expect("local origin is configured during setup"),
+            )
+            .expect("origin is retained");
+
+        let mut builder = MobileWorkflowBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_origin_catalog_tool(
+                ToolPolicy::json("net.status"),
+                ToolMetadata::new("Gets one reviewed service origin."),
+                catalog,
+            )
+            .expect("static origin adapter registers");
+        let mut runtime = builder.build();
+        let source = format!(
+            "use mod.tool\n\
+             use mod.std.assert\n\
+             let raw = tool.call_json(\"net.status\", {{origin: \"status\", url: \"{dynamic_url}\"}})\n\
+             let response = raw.parse_json()\n\
+             assert(response.available == true)"
+        );
+        let plan = runtime
+            .plan(vec![WorkflowStep::new("check-status", source)])
+            .expect("trusted plan is valid");
+        let approval = runtime
+            .approve_with_step_capability_policies(
+                &plan,
+                vec![WorkflowStepCapabilityPolicy::new(
+                    "check-status",
+                    [CapabilityLeaseGrant::new("net.status", 1)],
+                )],
+            )
+            .expect("origin request is explicitly approved");
+
+        runtime.execute(&plan, approval).expect("workflow succeeds");
+
+        let request = received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("one dynamic origin request reaches the server");
+        server.join().expect("server completes");
+        assert!(request.starts_with("GET /dynamic/status?mode=workflow HTTP/1.1\r\n"));
         let lower = request.to_ascii_lowercase();
         assert!(!lower.contains("authorization:"));
         assert!(!lower.contains("cookie:"));

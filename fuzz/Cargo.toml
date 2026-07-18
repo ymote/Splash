@@ -15,7 +15,7 @@ libfuzzer-sys = "0.4"
 lsp-server = "0.9.0"
 lsp-types = "0.97.0"
 serde_json = "1.0.150"
-splash-capabilities = { version = "0.1.0", path = "../crates/splash-capabilities", features = ["durable-audit-journal", "json-line-worker"] }
+splash-capabilities = { version = "0.1.0", path = "../crates/splash-capabilities", features = ["durable-audit-journal", "http-endpoint-catalog", "json-line-worker"] }
 splash-core = { path = "../crates/splash-core" }
 splash-protocol = { version = "0.1.0", path = "../crates/splash-protocol" }
 splash-sandbox = { version = "0.1.0", path = "../crates/splash-sandbox" }
@@ -99,5 +99,11 @@ doc = false
 [[bin]]
 name = "bubblewrap_policy"
 path = "fuzz_targets/bubblewrap_policy.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "http_origin_policy"
+path = "fuzz_targets/http_origin_policy.rs"
 test = false
 doc = false

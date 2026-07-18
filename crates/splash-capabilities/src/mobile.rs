@@ -166,6 +166,51 @@ impl MobileRuntimeBuilder {
             )
     }
 
+    /// Registers one setup-selected HTTP origin catalog for the sealed
+    /// profile.
+    ///
+    /// Dynamic Splash source can provide a bounded URL only when its exact
+    /// scheme, host, and effective port match a reviewed opaque origin policy.
+    /// It still cannot choose methods, headers, credentials, redirects,
+    /// proxies, or a different origin. This is API-level mediation, not OS
+    /// containment.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: crate::http_endpoint_catalog::HttpOriginCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .register_http_origin_catalog_tool(policy, metadata, catalog)
+    }
+
+    /// Registers one setup-selected HTTPS origin catalog with a host-owned
+    /// secret resolver for the sealed profile.
+    ///
+    /// A resolved secret is sent only after the supplied URL has passed exact
+    /// origin matching; Splash cannot select the secret, header, or another
+    /// origin.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: crate::http_endpoint_catalog::HttpOriginCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: crate::http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        self.runtime
+            .register_http_origin_catalog_tool_with_secret_resolver(
+                policy,
+                metadata,
+                catalog,
+                secret_resolver,
+            )
+    }
+
     /// Registers one reviewed JSON adapter with executable input and output
     /// contracts.
     pub fn register_json_tool<F>(
@@ -328,7 +373,7 @@ mod tests {
     #[cfg(feature = "http-endpoint-catalog")]
     use crate::http_endpoint_catalog::{
         HttpEndpoint, HttpEndpointCatalog, HttpEndpointMethod, HttpEndpointSecret,
-        HttpEndpointSecretStore,
+        HttpEndpointSecretStore, HttpOrigin, HttpOriginCatalog,
     };
     #[cfg(feature = "platform-keyring-secret-resolver")]
     use crate::platform_keyring_secret_resolver::{
@@ -464,6 +509,50 @@ mod tests {
         let serialized = serde_json::to_string(&input_schema).expect("schema serializes");
         assert!(!serialized.contains("api.example.test"));
         assert!(!serialized.contains("/v1/status"));
+    }
+
+    #[cfg(feature = "http-endpoint-catalog")]
+    #[test]
+    fn seals_an_origin_catalog_without_exposing_reviewed_origins() {
+        let mut catalog = HttpOriginCatalog::default();
+        catalog
+            .insert(
+                HttpOrigin::https(
+                    "service",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/",
+                )
+                .expect("reviewed origin is valid"),
+            )
+            .expect("origin is retained");
+
+        let mut builder = MobileRuntimeBuilder::new().expect("default limits are valid");
+        builder
+            .register_http_origin_catalog_tool(
+                ToolPolicy::json("net.request"),
+                ToolMetadata::new("Requests one reviewed service origin."),
+                catalog,
+            )
+            .expect("static origin adapter registers");
+        let runtime = builder.build();
+
+        let descriptor = runtime
+            .tool_catalog()
+            .into_iter()
+            .next()
+            .expect("one tool is sealed");
+        assert!(descriptor.contract_enforced);
+        let input_schema = descriptor
+            .metadata
+            .input_schema
+            .expect("opaque origin request contract is published");
+        assert_eq!(
+            input_schema["properties"]["origin"]["enum"],
+            json!(["service"])
+        );
+        assert!(input_schema["properties"].get("url").is_some());
+        let serialized = serde_json::to_string(&input_schema).expect("schema serializes");
+        assert!(!serialized.contains("api.example.test"));
     }
 
     #[cfg(feature = "http-endpoint-catalog")]

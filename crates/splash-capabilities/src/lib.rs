@@ -1898,11 +1898,13 @@ impl CapabilityHost {
         catalog.validate_tool_policy(&policy)?;
         let max_output_bytes = policy.max_output_bytes;
         let contract = catalog.tool_contract()?;
-        self.register_http_endpoint_catalog_contract(
+        self.register_http_catalog_contract(
             policy,
             metadata,
             contract,
             catalog.into_tool_handler(max_output_bytes),
+            "HTTP endpoint access was denied",
+            "HTTP endpoint request failed",
         )
     }
 
@@ -1927,21 +1929,88 @@ impl CapabilityHost {
         catalog.validate_tool_policy(&policy)?;
         let max_output_bytes = policy.max_output_bytes;
         let contract = catalog.tool_contract()?;
-        self.register_http_endpoint_catalog_contract(
+        self.register_http_catalog_contract(
             policy,
             metadata,
             contract,
             catalog.into_tool_handler_with_secret_resolver(max_output_bytes, secret_resolver),
+            "HTTP endpoint access was denied",
+            "HTTP endpoint request failed",
+        )
+    }
+
+    /// Registers a bounded catalog of host-selected HTTP origins as one JSON
+    /// capability.
+    ///
+    /// Splash can select a bounded absolute URL only after the catalog checks
+    /// its exact scheme, host, and effective port against an opaque reviewed
+    /// origin policy. The host still fixes the method, headers, credentials,
+    /// proxy behavior, redirect policy, deadline, and response bounds. This
+    /// is API-level mediation for script requests, not OS egress containment.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpOriginCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        if catalog.requires_secret_resolver() {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "HTTP origin catalog secret bindings require an explicit secret resolver",
+            ));
+        }
+        catalog.validate_tool_policy(&policy)?;
+        let max_output_bytes = policy.max_output_bytes;
+        let contract = catalog.tool_contract()?;
+        self.register_http_catalog_contract(
+            policy,
+            metadata,
+            contract,
+            catalog.into_tool_handler(max_output_bytes),
+            "HTTP origin access was denied",
+            "HTTP origin request failed",
+        )
+    }
+
+    /// Registers a bounded catalog of host-selected HTTPS origins whose
+    /// reviewed credential bindings resolve only at invocation time.
+    ///
+    /// A resolved secret can be attached only to an accepted URL at the exact
+    /// configured origin. Splash cannot select a secret, header, method,
+    /// redirect, proxy, or another origin.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpOriginCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        catalog.validate_tool_policy(&policy)?;
+        let max_output_bytes = policy.max_output_bytes;
+        let contract = catalog.tool_contract()?;
+        self.register_http_catalog_contract(
+            policy,
+            metadata,
+            contract,
+            catalog.into_tool_handler_with_secret_resolver(max_output_bytes, secret_resolver),
+            "HTTP origin access was denied",
+            "HTTP origin request failed",
         )
     }
 
     #[cfg(feature = "http-endpoint-catalog")]
-    fn register_http_endpoint_catalog_contract<F>(
+    fn register_http_catalog_contract<F>(
         &mut self,
         policy: ToolPolicy,
         metadata: ToolMetadata,
         contract: JsonToolContract,
         handler: F,
+        denied_message: &'static str,
+        failed_message: &'static str,
     ) -> Result<(), ToolRegistrationError>
     where
         F: FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static,
@@ -1960,11 +2029,11 @@ impl CapabilityHost {
             metadata,
             Some(redacted_schema_validator(
                 input,
-                ToolError::Denied("HTTP endpoint access was denied".to_owned()),
+                ToolError::Denied(denied_message.to_owned()),
             )),
             Some(redacted_schema_validator(
                 output,
-                ToolError::Failed("HTTP endpoint request failed".to_owned()),
+                ToolError::Failed(failed_message.to_owned()),
             )),
             handler,
         )
@@ -3733,6 +3802,46 @@ impl CapabilityRuntime {
         self.runtime
             .host_mut()
             .register_http_endpoint_catalog_tool_with_secret_resolver(
+                policy,
+                metadata,
+                catalog,
+                secret_resolver,
+            )
+    }
+
+    /// Registers a bounded catalog of host-selected HTTP origins as one JSON
+    /// capability. See [`CapabilityHost::register_http_origin_catalog_tool`]
+    /// for the exact-origin and containment boundary.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpOriginCatalog,
+    ) -> Result<(), ToolRegistrationError> {
+        self.runtime
+            .host_mut()
+            .register_http_origin_catalog_tool(policy, metadata, catalog)
+    }
+
+    /// Registers a host-selected HTTPS origin catalog with a host-owned
+    /// secret resolver. See
+    /// [`CapabilityHost::register_http_origin_catalog_tool_with_secret_resolver`]
+    /// for the authority and disclosure boundary.
+    #[cfg(feature = "http-endpoint-catalog")]
+    pub fn register_http_origin_catalog_tool_with_secret_resolver<R>(
+        &mut self,
+        policy: ToolPolicy,
+        metadata: ToolMetadata,
+        catalog: http_endpoint_catalog::HttpOriginCatalog,
+        secret_resolver: R,
+    ) -> Result<(), ToolRegistrationError>
+    where
+        R: http_endpoint_catalog::HttpEndpointSecretResolver + 'static,
+    {
+        self.runtime
+            .host_mut()
+            .register_http_origin_catalog_tool_with_secret_resolver(
                 policy,
                 metadata,
                 catalog,

@@ -1,11 +1,17 @@
-# Fixed HTTP endpoint catalogs
+# HTTP endpoint and origin catalogs
 
 The optional
-splash_capabilities::http_endpoint_catalog::HttpEndpointCatalog is a narrow
-outbound JSON capability for a reviewed, finite set of host-selected HTTP
-endpoints. It can inject a host-resolved credential into one fixed HTTPS
-endpoint, but it is not a general HTTP client, a general secret-retrieval API,
-a proxy, or an operating-system egress sandbox.
+`splash_capabilities::http_endpoint_catalog` module provides two narrow
+outbound JSON capabilities selected during trusted Rust setup:
+
+- `HttpEndpointCatalog` fixes each complete URL, method, and optional
+  credential binding behind an opaque ID.
+- `HttpOriginCatalog` fixes each exact scheme, host, effective port, method,
+  and optional credential binding, while accepting a bounded script-supplied
+  path and query only at that reviewed origin.
+
+Neither catalog is a general HTTP client, a general secret-retrieval API, a
+proxy, or an operating-system egress sandbox.
 
 Enable the feature explicitly because it links an HTTP/TLS client:
 
@@ -135,17 +141,92 @@ runtime.register_http_endpoint_catalog_tool_with_secret_resolver(
 ~~~
 
 GET requires exactly {endpoint: "..."}. POST requires
-{endpoint: "...", body: {...}} or an array body. The body remains bounded by
-the catalog request limit, and the tool policy may lower that input budget but
-cannot widen it. Its field semantics are intentionally not inferred from the
-remote API. Use separate narrowly named catalog tools, per-step leases, a
-trusted input-aware authorizer, or a dedicated schema-checked Rust adapter when
-a remote endpoint needs tighter payload rules.
+{endpoint: "...", body: {...}} or an array body. The complete JSON request
+envelope remains bounded by the catalog request limit, and the tool policy may
+lower that input budget but cannot widen it. Its field semantics are
+intentionally not inferred from the remote API. Use separate narrowly named
+catalog tools, per-step leases, a trusted input-aware authorizer, or a dedicated
+schema-checked Rust adapter when a remote endpoint needs tighter payload rules.
 
 One catalog tool can invoke every entry in its catalog. Use separate tools or a
 trusted authorizer when different endpoints need different workflow grants.
 The host decides whether to share its host-side catalog descriptor with an LLM;
 Splash source has no catalog-discovery API.
+
+## Exact-origin policy requests
+
+Use `HttpOriginCatalog` only when a reviewed service intentionally supports
+dynamic paths or queries below one complete origin. The host still fixes the
+method and every transport decision:
+
+~~~rust
+use splash_capabilities::{
+    http_endpoint_catalog::{
+        HttpEndpointMethod, HttpEndpointSecret, HttpEndpointSecretStore, HttpOrigin,
+        HttpOriginCatalog,
+    },
+    CapabilityRuntime, ToolMetadata, ToolPolicy,
+};
+
+let mut catalog = HttpOriginCatalog::default();
+catalog.insert(
+    HttpOrigin::https(
+        "release.api",
+        HttpEndpointMethod::Post,
+        "https://api.example.com/",
+    )?
+    .with_bearer_secret("release.api.token")?,
+)?;
+
+let mut secrets = HttpEndpointSecretStore::new();
+secrets.insert(
+    "release.api.token",
+    HttpEndpointSecret::new(release_api_token)?,
+)?;
+
+runtime.register_http_origin_catalog_tool_with_secret_resolver(
+    ToolPolicy::json("release.request"),
+    ToolMetadata::new("Posts JSON to the reviewed release API origin."),
+    catalog,
+    secrets,
+)?;
+~~~
+
+Splash supplies an opaque origin ID, a complete bounded URL, and a JSON body
+for a host-configured `POST`:
+
+~~~splash
+use mod.tool
+
+let raw = tool.call_json("release.request", {
+    origin: "release.api"
+    url: "https://api.example.com/v1/releases/42?include=checks"
+    body: { action: "publish" }
+})
+let response = raw.parse_json()
+response
+~~~
+
+The origin constructor itself accepts only an HTTP or HTTPS origin with no URL
+credentials, fragment, path other than `/`, or query. At invocation, the URL
+must be absolute, at most 4 KiB, and match the reviewed scheme, host, and
+effective port exactly. Host case and omitted default ports are normalized for
+matching; `https://api.example.com` and
+`https://api.example.com:443` are the same origin. A different scheme, host,
+or port fails before any secret is resolved or request is sent.
+
+Path and query are deliberately script data after that origin match. This is
+not path-prefix authorization: a host that needs a fixed path, fixed query, or
+credential valid for only one route must use `HttpEndpointCatalog` instead.
+Likewise, a secret bound to `HttpOrigin` is intentionally eligible for every
+accepted path at that exact origin, so hosts must scope the service credential
+accordingly. `HttpOrigin::insecure_http` is for trusted local or development
+services only and cannot carry secret authorization.
+
+The executable request schema contains only opaque origin IDs and the bounded
+`url` field; it does not publish configured hosts, ports, credentials, or
+header bindings. The runtime independently rechecks the complete request,
+including when a host invokes the adapter directly.
 
 ## Fixed transport behavior
 
@@ -194,6 +275,11 @@ response-format failures. URLs, remote status codes, response bodies, headers,
 secret identifiers, secret values, and transport details are not released to
 script diagnostics.
 
+For an origin catalog, the corresponding script-facing messages are HTTP
+origin access was denied and HTTP origin request failed. In particular, an
+unmatched script URL is not reflected in diagnostics and cannot trigger secret
+resolution.
+
 The endpoint URL has no public accessor and is omitted from Debug. The
 published tool contract contains opaque endpoint IDs, not endpoint URLs or
 credential bindings. `HttpEndpointSecret` and `HttpEndpointSecretStore` redact
@@ -209,13 +295,13 @@ result as other resolver failures.
 ## Security boundary
 
 This is API-level mediation only. It stops a generated Splash program from
-changing the target of this one catalog tool; it does not prevent the embedding
-process or another trusted Rust adapter from opening a network connection. It
-also does not pin DNS results, enforce a firewall rule, validate the remote
-service's authorization model, protect a host-selected endpoint from later
-server-side changes, offer general secret access, guarantee zeroization of
-HTTP/TLS implementation buffers, or contain a blocking request that is already
-running.
+changing a fixed endpoint or escaping an exact reviewed origin; it does not
+prevent the embedding process or another trusted Rust adapter from opening a
+network connection. It also does not pin DNS results, enforce a firewall rule,
+validate the remote service's authorization model, protect a host-selected
+endpoint or origin from later server-side changes, offer general secret access,
+guarantee zeroization of HTTP/TLS implementation buffers, or contain a
+blocking request that is already running.
 
 Hosts must treat endpoint setup as trusted policy, keep secrets out of URLs and
 tool metadata, keep the resolver's own logs and errors free of secret material,
@@ -234,3 +320,9 @@ before build(). Use each matching
 catalog has a credential binding. Each builder consumes both catalog and
 resolver during setup, so dynamic source and workflow steps cannot modify the
 catalog or select a secret afterward.
+
+The corresponding origin-policy methods are
+`register_http_origin_catalog_tool` and
+`register_http_origin_catalog_tool_with_secret_resolver`. They preserve the
+same sealed setup boundary; a workflow still needs an approved capability lease
+for the catalog tool before it can make a request.

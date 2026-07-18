@@ -72,18 +72,21 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded host-owned fixed-file catalog adapter for reviewed regular UTF-8
   files, addressed only by opaque identifiers and pinned at setup rather than
   by script-selected filesystem paths.
-- A feature-gated host-owned fixed HTTP endpoint catalog for reviewed JSON GET
-  and POST calls addressed only by opaque IDs, with HTTPS by default, bounded
-  request/response data, no proxy or redirect following, and no script-selected URL,
-  method, header, query, or secret. A host can inject a resolved credential
-  only into one fixed HTTPS endpoint. An optional native resolver performs
-  read-only exact credential lookup on macOS, iOS, and Windows without a mock
-  fallback; this is API-level mediation, not egress containment or a general
-  secret API.
+- A feature-gated host-owned fixed HTTP endpoint catalog and exact-origin
+  policy catalog for reviewed JSON GET and POST calls. Fixed endpoints accept
+  only opaque IDs; origin policies admit a bounded script URL only after exact
+  scheme, host, and effective-port matching. Both use HTTPS by default, bound
+  request/response data, disable proxies and redirects, and keep methods,
+  headers, and credential bindings host controlled. A host can inject a
+  resolved credential into one fixed HTTPS endpoint or intentionally across
+  every accepted route at one exact HTTPS origin. An optional native resolver
+  performs read-only exact credential lookup on macOS, iOS, and Windows
+  without a mock fallback; this is API-level mediation, not egress containment
+  or a general secret API.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
   policies, checkpoints, and execution, including setup-only fixed-file and
-  fixed-endpoint catalog adapters, without exposing mutable capability
+  fixed-endpoint/origin catalog adapters, without exposing mutable capability
   registration.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
@@ -498,7 +501,7 @@ both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-
 - `splash-capabilities`: explicit tool policy, cursor-safe bounded audit export
   with a feature-gated authenticated durable journal, deferred promises,
   LLM-facing host catalog, approval-bound capability leases, JSON contracts,
-  fixed-file and feature-gated fixed-endpoint catalogs, aggregate catalog
+  fixed-file and feature-gated HTTP endpoint/origin catalogs, aggregate catalog
   limits, safe host bridge, and a sealed static-catalog mobile/embedded profile.
 - `splash-schema`: bounded executable JSON-schema subset for tool contracts.
 - `splash-storage`: host-only authenticated records, rollback protection, and
@@ -538,9 +541,9 @@ define the host-managed async boundary.
 [Fixed-file catalogs](docs/fixed-file-catalog.md) define the narrow
 descriptor-pinned local text-file boundary.
 
-[Fixed HTTP endpoint catalogs](docs/http-endpoint-catalog.md) define the narrow
-host-selected outbound JSON boundary, endpoint-bound credential injection, and
-their explicit non-guarantees.
+[HTTP endpoint and origin catalogs](docs/http-endpoint-catalog.md) define the
+narrow host-selected outbound JSON boundary, endpoint- and origin-bound
+credential injection, and their explicit non-guarantees.
 
 [Editor module-interface projection](docs/module-catalog.md) defines bounded
 refreshable authoring metadata for host-defined `mod.*` interfaces.

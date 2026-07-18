@@ -85,6 +85,13 @@
   or Windows credential stores without an in-process mock fallback. It is
   API-level mediation only, not a general secret broker, dynamic origin
   policy, or operating-system egress boundary.
+- Feature-gated bounded exact-origin HTTP catalog for host-selected JSON GET
+  and POST methods. Script source can supply a bounded complete URL only after
+  exact scheme, host, and effective-port matching against an opaque configured
+  origin; proxies and redirects remain disabled, and host-selected credentials
+  resolve only after matching. Dynamic paths and queries are intentional data,
+  not path-prefix authorization. It is API-level mediation only, not DNS
+  pinning or operating-system egress containment.
 - Sealed static-catalog mobile and embedded profile for app-provided local
   adapters, with no post-build registration or external-dispatch API.
 - Sealed mobile and embedded workflow facade for static local adapters, with
@@ -252,10 +259,11 @@
   persistent filesystem.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
-- A dynamic or origin-policy-evaluated network boundary, secret broker, and
-  audited executable policy. The fixed endpoint catalog is deliberately
-  narrower and does not enforce egress at the operating-system boundary; the
-  broader selectors must remain denied until each can be enforced.
+- An operating-system-enforced dynamic/origin-policy network boundary, a
+  general secret broker, and an audited executable policy. The exact-origin
+  catalog deliberately mediates only Splash-initiated HTTP requests and does
+  not enforce egress at the operating-system boundary; broader selectors must
+  remain denied until each can be enforced.
 
 ## Before a stable language release
 

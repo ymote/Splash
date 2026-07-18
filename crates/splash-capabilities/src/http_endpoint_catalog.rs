@@ -1,10 +1,10 @@
-//! A bounded, host-owned catalog of fixed HTTP JSON endpoints.
+//! Bounded, host-owned HTTP JSON capability catalogs.
 //!
-//! A host selects every endpoint during setup and assigns it a canonical opaque
-//! identifier. Splash can request only that identifier through a registered
-//! JSON tool. It never supplies a URL, method, header, query parameter, or
-//! redirect target. HTTPS is required by default; an explicitly named HTTP
-//! constructor exists only for trusted local or development integrations.
+//! A host selects every fixed endpoint or exact origin policy during setup and
+//! assigns it a canonical opaque identifier. Fixed endpoint tools accept only
+//! that identifier; origin-policy tools accept a bounded URL only after exact
+//! origin matching. HTTPS is required by default, and explicitly named HTTP
+//! constructors exist only for trusted local or development integrations.
 //!
 //! This is API-level network mediation, not operating-system egress
 //! containment. The embedding process can still make unrelated network calls,
@@ -52,6 +52,9 @@ pub const MAX_HTTP_ENDPOINT_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HTTP_ENDPOINT_ID_BYTES: usize = 128;
 /// Maximum UTF-8 byte length of a fixed endpoint URL.
 pub const MAX_HTTP_ENDPOINT_URL_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 byte length of one script-supplied URL evaluated against a
+/// host-selected HTTP origin policy.
+pub const MAX_HTTP_ORIGIN_URL_BYTES: usize = MAX_HTTP_ENDPOINT_URL_BYTES;
 /// Maximum UTF-8 byte length of an opaque host-selected secret identifier.
 pub const MAX_HTTP_ENDPOINT_SECRET_ID_BYTES: usize = 128;
 /// Maximum byte length of one host-resolved HTTP secret header value.
@@ -63,7 +66,7 @@ pub const DEFAULT_HTTP_ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(
 /// Absolute maximum end-to-end request deadline.
 pub const MAX_HTTP_ENDPOINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Fixed method selected by the embedding host for one endpoint.
+/// Request method selected by the embedding host for one HTTP catalog entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpEndpointMethod {
     /// A bodyless `GET` request.
@@ -78,7 +81,8 @@ enum EndpointTransport {
     InsecureHttp,
 }
 
-/// A host-held secret value that can be injected into one fixed HTTPS endpoint.
+/// A host-held secret value injected only into one reviewed HTTPS catalog
+/// binding.
 ///
 /// Splash source cannot construct, inspect, serialize, or receive this value.
 /// Values are restricted to printable ASCII HTTP header bytes, bounded, and
@@ -485,12 +489,181 @@ impl fmt::Debug for HttpEndpoint {
     }
 }
 
-/// Host-selected bounds for a [`HttpEndpointCatalog`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalHttpOrigin {
+    transport: EndpointTransport,
+    host: String,
+    port: u16,
+}
+
+/// One host-selected origin policy in a [`HttpOriginCatalog`].
+///
+/// Splash chooses an opaque identifier and provides an absolute request URL,
+/// but this policy accepts it only when its scheme, host, and effective port
+/// exactly match the reviewed origin. The host fixes the request method,
+/// optional credential binding, transport, timeout, headers, and response
+/// bounds. It does not expose an ambient URL, header, redirect, proxy, or
+/// network-origin API.
+///
+/// This is API-level mediation for Splash-initiated requests, not an
+/// operating-system egress boundary. The embedding process can still make
+/// unrelated network calls and must use a target-specific containment backend
+/// when it needs an OS-enforced network perimeter.
+pub struct HttpOrigin {
+    identifier: String,
+    origin_url: String,
+    origin: CanonicalHttpOrigin,
+    method: HttpEndpointMethod,
+    authorization: HttpEndpointAuthorization,
+}
+
+impl HttpOrigin {
+    /// Creates an HTTPS origin policy.
+    ///
+    /// `origin` must be an origin URL with no credentials, fragment, path
+    /// other than `/`, or query. Requests can select a path and query only
+    /// beneath this exact scheme, host, and effective port.
+    pub fn https(
+        identifier: impl Into<String>,
+        method: HttpEndpointMethod,
+        origin: impl Into<String>,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        Self::new(
+            identifier.into(),
+            method,
+            origin.into(),
+            EndpointTransport::Https,
+        )
+    }
+
+    /// Creates an explicitly insecure HTTP origin policy.
+    ///
+    /// This constructor is intended only for trusted local or development
+    /// services. It cannot carry secret authorization and must not be used as
+    /// a production general-origin policy.
+    pub fn insecure_http(
+        identifier: impl Into<String>,
+        method: HttpEndpointMethod,
+        origin: impl Into<String>,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        Self::new(
+            identifier.into(),
+            method,
+            origin.into(),
+            EndpointTransport::InsecureHttp,
+        )
+    }
+
+    /// Returns the opaque identifier selected by the host.
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    /// Returns the host-selected request method.
+    pub const fn method(&self) -> HttpEndpointMethod {
+        self.method
+    }
+
+    /// Binds a host-resolved bearer token to every accepted HTTPS URL at this
+    /// exact origin.
+    ///
+    /// Use this only when the reviewed credential is intentionally valid for
+    /// every script-selectable path at the origin. Splash cannot select the
+    /// secret, header name, origin, or transport.
+    pub fn with_bearer_secret(
+        self,
+        secret_identifier: impl Into<String>,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        self.with_authorization(HttpEndpointAuthorization::BearerSecret {
+            secret_identifier: validate_secret_identifier(secret_identifier.into())?,
+        })
+    }
+
+    /// Binds a host-resolved secret to one reviewed header on every accepted
+    /// HTTPS URL at this exact origin.
+    ///
+    /// Transport-managed headers, cookies, and response-shaping headers stay
+    /// unavailable, so this does not become a general header API.
+    pub fn with_secret_header(
+        self,
+        name: impl AsRef<str>,
+        secret_identifier: impl Into<String>,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        let name = HeaderName::from_str(name.as_ref())
+            .map_err(|_| HttpEndpointCatalogError::InvalidSecretHeaderName)?;
+        if !is_allowed_secret_header(&name) {
+            return Err(HttpEndpointCatalogError::ForbiddenSecretHeaderName);
+        }
+        self.with_authorization(HttpEndpointAuthorization::HeaderSecret {
+            name,
+            secret_identifier: validate_secret_identifier(secret_identifier.into())?,
+        })
+    }
+
+    fn new(
+        identifier: String,
+        method: HttpEndpointMethod,
+        origin_url: String,
+        transport: EndpointTransport,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        if !is_valid_identifier(&identifier) {
+            return Err(HttpEndpointCatalogError::InvalidIdentifier);
+        }
+        let origin = validate_origin_url(&origin_url, transport)?;
+        Ok(Self {
+            identifier,
+            origin_url,
+            origin,
+            method,
+            authorization: HttpEndpointAuthorization::None,
+        })
+    }
+
+    fn with_authorization(
+        mut self,
+        authorization: HttpEndpointAuthorization,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        if self.origin.transport != EndpointTransport::Https {
+            return Err(HttpEndpointCatalogError::SecretAuthorizationRequiresHttps);
+        }
+        if self.authorization.is_configured() {
+            return Err(HttpEndpointCatalogError::SecretAuthorizationAlreadyConfigured);
+        }
+        self.authorization = authorization;
+        Ok(self)
+    }
+
+    fn accepts_url(&self, url: &str) -> Result<(), HttpEndpointCatalogError> {
+        let (_, actual) = parse_http_url(url)?;
+        if actual == self.origin {
+            Ok(())
+        } else {
+            Err(HttpEndpointCatalogError::OriginMismatch)
+        }
+    }
+}
+
+impl fmt::Debug for HttpOrigin {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpOrigin")
+            .field("identifier", &self.identifier)
+            .field("method", &self.method)
+            .field("transport", &self.origin.transport)
+            .field(
+                "has_secret_authorization",
+                &self.authorization.is_configured(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Host-selected bounds for an HTTP JSON capability catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HttpEndpointCatalogLimits {
-    /// Maximum retained fixed endpoints.
+    /// Maximum retained fixed endpoints or exact origin policies.
     pub max_entries: usize,
-    /// Maximum script-supplied JSON request bytes for one endpoint call.
+    /// Maximum complete script-supplied JSON request bytes for one catalog call.
     pub max_request_bytes: usize,
     /// Maximum accepted JSON response bytes before parsing.
     pub max_response_bytes: usize,
@@ -568,7 +741,7 @@ impl Default for HttpEndpointCatalogLimits {
     }
 }
 
-/// Host-side error while configuring or invoking a fixed endpoint catalog.
+/// Host-side error while configuring or invoking an HTTP capability catalog.
 ///
 /// Script-facing tool failures map these cases to generic denied or failed
 /// messages so endpoint membership, URLs, remote status, and transport details
@@ -580,6 +753,8 @@ pub enum HttpEndpointCatalogError {
     InvalidUrl,
     UrlCredentialsNotAllowed,
     UrlFragmentNotAllowed,
+    OriginPathOrQueryNotAllowed,
+    OriginMismatch,
     HttpsRequired,
     InsecureHttpRequired,
     InvalidSecretIdentifier,
@@ -612,6 +787,12 @@ impl Display for HttpEndpointCatalogError {
             }
             Self::UrlFragmentNotAllowed => {
                 formatter.write_str("HTTP endpoint URLs must not contain fragments")
+            }
+            Self::OriginPathOrQueryNotAllowed => formatter.write_str(
+                "HTTP origin configuration must not contain a path other than / or a query",
+            ),
+            Self::OriginMismatch => {
+                formatter.write_str("HTTP request URL is outside the configured origin")
             }
             Self::HttpsRequired => formatter.write_str("HTTP endpoint URL must use HTTPS"),
             Self::InsecureHttpRequired => {
@@ -848,6 +1029,7 @@ impl HttpEndpointCatalog {
         if object.keys().any(|key| key != "endpoint" && key != "body") {
             return Err(HttpEndpointCatalogError::InvalidRequest);
         }
+        validate_request_bytes(&request.input, max_request_bytes)?;
         let identifier = object
             .get("endpoint")
             .and_then(JsonValue::as_str)
@@ -876,85 +1058,16 @@ impl HttpEndpointCatalog {
                 )
             }
         };
-        if encoded_body
-            .as_ref()
-            .is_some_and(|body| body.len() > max_request_bytes)
-        {
-            return Err(HttpEndpointCatalogError::RequestTooLarge {
-                maximum: max_request_bytes,
-            });
-        }
         let secret_header = endpoint.authorization.resolve_header(secret_resolver)?;
-
-        let mut response = match (endpoint.method, encoded_body) {
-            (HttpEndpointMethod::Get, None) => {
-                let request = agents.for_endpoint(endpoint).get(&endpoint.url);
-                let request = match secret_header {
-                    Some((name, value)) => request.header(name, value),
-                    None => request,
-                };
-                request.call()
-            }
-            (HttpEndpointMethod::Post, Some(body)) => {
-                let request = agents
-                    .for_endpoint(endpoint)
-                    .post(&endpoint.url)
-                    .header("Content-Type", "application/json");
-                let request = match secret_header {
-                    Some((name, value)) => request.header(name, value),
-                    None => request,
-                };
-                request.send(body)
-            }
-            _ => return Err(HttpEndpointCatalogError::InvalidRequest),
-        }
-        .map_err(|_| HttpEndpointCatalogError::Transport)?;
-
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            return Err(HttpEndpointCatalogError::UnexpectedStatus { status });
-        }
-        if let Some(content_length) = response
-            .headers()
-            .get("content-length")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            if content_length > max_response_bytes {
-                return Err(HttpEndpointCatalogError::ResponseTooLarge {
-                    maximum: max_response_bytes,
-                });
-            }
-        }
-
-        let mut bytes = Vec::with_capacity(max_response_bytes.min(8 * 1024).saturating_add(1));
-        let limit = u64::try_from(max_response_bytes.saturating_add(1))
-            .expect("bounded HTTP response limit fits into u64");
-        response
-            .body_mut()
-            .as_reader()
-            .take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|_| HttpEndpointCatalogError::Transport)?;
-        if bytes.len() > max_response_bytes {
-            return Err(HttpEndpointCatalogError::ResponseTooLarge {
-                maximum: max_response_bytes,
-            });
-        }
-        let output = serde_json::from_slice::<JsonValue>(&bytes)
-            .map_err(|_| HttpEndpointCatalogError::InvalidResponseJson)?;
-        if !output.is_object() && !output.is_array() {
-            return Err(HttpEndpointCatalogError::InvalidResponseJson);
-        }
-        let output_bytes = serde_json::to_vec(&output)
-            .map_err(|_| HttpEndpointCatalogError::InvalidResponseJson)?
-            .len();
-        if output_bytes > max_response_bytes {
-            return Err(HttpEndpointCatalogError::ResponseTooLarge {
-                maximum: max_response_bytes,
-            });
-        }
-        Ok(output)
+        execute_json_http_request(
+            agents,
+            endpoint.transport,
+            endpoint.method,
+            &endpoint.url,
+            encoded_body,
+            secret_header,
+            max_response_bytes,
+        )
     }
 }
 
@@ -962,6 +1075,250 @@ impl Default for HttpEndpointCatalog {
     fn default() -> Self {
         Self::new(HttpEndpointCatalogLimits::default())
             .expect("default HTTP endpoint catalog limits are valid")
+    }
+}
+
+/// A setup-only catalog of host-selected HTTP origin policies.
+///
+/// Each entry retains an opaque identifier, an exact reviewed origin, and a
+/// fixed method. During invocation, Splash supplies a bounded absolute URL;
+/// the catalog rejects it unless its scheme, host, and effective port match
+/// the selected origin. The requested path and query remain script data, while
+/// redirects, proxies, headers, and request methods remain host controlled.
+pub struct HttpOriginCatalog {
+    limits: HttpEndpointCatalogLimits,
+    entries: BTreeMap<String, HttpOrigin>,
+}
+
+impl HttpOriginCatalog {
+    /// Creates an empty origin catalog with explicit request and response
+    /// bounds.
+    pub fn new(limits: HttpEndpointCatalogLimits) -> Result<Self, HttpEndpointCatalogError> {
+        Ok(Self {
+            limits: limits.validate()?,
+            entries: BTreeMap::new(),
+        })
+    }
+
+    /// Returns the immutable bounds selected during trusted setup.
+    pub const fn limits(&self) -> HttpEndpointCatalogLimits {
+        self.limits
+    }
+
+    /// Returns the number of retained origin policies.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether no origin policies are retained.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn requires_secret_resolver(&self) -> bool {
+        self.entries
+            .values()
+            .any(|origin| origin.authorization.is_configured())
+    }
+
+    /// Adds one validated host-selected origin policy.
+    pub fn insert(&mut self, origin: HttpOrigin) -> Result<(), HttpEndpointCatalogError> {
+        if self.entries.contains_key(origin.identifier()) {
+            return Err(HttpEndpointCatalogError::DuplicateIdentifier);
+        }
+        if self.entries.len() >= self.limits.max_entries {
+            return Err(HttpEndpointCatalogError::EntryLimitExceeded {
+                maximum: self.limits.max_entries,
+            });
+        }
+        self.entries.insert(origin.identifier.clone(), origin);
+        Ok(())
+    }
+
+    pub(crate) fn validate_tool_policy(
+        &self,
+        policy: &ToolPolicy,
+    ) -> Result<(), ToolRegistrationError> {
+        if policy.data_format != ToolDataFormat::Json {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "HTTP origin catalog tools require a JSON policy",
+            ));
+        }
+        if policy.max_input_bytes > self.limits.max_request_bytes {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "HTTP origin catalog input limit exceeds its request limit",
+            ));
+        }
+        if self.entries.is_empty() {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "HTTP origin catalog must contain at least one origin",
+            ));
+        }
+        if policy.max_output_bytes < 2 {
+            return Err(ToolRegistrationError::InvalidPolicy(
+                "HTTP origin catalog output limit must allow a JSON envelope",
+            ));
+        }
+        for origin in self.entries.values() {
+            let minimum_request = match origin.method {
+                HttpEndpointMethod::Get => {
+                    json!({"origin": origin.identifier(), "url": &origin.origin_url})
+                }
+                HttpEndpointMethod::Post => {
+                    json!({"origin": origin.identifier(), "url": &origin.origin_url, "body": {}})
+                }
+            };
+            let minimum_bytes = serde_json::to_vec(&minimum_request)
+                .map_err(|_| ToolRegistrationError::InvalidPolicy("HTTP request is invalid"))?
+                .len();
+            if minimum_bytes > policy.max_input_bytes {
+                return Err(ToolRegistrationError::InvalidPolicy(
+                    "HTTP origin identifier exceeds the tool input limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Builds the executable structural contract published with this origin
+    /// catalog tool. The configured origins are not exposed through the
+    /// contract; only their opaque host-selected identifiers are published.
+    pub(crate) fn tool_contract(&self) -> Result<JsonToolContract, ToolRegistrationError> {
+        let identifiers: Vec<JsonValue> = self
+            .entries
+            .keys()
+            .cloned()
+            .map(JsonValue::String)
+            .collect();
+        JsonToolContract::new(
+            json!({
+                "type": "object",
+                "properties": {
+                    "origin": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_HTTP_ENDPOINT_ID_BYTES,
+                        "enum": identifiers
+                    },
+                    "url": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_HTTP_ORIGIN_URL_BYTES
+                    },
+                    "body": {}
+                },
+                "required": ["origin", "url"],
+                "additionalProperties": false
+            }),
+            json!({}),
+        )
+        .map_err(|_| {
+            ToolRegistrationError::InvalidPolicy("HTTP origin catalog contract is invalid")
+        })
+    }
+
+    pub(crate) fn into_tool_handler(
+        self,
+        max_output_bytes: usize,
+    ) -> impl FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static {
+        self.into_tool_handler_with_secret_resolver(max_output_bytes, NoHttpEndpointSecretResolver)
+    }
+
+    pub(crate) fn into_tool_handler_with_secret_resolver<R>(
+        self,
+        max_output_bytes: usize,
+        secret_resolver: R,
+    ) -> impl FnMut(&JsonToolRequest) -> Result<JsonValue, ToolError> + 'static
+    where
+        R: HttpEndpointSecretResolver + 'static,
+    {
+        let agents = HttpEndpointAgents::new(self.limits);
+        let max_request_bytes = self.limits.max_request_bytes;
+        let max_response_bytes = self.limits.max_response_bytes.min(max_output_bytes);
+        let mut secret_resolver = secret_resolver;
+        move |request| {
+            self.execute(
+                &agents,
+                request,
+                max_request_bytes,
+                max_response_bytes,
+                &mut secret_resolver,
+            )
+            .map_err(HttpEndpointCatalogError::into_origin_tool_error)
+        }
+    }
+
+    fn execute(
+        &self,
+        agents: &HttpEndpointAgents,
+        request: &JsonToolRequest,
+        max_request_bytes: usize,
+        max_response_bytes: usize,
+        secret_resolver: &mut dyn HttpEndpointSecretResolver,
+    ) -> Result<JsonValue, HttpEndpointCatalogError> {
+        let object = request
+            .input
+            .as_object()
+            .ok_or(HttpEndpointCatalogError::InvalidRequest)?;
+        if object
+            .keys()
+            .any(|key| key != "origin" && key != "url" && key != "body")
+        {
+            return Err(HttpEndpointCatalogError::InvalidRequest);
+        }
+        validate_request_bytes(&request.input, max_request_bytes)?;
+        let identifier = object
+            .get("origin")
+            .and_then(JsonValue::as_str)
+            .filter(|identifier| is_valid_identifier(identifier))
+            .ok_or(HttpEndpointCatalogError::InvalidRequest)?;
+        let origin = self
+            .entries
+            .get(identifier)
+            .ok_or(HttpEndpointCatalogError::NotFound)?;
+        let url = object
+            .get("url")
+            .and_then(JsonValue::as_str)
+            .filter(|url| !url.is_empty() && url.len() <= MAX_HTTP_ORIGIN_URL_BYTES)
+            .ok_or(HttpEndpointCatalogError::InvalidRequest)?;
+        origin.accepts_url(url)?;
+
+        let body = object.get("body");
+        let encoded_body = match origin.method {
+            HttpEndpointMethod::Get => {
+                if body.is_some() {
+                    return Err(HttpEndpointCatalogError::UnexpectedRequestBody);
+                }
+                None
+            }
+            HttpEndpointMethod::Post => {
+                let body = body.ok_or(HttpEndpointCatalogError::MissingRequestBody)?;
+                if !body.is_object() && !body.is_array() {
+                    return Err(HttpEndpointCatalogError::InvalidRequest);
+                }
+                Some(
+                    serde_json::to_vec(body)
+                        .map_err(|_| HttpEndpointCatalogError::InvalidRequest)?,
+                )
+            }
+        };
+        let secret_header = origin.authorization.resolve_header(secret_resolver)?;
+        execute_json_http_request(
+            agents,
+            origin.origin.transport,
+            origin.method,
+            url,
+            encoded_body,
+            secret_header,
+            max_response_bytes,
+        )
+    }
+}
+
+impl Default for HttpOriginCatalog {
+    fn default() -> Self {
+        Self::new(HttpEndpointCatalogLimits::default())
+            .expect("default HTTP origin catalog limits are valid")
     }
 }
 
@@ -978,8 +1335,8 @@ impl HttpEndpointAgents {
         }
     }
 
-    fn for_endpoint(&self, endpoint: &HttpEndpoint) -> &Agent {
-        match endpoint.transport {
+    fn for_transport(&self, transport: EndpointTransport) -> &Agent {
+        match transport {
             EndpointTransport::Https => &self.https,
             EndpointTransport::InsecureHttp => &self.insecure_http,
         }
@@ -1003,8 +1360,131 @@ fn build_agent(limits: HttpEndpointCatalogLimits, https_only: bool) -> Agent {
         .into()
 }
 
+fn execute_json_http_request(
+    agents: &HttpEndpointAgents,
+    transport: EndpointTransport,
+    method: HttpEndpointMethod,
+    url: &str,
+    encoded_body: Option<Vec<u8>>,
+    secret_header: Option<(HeaderName, HeaderValue)>,
+    max_response_bytes: usize,
+) -> Result<JsonValue, HttpEndpointCatalogError> {
+    let mut response = match (method, encoded_body) {
+        (HttpEndpointMethod::Get, None) => {
+            let request = agents.for_transport(transport).get(url);
+            let request = match secret_header {
+                Some((name, value)) => request.header(name, value),
+                None => request,
+            };
+            request.call()
+        }
+        (HttpEndpointMethod::Post, Some(body)) => {
+            let request = agents
+                .for_transport(transport)
+                .post(url)
+                .header("Content-Type", "application/json");
+            let request = match secret_header {
+                Some((name, value)) => request.header(name, value),
+                None => request,
+            };
+            request.send(body)
+        }
+        _ => return Err(HttpEndpointCatalogError::InvalidRequest),
+    }
+    .map_err(|_| HttpEndpointCatalogError::Transport)?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(HttpEndpointCatalogError::UnexpectedStatus { status });
+    }
+    if let Some(content_length) = response
+        .headers()
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if content_length > max_response_bytes {
+            return Err(HttpEndpointCatalogError::ResponseTooLarge {
+                maximum: max_response_bytes,
+            });
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(max_response_bytes.min(8 * 1024).saturating_add(1));
+    let limit = u64::try_from(max_response_bytes.saturating_add(1))
+        .expect("bounded HTTP response limit fits into u64");
+    response
+        .body_mut()
+        .as_reader()
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| HttpEndpointCatalogError::Transport)?;
+    if bytes.len() > max_response_bytes {
+        return Err(HttpEndpointCatalogError::ResponseTooLarge {
+            maximum: max_response_bytes,
+        });
+    }
+    let output = serde_json::from_slice::<JsonValue>(&bytes)
+        .map_err(|_| HttpEndpointCatalogError::InvalidResponseJson)?;
+    if !output.is_object() && !output.is_array() {
+        return Err(HttpEndpointCatalogError::InvalidResponseJson);
+    }
+    let output_bytes = serde_json::to_vec(&output)
+        .map_err(|_| HttpEndpointCatalogError::InvalidResponseJson)?
+        .len();
+    if output_bytes > max_response_bytes {
+        return Err(HttpEndpointCatalogError::ResponseTooLarge {
+            maximum: max_response_bytes,
+        });
+    }
+    Ok(output)
+}
+
+fn validate_request_bytes(
+    input: &JsonValue,
+    maximum: usize,
+) -> Result<(), HttpEndpointCatalogError> {
+    let bytes = serde_json::to_vec(input).map_err(|_| HttpEndpointCatalogError::InvalidRequest)?;
+    if bytes.len() > maximum {
+        return Err(HttpEndpointCatalogError::RequestTooLarge { maximum });
+    }
+    Ok(())
+}
+
 fn validate_url(url: &str, transport: EndpointTransport) -> Result<(), HttpEndpointCatalogError> {
-    if url.is_empty() || url.len() > MAX_HTTP_ENDPOINT_URL_BYTES {
+    let (_, actual) = parse_http_url(url)?;
+    if actual.transport == transport {
+        Ok(())
+    } else {
+        match transport {
+            EndpointTransport::Https => Err(HttpEndpointCatalogError::HttpsRequired),
+            EndpointTransport::InsecureHttp => Err(HttpEndpointCatalogError::InsecureHttpRequired),
+        }
+    }
+}
+
+fn validate_origin_url(
+    url: &str,
+    transport: EndpointTransport,
+) -> Result<CanonicalHttpOrigin, HttpEndpointCatalogError> {
+    let (uri, origin) = parse_http_url(url)?;
+    if origin.transport != transport {
+        return match transport {
+            EndpointTransport::Https => Err(HttpEndpointCatalogError::HttpsRequired),
+            EndpointTransport::InsecureHttp => Err(HttpEndpointCatalogError::InsecureHttpRequired),
+        };
+    }
+    if uri
+        .path_and_query()
+        .is_some_and(|path_and_query| path_and_query.as_str() != "/")
+    {
+        return Err(HttpEndpointCatalogError::OriginPathOrQueryNotAllowed);
+    }
+    Ok(origin)
+}
+
+fn parse_http_url(url: &str) -> Result<(Uri, CanonicalHttpOrigin), HttpEndpointCatalogError> {
+    if url.is_empty() || url.len() > MAX_HTTP_ORIGIN_URL_BYTES {
         return Err(HttpEndpointCatalogError::InvalidUrl);
     }
     if url.contains('#') {
@@ -1014,18 +1494,52 @@ fn validate_url(url: &str, transport: EndpointTransport) -> Result<(), HttpEndpo
     let scheme = uri
         .scheme_str()
         .ok_or(HttpEndpointCatalogError::InvalidUrl)?;
+    let transport = match scheme {
+        "https" => EndpointTransport::Https,
+        "http" => EndpointTransport::InsecureHttp,
+        _ => return Err(HttpEndpointCatalogError::InvalidUrl),
+    };
     let authority = uri
         .authority()
         .ok_or(HttpEndpointCatalogError::InvalidUrl)?;
     if authority.as_str().contains('@') {
         return Err(HttpEndpointCatalogError::UrlCredentialsNotAllowed);
     }
-    match transport {
-        EndpointTransport::Https if scheme == "https" => Ok(()),
-        EndpointTransport::Https => Err(HttpEndpointCatalogError::HttpsRequired),
-        EndpointTransport::InsecureHttp if scheme == "http" => Ok(()),
-        EndpointTransport::InsecureHttp => Err(HttpEndpointCatalogError::InsecureHttpRequired),
+    let host = authority.host();
+    if host.is_empty() {
+        return Err(HttpEndpointCatalogError::InvalidUrl);
     }
+    let host = host.to_ascii_lowercase();
+    let port = match authority.port_u16() {
+        Some(port) => port,
+        None if authority_has_explicit_port(authority.as_str()) => {
+            return Err(HttpEndpointCatalogError::InvalidUrl);
+        }
+        None => match transport {
+            EndpointTransport::Https => 443,
+            EndpointTransport::InsecureHttp => 80,
+        },
+    };
+    if port == 0 {
+        return Err(HttpEndpointCatalogError::InvalidUrl);
+    }
+    Ok((
+        uri,
+        CanonicalHttpOrigin {
+            transport,
+            host,
+            port,
+        },
+    ))
+}
+
+fn authority_has_explicit_port(authority: &str) -> bool {
+    if let Some(bracketed_host) = authority.strip_prefix('[') {
+        return bracketed_host
+            .find(']')
+            .is_none_or(|closing_bracket| !bracketed_host[closing_bracket + 1..].is_empty());
+    }
+    authority.contains(':')
 }
 
 fn is_valid_identifier(identifier: &str) -> bool {
@@ -1085,16 +1599,39 @@ fn is_allowed_secret_header(name: &HeaderName) -> bool {
 
 impl HttpEndpointCatalogError {
     fn into_tool_error(self) -> ToolError {
+        self.into_tool_error_with_messages(
+            "HTTP endpoint access was denied",
+            "HTTP endpoint request failed",
+        )
+    }
+
+    fn into_origin_tool_error(self) -> ToolError {
+        self.into_tool_error_with_messages(
+            "HTTP origin access was denied",
+            "HTTP origin request failed",
+        )
+    }
+
+    fn into_tool_error_with_messages(
+        self,
+        denied_message: &'static str,
+        failed_message: &'static str,
+    ) -> ToolError {
         match self {
             Self::InvalidIdentifier
+            | Self::InvalidUrl
+            | Self::UrlCredentialsNotAllowed
+            | Self::UrlFragmentNotAllowed
+            | Self::OriginPathOrQueryNotAllowed
+            | Self::OriginMismatch
+            | Self::HttpsRequired
+            | Self::InsecureHttpRequired
             | Self::NotFound
             | Self::InvalidRequest
             | Self::MissingRequestBody
             | Self::UnexpectedRequestBody
-            | Self::RequestTooLarge { .. } => {
-                ToolError::Denied("HTTP endpoint access was denied".to_owned())
-            }
-            _ => ToolError::Failed("HTTP endpoint request failed".to_owned()),
+            | Self::RequestTooLarge { .. } => ToolError::Denied(denied_message.to_owned()),
+            _ => ToolError::Failed(failed_message.to_owned()),
         }
     }
 }
@@ -1111,6 +1648,7 @@ mod tests {
 
     use super::*;
     use crate::{AuditOutcome, CapabilityRuntime, ToolMetadata};
+    use ureq::http::Uri;
 
     fn start_http_server(
         status: &'static str,
@@ -1171,6 +1709,15 @@ mod tests {
             }
         }
         String::from_utf8(bytes).expect("request bytes are UTF-8")
+    }
+
+    fn origin_for_url(url: &str) -> String {
+        let uri: Uri = url.parse().expect("test URL is a valid URI");
+        format!(
+            "{}://{}",
+            uri.scheme_str().expect("test URL has a scheme"),
+            uri.authority().expect("test URL has an authority")
+        )
     }
 
     #[test]
@@ -1377,6 +1924,237 @@ mod tests {
             ToolError::Denied("HTTP endpoint access was denied".to_owned())
         );
         assert!(!error.to_string().contains("not-approved"));
+    }
+
+    #[test]
+    fn origin_policy_accepts_only_the_exact_scheme_host_and_effective_port() {
+        let origin = HttpOrigin::https(
+            "service",
+            HttpEndpointMethod::Get,
+            "https://Api.Example.test/",
+        )
+        .unwrap();
+
+        assert!(origin
+            .accepts_url("https://api.example.test/v1/status?mode=dynamic")
+            .is_ok());
+        assert!(origin
+            .accepts_url("https://api.example.test:443/v1/status")
+            .is_ok());
+        assert!(matches!(
+            origin.accepts_url("http://api.example.test/v1/status"),
+            Err(HttpEndpointCatalogError::OriginMismatch)
+        ));
+        assert!(matches!(
+            origin.accepts_url("https://other.example.test/v1/status"),
+            Err(HttpEndpointCatalogError::OriginMismatch)
+        ));
+        assert!(matches!(
+            origin.accepts_url("https://api.example.test:444/v1/status"),
+            Err(HttpEndpointCatalogError::OriginMismatch)
+        ));
+        assert!(matches!(
+            origin.accepts_url("https://api.example.test:99999/v1/status"),
+            Err(HttpEndpointCatalogError::InvalidUrl)
+        ));
+        assert!(matches!(
+            origin.accepts_url("https://operator:secret@api.example.test/v1/status"),
+            Err(HttpEndpointCatalogError::UrlCredentialsNotAllowed)
+        ));
+        assert!(matches!(
+            origin.accepts_url("https://api.example.test/v1/status#fragment"),
+            Err(HttpEndpointCatalogError::UrlFragmentNotAllowed)
+        ));
+
+        let ipv6_origin =
+            HttpOrigin::insecure_http("local-ipv6", HttpEndpointMethod::Get, "http://[::1]/")
+                .unwrap();
+        assert!(ipv6_origin
+            .accepts_url("http://[::1]:80/dynamic/status")
+            .is_ok());
+    }
+
+    #[test]
+    fn origin_policy_rejects_unscoped_configuration_and_redacts_debug_output() {
+        assert!(matches!(
+            HttpOrigin::https(
+                "service",
+                HttpEndpointMethod::Get,
+                "https://api.example.test/v1"
+            ),
+            Err(HttpEndpointCatalogError::OriginPathOrQueryNotAllowed)
+        ));
+        assert!(matches!(
+            HttpOrigin::https(
+                "service",
+                HttpEndpointMethod::Get,
+                "https://api.example.test/?scope=too-broad"
+            ),
+            Err(HttpEndpointCatalogError::OriginPathOrQueryNotAllowed)
+        ));
+        assert!(matches!(
+            HttpOrigin::https(
+                "service",
+                HttpEndpointMethod::Get,
+                "https://api.example.test:0"
+            ),
+            Err(HttpEndpointCatalogError::InvalidUrl)
+        ));
+        assert!(matches!(
+            HttpOrigin::https(
+                "service",
+                HttpEndpointMethod::Get,
+                "https://api.example.test:99999"
+            ),
+            Err(HttpEndpointCatalogError::InvalidUrl)
+        ));
+        assert!(matches!(
+            HttpOrigin::insecure_http("local", HttpEndpointMethod::Get, "http://127.0.0.1")
+                .unwrap()
+                .with_bearer_secret("local.auth"),
+            Err(HttpEndpointCatalogError::SecretAuthorizationRequiresHttps)
+        ));
+
+        let origin = HttpOrigin::https(
+            "service",
+            HttpEndpointMethod::Get,
+            "https://api.example.test/",
+        )
+        .unwrap();
+        let debug = format!("{origin:?}");
+        assert!(!debug.contains("api.example.test"));
+    }
+
+    #[test]
+    fn executes_a_dynamic_path_and_query_only_at_the_configured_origin() {
+        let (fixed_url, received, server) = start_http_server("200 OK", br#"{"accepted":true}"#);
+        let origin_url = origin_for_url(&fixed_url);
+        let dynamic_url = format!("{origin_url}/dynamic/path?mode=script");
+        let mut catalog = HttpOriginCatalog::default();
+        catalog
+            .insert(
+                HttpOrigin::insecure_http("local", HttpEndpointMethod::Post, origin_url).unwrap(),
+            )
+            .unwrap();
+        let mut handler = catalog.into_tool_handler(64);
+
+        let response = handler(&JsonToolRequest {
+            name: "net.request".to_owned(),
+            input: json!({
+                "origin": "local",
+                "url": dynamic_url,
+                "body": {"value": 42}
+            }),
+            call_index: 1,
+        })
+        .unwrap();
+        assert_eq!(response, json!({"accepted": true}));
+
+        let request = received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dynamic request reaches the reviewed origin");
+        server.join().expect("server completes");
+        assert!(request.starts_with("POST /dynamic/path?mode=script HTTP/1.1\r\n"));
+        assert!(request.ends_with("{\"value\":42}"));
+        let lower = request.to_ascii_lowercase();
+        assert!(!lower.contains("authorization:"));
+        assert!(!lower.contains("cookie:"));
+    }
+
+    #[test]
+    fn origin_catalog_redacts_mismatches_and_never_resolves_a_secret_first() {
+        let mut catalog = HttpOriginCatalog::default();
+        catalog
+            .insert(
+                HttpOrigin::https(
+                    "service",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/",
+                )
+                .unwrap()
+                .with_bearer_secret("release.auth")
+                .unwrap(),
+            )
+            .unwrap();
+
+        let calls = Rc::new(RefCell::new(0_usize));
+        let resolver_calls = Rc::clone(&calls);
+        let mut handler = catalog.into_tool_handler_with_secret_resolver(64, move |_: &str| {
+            *resolver_calls.borrow_mut() += 1;
+            Ok(HttpEndpointSecret::new("test-only-token").unwrap())
+        });
+        let error = handler(&JsonToolRequest {
+            name: "net.request".to_owned(),
+            input: json!({
+                "origin": "service",
+                "url": "https://not-approved.example.test/v1/status"
+            }),
+            call_index: 1,
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ToolError::Denied("HTTP origin access was denied".to_owned())
+        );
+        assert_eq!(*calls.borrow(), 0);
+        assert!(!error.to_string().contains("not-approved"));
+        assert!(!error.to_string().contains("release.auth"));
+    }
+
+    #[test]
+    fn origin_catalog_publishes_only_opaque_ids_and_redacts_runtime_mismatches() {
+        let mut catalog = HttpOriginCatalog::default();
+        catalog
+            .insert(
+                HttpOrigin::https(
+                    "service",
+                    HttpEndpointMethod::Get,
+                    "https://api.example.test/",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_http_origin_catalog_tool(
+                ToolPolicy::json("net.request"),
+                ToolMetadata::new("Requests a reviewed origin."),
+                catalog,
+            )
+            .unwrap();
+
+        let descriptor = runtime
+            .tool_catalog()
+            .into_iter()
+            .next()
+            .expect("catalog publishes one tool");
+        let input_schema = descriptor
+            .metadata
+            .input_schema
+            .expect("origin request schema is published");
+        assert_eq!(
+            input_schema["properties"]["origin"]["enum"],
+            json!(["service"])
+        );
+        assert_eq!(
+            input_schema["properties"]["url"]["maxLength"],
+            json!(MAX_HTTP_ORIGIN_URL_BYTES)
+        );
+        let published = serde_json::to_string(&input_schema).expect("schema serializes");
+        assert!(!published.contains("api.example.test"));
+
+        let report = runtime
+            .eval(
+                "use mod.tool\n\
+                 tool.call_json(\"net.request\", {origin: \"service\", url: \"https://not-approved.example.test/v1/status\"})",
+            )
+            .unwrap();
+        assert!(!report.succeeded());
+        let diagnostics = format!("{:?}", report.diagnostics);
+        assert!(diagnostics.contains("HTTP origin access was denied"));
+        assert!(!diagnostics.contains("not-approved"));
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Denied);
     }
 
     #[test]

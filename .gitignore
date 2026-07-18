@@ -35,6 +35,9 @@ vendor/makepad/target/
 !/fuzz/corpus/bubblewrap_policy/
 /fuzz/corpus/bubblewrap_policy/*
 !/fuzz/corpus/bubblewrap_policy/*.seed
+!/fuzz/corpus/http_origin_policy/
+/fuzz/corpus/http_origin_policy/*
+!/fuzz/corpus/http_origin_policy/*.seed
 /fuzz/target/
 *.swp
 .DS_Store
