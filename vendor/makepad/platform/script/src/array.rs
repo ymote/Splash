@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::rc::Rc;
 
 /// Appends `bytes` with the same replacement behavior as
@@ -208,6 +209,35 @@ pub enum ScriptArrayStorage {
 }
 
 impl ScriptArrayStorage {
+    /// Backing allocation retained by this storage, excluding the enum itself.
+    ///
+    /// The heap budget uses retained capacity instead of logical length so a
+    /// cleared or sparsely written collection cannot hide already-reserved
+    /// memory from the host's accounting boundary.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::ScriptValue(values) => values.capacity().saturating_mul(size_of::<ScriptValue>()),
+            Self::F32(values) => values.capacity().saturating_mul(size_of::<f32>()),
+            Self::U32(values) => values.capacity().saturating_mul(size_of::<u32>()),
+            Self::U16(values) => values.capacity().saturating_mul(size_of::<u16>()),
+            Self::U8(values) => values.capacity(),
+        }
+    }
+
+    /// Minimum backing bytes needed to represent `length` values before any
+    /// allocator growth policy is applied. Callers use this before sparse
+    /// indexed writes so a hostile index cannot request an unbounded resize.
+    pub(crate) fn minimum_bytes_for_len(&self, length: usize) -> Option<usize> {
+        let element_bytes = match self {
+            Self::ScriptValue(_) => size_of::<ScriptValue>(),
+            Self::F32(_) => size_of::<f32>(),
+            Self::U32(_) => size_of::<u32>(),
+            Self::U16(_) => size_of::<u16>(),
+            Self::U8(_) => size_of::<u8>(),
+        };
+        length.checked_mul(element_bytes)
+    }
+
     pub fn clear(&mut self) {
         match self {
             Self::ScriptValue(v) => v.clear(),

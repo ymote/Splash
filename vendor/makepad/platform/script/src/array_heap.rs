@@ -2,18 +2,46 @@ use crate::heap::*;
 use crate::trap::*;
 use crate::value::*;
 use crate::*;
+use std::mem::size_of;
 
 impl ScriptHeap {
     // Arrays
+
+    fn prepare_array_storage_growth(
+        &mut self,
+        array: ScriptArray,
+        requested_len: usize,
+    ) -> Option<usize> {
+        let storage = &self.arrays[array].storage;
+        let before = storage.retained_bytes();
+        if self.max_heap_bytes.is_none() {
+            return Some(before);
+        }
+        let growth = storage
+            .minimum_bytes_for_len(requested_len)
+            .map(|required| required.saturating_sub(before));
+        if self.can_grow_heap_by(growth) {
+            Some(before)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn note_array_storage_growth(&mut self, array: ScriptArray, before: usize) {
+        let after = self.arrays[array].storage.retained_bytes();
+        self.note_heap_capacity_change(before, after);
+    }
 
     pub fn freeze_array(&mut self, array: ScriptArray) {
         self.arrays[array].tag.freeze()
     }
 
     pub fn new_array(&mut self) -> ScriptArray {
-        if let Some(arr) = self.arrays_free.pop() {
+        let capacity = self.arrays.capacity();
+        let (array, previous_storage) = if let Some(arr) = self.arrays_free.pop() {
             // arr already has the correct generation from gc.rs sweep
             let array = &mut self.arrays[arr];
+            let previous_storage = array.storage.retained_bytes();
             // Reused array slots may come from typed buffers (U8/U16/U32/F32).
             // New arrays must start as generic ScriptValue storage.
             if !matches!(array.storage, ScriptArrayStorage::ScriptValue(_)) {
@@ -22,15 +50,26 @@ impl ScriptHeap {
                 array.storage.clear();
             }
             array.tag.set_alloced();
-            arr
+            (arr, previous_storage)
         } else {
             let index = self.arrays.len();
             let mut array = ScriptArrayData::default();
             array.tag.set_alloced();
             self.arrays.push(array);
             // New slot starts at generation 0
-            ScriptArray::new(index as _, crate::value::GENERATION_ZERO)
-        }
+            (ScriptArray::new(index as _, crate::value::GENERATION_ZERO), 0)
+        };
+        self.note_heap_growth(
+            self.arrays
+                .capacity()
+                .saturating_sub(capacity)
+                .saturating_mul(size_of::<crate::gen_index::GenSlot<ScriptArrayData>>()),
+        );
+        self.note_heap_capacity_change(
+            previous_storage,
+            self.arrays[array].storage.retained_bytes(),
+        );
+        array
     }
 
     pub fn array_len(&self, array: ScriptArray) -> usize {
@@ -38,13 +77,23 @@ impl ScriptHeap {
     }
 
     pub fn array_push(&mut self, array: ScriptArray, value: ScriptValue, trap: ScriptTrap) {
-        let array = &mut self.arrays[array];
-        if array.tag.is_immutable() {
+        if self.arrays[array].tag.is_immutable() {
             script_err_immutable!(trap, "array is immutable");
             return;
         }
-        array.tag.set_dirty();
-        array.storage.push(value);
+        let Some(requested_len) = self.arrays[array].storage.len().checked_add(1) else {
+            self.can_grow_heap_by(None);
+            return;
+        };
+        let Some(before) = self.prepare_array_storage_growth(array, requested_len) else {
+            return;
+        };
+        {
+            let array_data = &mut self.arrays[array];
+            array_data.tag.set_dirty();
+            array_data.storage.push(value);
+        }
+        self.note_array_storage_growth(array, before);
     }
 
     pub fn array_pop_front_option(&mut self, array: ScriptArray) -> Option<ScriptValue> {
@@ -57,21 +106,43 @@ impl ScriptHeap {
     }
 
     pub fn array_push_vec(&mut self, array: ScriptArray, object: ScriptObject, trap: ScriptTrap) {
-        let array = &mut self.arrays[array];
-        if array.tag.is_immutable() {
+        if self.arrays[array].tag.is_immutable() {
             script_err_immutable!(trap, "array is immutable");
             return;
         }
-        array.tag.set_dirty();
-        let object = &self.objects[object];
-        for kv in &object.vec {
-            array.storage.push(kv.value);
+        let Some(requested_len) = self.arrays[array]
+            .storage
+            .len()
+            .checked_add(self.objects[object].vec.len())
+        else {
+            self.can_grow_heap_by(None);
+            return;
+        };
+        let Some(before) = self.prepare_array_storage_growth(array, requested_len) else {
+            return;
+        };
+        let values = self.objects[object]
+            .vec
+            .iter()
+            .map(|entry| entry.value)
+            .collect::<Vec<_>>();
+        {
+            let array_data = &mut self.arrays[array];
+            array_data.tag.set_dirty();
+            for value in values {
+                array_data.storage.push(value);
+            }
         }
+        self.note_array_storage_growth(array, before);
     }
 
     /// Merges all elements from source array into target array.
     /// Used by the splat operator (..) to spread one array into another.
     pub fn merge_array(&mut self, target: ScriptArray, source: ScriptArray, trap: ScriptTrap) {
+        if self.arrays[target].tag.is_immutable() {
+            script_err_immutable!(trap, "array is immutable");
+            return;
+        }
         // Get the storage from source first
         let source_storage = &self.arrays[source].storage;
         let values: Vec<ScriptValue> = match source_storage {
@@ -90,21 +161,35 @@ impl ScriptHeap {
             }
         };
 
-        let target_arr = &mut self.arrays[target];
-        if target_arr.tag.is_immutable() {
-            script_err_immutable!(trap, "array is immutable");
+        let Some(requested_len) = self.arrays[target].storage.len().checked_add(values.len()) else {
+            self.can_grow_heap_by(None);
             return;
-        }
+        };
+        let Some(before) = self.prepare_array_storage_growth(target, requested_len) else {
+            return;
+        };
+        let target_arr = &mut self.arrays[target];
         target_arr.tag.set_dirty();
         for v in values {
             target_arr.storage.push(v);
         }
+        self.note_array_storage_growth(target, before);
     }
 
     pub fn array_push_unchecked(&mut self, array: ScriptArray, value: ScriptValue) {
-        let array = &mut self.arrays[array];
-        array.tag.set_dirty();
-        array.storage.push(value);
+        let Some(requested_len) = self.arrays[array].storage.len().checked_add(1) else {
+            self.can_grow_heap_by(None);
+            return;
+        };
+        let Some(before) = self.prepare_array_storage_growth(array, requested_len) else {
+            return;
+        };
+        {
+            let array_data = &mut self.arrays[array];
+            array_data.tag.set_dirty();
+            array_data.storage.push(value);
+        }
+        self.note_array_storage_growth(array, before);
     }
 
     pub fn array_storage(&self, array: ScriptArray) -> &ScriptArrayStorage {
@@ -114,12 +199,45 @@ impl ScriptHeap {
 
     pub fn new_array_from_vec_u8(&mut self, data: Vec<u8>) -> ScriptArray {
         let ptr = self.new_array();
-        let array = &mut self.arrays[ptr];
-        array.tag.set_dirty();
-        array.storage = ScriptArrayStorage::U8(data);
+        let before = self.arrays[ptr].storage.retained_bytes();
+        {
+            let array_data = &mut self.arrays[ptr];
+            array_data.tag.set_dirty();
+            array_data.storage = ScriptArrayStorage::U8(data);
+        }
+        self.note_array_storage_growth(ptr, before);
         ptr
     }
 
+    /// Mutates one array storage value while preserving aggregate heap
+    /// accounting. Normal VM and adapter conversion paths should prefer this
+    /// over [`Self::array_mut`].
+    pub(crate) fn array_mut_with<R, F: FnOnce(&mut ScriptArrayStorage) -> R>(
+        &mut self,
+        array: ScriptArray,
+        trap: ScriptTrap,
+        cb: F,
+    ) -> Option<R> {
+        let before = self.arrays[array].storage.retained_bytes();
+        let result = {
+            let array_data = &mut self.arrays[array];
+            if array_data.tag.is_immutable() {
+                script_err_immutable!(trap, "array is immutable");
+                return None;
+            }
+            array_data.tag.set_dirty();
+            cb(&mut array_data.storage)
+        };
+        self.note_array_storage_growth(array, before);
+        Some(result)
+    }
+
+    /// Returns direct mutable access for trusted raw VM hosts.
+    ///
+    /// This cannot observe capacity changes after the borrow escapes. A host
+    /// that uses it while a heap cap is active must call
+    /// [`Self::reconcile_heap_bytes`] before it re-enters untrusted script.
+    /// Splash's normal VM paths use accounting-aware helpers instead.
     pub fn array_mut(
         &mut self,
         array: ScriptArray,
@@ -151,10 +269,12 @@ impl ScriptHeap {
         array: ScriptArray,
         cb: F,
     ) -> R {
+        let before = self.arrays[array].storage.retained_bytes();
         let mut storage = ScriptArrayStorage::ScriptValue(Default::default());
         std::mem::swap(&mut self.arrays[array].storage, &mut storage);
         let r = cb(self, &mut storage);
         std::mem::swap(&mut self.arrays[array].storage, &mut storage);
+        self.note_array_storage_growth(array, before);
         r
     }
 
@@ -234,12 +354,22 @@ impl ScriptHeap {
         value: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        let array = &mut self.arrays[array];
-        if array.tag.is_immutable() {
+        if self.arrays[array].tag.is_immutable() {
             return script_err_immutable!(trap, "array is immutable");
         }
-        array.tag.set_dirty();
-        array.storage.set_index(index, value);
+        let Some(requested_len) = index.checked_add(1) else {
+            self.can_grow_heap_by(None);
+            return NIL;
+        };
+        let Some(before) = self.prepare_array_storage_growth(array, requested_len) else {
+            return NIL;
+        };
+        {
+            let array_data = &mut self.arrays[array];
+            array_data.tag.set_dirty();
+            array_data.storage.set_index(index, value);
+        }
+        self.note_array_storage_growth(array, before);
         NIL
     }
 }

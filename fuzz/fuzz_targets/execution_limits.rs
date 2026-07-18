@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use splash_core::{check_syntax_named, ExecutionLimits, Runtime, RuntimeError};
+use splash_core::{
+    check_syntax_named, ExecutionLimits, Runtime, RuntimeError, DEFAULT_MAX_SCRIPT_HEAP_BYTES,
+};
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 8 * 1024;
 const MAX_FUZZ_SYNTAX_TOKENS: usize = 1_024;
 const MAX_FUZZ_SYNTAX_NESTING: usize = 64;
+const MIN_FUZZ_HEAP_BYTES: usize = 2 * 1024 * 1024;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(unbounded_source) = std::str::from_utf8(data) else {
@@ -71,6 +74,7 @@ fn fuzz_limits(data: &[u8]) -> ExecutionLimits {
         0 => ExecutionLimits {
             max_source_bytes: 64,
             max_string_bytes: 64,
+            max_heap_bytes: MIN_FUZZ_HEAP_BYTES,
             max_syntax_tokens: 8,
             max_syntax_nesting: 2,
             instruction_limit: 16,
@@ -81,6 +85,7 @@ fn fuzz_limits(data: &[u8]) -> ExecutionLimits {
         1 => ExecutionLimits {
             max_source_bytes: 512,
             max_string_bytes: 512,
+            max_heap_bytes: MIN_FUZZ_HEAP_BYTES,
             max_syntax_tokens: 64,
             max_syntax_nesting: 4,
             instruction_limit: 64,
@@ -91,6 +96,7 @@ fn fuzz_limits(data: &[u8]) -> ExecutionLimits {
         2 => ExecutionLimits {
             max_source_bytes: 4 * 1024,
             max_string_bytes: 4 * 1024,
+            max_heap_bytes: 4 * 1024 * 1024,
             max_syntax_tokens: 512,
             max_syntax_nesting: 16,
             instruction_limit: 256,
@@ -101,6 +107,7 @@ fn fuzz_limits(data: &[u8]) -> ExecutionLimits {
         3 => ExecutionLimits {
             max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
             max_string_bytes: MAX_FUZZ_SOURCE_BYTES,
+            max_heap_bytes: 4 * 1024 * 1024,
             max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
             max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
             instruction_limit: 4_096,
@@ -111,6 +118,7 @@ fn fuzz_limits(data: &[u8]) -> ExecutionLimits {
         _ => ExecutionLimits {
             max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
             max_string_bytes: MAX_FUZZ_SOURCE_BYTES,
+            max_heap_bytes: DEFAULT_MAX_SCRIPT_HEAP_BYTES,
             max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
             max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
             instruction_limit: 4_096,
@@ -125,6 +133,7 @@ fn replacement_limits() -> ExecutionLimits {
     ExecutionLimits {
         max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_string_bytes: MAX_FUZZ_SOURCE_BYTES,
+        max_heap_bytes: DEFAULT_MAX_SCRIPT_HEAP_BYTES,
         max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
         max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
         instruction_limit: 512,

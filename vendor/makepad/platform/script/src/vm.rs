@@ -686,6 +686,23 @@ impl<'a> ScriptVm<'a> {
 
     pub fn run_core(&mut self) -> ScriptValue {
         loop {
+            if self.bx.heap.take_heap_limit_exceeded() {
+                let err = script_err_limit!(
+                    self.bx.threads.cur_ref().trap,
+                    "script heap allocation limit exceeded"
+                );
+                self.drain_errors();
+                self.bx
+                    .threads
+                    .cur()
+                    .trap
+                    .on
+                    .set(Some(ScriptTrapOn::Bail(err)));
+                if let Some(value) = self.handle_trap_on() {
+                    return value;
+                }
+            }
+
             if self.bx.heap.take_string_limit_exceeded() {
                 let err = script_err_limit!(
                     self.bx.threads.cur_ref().trap,
@@ -987,10 +1004,12 @@ impl<'a> ScriptVm<'a> {
         object: ScriptObject,
         f: F,
     ) -> R {
+        let before = self.bx.heap.objects[object].retained_bytes();
         let mut map = ScriptObjectMap::default();
         std::mem::swap(&mut map, &mut self.bx.heap.objects[object].map);
         let r = f(self, &mut map);
         std::mem::swap(&mut map, &mut self.bx.heap.objects[object].map);
+        self.bx.heap.note_object_storage_growth(object, before);
         r
     }
 
@@ -1007,10 +1026,12 @@ impl<'a> ScriptVm<'a> {
             self.proto_map_iter_mut_with(proto, f);
         }
         // Then process this object's map
+        let before = self.bx.heap.objects[object].retained_bytes();
         let mut map = ScriptObjectMap::default();
         std::mem::swap(&mut map, &mut self.bx.heap.objects[object].map);
         f(self, &mut map);
         std::mem::swap(&mut map, &mut self.bx.heap.objects[object].map);
+        self.bx.heap.note_object_storage_growth(object, before);
     }
 
     pub fn vec_with<R, F: FnOnce(&mut Self, &[ScriptVecValue]) -> R>(
@@ -1030,10 +1051,12 @@ impl<'a> ScriptVm<'a> {
         object: ScriptObject,
         f: F,
     ) -> R {
+        let before = self.bx.heap.objects[object].retained_bytes();
         let mut vec = Vec::new();
         std::mem::swap(&mut vec, &mut self.bx.heap.objects[object].vec);
         let r = f(self, &mut vec);
         std::mem::swap(&mut vec, &mut self.bx.heap.objects[object].vec);
+        self.bx.heap.note_object_storage_growth(object, before);
         r
     }
 
@@ -1590,6 +1613,37 @@ mod tests {
             .take_errors()
             .iter()
             .any(|diagnostic| diagnostic.contains("script string allocation limit exceeded")));
+    }
+
+    #[test]
+    fn heap_limit_bails_instead_of_entering_a_try_fallback() {
+        let mut host = ();
+        let mut std = ();
+        let mut vm = ScriptVm {
+            host: &mut host,
+            std: &mut std,
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        vm.bx.heap.reconcile_heap_bytes();
+        let baseline = vm.bx.heap.accounted_heap_bytes();
+        vm.bx.heap.set_max_heap_bytes(Some(baseline + 256 * 1024));
+        vm.bx.captured_errors = Some(Vec::new());
+
+        let result = vm.eval(ScriptMod {
+            file: "heap-limit.splash".to_owned(),
+            code: "let values = []\n\
+                   try { values[268435456] = 1 } { \"ok\" }\n\
+                   ;"
+                .to_owned(),
+            ..Default::default()
+        });
+
+        assert!(result.is_err());
+        assert!(vm.bx.threads.cur_ref().trap.err.borrow().is_empty());
+        assert!(vm
+            .take_errors()
+            .iter()
+            .any(|diagnostic| diagnostic.contains("script heap allocation limit exceeded")));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 use crate::array::*;
+use crate::gen_index::GenSlot;
 use crate::heap::*;
 use crate::string::*;
 use crate::value::*;
 use std::fmt::{self, Write};
+use std::mem::size_of;
 
 /// A sink used while the VM converts values into strings.
 ///
@@ -237,8 +239,12 @@ impl ScriptHeap {
             return index.into();
         }
 
+        let string_capacity = out.capacity();
+        let strings_capacity = self.strings.capacity();
+        let intern_capacity = self.string_intern.capacity();
+
         // fetch a free string
-        if let Some(str) = self.strings_free.pop() {
+        let stored = if let Some(str) = self.strings_free.pop() {
             // str already has the correct generation from gc.rs sweep
             let out = ScriptRcString::new(out);
             self.strings[str] = Some(ScriptStringData {
@@ -258,8 +264,28 @@ impl ScriptHeap {
             let ret = ScriptString::new(index as _, crate::value::GENERATION_ZERO);
             self.string_intern.insert(out, ret);
             ret
-        }
-        .into()
+        };
+
+        let slot_growth = self
+            .strings
+            .capacity()
+            .saturating_sub(strings_capacity)
+            .saturating_mul(size_of::<GenSlot<Option<ScriptStringData>>>());
+        let intern_entry_bytes = size_of::<(ScriptRcString, ScriptString)>()
+            .saturating_add(size_of::<usize>().saturating_mul(2))
+            .saturating_add(1);
+        let intern_growth = self
+            .string_intern
+            .capacity()
+            .saturating_sub(intern_capacity)
+            .saturating_mul(intern_entry_bytes);
+        self.note_heap_growth(
+            string_capacity
+                .saturating_add(slot_growth)
+                .saturating_add(intern_growth),
+        );
+
+        stored.into()
     }
 
     pub fn check_intern_string(&self, value: &str) -> Option<ScriptValue> {
@@ -288,6 +314,7 @@ impl ScriptHeap {
 
     pub fn string_to_bytes_array(&mut self, v: ScriptValue) -> ScriptArray {
         let arr = self.new_array();
+        let before = self.arrays[arr].storage.retained_bytes();
         if v.as_inline_string(|str| {
             let array = &mut self.arrays[arr];
             if let ScriptArrayStorage::U8(v) = &mut array.storage {
@@ -313,11 +340,13 @@ impl ScriptHeap {
                 array.storage = ScriptArrayStorage::U8(str.as_bytes().into());
             }
         }
-        return arr;
+        self.note_array_storage_growth(arr, before);
+        arr
     }
 
     pub fn string_to_chars_array(&mut self, v: ScriptValue) -> ScriptArray {
         let arr = self.new_array();
+        let before = self.arrays[arr].storage.retained_bytes();
         if v.as_inline_string(|str| {
             let array = &mut self.arrays[arr];
             if let ScriptArrayStorage::U32(v) = &mut array.storage {
@@ -347,7 +376,8 @@ impl ScriptHeap {
                 array.storage = ScriptArrayStorage::U32(str.chars().map(|c| c as u32).collect());
             }
         }
-        return arr;
+        self.note_array_storage_growth(arr, before);
+        arr
     }
 
     pub fn cast_to_string<S: ScriptStringSink>(&self, v: ScriptValue, out: &mut S) {
@@ -414,7 +444,9 @@ impl ScriptHeap {
     }
 
     fn new_string_buffer(&mut self) -> ScriptStringBuffer {
-        let out = if let Some(out) = self.strings_reuse.pop() {
+        let out = if self.max_heap_bytes.is_some() {
+            String::new()
+        } else if let Some(out) = self.strings_reuse.pop() {
             if self
                 .max_string_bytes
                 .is_some_and(|maximum| out.capacity() > maximum)
@@ -430,7 +462,11 @@ impl ScriptHeap {
     }
 
     fn take_string_buffer(&mut self) -> String {
-        self.strings_reuse.pop().unwrap_or_default()
+        if self.max_heap_bytes.is_some() {
+            String::new()
+        } else {
+            self.strings_reuse.pop().unwrap_or_default()
+        }
     }
 
     fn recycle_string_buffer(&mut self, out: ScriptStringBuffer) {
@@ -443,6 +479,9 @@ impl ScriptHeap {
 
     fn recycle_string(&mut self, mut out: String) {
         out.clear();
+        if self.max_heap_bytes.is_some() {
+            return;
+        }
         if self
             .max_string_bytes
             .is_none_or(|maximum| out.capacity() <= maximum)

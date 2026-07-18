@@ -243,6 +243,7 @@ fn profile_output() -> JsonValue {
         },
         "evaluation_limits": {
             "string_bytes": limits.max_string_bytes,
+            "heap_bytes": limits.max_heap_bytes,
             "instruction_limit": limits.instruction_limit,
             "soft_timeout_ms": soft_timeout_ms,
             "hard_timeout_ms": hard_timeout_ms,
@@ -1164,6 +1165,10 @@ mod tests {
         assert_eq!(
             output["evaluation_limits"]["string_bytes"],
             json!(limits.max_string_bytes)
+        );
+        assert_eq!(
+            output["evaluation_limits"]["heap_bytes"],
+            json!(limits.max_heap_bytes)
         );
         assert_eq!(
             output["preflight_limits"]["source_bytes"],

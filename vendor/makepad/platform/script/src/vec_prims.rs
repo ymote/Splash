@@ -100,29 +100,31 @@ where
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
         let arr = vm.bx.heap.new_array();
         let trap = vm.bx.threads.cur().trap.pass();
-        let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
         // we swap the vec off of the heap to be able to script_to_value the rest
-        let mut vec_store = ScriptArrayStorage::ScriptValue(Default::default());
-        std::mem::swap(&mut vec_store, astore);
-        if let ScriptArrayStorage::ScriptValue(vec) = &mut vec_store {
-            vec.clear();
-            for v in self {
-                vec.push_back(v.script_to_value(vm));
-            }
-            let trap = vm.bx.threads.cur().trap.pass();
-            let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-            std::mem::swap(&mut vec_store, astore);
-        } else {
-            let mut vec_store = ScriptArrayStorage::ScriptValue(Default::default());
-            if let ScriptArrayStorage::ScriptValue(vec) = &mut vec_store {
-                for v in self {
-                    vec.push_back(v.script_to_value(vm));
-                }
-                let trap = vm.bx.threads.cur().trap.pass();
-                let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-                std::mem::swap(&mut vec_store, astore);
-            }
+        let mut vec_store = vm
+            .bx
+            .heap
+            .array_mut_with(arr, trap, |astore| {
+                let mut store = ScriptArrayStorage::ScriptValue(Default::default());
+                std::mem::swap(&mut store, astore);
+                store
+            })
+            .unwrap();
+        if !matches!(vec_store, ScriptArrayStorage::ScriptValue(_)) {
+            vec_store = ScriptArrayStorage::ScriptValue(Default::default());
         }
+        let ScriptArrayStorage::ScriptValue(vec) = &mut vec_store else {
+            unreachable!("array storage was normalized to ScriptValue");
+        };
+        vec.clear();
+        for v in self {
+            vec.push_back(v.script_to_value(vm));
+        }
+        let trap = vm.bx.threads.cur().trap.pass();
+        vm.bx
+            .heap
+            .array_mut_with(arr, trap, |astore| std::mem::swap(&mut vec_store, astore))
+            .unwrap();
         arr.into()
     }
 }
@@ -238,13 +240,17 @@ impl ScriptApply for Vec<u8> {
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
         let arr = vm.bx.heap.new_array();
         let trap = vm.bx.threads.cur().trap.pass();
-        let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-        if let ScriptArrayStorage::U8(v) = astore {
-            v.clear();
-            v.extend(self)
-        } else {
-            *astore = ScriptArrayStorage::U8(self.clone());
-        }
+        vm.bx
+            .heap
+            .array_mut_with(arr, trap, |astore| {
+                if let ScriptArrayStorage::U8(v) = astore {
+                    v.clear();
+                    v.extend(self)
+                } else {
+                    *astore = ScriptArrayStorage::U8(self.clone());
+                }
+            })
+            .unwrap();
         arr.into()
     }
 }
@@ -327,13 +333,17 @@ impl ScriptApply for Vec<ScriptValue> {
     fn script_to_value(&self, vm: &mut ScriptVm) -> ScriptValue {
         let arr = vm.bx.heap.new_array();
         let trap = vm.bx.threads.cur().trap.pass();
-        let astore = vm.bx.heap.array_mut(arr, trap).unwrap();
-        if let ScriptArrayStorage::ScriptValue(v) = astore {
-            v.clear();
-            v.extend(self)
-        } else {
-            *astore = ScriptArrayStorage::ScriptValue(self.iter().cloned().collect());
-        }
+        vm.bx
+            .heap
+            .array_mut_with(arr, trap, |astore| {
+                if let ScriptArrayStorage::ScriptValue(v) = astore {
+                    v.clear();
+                    v.extend(self)
+                } else {
+                    *astore = ScriptArrayStorage::ScriptValue(self.iter().cloned().collect());
+                }
+            })
+            .unwrap();
         arr.into()
     }
 }

@@ -7,12 +7,89 @@ use crate::traits::*;
 use crate::trap::*;
 use crate::value::*;
 use crate::*;
+use std::mem::size_of;
 
 impl ScriptHeap {
     // New objects
 
+    fn prepare_object_vec_growth(
+        &mut self,
+        object: ScriptObject,
+        requested_len: usize,
+    ) -> Option<usize> {
+        let before = self.objects[object]
+            .vec
+            .capacity()
+            .saturating_mul(size_of::<ScriptVecValue>());
+        if self.max_heap_bytes.is_none() {
+            return Some(before);
+        }
+        let growth = ScriptObjectData::minimum_vec_bytes_for_len(requested_len)
+            .map(|required| required.saturating_sub(before));
+        if self.can_grow_heap_by(growth) {
+            Some(before)
+        } else {
+            None
+        }
+    }
+
+    fn prepare_object_map_growth(
+        &mut self,
+        object: ScriptObject,
+        key: ScriptValue,
+    ) -> Option<usize> {
+        let storage = &self.objects[object];
+        let before = storage.retained_bytes();
+        if self.max_heap_bytes.is_none() {
+            return Some(before);
+        }
+        let growth = storage
+            .anticipated_retained_bytes_after_map_insert(key)
+            .map(|required| required.saturating_sub(before));
+        if self.can_grow_heap_by(growth) {
+            Some(before)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn note_object_storage_growth(&mut self, object: ScriptObject, before: usize) {
+        let after = self.objects[object].retained_bytes();
+        self.note_heap_capacity_change(before, after);
+    }
+
+    pub(crate) fn insert_object_map(
+        &mut self,
+        object: ScriptObject,
+        key: ScriptValue,
+        value: ScriptValue,
+    ) {
+        let Some(before) = self.prepare_object_map_growth(object, key) else {
+            return;
+        };
+        self.objects[object].map_insert(key, value);
+        self.note_object_storage_growth(object, before);
+    }
+
+    pub(crate) fn push_object_vec(
+        &mut self,
+        object: ScriptObject,
+        value: ScriptVecValue,
+    ) {
+        let Some(requested_len) = self.objects[object].vec.len().checked_add(1) else {
+            self.can_grow_heap_by(None);
+            return;
+        };
+        let Some(before) = self.prepare_object_vec_growth(object, requested_len) else {
+            return;
+        };
+        self.objects[object].vec.push(value);
+        self.note_object_storage_growth(object, before);
+    }
+
     pub fn new_object(&mut self) -> ScriptObject {
-        if let Some(obj) = self.objects_free.pop() {
+        let capacity = self.objects.capacity();
+        let object = if let Some(obj) = self.objects_free.pop() {
             // obj already has the correct generation from gc.rs sweep
             let object = &mut self.objects[obj];
             debug_assert!(
@@ -29,7 +106,14 @@ impl ScriptHeap {
             object.proto = id!(object).into();
             let (_, generation) = self.objects.push(object);
             ScriptObject::new(index, generation)
-        }
+        };
+        self.note_heap_growth(
+            self.objects
+                .capacity()
+                .saturating_sub(capacity)
+                .saturating_mul(size_of::<crate::gen_index::GenSlot<ScriptObjectData>>()),
+        );
+        object
     }
 
     pub fn new_with_proto_checked(&mut self, proto: ScriptValue, trap: ScriptTrap) -> ScriptObject {
@@ -67,9 +151,11 @@ impl ScriptHeap {
             return ptr;
         };
 
-        if let Some(obj) = self.objects_free.pop() {
+        let objects_capacity = self.objects.capacity();
+        let (object, previous_storage) = if let Some(obj) = self.objects_free.pop() {
             // obj already has the correct generation from gc.rs sweep
             let index = obj.index;
+            let previous_storage = self.objects[obj].retained_bytes();
 
             // Use raw index for split_at_mut (internal operation)
             let (object, proto_object) = if index > proto_ptr.index {
@@ -90,7 +176,7 @@ impl ScriptHeap {
             if copy_vec_from_auto_proto && proto_object.tag.is_auto() {
                 object.vec.extend_from_slice(&proto_object.vec);
             }
-            obj
+            (obj, previous_storage)
         } else {
             let index = self.objects.len() as u32;
             let mut object = ScriptObjectData::with_proto(proto);
@@ -101,8 +187,16 @@ impl ScriptHeap {
                 object.vec.extend_from_slice(&proto_object.vec);
             }
             let (_, generation) = self.objects.push(object);
-            ScriptObject::new(index, generation)
-        }
+            (ScriptObject::new(index, generation), 0)
+        };
+        let slot_growth = self
+            .objects
+            .capacity()
+            .saturating_sub(objects_capacity)
+            .saturating_mul(size_of::<crate::gen_index::GenSlot<ScriptObjectData>>());
+        self.note_heap_growth(slot_growth);
+        self.note_heap_capacity_change(previous_storage, self.objects[object].retained_bytes());
+        object
     }
 
     pub fn new_if_reffed(&mut self, ptr: ScriptObject) -> ScriptObject {
@@ -207,8 +301,7 @@ impl ScriptHeap {
         key: ScriptValue,
         sself: ScriptValue,
     ) {
-        let object = &mut self.objects[ptr];
-        object.map_insert(key, sself);
+        self.insert_object_map(ptr, key, sself);
     }
 
     fn set_value_index(
@@ -219,18 +312,28 @@ impl ScriptHeap {
         trap: ScriptTrap,
     ) -> ScriptValue {
         // alright so. now what.
-        let object = &mut self.objects[ptr];
-        if object.tag.is_vec_frozen() {
+        if self.objects[ptr].tag.is_vec_frozen() {
             // has rw flags
             return script_err_immutable!(trap, "cannot set index on frozen vec");
         }
 
         let index = index.as_index();
-        if index >= object.vec.len() {
-            object.vec.resize(index + 1, ScriptVecValue::default());
+        let Some(requested_len) = index.checked_add(1) else {
+            self.can_grow_heap_by(None);
+            return NIL;
+        };
+        let Some(before) = self.prepare_object_vec_growth(ptr, requested_len) else {
+            return NIL;
+        };
+        {
+            let object = &mut self.objects[ptr];
+            if index >= object.vec.len() {
+                object.vec.resize(requested_len, ScriptVecValue::default());
+            }
+            object.vec[index].value = value;
         }
-        object.vec[index].value = value;
-        return NIL;
+        self.note_object_storage_growth(ptr, before);
+        NIL
     }
 
     pub fn set_value_vec(
@@ -240,18 +343,19 @@ impl ScriptHeap {
         value: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        let object = &mut self.objects[ptr];
-        if object.tag.is_vec_frozen() {
+        if self.objects[ptr].tag.is_vec_frozen() {
             return script_err_immutable!(trap, "cannot set vec key on frozen vec");
         }
-        for kv in object.vec.iter_mut().rev() {
-            if kv.key == key {
-                kv.value = value;
-                return NIL;
+        {
+            let object = &mut self.objects[ptr];
+            for kv in object.vec.iter_mut().rev() {
+                if kv.key == key {
+                    kv.value = value;
+                    return NIL;
+                }
             }
         }
-        // just append it
-        object.vec.push(ScriptVecValue { key, value });
+        self.push_object_vec(ptr, ScriptVecValue { key, value });
         NIL
     }
 
@@ -291,14 +395,13 @@ impl ScriptHeap {
             }
         }
         // alright nothing found
-        let object = &mut self.objects[ptr];
-        if object.tag.is_immutable() {
+        if self.objects[ptr].tag.is_immutable() {
             return script_err_immutable!(trap, "cannot modify immutable object");
         }
-        if object.tag.is_vec2() {
-            object.vec.push(ScriptVecValue { key, value });
+        if self.objects[ptr].tag.is_vec2() {
+            self.push_object_vec(ptr, ScriptVecValue { key, value });
         } else {
-            object.map_insert(key, value);
+            self.insert_object_map(ptr, key, value);
         }
         NIL
     }
@@ -379,8 +482,7 @@ impl ScriptHeap {
                     suggest_property(self, top_ptr, key)
                 );
             }
-            let object = &mut self.objects[top_ptr];
-            object.map_insert(key, value);
+            self.insert_object_map(top_ptr, key, value);
             return NIL;
         }
         // check against prototype or type
@@ -436,21 +538,21 @@ impl ScriptHeap {
                 }
             }
         }
-        let object = &mut self.objects[top_ptr];
+        let object = &self.objects[top_ptr];
         if object.tag.is_map_add() {
             if object.tag.is_vec2() {
-                for kv in object.vec.iter_mut().rev() {
+                for kv in object.vec.iter().rev() {
                     if kv.key == key {
                         return script_err_duplicate!(trap, "key {:?} already exists in vec", key);
                     }
                 }
-                object.vec.push(ScriptVecValue { key, value });
+                self.push_object_vec(top_ptr, ScriptVecValue { key, value });
                 return NIL;
             }
             if let Some(_) = object.map_get(&key) {
                 return script_err_duplicate!(trap, "key {:?} already exists in map", key);
             } else {
-                object.map_insert(key, value);
+                self.insert_object_map(top_ptr, key, value);
                 return NIL;
             }
         }
@@ -464,21 +566,20 @@ impl ScriptHeap {
         value: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        let object = &mut self.objects[ptr];
-        if object.tag.is_immutable() {
+        if self.objects[ptr].tag.is_immutable() {
             return script_err_immutable!(trap, "cannot set property on immutable object");
         }
-        if object.tag.is_vec2() {
-            for kv in object.vec.iter_mut().rev() {
+        if self.objects[ptr].tag.is_vec2() {
+            for kv in self.objects[ptr].vec.iter_mut().rev() {
                 if kv.key == key {
                     kv.value = value;
                     return NIL;
                 }
             }
-            object.vec.push(ScriptVecValue { key, value });
+            self.push_object_vec(ptr, ScriptVecValue { key, value });
             return NIL;
         }
-        object.map_insert(key, value);
+        self.insert_object_map(ptr, key, value);
         NIL
     }
 
@@ -615,28 +716,14 @@ impl ScriptHeap {
         value: ScriptValue,
     ) -> Option<ScriptObject> {
         // if we already have sself value we have to shadow the scope
-        let object = &mut self.objects[ptr];
-        if let Some(_) = object.map.get(&key.into()) {
+        let key = key.into();
+        if self.objects[ptr].map.contains_key(&key) {
             let new_scope = self.new_with_proto(ptr.into());
-            let object = &mut self.objects[new_scope];
-            object.map.insert(
-                key.into(),
-                ScriptMapValue {
-                    tag: Default::default(),
-                    value,
-                },
-            );
+            self.insert_object_map(new_scope, key, value);
             return Some(new_scope);
-        } else {
-            object.map.insert(
-                key.into(),
-                ScriptMapValue {
-                    tag: Default::default(),
-                    value,
-                },
-            );
-            return None;
         }
+        self.insert_object_map(ptr, key, value);
+        None
     }
 
     // Reading object values
@@ -926,10 +1013,12 @@ impl ScriptHeap {
         object: ScriptObject,
         f: F,
     ) -> R {
+        let before = self.objects[object].retained_bytes();
         let mut map = ScriptObjectMap::default();
         std::mem::swap(&mut map, &mut self.objects[object].map);
         let r = f(s, &mut map);
         std::mem::swap(&mut map, &mut self.objects[object].map);
+        self.note_object_storage_growth(object, before);
         r
     }
 
@@ -1074,6 +1163,18 @@ impl ScriptHeap {
                 target.index
             );
         }
+        if self.objects[target].tag.is_vec_frozen() {
+            return script_err_immutable!(trap, "cannot push to frozen vec");
+        }
+        let source_len = self.objects[source].vec.len();
+        let Some(requested_len) = self.objects[target].vec.len().checked_add(source_len) else {
+            self.can_grow_heap_by(None);
+            return NIL;
+        };
+        let Some(_) = self.prepare_object_vec_growth(target, requested_len) else {
+            return NIL;
+        };
+        let before = self.objects[target].retained_bytes();
         let (target_obj, source_obj) = if target.index > source.index {
             let (o1, o2) = self.objects.slots_split_at_mut(target.index as usize);
             (&mut o2[0].data, &mut o1[source.index as usize].data)
@@ -1081,10 +1182,8 @@ impl ScriptHeap {
             let (o1, o2) = self.objects.slots_split_at_mut(source.index as usize);
             (&mut o1[target.index as usize].data, &mut o2[0].data)
         };
-        if target_obj.tag.is_vec_frozen() {
-            return script_err_immutable!(trap, "cannot push to frozen vec");
-        }
         target_obj.push_vec_from_other(source_obj);
+        self.note_object_storage_growth(target, before);
         NIL
     }
 
@@ -1105,6 +1204,22 @@ impl ScriptHeap {
                         target.index
                     );
                 }
+                if self.objects[target].tag.is_vec_frozen() {
+                    return script_err_immutable!(
+                        trap,
+                        "cannot push to frozen vec in nested push"
+                    );
+                }
+                let source_len = self.objects[source].vec.len();
+                let Some(requested_len) = self.objects[target].vec.len().checked_add(source_len)
+                else {
+                    self.can_grow_heap_by(None);
+                    return NIL;
+                };
+                let Some(_) = self.prepare_object_vec_growth(target, requested_len) else {
+                    return NIL;
+                };
+                let before = self.objects[target].retained_bytes();
                 let (target_obj, source_obj) = if target.index > source.index {
                     let (o1, o2) = self.objects.slots_split_at_mut(target.index as usize);
                     (&mut o2[0].data, &mut o1[source.index as usize].data)
@@ -1112,13 +1227,11 @@ impl ScriptHeap {
                     let (o1, o2) = self.objects.slots_split_at_mut(source.index as usize);
                     (&mut o1[target.index as usize].data, &mut o2[0].data)
                 };
-                if target_obj.tag.is_vec_frozen() {
-                    return script_err_immutable!(trap, "cannot push to frozen vec in nested push");
-                }
                 target_obj.push_vec_from_other(source_obj);
                 if map {
                     target_obj.merge_map_from_other(source_obj);
                 }
+                self.note_object_storage_growth(target, before);
             }
         }
         NIL
@@ -1140,6 +1253,22 @@ impl ScriptHeap {
                 target.index
             );
         }
+        if self.objects[target].tag.is_immutable() {
+            return script_err_immutable!(trap, "cannot merge into immutable object");
+        }
+        let source_len = self.objects[source].vec.len();
+        let copy_vec = !self.objects[target].tag.is_vec_frozen();
+        if copy_vec {
+            let Some(requested_len) = self.objects[target].vec.len().checked_add(source_len)
+            else {
+                self.can_grow_heap_by(None);
+                return NIL;
+            };
+            let Some(_) = self.prepare_object_vec_growth(target, requested_len) else {
+                return NIL;
+            };
+        }
+        let before = self.objects[target].retained_bytes();
         let (target_obj, source_obj) = if target.index > source.index {
             let (o1, o2) = self.objects.slots_split_at_mut(target.index as usize);
             (&mut o2[0].data, &mut o1[source.index as usize].data)
@@ -1147,14 +1276,12 @@ impl ScriptHeap {
             let (o1, o2) = self.objects.slots_split_at_mut(source.index as usize);
             (&mut o1[target.index as usize].data, &mut o2[0].data)
         };
-        if target_obj.tag.is_immutable() {
-            return script_err_immutable!(trap, "cannot merge into immutable object");
-        }
         if !target_obj.tag.is_vec_frozen() {
             target_obj.push_vec_from_other(source_obj);
         }
         // Only add map entries that don't already exist in target
         target_obj.merge_map_from_other_no_overwrite(source_obj);
+        self.note_object_storage_growth(target, before);
         NIL
     }
 
@@ -1165,17 +1292,15 @@ impl ScriptHeap {
         value: ScriptValue,
         trap: ScriptTrap,
     ) -> ScriptValue {
-        let object = &mut self.objects[ptr];
-        if object.tag.is_vec_frozen() {
+        if self.objects[ptr].tag.is_vec_frozen() {
             return script_err_immutable!(trap, "cannot push to frozen vec");
         }
-        object.vec.push(ScriptVecValue { key, value });
+        self.push_object_vec(ptr, ScriptVecValue { key, value });
         NIL
     }
 
     pub fn vec_push_unchecked(&mut self, ptr: ScriptObject, key: ScriptValue, value: ScriptValue) {
-        let object = &mut self.objects[ptr];
-        object.vec.push(ScriptVecValue { key, value });
+        self.push_object_vec(ptr, ScriptVecValue { key, value });
     }
 
     pub fn vec_remove(
@@ -1217,5 +1342,24 @@ impl ScriptHeap {
             key: NIL,
             value: script_err_out_of_bounds!(trap, "cannot pop from empty vec"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_map_insert_rejects_rehash_before_mutation() {
+        let mut heap = ScriptHeap::empty();
+        let object = heap.new_object();
+        heap.set_max_heap_bytes(Some(usize::MAX));
+        let baseline = heap.accounted_heap_bytes();
+        heap.set_max_heap_bytes(Some(baseline.checked_add(1).unwrap()));
+
+        heap.insert_object_map(object, id!(entry).into(), NIL);
+
+        assert!(heap.take_heap_limit_exceeded());
+        assert!(heap.objects[object].map.is_empty());
     }
 }

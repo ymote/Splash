@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use splash_core::{check_syntax_named, ExecutionLimits, Runtime};
+use splash_core::{
+    check_syntax_named, ExecutionLimits, Runtime, DEFAULT_MAX_SCRIPT_HEAP_BYTES,
+};
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 8 * 1024;
 const MAX_FUZZ_SYNTAX_TOKENS: usize = 1_024;
@@ -22,6 +24,7 @@ fuzz_target!(|data: &[u8]| {
     let limits = ExecutionLimits {
         max_source_bytes: MAX_FUZZ_SOURCE_BYTES,
         max_string_bytes: MAX_FUZZ_SOURCE_BYTES,
+        max_heap_bytes: DEFAULT_MAX_SCRIPT_HEAP_BYTES,
         max_syntax_tokens: MAX_FUZZ_SYNTAX_TOKENS,
         max_syntax_nesting: MAX_FUZZ_SYNTAX_NESTING,
         instruction_limit: FUZZ_INSTRUCTION_LIMIT,

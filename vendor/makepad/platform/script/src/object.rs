@@ -11,6 +11,7 @@ use ::std::cell::RefCell;
 use ::std::collections::hash_map::Entry;
 use ::std::collections::HashMap;
 use ::std::fmt;
+use ::std::mem::size_of;
 use ::std::rc::Rc;
 //use std::collections::btree_map::BTreeMap;
 
@@ -631,6 +632,61 @@ pub struct ScriptObjectData {
 }
 
 impl ScriptObjectData {
+    const MAP_GROWTH_CAPACITY_FLOOR: usize = 8;
+    const MAP_GROWTH_CAPACITY_MULTIPLIER: usize = 4;
+
+    fn map_entry_bytes() -> usize {
+        size_of::<(ScriptValue, ScriptMapValue)>()
+            .saturating_add(size_of::<usize>().saturating_mul(2))
+            .saturating_add(1)
+    }
+
+    /// Backing allocation retained by this object's dynamic property storage.
+    ///
+    /// HashMap's public API does not expose allocator bytes, so the accounting
+    /// model charges a conservative per-bucket control allowance in addition
+    /// to the key/value payload.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.map
+            .capacity()
+            .saturating_mul(Self::map_entry_bytes())
+            .saturating_add(self.vec.capacity().saturating_mul(size_of::<ScriptVecValue>()))
+    }
+
+    /// Conservative retained capacity needed before inserting a new map key.
+    ///
+    /// `HashMap` does not expose the exact size of its next rehash. When the
+    /// current table is full, reserve four times the visible capacity (with a
+    /// small initial floor) before allowing the insertion. That is deliberately
+    /// larger than the standard table's geometric growth so a generated key
+    /// cannot request a rehash after the heap cap has already rejected it.
+    /// Post-insert accounting remains in place as a backstop for implementation
+    /// changes in the underlying map.
+    pub(crate) fn anticipated_retained_bytes_after_map_insert(
+        &self,
+        key: ScriptValue,
+    ) -> Option<usize> {
+        let map_capacity = if self.map.contains_key(&key) || self.map.len() < self.map.capacity() {
+            self.map.capacity()
+        } else {
+            self.map
+                .capacity()
+                .checked_mul(Self::MAP_GROWTH_CAPACITY_MULTIPLIER)?
+                .max(Self::MAP_GROWTH_CAPACITY_FLOOR)
+        };
+        let map_bytes = map_capacity.checked_mul(Self::map_entry_bytes())?;
+        let vec_bytes = self.vec.capacity().checked_mul(size_of::<ScriptVecValue>())?;
+        map_bytes.checked_add(vec_bytes)
+    }
+
+    /// Minimum bytes needed to represent a vector-style object through the
+    /// requested logical length. This deliberately uses length rather than a
+    /// guessed Vec growth factor so callers can reject impossible sparse
+    /// indexes before a resize attempts an allocation.
+    pub(crate) fn minimum_vec_bytes_for_len(length: usize) -> Option<usize> {
+        length.checked_mul(size_of::<ScriptVecValue>())
+    }
+
     pub fn add_type_methods(native: &mut ScriptNative, heap: &mut ScriptHeap) {
         native.add_type_method(
             heap,

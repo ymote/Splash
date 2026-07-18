@@ -47,7 +47,9 @@ the canonical profile rejects never enters the inherited tokenizer or parser.
 The default preflight budget is 256 KiB of source, 32,768 lexical tokens, and
 128 syntax-nesting levels; an embedded host can lower all three through
 `ExecutionLimits`. Evaluation additionally limits each newly constructed
-script string to 256 KiB by default through `ExecutionLimits::max_string_bytes`.
+script string to 256 KiB by default through `ExecutionLimits::max_string_bytes`
+and tracked retained Splash VM storage to 8 MiB by default through
+`ExecutionLimits::max_heap_bytes`.
 
 `splash format <file>` applies the same profile and compatibility checks, then
 writes canonical whitespace to standard output without evaluating source or
@@ -326,8 +328,10 @@ both `Runtime::eval` and `Runtime::eval_vm_compatibility`; a host using the raw
 Makepad VM owns its upstream JSON behavior. Separately,
 `ExecutionLimits::max_string_bytes` caps the script string produced by a direct
 conversion or JSON reconstruction. Exceeding that per-string limit is an
-uncatchable resource failure, not a complete VM-heap or aggregate-dataflow
-memory limit.
+uncatchable resource failure. `ExecutionLimits::max_heap_bytes` separately
+caps retained script strings, arrays, object storage, slots, and intern tables;
+it is still not a process-memory, code/stack, opaque-adapter, or aggregate
+workflow-data quota.
 
 Hosts can register a `JsonToolContract` to enforce bounded schemas for those
 JSON envelopes. Contract checks run before the handler and before output
@@ -419,7 +423,7 @@ or mutate its keys, input digest, worker observation, or restart policy.
 - Import `mod.tool` before calling a tool.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
   fallback cannot inspect the error, and hard string-allocation,
-  instruction/deadline termination remains uncatchable. End each block branch
+  heap-allocation, instruction/deadline termination remains uncatchable. End each block branch
   with a value-producing expression; use `nil` when the branch has no other
   result. Parenthesize a record literal used as the whole protected or fallback
   branch.

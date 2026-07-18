@@ -23,7 +23,7 @@ impl ScriptHeap {
         ty: ScriptPodTy,
         default: ScriptValue,
     ) -> ScriptPodType {
-        if let Some(ptr) = self.pod_types_free.pop() {
+        let pod_type = if let Some(ptr) = self.pod_types_free.pop() {
             let pod_type = &mut self.pod_types[ptr.index as usize];
             pod_type.object = object;
             pod_type.name = name;
@@ -41,7 +41,9 @@ impl ScriptHeap {
                 default,
             });
             ptr
-        }
+        };
+        self.reconcile_heap_bytes_if_limited();
+        pod_type
     }
 
     pub fn new_pod_array_type(&mut self, ty: ScriptPodTy, default: ScriptValue) -> ScriptPodType {
@@ -414,7 +416,7 @@ impl ScriptHeap {
 
     pub fn new_pod(&mut self, ty: ScriptPodType) -> ScriptPod {
         let pod_ty = &self.pod_types[ty.index as usize];
-        if let Some(ptr) = self.pods_free.pop() {
+        let pod = if let Some(ptr) = self.pods_free.pop() {
             let pod = &mut self.pods[ptr];
             pod.ty = ty;
             pod.tag.set_alloced();
@@ -437,7 +439,9 @@ impl ScriptHeap {
             pod.data
                 .resize(pod_ty.ty.size_of().next_multiple_of(4) >> 2, 0);
             ptr
-        }
+        };
+        self.reconcile_heap_bytes_if_limited();
+        pod
     }
 
     // POD writing

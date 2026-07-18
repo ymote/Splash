@@ -45,6 +45,12 @@ pub const DEFAULT_MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// This is an individual-string limit, not a complete VM heap accounting
 /// limit. Hosts with smaller memory budgets should lower it explicitly.
 pub const DEFAULT_MAX_SCRIPT_STRING_BYTES: usize = 256 * 1024;
+/// Default retained-capacity budget for Splash-owned VM heap data.
+///
+/// This accounts for script strings, arrays, object storage, slot tables, and
+/// intern tables. It is not an operating-system process memory limit and does
+/// not account for opaque trusted Rust adapter allocations.
+pub const DEFAULT_MAX_SCRIPT_HEAP_BYTES: usize = 8 * 1024 * 1024;
 const FORMAT_OUTPUT_MULTIPLIER: usize = 4;
 /// Maximum formatted output size under the default source budget.
 pub const DEFAULT_MAX_FORMATTED_SOURCE_BYTES: usize =
@@ -119,6 +125,13 @@ pub struct ExecutionLimits {
     ///
     /// This is not aggregate VM heap accounting.
     pub max_string_bytes: usize,
+    /// Maximum retained capacity tracked for Splash-owned VM heap data.
+    ///
+    /// This is not a process allocator quota and excludes opaque trusted Rust
+    /// adapters. The VM's bootstrap storage counts against this value, so
+    /// construction fails when it is below the required baseline. Hosts that
+    /// need OS-level containment must layer it separately.
+    pub max_heap_bytes: usize,
     pub max_syntax_tokens: usize,
     pub max_syntax_nesting: usize,
     pub instruction_limit: usize,
@@ -132,6 +145,7 @@ impl Default for ExecutionLimits {
         Self {
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_string_bytes: DEFAULT_MAX_SCRIPT_STRING_BYTES,
+            max_heap_bytes: DEFAULT_MAX_SCRIPT_HEAP_BYTES,
             max_syntax_tokens: DEFAULT_MAX_SYNTAX_TOKENS,
             max_syntax_nesting: DEFAULT_MAX_SYNTAX_NESTING,
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
@@ -152,6 +166,11 @@ impl ExecutionLimits {
         if self.max_string_bytes == 0 {
             return Err(RuntimeError::InvalidLimits(
                 "max_string_bytes must be greater than zero",
+            ));
+        }
+        if self.max_heap_bytes == 0 {
+            return Err(RuntimeError::InvalidLimits(
+                "max_heap_bytes must be greater than zero",
             ));
         }
         if self.max_syntax_tokens == 0 {
@@ -222,6 +241,7 @@ impl ScriptJsonMethodLimits {
 pub enum RuntimeError {
     SourceTooLarge { actual: usize, maximum: usize },
     StringLimitExceeded { maximum: usize },
+    HeapLimitExceeded { actual: usize, maximum: usize },
     FormattedSourceTooLarge { actual: usize, maximum: usize },
     InvalidLimits(&'static str),
     SyntaxRejected(SyntaxReport),
@@ -243,6 +263,12 @@ impl Display for RuntimeError {
                 write!(
                     formatter,
                     "script string allocation exceeds {maximum} bytes"
+                )
+            }
+            Self::HeapLimitExceeded { actual, maximum } => {
+                write!(
+                    formatter,
+                    "script heap retains {actual} accounted bytes; maximum is {maximum} bytes"
                 )
             }
             Self::FormattedSourceTooLarge { actual, maximum } => {
@@ -674,8 +700,25 @@ impl<H: Any, S: Any> Runtime<H, S> {
             vm.bx
                 .heap
                 .set_max_string_bytes(Some(limits.max_string_bytes));
+            vm.bx.heap.set_max_heap_bytes(Some(limits.max_heap_bytes));
             install_bounded_json_methods(vm, installed_limits);
-        });
+            vm.bx.heap.reconcile_heap_bytes();
+            let actual = vm.bx.heap.accounted_heap_bytes();
+            let heap_limit_exceeded = vm.bx.heap.take_heap_limit_exceeded();
+            let string_limit_exceeded = vm.bx.heap.take_string_limit_exceeded();
+            if heap_limit_exceeded || actual > limits.max_heap_bytes {
+                return Err(RuntimeError::HeapLimitExceeded {
+                    actual,
+                    maximum: limits.max_heap_bytes,
+                });
+            }
+            if string_limit_exceeded {
+                return Err(RuntimeError::StringLimitExceeded {
+                    maximum: limits.max_string_bytes,
+                });
+            }
+            Ok(())
+        })?;
         Ok(runtime)
     }
 
@@ -694,10 +737,21 @@ impl<H: Any, S: Any> Runtime<H, S> {
         if self.with_vm(|vm| has_paused_thread(vm)) {
             return Err(RuntimeError::EvaluationInProgress);
         }
+        let actual = self.with_vm(|vm| {
+            vm.bx.heap.reconcile_heap_bytes();
+            vm.bx.heap.accounted_heap_bytes()
+        });
+        if actual > limits.max_heap_bytes {
+            return Err(RuntimeError::HeapLimitExceeded {
+                actual,
+                maximum: limits.max_heap_bytes,
+            });
+        }
         self.with_vm(|vm| {
             vm.bx
                 .heap
                 .set_max_string_bytes(Some(limits.max_string_bytes));
+            vm.bx.heap.set_max_heap_bytes(Some(limits.max_heap_bytes));
         });
         self.limits = limits;
         self.json_method_limits
@@ -718,8 +772,10 @@ impl<H: Any, S: Any> Runtime<H, S> {
     pub fn configure(&mut self, configure: impl FnOnce(&mut vm::ScriptVm)) {
         self.with_vm(configure);
         let max_string_bytes = self.limits.max_string_bytes;
+        let max_heap_bytes = self.limits.max_heap_bytes;
         self.with_vm(|vm| {
             vm.bx.heap.set_max_string_bytes(Some(max_string_bytes));
+            vm.bx.heap.set_max_heap_bytes(Some(max_heap_bytes));
         });
     }
 
@@ -742,13 +798,24 @@ impl<H: Any, S: Any> Runtime<H, S> {
         let encoded =
             serialize_bounded_json(value, max_bytes, max_depth).map_err(RuntimeError::JsonData)?;
         let max_string_bytes = self.limits.max_string_bytes;
+        let max_heap_bytes = self.limits.max_heap_bytes;
         self.with_vm(|vm| {
             if has_paused_thread(vm) {
                 return Err(RuntimeError::EvaluationInProgress);
             }
             let mut parser = vm::json::JsonParserThread::default();
             let value = parser.read_json(&encoded, &mut vm.bx.heap);
-            if vm.bx.heap.take_string_limit_exceeded() {
+            vm.bx.heap.reconcile_heap_bytes();
+            let actual = vm.bx.heap.accounted_heap_bytes();
+            let heap_limit_exceeded = vm.bx.heap.take_heap_limit_exceeded();
+            let string_limit_exceeded = vm.bx.heap.take_string_limit_exceeded();
+            if heap_limit_exceeded || actual > max_heap_bytes {
+                return Err(RuntimeError::HeapLimitExceeded {
+                    actual,
+                    maximum: max_heap_bytes,
+                });
+            }
+            if string_limit_exceeded {
                 return Err(RuntimeError::StringLimitExceeded {
                     maximum: max_string_bytes,
                 });
@@ -923,6 +990,19 @@ impl<H: Any, S: Any> Runtime<H, S> {
             if has_paused_thread(vm) {
                 return Err(RuntimeError::EvaluationInProgress);
             }
+            vm.bx.heap.reconcile_heap_bytes();
+            let actual = vm.bx.heap.accounted_heap_bytes();
+            if actual > limits.max_heap_bytes {
+                return Err(RuntimeError::HeapLimitExceeded {
+                    actual,
+                    maximum: limits.max_heap_bytes,
+                });
+            }
+            // A new evaluation has no active VM instruction that could own a
+            // previously raised flag. Once retained storage fits the current
+            // limit, discard stale resource signals before starting fresh code.
+            vm.bx.heap.take_heap_limit_exceeded();
+            vm.bx.heap.take_string_limit_exceeded();
             // Keep the public runtime single-flight. The underlying VM can
             // manage several threads, but evaluating new source into a paused
             // frame would make its module/body lifecycle ambiguous.
@@ -961,9 +1041,31 @@ impl<H: Any, S: Any> Runtime<H, S> {
     ///
     /// This may take time proportional to the live VM heap, so callers should
     /// schedule it outside latency-sensitive work. Paused script threads remain
-    /// GC roots and are safe to collect around.
+    /// GC roots and are safe to collect around. When collection reduces tracked
+    /// retained storage below the configured limit, it also clears a stale
+    /// heap-limit signal from the completed evaluation that exceeded it.
     pub fn collect_garbage(&mut self) {
-        self.with_vm(|vm| vm.gc());
+        let max_heap_bytes = self.limits.max_heap_bytes;
+        self.with_vm(|vm| {
+            vm.gc();
+            vm.bx.heap.reconcile_heap_bytes();
+            if vm.bx.heap.accounted_heap_bytes() <= max_heap_bytes {
+                // A heap-cap failure is uncatchable inside the evaluation that
+                // raised it. GC is a host scheduling boundary, so once the
+                // retained state fits again the next evaluation may proceed.
+                vm.bx.heap.take_heap_limit_exceeded();
+            }
+        });
+    }
+
+    /// Returns the currently accounted retained capacity of Splash-owned VM
+    /// heap data. This is useful for host telemetry and choosing a target
+    /// budget; it is not a process-wide allocator measurement.
+    pub fn accounted_heap_bytes(&mut self) -> usize {
+        self.with_vm(|vm| {
+            vm.bx.heap.reconcile_heap_bytes();
+            vm.bx.heap.accounted_heap_bytes()
+        })
     }
 
     fn with_vm<R>(&mut self, operation: impl FnOnce(&mut vm::ScriptVm) -> R) -> R {
@@ -4915,6 +5017,236 @@ compute(outer, 2)
             check_syntax_named("strings.splash", "true", limits).unwrap_err(),
             RuntimeError::InvalidLimits("max_string_bytes must be greater than zero")
         );
+    }
+
+    #[test]
+    fn rejects_zero_heap_limit() {
+        let limits = ExecutionLimits {
+            max_heap_bytes: 0,
+            ..ExecutionLimits::default()
+        };
+
+        assert_eq!(
+            check_syntax_named("heap.splash", "true", limits).unwrap_err(),
+            RuntimeError::InvalidLimits("max_heap_bytes must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_a_heap_limit_below_live_vm_storage() {
+        let mut runtime = Runtime::default();
+        let actual = runtime.accounted_heap_bytes();
+        assert!(actual > 0);
+
+        let mut limits = runtime.limits();
+        limits.max_heap_bytes = actual - 1;
+        assert_eq!(
+            runtime.set_limits(limits),
+            Err(RuntimeError::HeapLimitExceeded {
+                actual,
+                maximum: actual - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_a_heap_limit_below_bootstrap_storage() {
+        let mut baseline_runtime = Runtime::default();
+        let baseline = baseline_runtime.accounted_heap_bytes();
+        assert!(baseline > 0);
+
+        let limits = ExecutionLimits {
+            max_heap_bytes: baseline - 1,
+            ..ExecutionLimits::default()
+        };
+        let error = match Runtime::with_limits((), (), limits) {
+            Ok(_) => panic!("a cap below the runtime baseline must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            RuntimeError::HeapLimitExceeded {
+                actual: baseline,
+                maximum: baseline - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_accepts_its_bootstrap_heap_baseline() {
+        let mut baseline_runtime = Runtime::default();
+        let baseline = baseline_runtime.accounted_heap_bytes();
+        let limits = ExecutionLimits {
+            max_heap_bytes: baseline,
+            ..ExecutionLimits::default()
+        };
+
+        assert!(Runtime::with_limits((), (), limits).is_ok());
+    }
+
+    #[test]
+    fn runtime_bounds_sparse_array_growth_without_catch_recovery() {
+        let mut runtime = Runtime::default();
+        let baseline = runtime.accounted_heap_bytes();
+        let mut limits = runtime.limits();
+        limits.max_heap_bytes = baseline + 256 * 1024;
+        runtime.set_limits(limits).unwrap();
+
+        let exceeded = runtime
+            .eval("let values = []\ntry values[268435456] = 1 catch \"recovered\"")
+            .unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("heap allocation limit")));
+        assert!(runtime.accounted_heap_bytes() <= limits.max_heap_bytes);
+
+        let recovered = runtime.eval("2").unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(recovered.value.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn runtime_bounds_sparse_object_growth_without_catch_recovery() {
+        let mut runtime = Runtime::default();
+        let baseline = runtime.accounted_heap_bytes();
+        let mut limits = runtime.limits();
+        limits.max_heap_bytes = baseline + 256 * 1024;
+        runtime.set_limits(limits).unwrap();
+
+        let exceeded = runtime
+            .eval("let values = {}\ntry values[268435456] = 1 catch \"recovered\"")
+            .unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("heap allocation limit")));
+        assert!(runtime.accounted_heap_bytes() <= limits.max_heap_bytes);
+
+        let recovered = runtime.eval("2").unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(recovered.value.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn heap_limit_bounds_total_string_storage_after_individual_strings_pass() {
+        let mut runtime = Runtime::default();
+        let baseline = runtime.accounted_heap_bytes();
+        let mut limits = runtime.limits();
+        limits.max_heap_bytes = baseline + 8 * 1024;
+        runtime.set_limits(limits).unwrap();
+
+        let exceeded = runtime
+            .eval(
+                "let payload = \"x\"\n\
+                 let index = 0\n\
+                 while (index < 14) {\n\
+                     payload += payload\n\
+                     index += 1\n\
+                 }\n\
+                 payload",
+            )
+            .unwrap();
+
+        assert!(!exceeded.completed());
+        assert!(exceeded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("heap allocation limit")));
+
+        assert!(matches!(
+            runtime.eval("2"),
+            Err(RuntimeError::HeapLimitExceeded { maximum, .. }) if maximum == limits.max_heap_bytes
+        ));
+    }
+
+    #[test]
+    fn collection_recovers_after_a_heap_limit_failure() {
+        let mut runtime = Runtime::default();
+        let baseline = runtime.accounted_heap_bytes();
+        let mut limits = runtime.limits();
+        limits.max_heap_bytes = baseline + 8 * 1024;
+        runtime.set_limits(limits).unwrap();
+
+        let exceeded = runtime
+            .eval(
+                "let payload = \"x\"\n\
+                 let index = 0\n\
+                 while (index < 14) {\n\
+                     payload += payload\n\
+                     index += 1\n\
+                 }\n\
+                 payload",
+            )
+            .unwrap();
+        assert!(!exceeded.completed());
+
+        runtime.collect_garbage();
+        assert!(runtime.accounted_heap_bytes() <= limits.max_heap_bytes);
+
+        let recovered = runtime.eval("2").unwrap();
+        assert!(recovered.completed(), "{:?}", recovered.diagnostics);
+        assert_eq!(recovered.value.as_u40(), Some(2));
+    }
+
+    #[test]
+    fn heap_limit_bounds_host_json_globals() {
+        let mut runtime = Runtime::default();
+        let baseline = runtime.accounted_heap_bytes();
+        let mut limits = runtime.limits();
+        limits.max_heap_bytes = baseline + 4 * 1024;
+        runtime.set_limits(limits).unwrap();
+
+        let values = JsonValue::Array((0..2_048).map(JsonValue::from).collect());
+        let error = runtime
+            .set_json_global(
+                "workflow",
+                &values,
+                DEFAULT_MAX_JSON_DATA_BYTES,
+                DEFAULT_MAX_JSON_DATA_DEPTH,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::HeapLimitExceeded { maximum, .. } if maximum == limits.max_heap_bytes
+        ));
+    }
+
+    #[test]
+    fn json_global_drains_a_string_failure_when_heap_failure_takes_precedence() {
+        let mut runtime = Runtime::default();
+        let baseline = runtime.accounted_heap_bytes();
+        let mut limits = runtime.limits();
+        limits.max_string_bytes = 1;
+        limits.max_heap_bytes = baseline + 1;
+        runtime.set_limits(limits).unwrap();
+
+        let error = runtime
+            .set_json_global(
+                "workflow",
+                &JsonValue::Array(vec![JsonValue::String("payload".to_owned())]),
+                DEFAULT_MAX_JSON_DATA_BYTES,
+                DEFAULT_MAX_JSON_DATA_DEPTH,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::HeapLimitExceeded { maximum, .. } if maximum == limits.max_heap_bytes
+        ));
+
+        runtime.collect_garbage();
+        runtime
+            .set_json_global(
+                "workflow",
+                &JsonValue::Null,
+                DEFAULT_MAX_JSON_DATA_BYTES,
+                DEFAULT_MAX_JSON_DATA_DEPTH,
+            )
+            .unwrap();
     }
 
     #[test]

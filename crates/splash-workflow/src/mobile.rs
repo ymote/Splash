@@ -721,6 +721,7 @@ mod tests {
             ExecutionLimits {
                 max_source_bytes: 32 * 1024,
                 max_string_bytes: 32 * 1024,
+                max_heap_bytes: 2 * 1024 * 1024,
                 max_syntax_tokens: 4 * 1024,
                 max_syntax_nesting: 64,
                 instruction_limit: DEFAULT_INSTRUCTION_LIMIT,

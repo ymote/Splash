@@ -31,6 +31,7 @@ impl ScriptHeap {
         };
 
         self.regex_intern.insert(key, idx);
+        self.reconcile_heap_bytes_if_limited();
         Ok(idx.into())
     }
 

@@ -93,14 +93,23 @@ embeds the raw Makepad VM.
 default through `ExecutionLimits::max_string_bytes`; a host can lower that
 limit for its target. An attempted overflow terminates the current evaluation
 as an uncatchable hard resource failure, including during compatibility
-evaluation and bounded JSON reconstruction. This is an individual-string
-length limit, not aggregate VM heap accounting: arrays, objects, many
-individually valid strings, and trusted Rust adapter allocations still need
-host-selected memory budgets and, where required, operating-system containment.
+evaluation and bounded JSON reconstruction.
+
+`ExecutionLimits::max_heap_bytes` additionally caps tracked retained capacity
+in the Splash-owned VM heap. Its default is 8 MiB and it accounts for script
+strings, arrays, object storage, slot tables, and intern tables. Sparse array
+and object writes, plus conservative object-map rehashes, are rejected before
+they request their backing allocation; other normal script allocations raise
+the same uncatchable hard resource failure when retained storage crosses the
+cap. This is not a process allocator quota: VM parser/code/stack work,
+allocator metadata, compiled regex internals, and opaque trusted Rust adapter
+allocations remain outside the accounting.
+Targets that need process-wide memory or effect containment must layer an
+operating-system boundary around the worker.
 
 Canonical `try/catch` handles ordinary script and native-binding errors and
 unwinds Splash function calls, but it is not a sandbox or transaction. It
-cannot catch string-allocation, instruction-limit, or hard-deadline
+cannot catch string-allocation, heap-allocation, instruction-limit, or hard-deadline
 termination, inspect an error object, widen a capability lease, refund a call,
 erase an audit outcome, or bypass a workflow data contract. A caught error is
 discarded before the fallback runs and does not appear in the evaluation

@@ -1,6 +1,6 @@
 use crate::array::*;
 use crate::gc::*;
-use crate::gen_index::GenVec;
+use crate::gen_index::{GenSlot, GenVec};
 use crate::handle::*;
 use crate::makepad_live_id::*;
 use crate::object::*;
@@ -15,6 +15,7 @@ use crate::value::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::mem::size_of;
 use std::rc::Rc;
 
 #[derive(Default)]
@@ -41,6 +42,12 @@ pub struct ScriptHeap {
     pub(crate) strings_free: Vec<ScriptString>,
     pub(crate) max_string_bytes: Option<usize>,
     pub(crate) string_limit_exceeded: bool,
+    pub(crate) max_heap_bytes: Option<usize>,
+    pub(crate) heap_limit_exceeded: bool,
+    // Cached retained-capacity accounting while an aggregate heap limit is
+    // active. Allocation paths update it by observed backing-capacity growth;
+    // hosts can reconcile it after trusted raw-VM configuration or collection.
+    pub(crate) accounted_heap_bytes: usize,
 
     pub(crate) arrays: GenVec<ScriptArrayData>,
     pub(crate) arrays_free: Vec<ScriptArray>,
@@ -75,6 +82,200 @@ impl ScriptHeap {
     /// which would otherwise never be released.
     const MAX_STRINGS_REUSE: usize = 1024;
 
+    /// Applies an aggregate cap to the Splash-owned heap data structures.
+    ///
+    /// `None` preserves the inherited Makepad VM behavior. The accounting
+    /// tracks retained capacity of script strings, arrays, objects, slots, and
+    /// intern tables. It intentionally cannot account for opaque host handles,
+    /// adapter-owned Rust allocations, or the process allocator's metadata.
+    pub fn set_max_heap_bytes(&mut self, maximum_bytes: Option<usize>) {
+        self.max_heap_bytes = maximum_bytes;
+        self.heap_limit_exceeded = false;
+
+        // A pooled buffer is retained process memory but does not represent a
+        // live script value. Drop it when enabling the cap so later string
+        // accounting has one clear ownership path.
+        if maximum_bytes.is_some() {
+            self.strings_reuse = Vec::new();
+        }
+        self.reconcile_heap_bytes();
+    }
+
+    /// Returns the configured aggregate Splash heap cap, if any.
+    pub fn max_heap_bytes(&self) -> Option<usize> {
+        self.max_heap_bytes
+    }
+
+    /// Returns the current tracked retained-capacity amount used for the
+    /// aggregate heap limit.
+    pub fn accounted_heap_bytes(&self) -> usize {
+        self.accounted_heap_bytes
+    }
+
+    /// Recomputes retained-capacity accounting from the current heap state.
+    ///
+    /// This is appropriate after trusted raw VM configuration or garbage
+    /// collection. Normal script allocation paths update the cached value in
+    /// constant time instead of scanning the heap on every instruction.
+    pub fn reconcile_heap_bytes(&mut self) {
+        self.accounted_heap_bytes = self.estimated_heap_bytes();
+        if self
+            .max_heap_bytes
+            .is_some_and(|maximum| self.accounted_heap_bytes > maximum)
+        {
+            self.heap_limit_exceeded = true;
+        }
+    }
+
+    /// Recomputes accounting for uncommon allocation paths whose backing
+    /// storage is owned by a lower-level helper.
+    pub(crate) fn reconcile_heap_bytes_if_limited(&mut self) {
+        if self.max_heap_bytes.is_some() {
+            self.reconcile_heap_bytes();
+        }
+    }
+
+    /// Returns and clears an aggregate heap-cap failure raised by a script
+    /// allocation path.
+    pub fn take_heap_limit_exceeded(&mut self) -> bool {
+        std::mem::take(&mut self.heap_limit_exceeded)
+    }
+
+    /// Records observed retained-capacity growth from a normal script-owned
+    /// allocation path. This remains a no-op for an unbounded raw VM.
+    pub(crate) fn note_heap_growth(&mut self, growth_bytes: usize) {
+        if self.max_heap_bytes.is_none() || growth_bytes == 0 {
+            return;
+        }
+        self.accounted_heap_bytes = self.accounted_heap_bytes.saturating_add(growth_bytes);
+        if self
+            .max_heap_bytes
+            .is_some_and(|maximum| self.accounted_heap_bytes > maximum)
+        {
+            self.heap_limit_exceeded = true;
+        }
+    }
+
+    /// Applies an observed retained-capacity replacement. A shrink makes the
+    /// cached amount accurate for later sparse-growth preflights, but never
+    /// clears a failure already raised by this execution.
+    pub(crate) fn note_heap_capacity_change(&mut self, before: usize, after: usize) {
+        if self.max_heap_bytes.is_none() || before == after {
+            return;
+        }
+        if after > before {
+            self.note_heap_growth(after - before);
+        } else {
+            self.accounted_heap_bytes = self.accounted_heap_bytes.saturating_sub(before - after);
+        }
+    }
+
+    /// Rejects a sparse collection resize before it asks Rust to allocate the
+    /// requested backing storage. Ordinary capacity growth is observed after
+    /// the operation; this preflight closes the one-operation allocation gap
+    /// for attacker-controlled indexes.
+    pub(crate) fn can_grow_heap_by(&mut self, growth_bytes: Option<usize>) -> bool {
+        let Some(maximum) = self.max_heap_bytes else {
+            return true;
+        };
+        let Some(growth_bytes) = growth_bytes else {
+            self.heap_limit_exceeded = true;
+            return false;
+        };
+        if growth_bytes > maximum.saturating_sub(self.accounted_heap_bytes) {
+            self.heap_limit_exceeded = true;
+            return false;
+        }
+        true
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        fn bytes_for<T>(capacity: usize) -> usize {
+            capacity.saturating_mul(size_of::<T>())
+        }
+
+        fn map_bytes<K, V, S>(map: &HashMap<K, V, S>) -> usize {
+            // HashMap keeps bucket control data in addition to key/value
+            // payload. Charge two machine words plus one control byte per
+            // usable bucket to avoid treating map capacity as free.
+            let entry_bytes = size_of::<(K, V)>()
+                .saturating_add(size_of::<usize>().saturating_mul(2))
+                .saturating_add(1);
+            map.capacity().saturating_mul(entry_bytes)
+        }
+
+        let mut bytes = size_of::<Self>();
+
+        bytes = bytes.saturating_add(bytes_for::<ScriptGcMark>(self.mark_vec.capacity()));
+        bytes = bytes.saturating_add(map_bytes(&*self.root_objects.borrow()));
+        bytes = bytes.saturating_add(map_bytes(&*self.root_arrays.borrow()));
+        bytes = bytes.saturating_add(map_bytes(&*self.root_handles.borrow()));
+        bytes = bytes.saturating_add(map_bytes(&self.type_defaults));
+
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<ScriptObjectData>>(
+            self.objects.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptObject>(self.objects_free.capacity()));
+        for object in self.objects.iter() {
+            bytes = bytes.saturating_add(object.retained_bytes());
+        }
+
+        bytes = bytes.saturating_add(map_bytes(&self.string_intern));
+        bytes = bytes.saturating_add(bytes_for::<String>(self.strings_reuse.capacity()));
+        for string in &self.strings_reuse {
+            bytes = bytes.saturating_add(string.capacity());
+        }
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<Option<ScriptStringData>>>(
+            self.strings.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptString>(self.strings_free.capacity()));
+        for string in self.strings.iter().flatten() {
+            bytes = bytes.saturating_add(string.string.0.capacity());
+        }
+
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<ScriptArrayData>>(
+            self.arrays.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptArray>(self.arrays_free.capacity()));
+        for array in self.arrays.iter() {
+            bytes = bytes.saturating_add(array.storage.retained_bytes());
+        }
+
+        bytes = bytes.saturating_add(bytes_for::<ScriptPodTypeData>(self.pod_types.capacity()));
+        bytes = bytes.saturating_add(bytes_for::<ScriptPodType>(self.pod_types_free.capacity()));
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<ScriptPodData>>(self.pods.capacity()));
+        bytes = bytes.saturating_add(bytes_for::<ScriptPod>(self.pods_free.capacity()));
+        for pod in self.pods.iter() {
+            bytes = bytes.saturating_add(bytes_for::<u32>(pod.data.capacity()));
+        }
+
+        bytes = bytes.saturating_add(bytes_for::<ScriptTypeCheck>(self.type_check.capacity()));
+        bytes = bytes.saturating_add(map_bytes(&self.type_index));
+
+        // Handle payloads are intentionally opaque Rust-owned allocations;
+        // count their slot bookkeeping but not the adapter's object graph.
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<Option<ScriptHandleData>>>(
+            self.handles.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptHandle>(self.handles_free.capacity()));
+
+        bytes = bytes.saturating_add(map_bytes(&self.regex_intern));
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<Option<ScriptRegexData>>>(
+            self.regexes.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptRegex>(self.regexes_free.capacity()));
+        for regex in self.regexes.iter().flatten() {
+            // The compiled regex engine is opaque, but the pattern's retained
+            // bytes and all VM-level indexes are charged here.
+            bytes = bytes.saturating_add(regex.pattern.capacity());
+        }
+        for key in self.regex_intern.keys() {
+            bytes = bytes.saturating_add(key.pattern.capacity());
+        }
+
+        bytes
+    }
+
     /// Release memory the heap is holding purely for reuse / over-allocation, called after a
     /// GC sweep. This is safe because it never removes or moves any live slot — it only:
     ///   - drops excess pooled-for-reuse `String` buffers beyond a cap (re-allocated lazily),
@@ -101,6 +302,7 @@ impl ScriptHeap {
         self.pod_types_free.shrink_to_fit();
         self.handles_free.shrink_to_fit();
         self.regexes_free.shrink_to_fit();
+        self.reconcile_heap_bytes_if_limited();
     }
 
     pub fn empty() -> Self {

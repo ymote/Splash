@@ -100,14 +100,12 @@ impl ScriptHeap {
                         );
                     }
                 }
-                self.objects[top_ptr].map_insert(key, value);
+                self.insert_object_map(top_ptr, key, value);
                 return NIL;
             }
         }
         // only allow if we are varargs
-        self.objects[top_ptr]
-            .vec
-            .push(ScriptVecValue { key: NIL, value });
+        self.push_object_vec(top_ptr, ScriptVecValue { key: NIL, value });
         return NIL;
     }
 
@@ -135,7 +133,7 @@ impl ScriptHeap {
                             format_value_type(self, value)
                         );
                     }
-                    self.objects[top_ptr].map_insert(key, value);
+                    self.insert_object_map(top_ptr, key, value);
                     return NIL;
                 }
             }
@@ -171,9 +169,9 @@ impl ScriptHeap {
                             );
                         }
                     }
-                    self.objects[top_ptr].map_insert(key, *value);
+                    self.insert_object_map(top_ptr, key, *value);
                 } else {
-                    self.objects[top_ptr].vec.push(ScriptVecValue {
+                    self.push_object_vec(top_ptr, ScriptVecValue {
                         key: NIL,
                         value: *value,
                     });

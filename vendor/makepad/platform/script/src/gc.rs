@@ -574,7 +574,9 @@ impl ScriptHeap {
                         self.strings.set_at(i, None);
                         if let Some(mut s) = Arc::into_inner(k.0) {
                             s.clear();
-                            self.strings_reuse.push(s);
+                            if self.max_heap_bytes.is_none() {
+                                self.strings_reuse.push(s);
+                            }
                         }
                         // Increment generation, then push ref with new generation
                         self.strings.free_slot(i as u32);
@@ -686,6 +688,7 @@ impl ScriptHeap {
             handles: self.handles.len() - self.handles_free.len(),
             regexes: self.regexes.len() - self.regexes_free.len(),
         };
+        self.reconcile_heap_bytes();
     }
 
     /// Check if garbage collection should be triggered.
