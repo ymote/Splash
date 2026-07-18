@@ -42,6 +42,14 @@ pub const WORKER_OPERATION_JOURNAL_FORMAT_VERSION: u8 = 2;
 /// This keeps manifest validation, authorization state, and contained-worker
 /// launch planning bounded independently of the wire-frame byte ceiling.
 pub const MAX_CAPABILITY_GRANTS_PER_MANIFEST: usize = 128;
+/// Maximum distinct network-origin identifiers that one OS-enforced broker
+/// binding can retain for a worker session.
+///
+/// This matches the maximum size of Splash's reviewed HTTP endpoint/origin
+/// catalogs. It is intentionally lower than the protocol's theoretical
+/// resource-selector count so a network boundary cannot grow without a
+/// corresponding bounded broker implementation.
+pub const MAX_NETWORK_ORIGIN_ACCESS_IDS: usize = 128;
 /// Maximum unique ordinary, cancellation, durable-operation, reconciliation,
 /// and compensation identifiers retained by one [`SessionAuthorizer`].
 ///
@@ -314,6 +322,153 @@ impl CapabilityManifest {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Self::new(self.session_id.clone(), grants)
+    }
+}
+
+/// Exact network-origin authority retained by one contained worker session.
+///
+/// This host-only value is derived from a validated manifest or from explicit
+/// opaque identifiers. It is not a Splash value, wire message, URL list, or
+/// network policy language. Linux containment backends use it to bind a
+/// session's `network_origin` resources to one reviewed host broker without
+/// granting ambient egress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkOriginAccess {
+    identifiers: BTreeSet<String>,
+}
+
+impl NetworkOriginAccess {
+    /// Derives the exact distinct `network_origin` resource identifiers in a
+    /// validated manifest.
+    ///
+    /// A broker binding must contain at least one resource. A worker with no
+    /// `network_origin` grant must not receive a broker socket merely because
+    /// another session uses one.
+    pub fn from_manifest(manifest: &CapabilityManifest) -> Result<Self, NetworkOriginAccessError> {
+        manifest
+            .validate()
+            .map_err(NetworkOriginAccessError::Protocol)?;
+        let identifiers = manifest
+            .grants
+            .iter()
+            .flat_map(|grant| grant.resources.iter())
+            .filter(|resource| resource.kind == ResourceKind::NetworkOrigin)
+            .map(|resource| resource.id.clone())
+            .collect::<BTreeSet<_>>();
+        Self::from_validated_identifiers(identifiers)
+    }
+
+    /// Creates an exact broker binding from host-selected opaque identifiers.
+    ///
+    /// Duplicate values are rejected rather than silently deduplicated so a
+    /// host review sees the complete configured set. Each value uses the same
+    /// token validation as a `ResourceKind::NetworkOrigin` selector.
+    pub fn from_identifiers<I, S>(identifiers: I) -> Result<Self, NetworkOriginAccessError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut retained = BTreeSet::new();
+        for identifier in identifiers {
+            let identifier = identifier.into();
+            ResourceSelector::new(ResourceKind::NetworkOrigin, identifier.clone())
+                .map_err(NetworkOriginAccessError::Protocol)?;
+            if !retained.insert(identifier.clone()) {
+                return Err(NetworkOriginAccessError::DuplicateIdentifier { identifier });
+            }
+        }
+        Self::from_validated_identifiers(retained)
+    }
+
+    fn from_validated_identifiers(
+        identifiers: BTreeSet<String>,
+    ) -> Result<Self, NetworkOriginAccessError> {
+        if identifiers.is_empty() {
+            return Err(NetworkOriginAccessError::Empty);
+        }
+        if identifiers.len() > MAX_NETWORK_ORIGIN_ACCESS_IDS {
+            return Err(NetworkOriginAccessError::TooManyIdentifiers {
+                maximum: MAX_NETWORK_ORIGIN_ACCESS_IDS,
+                actual: identifiers.len(),
+            });
+        }
+        Ok(Self { identifiers })
+    }
+
+    /// Returns whether this broker binding permits one opaque origin ID.
+    pub fn contains(&self, identifier: &str) -> bool {
+        self.identifiers.contains(identifier)
+    }
+
+    /// Returns the number of exact network-origin identifiers retained here.
+    pub fn len(&self) -> usize {
+        self.identifiers.len()
+    }
+
+    /// Returns whether this binding contains no identifiers.
+    ///
+    /// Valid values are never empty; this exists for hosts retaining values in
+    /// generic collections.
+    pub fn is_empty(&self) -> bool {
+        self.identifiers.is_empty()
+    }
+
+    /// Iterates retained opaque identifiers in deterministic order.
+    pub fn identifiers(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.identifiers.iter().map(String::as_str)
+    }
+
+    /// Returns whether this value exactly matches a manifest's current
+    /// `network_origin` resource set.
+    pub fn matches_manifest(
+        &self,
+        manifest: &CapabilityManifest,
+    ) -> Result<bool, NetworkOriginAccessError> {
+        Ok(self == &Self::from_manifest(manifest)?)
+    }
+}
+
+/// Failure while constructing or comparing [`NetworkOriginAccess`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NetworkOriginAccessError {
+    /// The source manifest or identifier violates portable protocol syntax.
+    Protocol(ProtocolError),
+    /// A broker socket without an active network-origin resource is denied.
+    Empty,
+    /// The configured broker set repeats an opaque identifier.
+    DuplicateIdentifier { identifier: String },
+    /// The exact broker set would exceed the fixed catalog capacity.
+    TooManyIdentifiers { maximum: usize, actual: usize },
+}
+
+impl Display for NetworkOriginAccessError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => write!(formatter, "invalid network-origin access: {error}"),
+            Self::Empty => formatter.write_str("network-origin access must not be empty"),
+            Self::DuplicateIdentifier { identifier } => {
+                write!(
+                    formatter,
+                    "network-origin access repeats identifier: {identifier}"
+                )
+            }
+            Self::TooManyIdentifiers { maximum, actual } => write!(
+                formatter,
+                "network-origin access has {actual} identifiers; maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NetworkOriginAccessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::Empty | Self::DuplicateIdentifier { .. } | Self::TooManyIdentifiers { .. } => {
+                None
+            }
+        }
     }
 }
 
@@ -3452,6 +3607,64 @@ mod tests {
             CapabilityManifest::new("session-1", vec![json_grant(), json_grant()]).unwrap_err();
 
         assert_eq!(error, ProtocolError::DuplicateGrant("math.add".to_owned()));
+    }
+
+    #[test]
+    fn network_origin_access_binds_the_exact_distinct_manifest_set() {
+        let mut first = CapabilityGrant::json("service.read");
+        first.resources = BTreeSet::from([
+            ResourceSelector::new(ResourceKind::NetworkOrigin, "release.api").unwrap(),
+            ResourceSelector::new(ResourceKind::FileRoot, "input").unwrap(),
+        ]);
+        let mut second = CapabilityGrant::json("service.write");
+        second.resources = BTreeSet::from([
+            ResourceSelector::new(ResourceKind::NetworkOrigin, "release.api").unwrap(),
+            ResourceSelector::new(ResourceKind::NetworkOrigin, "audit.api").unwrap(),
+        ]);
+        let manifest = CapabilityManifest::new("session-1", vec![first, second]).unwrap();
+
+        let access = NetworkOriginAccess::from_manifest(&manifest).unwrap();
+        assert_eq!(
+            access.identifiers().collect::<Vec<_>>(),
+            ["audit.api", "release.api"]
+        );
+        assert!(access.contains("release.api"));
+        assert!(!access.contains("input"));
+        assert!(access.matches_manifest(&manifest).unwrap());
+
+        let narrowed = manifest
+            .attenuate(&ManifestAttenuation {
+                allowed_tools: Some(BTreeSet::from(["service.read".to_owned()])),
+                ..ManifestAttenuation::default()
+            })
+            .unwrap();
+        assert!(!access.matches_manifest(&narrowed).unwrap());
+    }
+
+    #[test]
+    fn network_origin_access_rejects_empty_duplicate_and_oversized_sets() {
+        let no_network =
+            CapabilityManifest::new("session-1", vec![CapabilityGrant::json("math.add")]).unwrap();
+        assert_eq!(
+            NetworkOriginAccess::from_manifest(&no_network).unwrap_err(),
+            NetworkOriginAccessError::Empty
+        );
+        assert_eq!(
+            NetworkOriginAccess::from_identifiers(["release.api", "release.api"]).unwrap_err(),
+            NetworkOriginAccessError::DuplicateIdentifier {
+                identifier: "release.api".to_owned(),
+            }
+        );
+        let identifiers = (0..=MAX_NETWORK_ORIGIN_ACCESS_IDS)
+            .map(|index| format!("origin-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            NetworkOriginAccess::from_identifiers(identifiers).unwrap_err(),
+            NetworkOriginAccessError::TooManyIdentifiers {
+                maximum: MAX_NETWORK_ORIGIN_ACCESS_IDS,
+                actual: MAX_NETWORK_ORIGIN_ACCESS_IDS + 1,
+            }
+        );
     }
 
     #[test]

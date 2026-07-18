@@ -774,10 +774,73 @@ the protection it provides depends on the arguments supplied by its caller.
 See the [Bubblewrap security model](https://github.com/containers/bubblewrap/blob/main/README.md)
 for the underlying constraints.
 
+## Brokered Network-Origin Access
+
+The optional `splash-capabilities/linux-network-broker` feature is the one
+Linux exception to the default `network_origin` rejection. It is a narrow,
+host-owned HTTP broker, not a general network proxy. The host builds one
+`LinuxNetworkBroker` around one reviewed `HttpEndpointCatalog` or
+`HttpOriginCatalog`, then gives the matching `LinuxNetworkBrokerMount` to the
+same Bubblewrap policy:
+
+```rust
+use splash_capabilities::{
+    http_endpoint_catalog::{HttpEndpointCatalog, HttpEndpointSecretStore},
+    linux_network_broker::{
+        LinuxNetworkBroker, DEFAULT_LINUX_NETWORK_BROKER_DESTINATION,
+    },
+};
+use splash_protocol::NetworkOriginAccess;
+
+let access = NetworkOriginAccess::from_manifest(&attenuated_manifest)?;
+// `catalog` must contain exactly the opaque IDs in `access`, no more or less.
+let broker = LinuxNetworkBroker::bind_endpoint(
+    "/run/user/1000", // Existing host-owned parent; a private runtime dir is preferred.
+    DEFAULT_LINUX_NETWORK_BROKER_DESTINATION,
+    access,
+    catalog,
+    HttpEndpointSecretStore::default(),
+)?;
+
+policy.pin_mount_sources();
+policy.set_linux_network_broker(broker.mount().clone());
+let command = policy.compile(&attenuated_manifest)?;
+// Retain `broker` until `command`'s worker has exited, then call shutdown().
+```
+
+The broker creates a CSPRNG-named `0700` directory containing exactly one
+`0600` Unix socket. Policy compilation requires descriptor-pinned mount sources,
+the same exact `NetworkOriginAccess` as the manifest, that private directory
+shape, and a read-only mount at the selected worker path. Descriptor pinning
+retains the selected directory through launch but does not freeze mutable
+descendants, so the host must retain exclusive control of it. Bubblewrap still
+uses `--unshare-all` and never uses `--share-net`; a worker receives neither an
+IP stack nor a raw network client API. The host broker is the only process that
+opens the reviewed HTTP connection and, when configured, resolves a host-held
+endpoint credential.
+
+A reviewed worker adapter constructs `LinuxNetworkBrokerClient` with the fixed
+worker-visible socket path and passes its active `CapabilityGrant` on every
+request. The client checks that the input's opaque `endpoint` or `origin` ID is
+present in that grant before it opens the socket. The broker independently
+rechecks that the ID belongs to its exact session catalog and applies the
+catalog's existing request bounds, origin matching, proxy/redirect policy,
+credential handling, and generic failures. It accepts one bounded JSON-line
+request per connection and exposes no raw socket, URL, credential, or catalog
+enumeration API.
+
+This is an aggregate session boundary: one contained worker receives the union
+of all `network_origin` IDs in its manifest. The grant check is a reviewed
+adapter guard, not an OS per-tool process boundary. Hosts that need separate
+OS authority for two tools must launch separately attenuated worker sessions,
+each with its own broker and private directory. A crash-sensitive HTTP `POST`
+must still use a custom durable worker adapter and reconciliation contract;
+the broker does not make an external effect idempotent.
+
 ## Capability Semantics
 
-The backend implements only file-root visibility at the operating-system
-boundary:
+The backend implements file-root visibility and the optional brokered HTTP
+network-origin path at the operating-system boundary:
 
 - `file_root`: allowed only when its opaque ID is registered in the trusted
   policy. A host-backed source must be a directory, and its access mode is
@@ -791,8 +854,15 @@ boundary:
   the same host source.
 - `executable`: rejected. The worker program is fixed by host configuration;
   scripts cannot choose a second executable.
-- `network_origin`: rejected. The worker has no host network namespace, and
-  this backend does not pretend that an IP or DNS allowlist is an origin policy.
+- `network_origin`: rejected unless trusted host setup supplies one exact
+  `LinuxNetworkBrokerMount`. The broker's catalog IDs must exactly equal the
+  manifest's distinct network-origin IDs, its source must be descriptor pinned,
+  and its directory must contain only one private Unix socket. The worker keeps
+  an isolated network namespace, and the broker adds only that socket. This
+  supports the broker's reviewed HTTP endpoint or exact-origin catalog, not
+  arbitrary DNS, TCP, UDP, Unix sockets, or a general network proxy. Other
+  runtime and file-root mounts are independently trusted and can expose Unix
+  sockets, so hosts requiring broker-only IPC must exclude them.
 - `secret`: rejected. Secret provisioning needs a dedicated target-specific
   broker and is not implemented here.
 
@@ -839,11 +909,13 @@ It does not yet provide:
   before launch, but there is no shared tmpfs runtime quota. The watchdog adds
   a process-lifetime wall-clock deadline;
 - D-Bus mediation, device-specific policy, an executable-path policy, or a
-  network proxy. `DenyKnownEscapeSurface` is a narrow default-allow hardening
+  general network proxy. `DenyKnownEscapeSurface` is a narrow default-allow hardening
   filter, while `StrictAllowlist` is a target-specific syscall boundary, not a
   replacement for any of these;
-- a safe per-origin network allowlist, arbitrary executable selection, secret
-  broker, or filesystem access outside registered directory roots;
+- per-tool process isolation, non-HTTP network protocols, a portable network
+  policy backend, arbitrary executable selection, a general secret broker, or
+  filesystem access outside registered directory roots. The Linux broker's
+  catalog mediates only its exact aggregate session HTTP authority;
 - universal cancellation for synchronous, durable, or arbitrary adapters. The
   optional multiplexed protocol delivers one authenticated ordinary-call
   request only to explicitly cancellable adapters. The watchdog remains a

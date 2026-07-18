@@ -83,6 +83,13 @@ and keeps UI support optional rather than making UI the language boundary.
   performs read-only exact credential lookup on macOS, iOS, and Windows
   without a mock fallback; this is API-level mediation, not egress containment
   or a general secret API.
+- An optional Linux-only private Unix-socket HTTP broker for an isolated
+  Bubblewrap worker. It binds exactly the manifest's opaque `network_origin`
+  IDs to one reviewed endpoint or origin catalog, retains Bubblewrap's isolated
+  network namespace, and adds a descriptor-pinned private directory containing
+  one socket. It is aggregate per worker session, HTTP-only, and not a portable
+  firewall,
+  raw network API, per-tool process boundary, or durable-effect protocol.
 - A bounded worker-side capability secret-broker contract for reviewed Rust
   adapters: a host-owned provider can release a zeroizing binary secret only
   to one exact preconfigured `(tool, secret-id)` binding whose active worker
@@ -160,8 +167,10 @@ and keeps UI support optional rather than making UI the language boundary.
   contained worker, performs one watchdog-bounded reconciliation, and commits
   the observation through fenced authenticated compare-and-swap storage.
 - Linux Bubblewrap worker-policy compiler and launcher for a fixed,
-  host-selected worker and manifest-selected file roots; it rejects network,
-  executable, and secret selectors rather than claiming unsupported policy,
+  host-selected worker and manifest-selected file roots, plus an optional exact
+  brokered HTTP `network_origin` path; it rejects executable and secret
+  selectors and every network-origin grant without that broker rather than
+  claiming unsupported policy,
   denies persistent writable host roots unless they carry a verified,
   descriptor-pinned Linux project quota with a configured aggregate hard byte
   and inode bound plus mandatory further-user-namespace lockdown, or host code

@@ -292,6 +292,51 @@ redact their native credential mappings and locators. Credential-store errors
 remain finite host-side categories and become the same generic failed tool
 result as other resolver failures.
 
+## Linux contained-worker broker
+
+The `linux-network-broker` feature adds an optional Linux-only execution
+boundary for these catalogs when a worker is launched through
+`splash-sandbox::bubblewrap`. It is separate from ordinary catalog registration:
+the catalog remains host-owned, and the contained worker gets one read-only
+mounted Unix-socket directory while retaining an isolated network namespace and
+no direct HTTP client.
+
+```toml
+[dependencies]
+splash-capabilities = { path = "../splash-capabilities", features = ["linux-network-broker"] }
+```
+
+At setup, `LinuxNetworkBroker::bind_endpoint` or `bind_origin` takes one
+`NetworkOriginAccess` derived from the exact attenuated manifest. It refuses to
+start unless the reviewed catalog's opaque identifiers equal that set exactly.
+The returned `LinuxNetworkBrokerMount` must be installed with
+`BubblewrapWorkerPolicy::set_linux_network_broker` and descriptor-pinned mount
+sources; policy compilation rejects a missing, broader, narrower, mutable, or
+non-private socket mount. The host retains the broker for the worker session
+and calls `shutdown` after it reaps the worker.
+
+Inside a reviewed worker adapter, `LinuxNetworkBrokerClient` takes the fixed
+worker-visible socket path and the active `CapabilityGrant`. Before any socket
+I/O it verifies that the input's opaque `endpoint` or `origin` identifier is in
+that grant. The host then independently validates the broker protocol and runs
+the catalog, so the worker cannot select a URL, a different catalog, a raw
+socket destination, or a host credential. The protocol has fixed JSON-line
+framing, one request per connection, an approximately 1 MiB bounded maximum
+frame, the catalog's existing HTTP timeouts, and generic denied/failed
+responses.
+
+This broker mount is separate from any trusted runtime or `file_root` mount.
+Those mounts can expose their own Unix sockets, so a deployment requiring only
+broker-mediated IPC must exclude them.
+
+This is intentionally an aggregate session boundary. A single contained worker
+can use the union of network-origin IDs in its manifest; per-tool OS authority
+requires separately attenuated worker sessions and separate broker directories.
+A broker does not make an external POST durable or idempotent, so a
+crash-sensitive effect still needs a custom worker durable-operation adapter
+and reconciliation policy. See [Linux Bubblewrap workers](linux-bubblewrap.md)
+for the mount and containment requirements.
+
 ## Security boundary
 
 This is API-level mediation only. It stops a generated Splash program from
@@ -306,8 +351,12 @@ blocking request that is already running.
 Hosts must treat endpoint setup as trusted policy, keep secrets out of URLs and
 tool metadata, keep the resolver's own logs and errors free of secret material,
 and run effects needing real egress isolation behind a target-specific
-containment or network policy backend. In particular, this catalog is not
-sufficient to run untrusted local tools with ambient process authority.
+containment or network policy backend. The Linux broker is one such backend
+only for its reviewed HTTP catalog and an isolated Bubblewrap worker; it does
+not cover another adapter in the host process, non-HTTP traffic, per-tool
+process separation, or non-Linux/mobile/embedded targets. In particular, this
+catalog alone is not sufficient to run untrusted local tools with ambient
+process authority.
 The resolver runs in the local adapter before the HTTP request starts; its own
 latency and any platform credential-store behavior are host responsibility and
 are not bounded by the catalog's HTTP deadline.

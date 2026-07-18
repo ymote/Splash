@@ -342,16 +342,47 @@ bounded ephemeral `file_root` entries. It uses `--unshare-all` and never emits
 `--share-net`, so it does not retain the host network namespace. It also emits
 `--cap-drop ALL` unconditionally, including when Bubblewrap is launched by
 root, so the worker cannot retain Linux capabilities needed to undo mount or
-namespace policy. It rejects `network_origin`, `executable`, and `secret`
-selectors because this backend cannot correctly enforce them. It also rejects
-overlapping or root mounts and requires the worker program to live in a
-read-only runtime mount, avoiding a writable grant as an executable source.
+namespace policy. It rejects `executable` and `secret` selectors, and rejects
+every `network_origin` selector unless trusted host setup supplies the optional
+exact Linux network broker described below. It also rejects overlapping or root
+mounts and requires the worker program to live in a read-only runtime mount,
+avoiding a writable grant as an executable source.
 Hosts that explicitly select
 `require_no_further_user_namespaces` also get Bubblewrap's mandatory
 `--unshare-user --disable-userns` sequence, which prevents the worker from
 creating further user namespaces. That mode has no compatibility fallback and
 will fail on unsupported, setuid, or user-namespace-restricted hosts; it does
 not mean Bubblewrap never created an internal nested namespace.
+
+With the Linux-only `splash-capabilities/linux-network-broker` feature, the
+host can derive one exact `NetworkOriginAccess` set from the compiled manifest,
+bind a reviewed fixed-endpoint or exact-origin HTTP catalog to it, and install
+the returned `LinuxNetworkBrokerMount` into that same policy. The broker creates
+a CSPRNG-named `0700` directory containing exactly one `0600` Unix socket. The
+policy requires descriptor-pinned mount sources, checks that exact directory
+shape and that the socket and directory share an owner, requires the catalog
+authority to match the manifest's distinct opaque IDs exactly, and mounts that
+directory read-only into the worker. The worker still receives no host network
+namespace; within this broker path, the host broker outside the sandbox is the
+only component that resolves a configured secret or opens the reviewed HTTP
+connection.
+
+The private socket is not a general local authorization protocol. Its
+filesystem ownership and parent directory remain trusted host setup, and any
+process that can legitimately access the socket can issue requests within its
+aggregate session catalog. Descriptor pinning retains the selected directory
+identity through launch but cannot freeze mutable descendants, so trusted host
+setup must retain exclusive control of that directory. Separately selected
+runtime and file-root mounts are independent trusted policy decisions and can
+expose their own Unix sockets; hosts requiring broker-only IPC must exclude
+them. A reviewed `LinuxNetworkBrokerClient` rechecks the active worker grant
+before connecting, and the host catalog rechecks its exact identifier set, but
+those are not OS per-tool separation. A worker process has the union of its
+manifest's network origins. Hosts needing finer isolation must run separate
+attenuated sessions with separate broker directories. The broker does not
+expose raw TCP/UDP/DNS, arbitrary Unix sockets, catalog discovery, credentials,
+or a general proxy; it only carries one bounded catalog request per connection.
+It also does not make a POST durable or idempotent.
 
 `BubblewrapCommand::spawn_with_bootstrap` additionally checks that the private
 bootstrap session matches the compiled manifest before launch, then writes the

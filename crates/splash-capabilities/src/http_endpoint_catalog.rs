@@ -18,6 +18,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use serde_json::json;
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+use splash_protocol::NetworkOriginAccess;
 use ureq::{
     http::{
         header::{HeaderName, HeaderValue},
@@ -764,6 +766,7 @@ pub enum HttpEndpointCatalogError {
     SecretAuthorizationAlreadyConfigured,
     DuplicateIdentifier,
     EntryLimitExceeded { maximum: usize },
+    NetworkOriginAccessMismatch,
     NotFound,
     InvalidRequest,
     MissingRequestBody,
@@ -821,6 +824,9 @@ impl Display for HttpEndpointCatalogError {
                     "HTTP endpoint catalog exceeds its maximum of {maximum} entries"
                 )
             }
+            Self::NetworkOriginAccessMismatch => formatter.write_str(
+                "HTTP endpoint catalog identifiers do not exactly match the network-origin broker authority",
+            ),
             Self::NotFound => formatter.write_str("HTTP endpoint is not registered"),
             Self::InvalidRequest => formatter.write_str("HTTP endpoint request is invalid"),
             Self::MissingRequestBody => {
@@ -886,6 +892,23 @@ impl HttpEndpointCatalog {
     /// Returns whether the catalog contains no endpoints.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+    fn validate_network_origin_access(
+        &self,
+        access: &NetworkOriginAccess,
+    ) -> Result<(), HttpEndpointCatalogError> {
+        if self.entries.len() != access.len()
+            || !self
+                .entries
+                .keys()
+                .map(String::as_str)
+                .eq(access.identifiers())
+        {
+            return Err(HttpEndpointCatalogError::NetworkOriginAccessMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn requires_secret_resolver(&self) -> bool {
@@ -1115,6 +1138,23 @@ impl HttpOriginCatalog {
         self.entries.is_empty()
     }
 
+    #[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+    fn validate_network_origin_access(
+        &self,
+        access: &NetworkOriginAccess,
+    ) -> Result<(), HttpEndpointCatalogError> {
+        if self.entries.len() != access.len()
+            || !self
+                .entries
+                .keys()
+                .map(String::as_str)
+                .eq(access.identifiers())
+        {
+            return Err(HttpEndpointCatalogError::NetworkOriginAccessMismatch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn requires_secret_resolver(&self) -> bool {
         self.entries
             .values()
@@ -1319,6 +1359,128 @@ impl Default for HttpOriginCatalog {
     fn default() -> Self {
         Self::new(HttpEndpointCatalogLimits::default())
             .expect("default HTTP origin catalog limits are valid")
+    }
+}
+
+/// Catalog shape selected by a Linux Unix-socket network broker.
+///
+/// This is crate-private plumbing for the optional broker. The public catalog
+/// APIs remain the host's review surface; the broker only transports one
+/// already reviewed endpoint or exact-origin catalog through a contained
+/// worker's private Unix socket.
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetworkCatalogMode {
+    Endpoint,
+    Origin,
+}
+
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+impl NetworkCatalogMode {
+    pub(crate) const fn identifier_field(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::Origin => "origin",
+        }
+    }
+}
+
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+enum NetworkCatalog {
+    Endpoint(HttpEndpointCatalog),
+    Origin(HttpOriginCatalog),
+}
+
+/// One catalog executor retained only by the optional Linux Unix-socket
+/// broker thread.
+///
+/// The constructor proves the reviewed catalog IDs exactly equal the session's
+/// opaque `network_origin` set. Requests are checked again before a catalog can
+/// resolve a secret or open a host network connection.
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+pub(crate) struct NetworkCatalogExecutor<R> {
+    mode: NetworkCatalogMode,
+    access: NetworkOriginAccess,
+    catalog: NetworkCatalog,
+    agents: HttpEndpointAgents,
+    secret_resolver: R,
+}
+
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+impl<R> NetworkCatalogExecutor<R>
+where
+    R: HttpEndpointSecretResolver,
+{
+    pub(crate) fn endpoint(
+        catalog: HttpEndpointCatalog,
+        access: NetworkOriginAccess,
+        secret_resolver: R,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        catalog.validate_network_origin_access(&access)?;
+        let agents = HttpEndpointAgents::new(catalog.limits);
+        Ok(Self {
+            mode: NetworkCatalogMode::Endpoint,
+            access,
+            catalog: NetworkCatalog::Endpoint(catalog),
+            agents,
+            secret_resolver,
+        })
+    }
+
+    pub(crate) fn origin(
+        catalog: HttpOriginCatalog,
+        access: NetworkOriginAccess,
+        secret_resolver: R,
+    ) -> Result<Self, HttpEndpointCatalogError> {
+        catalog.validate_network_origin_access(&access)?;
+        let agents = HttpEndpointAgents::new(catalog.limits);
+        Ok(Self {
+            mode: NetworkCatalogMode::Origin,
+            access,
+            catalog: NetworkCatalog::Origin(catalog),
+            agents,
+            secret_resolver,
+        })
+    }
+
+    pub(crate) const fn mode(&self) -> NetworkCatalogMode {
+        self.mode
+    }
+
+    pub(crate) fn execute(
+        &mut self,
+        input: JsonValue,
+    ) -> Result<JsonValue, HttpEndpointCatalogError> {
+        let identifier = input
+            .as_object()
+            .and_then(|object| object.get(self.mode.identifier_field()))
+            .and_then(JsonValue::as_str)
+            .filter(|identifier| is_valid_identifier(identifier))
+            .ok_or(HttpEndpointCatalogError::InvalidRequest)?;
+        if !self.access.contains(identifier) {
+            return Err(HttpEndpointCatalogError::NotFound);
+        }
+        let request = JsonToolRequest {
+            name: "linux.network.broker".to_owned(),
+            input,
+            call_index: 0,
+        };
+        match &self.catalog {
+            NetworkCatalog::Endpoint(catalog) => catalog.execute(
+                &self.agents,
+                &request,
+                catalog.limits.max_request_bytes,
+                catalog.limits.max_response_bytes,
+                &mut self.secret_resolver,
+            ),
+            NetworkCatalog::Origin(catalog) => catalog.execute(
+                &self.agents,
+                &request,
+                catalog.limits.max_request_bytes,
+                catalog.limits.max_response_bytes,
+                &mut self.secret_resolver,
+            ),
+        }
     }
 }
 
@@ -1598,6 +1760,25 @@ fn is_allowed_secret_header(name: &HeaderName) -> bool {
 }
 
 impl HttpEndpointCatalogError {
+    pub(crate) const fn is_access_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidIdentifier
+                | Self::InvalidUrl
+                | Self::UrlCredentialsNotAllowed
+                | Self::UrlFragmentNotAllowed
+                | Self::OriginPathOrQueryNotAllowed
+                | Self::OriginMismatch
+                | Self::HttpsRequired
+                | Self::InsecureHttpRequired
+                | Self::NotFound
+                | Self::InvalidRequest
+                | Self::MissingRequestBody
+                | Self::UnexpectedRequestBody
+                | Self::RequestTooLarge { .. }
+        )
+    }
+
     fn into_tool_error(self) -> ToolError {
         self.into_tool_error_with_messages(
             "HTTP endpoint access was denied",
@@ -1617,21 +1798,10 @@ impl HttpEndpointCatalogError {
         denied_message: &'static str,
         failed_message: &'static str,
     ) -> ToolError {
-        match self {
-            Self::InvalidIdentifier
-            | Self::InvalidUrl
-            | Self::UrlCredentialsNotAllowed
-            | Self::UrlFragmentNotAllowed
-            | Self::OriginPathOrQueryNotAllowed
-            | Self::OriginMismatch
-            | Self::HttpsRequired
-            | Self::InsecureHttpRequired
-            | Self::NotFound
-            | Self::InvalidRequest
-            | Self::MissingRequestBody
-            | Self::UnexpectedRequestBody
-            | Self::RequestTooLarge { .. } => ToolError::Denied(denied_message.to_owned()),
-            _ => ToolError::Failed(failed_message.to_owned()),
+        if self.is_access_denied() {
+            ToolError::Denied(denied_message.to_owned())
+        } else {
+            ToolError::Failed(failed_message.to_owned())
         }
     }
 }

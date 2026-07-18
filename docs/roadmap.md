@@ -187,10 +187,19 @@
   fresh-session dispatch, reconciliation, or compensation exchange; it is
   bounded and verified but does not provide automatic recovery policy.
 - Linux Bubblewrap policy compiler and launcher for fixed workers and
-  manifest-selected file roots. It fails closed for network-origin,
-  executable, and secret selectors, and does not fall back to unrestricted
-  process launch. It unconditionally drops every Linux capability before the
-  worker executes, including when the host invokes Bubblewrap as root.
+  manifest-selected file roots. It fails closed for executable and secret
+  selectors, and for network-origin selectors unless an exact private Linux
+  HTTP broker is configured; it does not fall back to unrestricted process
+  launch. It unconditionally drops every Linux capability before the worker
+  executes, including when the host invokes Bubblewrap as root.
+- Optional Linux host-owned Unix-socket HTTP broker for an isolated Bubblewrap
+  worker. It derives a bounded exact network-origin ID set from the manifest,
+  requires a reviewed fixed-endpoint or exact-origin catalog with exactly that
+  set, creates one CSPRNG-named private socket directory, and mounts it
+  descriptor-pinned and read-only while retaining Bubblewrap's isolated network
+  namespace. It is HTTP-only aggregate per session authority, not a general
+  proxy, per-tool OS isolation, durable-effect mechanism, or portable network
+  backend.
 - Optional per-policy launch requirements for a typed resource-limit runner
   and a cgroup-v2-backed launch. A missing required runner rejects compilation,
   and a cgroup-required compiled command rejects uncgrouped launch APIs rather
@@ -292,14 +301,15 @@
   provide a shared tmpfs runtime quota or portable durable-storage boundary.
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
-- An operating-system-enforced dynamic/origin-policy network boundary,
-  target-specific credential-provider and secret-delivery backends, and a
-  complete audited code-execution policy beyond Landlock's filesystem-execute
-  action. The exact-origin catalog deliberately
-  mediates only Splash-initiated HTTP requests and the worker secret broker
-  deliberately mediates only a reviewed adapter's host-owned resolver; neither
-  enforces egress or secret delivery at the operating-system boundary. Broader
-  selectors must remain denied until each can be enforced.
+- Network containment beyond the Linux broker-backed HTTP catalogs: per-tool
+  OS separation, arbitrary non-HTTP protocols, DNS/firewall policy, macOS,
+  Windows, mobile, and embedded implementations. Target-specific
+  credential-provider and secret-delivery backends, plus a complete audited
+  code-execution policy beyond Landlock's filesystem-execute action, also
+  remain. The exact-origin catalog alone still mediates only Splash-initiated
+  HTTP requests, and the worker secret broker deliberately mediates only a
+  reviewed adapter's host-owned resolver; broader selectors must remain denied
+  until each is enforced.
 
 ## Before a stable language release
 

@@ -39,8 +39,8 @@ use rustix::{
 #[cfg(target_os = "linux")]
 use splash_linux_project_quota::inspect_project_quota;
 use splash_protocol::{
-    CapabilityManifest, PrivatePipeWorkerBootstrap, PrivatePipeWorkerBootstrapError, ProtocolError,
-    ResourceKind, ResourceSelector,
+    CapabilityManifest, NetworkOriginAccess, NetworkOriginAccessError, PrivatePipeWorkerBootstrap,
+    PrivatePipeWorkerBootstrapError, ProtocolError, ResourceKind, ResourceSelector,
 };
 
 const MAX_TMPFS_BYTES: usize = usize::MAX >> 1;
@@ -72,6 +72,13 @@ pub const MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES: usize = 30;
 /// pre-exec runner.
 pub const MAX_LANDLOCK_EXECUTABLE_RUNNER_EXECUTABLES: usize =
     MAX_LANDLOCK_EXECUTABLE_RUNNER_ADDITIONAL_EXECUTABLES + 2;
+
+/// Maximum UTF-8 byte length of the one Unix-socket filename exposed by a
+/// Linux network broker mount.
+pub const MAX_LINUX_NETWORK_BROKER_SOCKET_NAME_BYTES: usize = 128;
+/// Maximum byte length of a filesystem Unix-socket path on Linux, excluding
+/// its terminating NUL byte.
+pub const MAX_LINUX_NETWORK_BROKER_SOCKET_PATH_BYTES: usize = 107;
 
 /// Access mode for a host-selected file-root binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -649,6 +656,88 @@ impl ReadOnlyMount {
     }
 }
 
+/// One host-owned Linux Unix-socket directory mounted read-only into a
+/// Bubblewrap worker.
+///
+/// The worker remains inside Bubblewrap's isolated network namespace. This
+/// mount gives it access to one host broker through one filesystem Unix socket;
+/// it does not share the host network namespace or grant raw egress. Other
+/// selected policy mounts remain separate trusted configuration.
+/// The broker itself must enforce the same exact [`NetworkOriginAccess`] set
+/// and use a reviewed origin/endpoint catalog. Compilation requires a
+/// descriptor-pinned source directory with mode `0700`, exactly one socket
+/// file with mode `0600`, and no other directory entries.
+///
+/// This is trusted host setup, not a Splash API. Bind one broker mount to one
+/// attenuated worker session. A worker process is an aggregate authority for
+/// its whole manifest; hosts needing OS-enforced per-tool separation must use
+/// separately attenuated worker sessions and broker directories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinuxNetworkBrokerMount {
+    source_directory: PathBuf,
+    destination_directory: PathBuf,
+    socket_name: String,
+    access: NetworkOriginAccess,
+}
+
+impl LinuxNetworkBrokerMount {
+    /// Creates a trusted mapping from one host-owned socket directory to one
+    /// worker-visible directory.
+    ///
+    /// `socket_name` is a single ASCII filename, not a path. The directory and
+    /// socket must already exist when the policy compiles; use the optional
+    /// `splash-capabilities/linux-network-broker` host service to create and
+    /// retain a compliant directory.
+    pub fn new(
+        source_directory: impl Into<PathBuf>,
+        destination_directory: impl Into<PathBuf>,
+        socket_name: impl Into<String>,
+        access: NetworkOriginAccess,
+    ) -> Result<Self, BubblewrapPolicyError> {
+        let source_directory = source_directory.into();
+        let destination_directory = destination_directory.into();
+        let socket_name = socket_name.into();
+        validate_host_path("Linux network broker source directory", &source_directory)?;
+        validate_sandbox_path(
+            "Linux network broker destination directory",
+            &destination_directory,
+        )?;
+        validate_linux_network_broker_socket_name(&socket_name)?;
+        validate_linux_network_broker_socket_path(&destination_directory, &socket_name)?;
+        Ok(Self {
+            source_directory,
+            destination_directory,
+            socket_name,
+            access,
+        })
+    }
+
+    /// Returns the trusted host directory selected for this broker.
+    pub fn source_directory(&self) -> &Path {
+        &self.source_directory
+    }
+
+    /// Returns the worker-visible mount directory containing the broker socket.
+    pub fn destination_directory(&self) -> &Path {
+        &self.destination_directory
+    }
+
+    /// Returns the one worker-visible Unix socket path.
+    pub fn worker_socket_path(&self) -> PathBuf {
+        self.destination_directory.join(&self.socket_name)
+    }
+
+    /// Returns the exact session network-origin authority bound to this mount.
+    pub fn access(&self) -> &NetworkOriginAccess {
+        &self.access
+    }
+
+    #[cfg(target_os = "linux")]
+    fn socket_name(&self) -> &str {
+        &self.socket_name
+    }
+}
+
 /// A host-selected upper bound for one Linux filesystem project quota.
 ///
 /// A Linux project quota is enforced by the backing filesystem rather than by
@@ -898,6 +987,7 @@ pub struct BubblewrapWorkerPolicy {
     resource_limit_runner: Option<ResourceLimitRunner>,
     resource_limit_runner_required: bool,
     landlock_executable_runner: Option<LandlockExecutableRunner>,
+    linux_network_broker: Option<LinuxNetworkBrokerMount>,
     cgroup_v2_required: bool,
     seccomp_profile: WorkerSeccompProfile,
     seccomp_allowlist: Option<WorkerSeccompAllowlist>,
@@ -935,6 +1025,7 @@ impl BubblewrapWorkerPolicy {
             resource_limit_runner: None,
             resource_limit_runner_required: false,
             landlock_executable_runner: None,
+            linux_network_broker: None,
             cgroup_v2_required: false,
             seccomp_profile: WorkerSeccompProfile::Disabled,
             seccomp_allowlist: None,
@@ -958,6 +1049,25 @@ impl BubblewrapWorkerPolicy {
     pub fn add_runtime_mount(&mut self, mount: ReadOnlyMount) -> &mut Self {
         self.runtime_mounts.push(mount);
         self
+    }
+
+    /// Selects one host-owned Unix-socket broker for the active exact
+    /// `network_origin` resource set.
+    ///
+    /// The compiler keeps Bubblewrap's `--unshare-all` network namespace and
+    /// adds the broker directory read-only. It rejects a broker whose
+    /// [`LinuxNetworkBrokerMount::access`] does not exactly match the compiled
+    /// manifest, a broker source that is not descriptor pinned, or a directory
+    /// that does not contain exactly one private socket. Replacing an existing
+    /// broker intentionally replaces the whole trusted configuration.
+    pub fn set_linux_network_broker(&mut self, broker: LinuxNetworkBrokerMount) -> &mut Self {
+        self.linux_network_broker = Some(broker);
+        self
+    }
+
+    /// Returns the selected Linux Unix-socket broker, if any.
+    pub fn linux_network_broker(&self) -> Option<&LinuxNetworkBrokerMount> {
+        self.linux_network_broker.as_ref()
     }
 
     /// Returns how this policy passes selected mount roots to Bubblewrap.
@@ -1387,10 +1497,12 @@ impl BubblewrapWorkerPolicy {
 
     /// Validates a manifest and creates an immutable Bubblewrap launch plan.
     ///
-    /// `file_root` selectors map only through host-registered bindings. This
-    /// backend rejects `executable`, `network_origin`, and `secret` selectors:
-    /// it always creates a network namespace and has no correct enforcement
-    /// mechanism for per-origin networking, arbitrary executables, or secret
+    /// `file_root` selectors map only through host-registered bindings.
+    /// `network_origin` selectors require one exact
+    /// [`LinuxNetworkBrokerMount`] and retain Bubblewrap's isolated network
+    /// namespace; the policy adds that broker's Unix socket. This
+    /// backend still rejects `executable` and `secret` selectors because it has
+    /// no correct enforcement mechanism for arbitrary executables or secret
     /// delivery.
     pub fn compile(
         &self,
@@ -1422,6 +1534,20 @@ impl BubblewrapWorkerPolicy {
         if self.resource_limit_runner_required && self.resource_limit_runner.is_none() {
             return Err(BubblewrapPolicyError::ResourceLimitRunnerRequired);
         }
+        let network_origin_access = if let Some(broker) = &self.linux_network_broker {
+            ensure_linux_network_broker_supported()?;
+            if self.mount_source_binding != MountSourceBinding::DescriptorPinned {
+                return Err(BubblewrapPolicyError::NetworkBrokerRequiresPinnedMountSources);
+            }
+            let access = NetworkOriginAccess::from_manifest(manifest)
+                .map_err(BubblewrapPolicyError::NetworkBrokerAccess)?;
+            if broker.access() != &access {
+                return Err(BubblewrapPolicyError::NetworkBrokerManifestMismatch);
+            }
+            Some(access)
+        } else {
+            None
+        };
 
         let resources = manifest
             .grants
@@ -1450,6 +1576,12 @@ impl BubblewrapWorkerPolicy {
             .iter()
             .map(|mount| resolve_runtime_mount(mount, self.mount_source_binding))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(broker) = &self.linux_network_broker {
+            mounts.push(resolve_linux_network_broker_mount(
+                broker,
+                self.mount_source_binding,
+            )?);
+        }
 
         #[cfg(target_os = "linux")]
         let mut active_linux_project_quotas = BTreeMap::new();
@@ -1553,6 +1685,7 @@ impl BubblewrapWorkerPolicy {
                         }
                     }
                 }
+                ResourceKind::NetworkOrigin if network_origin_access.is_some() => {}
                 ResourceKind::Executable | ResourceKind::NetworkOrigin | ResourceKind::Secret => {
                     return Err(BubblewrapPolicyError::UnsupportedResource { resource });
                 }
@@ -3408,6 +3541,33 @@ pub enum BubblewrapPolicyError {
     DescriptorPinnedExecutablesRequirePinnedMountSources,
     EmptyResourceLimits,
     ResourceLimitRunnerRequired,
+    NetworkBrokerUnsupportedPlatform,
+    NetworkBrokerRequiresPinnedMountSources,
+    NetworkBrokerAccess(NetworkOriginAccessError),
+    NetworkBrokerManifestMismatch,
+    InvalidNetworkBrokerSocketName {
+        socket_name: String,
+    },
+    NetworkBrokerSocketPathTooLong {
+        destination_directory: PathBuf,
+        socket_name: String,
+    },
+    NetworkBrokerDirectoryNotPrivate {
+        directory: PathBuf,
+    },
+    NetworkBrokerDirectoryContentsInvalid {
+        directory: PathBuf,
+    },
+    NetworkBrokerSocketNotPrivate {
+        socket: PathBuf,
+    },
+    NetworkBrokerSocketNotSocket {
+        socket: PathBuf,
+    },
+    NetworkBrokerSocketOwnerMismatch {
+        directory: PathBuf,
+        socket: PathBuf,
+    },
     DuplicateLandlockAllowedExecutable {
         program: PathBuf,
     },
@@ -3694,6 +3854,57 @@ impl Display for BubblewrapPolicyError {
             Self::ResourceLimitRunnerRequired => {
                 formatter.write_str("worker policy requires a typed resource-limit runner")
             }
+            Self::NetworkBrokerUnsupportedPlatform => {
+                formatter.write_str("Linux network broker mounts are supported only on Linux")
+            }
+            Self::NetworkBrokerRequiresPinnedMountSources => formatter.write_str(
+                "Linux network broker mounts require descriptor-pinned mount sources",
+            ),
+            Self::NetworkBrokerAccess(error) => {
+                write!(formatter, "invalid Linux network broker authority: {error}")
+            }
+            Self::NetworkBrokerManifestMismatch => formatter.write_str(
+                "Linux network broker authority does not exactly match the compiled manifest",
+            ),
+            Self::InvalidNetworkBrokerSocketName { socket_name } => write!(
+                formatter,
+                "Linux network broker socket name {socket_name:?} must be one bounded ASCII filename"
+            ),
+            Self::NetworkBrokerSocketPathTooLong {
+                destination_directory,
+                socket_name,
+            } => write!(
+                formatter,
+                "Linux network broker socket {}/{} exceeds the Linux Unix-socket path limit",
+                destination_directory.display(),
+                socket_name
+            ),
+            Self::NetworkBrokerDirectoryNotPrivate { directory } => write!(
+                formatter,
+                "Linux network broker directory {} must have mode 0700",
+                directory.display()
+            ),
+            Self::NetworkBrokerDirectoryContentsInvalid { directory } => write!(
+                formatter,
+                "Linux network broker directory {} must contain exactly one configured socket",
+                directory.display()
+            ),
+            Self::NetworkBrokerSocketNotPrivate { socket } => write!(
+                formatter,
+                "Linux network broker socket {} must have mode 0600",
+                socket.display()
+            ),
+            Self::NetworkBrokerSocketNotSocket { socket } => write!(
+                formatter,
+                "Linux network broker path {} must be a Unix socket",
+                socket.display()
+            ),
+            Self::NetworkBrokerSocketOwnerMismatch { directory, socket } => write!(
+                formatter,
+                "Linux network broker socket {} must have the same owner as directory {}",
+                socket.display(),
+                directory.display()
+            ),
             Self::DuplicateLandlockAllowedExecutable { program } => write!(
                 formatter,
                 "Landlock executable runner repeats allowed executable {}",
@@ -3855,6 +4066,7 @@ impl std::error::Error for BubblewrapPolicyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Protocol(error) => Some(error),
+            Self::NetworkBrokerAccess(error) => Some(error),
             Self::SourceIo { source, .. } => Some(source),
             Self::LinuxProjectQuotaDirectoryOpen { source, .. }
             | Self::LinuxProjectQuotaDirectoryInspect { source, .. } => Some(source),
@@ -3896,6 +4108,16 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::DescriptorPinnedExecutablesRequirePinnedMountSources
             | Self::EmptyResourceLimits
             | Self::ResourceLimitRunnerRequired
+            | Self::NetworkBrokerUnsupportedPlatform
+            | Self::NetworkBrokerRequiresPinnedMountSources
+            | Self::NetworkBrokerManifestMismatch
+            | Self::InvalidNetworkBrokerSocketName { .. }
+            | Self::NetworkBrokerSocketPathTooLong { .. }
+            | Self::NetworkBrokerDirectoryNotPrivate { .. }
+            | Self::NetworkBrokerDirectoryContentsInvalid { .. }
+            | Self::NetworkBrokerSocketNotPrivate { .. }
+            | Self::NetworkBrokerSocketNotSocket { .. }
+            | Self::NetworkBrokerSocketOwnerMismatch { .. }
             | Self::DuplicateLandlockAllowedExecutable { .. }
             | Self::TooManyLandlockAllowedExecutables { .. }
             | Self::LandlockExecutableRunnerUnsupportedPlatform
@@ -4475,6 +4697,127 @@ fn validate_absolute_normal_path(
     Ok(())
 }
 
+fn validate_linux_network_broker_socket_name(
+    socket_name: &str,
+) -> Result<(), BubblewrapPolicyError> {
+    let valid = !socket_name.is_empty()
+        && socket_name.len() <= MAX_LINUX_NETWORK_BROKER_SOCKET_NAME_BYTES
+        && socket_name != "."
+        && socket_name != ".."
+        && socket_name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_uppercase()
+                || byte.is_ascii_digit()
+                || (matches!(byte, b'.' | b'_' | b'-') && (index > 0 || byte != b'.'))
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BubblewrapPolicyError::InvalidNetworkBrokerSocketName {
+            socket_name: socket_name.to_owned(),
+        })
+    }
+}
+
+fn validate_linux_network_broker_socket_path(
+    destination_directory: &Path,
+    socket_name: &str,
+) -> Result<(), BubblewrapPolicyError> {
+    let path_length = destination_directory
+        .as_os_str()
+        .len()
+        .saturating_add(1)
+        .saturating_add(socket_name.len());
+    if path_length <= MAX_LINUX_NETWORK_BROKER_SOCKET_PATH_BYTES {
+        Ok(())
+    } else {
+        Err(BubblewrapPolicyError::NetworkBrokerSocketPathTooLong {
+            destination_directory: destination_directory.to_path_buf(),
+            socket_name: socket_name.to_owned(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_network_broker_directory(
+    directory: &Path,
+    socket_name: &str,
+) -> Result<(), BubblewrapPolicyError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+
+    let metadata = fs::metadata(directory).map_err(|source| BubblewrapPolicyError::SourceIo {
+        field: "Linux network broker source directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    if metadata.permissions().mode() & 0o7777 != 0o700 {
+        return Err(BubblewrapPolicyError::NetworkBrokerDirectoryNotPrivate {
+            directory: directory.to_path_buf(),
+        });
+    }
+
+    let socket = directory.join(socket_name);
+    let mut entries =
+        fs::read_dir(directory).map_err(|source| BubblewrapPolicyError::SourceIo {
+            field: "Linux network broker source directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    let Some(entry) =
+        entries
+            .next()
+            .transpose()
+            .map_err(|source| BubblewrapPolicyError::SourceIo {
+                field: "Linux network broker source directory",
+                path: directory.to_path_buf(),
+                source,
+            })?
+    else {
+        return Err(
+            BubblewrapPolicyError::NetworkBrokerDirectoryContentsInvalid {
+                directory: directory.to_path_buf(),
+            },
+        );
+    };
+    if entry.path() != socket
+        || entries
+            .next()
+            .transpose()
+            .map_err(|source| BubblewrapPolicyError::SourceIo {
+                field: "Linux network broker source directory",
+                path: directory.to_path_buf(),
+                source,
+            })?
+            .is_some()
+    {
+        return Err(
+            BubblewrapPolicyError::NetworkBrokerDirectoryContentsInvalid {
+                directory: directory.to_path_buf(),
+            },
+        );
+    }
+
+    let socket_metadata =
+        fs::symlink_metadata(&socket).map_err(|source| BubblewrapPolicyError::SourceIo {
+            field: "Linux network broker socket",
+            path: socket.clone(),
+            source,
+        })?;
+    if !socket_metadata.file_type().is_socket() {
+        return Err(BubblewrapPolicyError::NetworkBrokerSocketNotSocket { socket });
+    }
+    if socket_metadata.permissions().mode() & 0o7777 != 0o600 {
+        return Err(BubblewrapPolicyError::NetworkBrokerSocketNotPrivate { socket });
+    }
+    if metadata.uid() != socket_metadata.uid() {
+        return Err(BubblewrapPolicyError::NetworkBrokerSocketOwnerMismatch {
+            directory: directory.to_path_buf(),
+            socket,
+        });
+    }
+    Ok(())
+}
+
 fn resolve_regular_executable_file(
     field: &'static str,
     path: &Path,
@@ -4534,6 +4877,46 @@ fn resolve_runtime_mount(
             is_runtime: true,
         },
     })
+}
+
+fn resolve_linux_network_broker_mount(
+    broker: &LinuxNetworkBrokerMount,
+    binding: MountSourceBinding,
+) -> Result<CompiledMount, BubblewrapPolicyError> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (broker, binding);
+        Err(BubblewrapPolicyError::NetworkBrokerUnsupportedPlatform)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if binding != MountSourceBinding::DescriptorPinned {
+            return Err(BubblewrapPolicyError::NetworkBrokerRequiresPinnedMountSources);
+        }
+        let (source, source_type) = resolve_bind_source(
+            "Linux network broker source directory",
+            &broker.source_directory,
+            binding,
+        )?;
+        if source_type != MountSourceType::Directory {
+            return Err(BubblewrapPolicyError::InvalidSourceType {
+                field: "Linux network broker source directory",
+                path: source.path.clone(),
+                expected: "directory",
+            });
+        }
+        validate_linux_network_broker_directory(&source.path, broker.socket_name())?;
+        Ok(CompiledMount {
+            destination: broker.destination_directory.clone(),
+            kind: CompiledMountKind::Bind {
+                source,
+                access: FileRootAccess::ReadOnly,
+                source_type: MountSourceType::Directory,
+                is_runtime: false,
+            },
+        })
+    }
 }
 
 fn resolve_file_root(
@@ -4954,6 +5337,11 @@ fn ensure_landlock_executable_runner_supported() -> Result<(), BubblewrapPolicyE
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_linux_network_broker_supported() -> Result<(), BubblewrapPolicyError> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn ensure_executable_source_binding_supported(
     binding: ExecutableSourceBinding,
@@ -4977,6 +5365,11 @@ fn ensure_mount_source_binding_supported(
 #[cfg(not(target_os = "linux"))]
 fn ensure_landlock_executable_runner_supported() -> Result<(), BubblewrapPolicyError> {
     Err(BubblewrapPolicyError::LandlockExecutableRunnerUnsupportedPlatform)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_linux_network_broker_supported() -> Result<(), BubblewrapPolicyError> {
+    Err(BubblewrapPolicyError::NetworkBrokerUnsupportedPlatform)
 }
 
 fn canonical_existing_path(
@@ -5728,6 +6121,29 @@ mod tests {
         FileRootBinding::new(source, destination, access).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    fn network_broker_mount(
+        root: &TestDirectory,
+        access: NetworkOriginAccess,
+    ) -> LinuxNetworkBrokerMount {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        let source = root.path().join("network-broker");
+        fs::create_dir(&source).unwrap();
+        let mut directory_permissions = fs::metadata(&source).unwrap().permissions();
+        directory_permissions.set_mode(0o700);
+        fs::set_permissions(&source, directory_permissions).unwrap();
+
+        let socket = source.join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut socket_permissions = fs::metadata(&socket).unwrap().permissions();
+        socket_permissions.set_mode(0o600);
+        fs::set_permissions(&socket, socket_permissions).unwrap();
+        drop(listener);
+
+        LinuxNetworkBrokerMount::new(source, "/run/splash-network", "broker.sock", access).unwrap()
+    }
+
     fn argument_strings(plan: &BubblewrapCommand) -> Vec<String> {
         plan.arguments()
             .iter()
@@ -5801,6 +6217,111 @@ mod tests {
         ));
         assert_eq!(plan.session_id(), "session-1");
         assert!(!arguments.iter().any(|argument| argument == "session-1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_origin_grants_require_one_exact_private_broker_mount() {
+        let root = TestDirectory::new();
+        let network_manifest = manifest([selector(ResourceKind::NetworkOrigin, "release.api")]);
+        let access = NetworkOriginAccess::from_manifest(&network_manifest).unwrap();
+        let broker = network_broker_mount(&root, access.clone());
+        assert_eq!(
+            broker.worker_socket_path(),
+            Path::new("/run/splash-network/broker.sock")
+        );
+
+        let mut policy = base_policy(&root);
+        policy.pin_mount_sources();
+        policy.set_linux_network_broker(broker);
+        let plan = policy.compile(&network_manifest).unwrap();
+        let arguments = argument_strings(&plan);
+
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--ro-bind-fd",
+                PINNED_MOUNT_DESCRIPTOR_PLACEHOLDER,
+                "/run/splash-network",
+            ]
+        ));
+        assert!(has_arguments(&arguments, &["--unshare-all"]));
+        assert!(!arguments.iter().any(|argument| argument == "--share-net"));
+        assert!(policy
+            .linux_network_broker()
+            .is_some_and(|configured| configured.access() == &access));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_broker_rejects_unpinned_mismatched_and_nonprivate_setup() {
+        let root = TestDirectory::new();
+        let network_manifest = manifest([selector(ResourceKind::NetworkOrigin, "release.api")]);
+        let access = NetworkOriginAccess::from_manifest(&network_manifest).unwrap();
+
+        let oversized_destination = PathBuf::from(format!(
+            "/{}",
+            "socket".repeat(MAX_LINUX_NETWORK_BROKER_SOCKET_PATH_BYTES)
+        ));
+        assert!(matches!(
+            LinuxNetworkBrokerMount::new(
+                root.path(),
+                oversized_destination,
+                "broker.sock",
+                access.clone(),
+            ),
+            Err(BubblewrapPolicyError::NetworkBrokerSocketPathTooLong { .. })
+        ));
+
+        let mut unpinned = base_policy(&root);
+        unpinned.set_linux_network_broker(network_broker_mount(&root, access.clone()));
+        assert!(matches!(
+            unpinned.compile(&network_manifest),
+            Err(BubblewrapPolicyError::NetworkBrokerRequiresPinnedMountSources)
+        ));
+
+        let root = TestDirectory::new();
+        let mut mismatched = base_policy(&root);
+        mismatched.pin_mount_sources();
+        mismatched.set_linux_network_broker(network_broker_mount(
+            &root,
+            NetworkOriginAccess::from_identifiers(["audit.api"]).unwrap(),
+        ));
+        assert!(matches!(
+            mismatched.compile(&network_manifest),
+            Err(BubblewrapPolicyError::NetworkBrokerManifestMismatch)
+        ));
+
+        let root = TestDirectory::new();
+        let mut insecure = base_policy(&root);
+        insecure.pin_mount_sources();
+        let broker = network_broker_mount(&root, access.clone());
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(broker.source_directory())
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(broker.source_directory(), permissions).unwrap();
+        insecure.set_linux_network_broker(broker);
+        assert!(matches!(
+            insecure.compile(&network_manifest),
+            Err(BubblewrapPolicyError::NetworkBrokerDirectoryNotPrivate { .. })
+        ));
+
+        let root = TestDirectory::new();
+        let mut special_mode = base_policy(&root);
+        special_mode.pin_mount_sources();
+        let broker = network_broker_mount(&root, access);
+        let mut permissions = fs::metadata(broker.source_directory())
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o1700);
+        fs::set_permissions(broker.source_directory(), permissions).unwrap();
+        special_mode.set_linux_network_broker(broker);
+        assert!(matches!(
+            special_mode.compile(&network_manifest),
+            Err(BubblewrapPolicyError::NetworkBrokerDirectoryNotPrivate { .. })
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -6663,6 +7184,105 @@ print("bounded-storage-active")
             "worker failed: {status}; stdout: {output:?}; stderr: {standard_error_output:?}"
         );
         assert_eq!(output, "bounded-storage-active\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a privileged Linux runner that can configure Bubblewrap namespaces"]
+    fn bubblewrap_network_broker_socket_is_available_without_host_tcp_egress() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let root = TestDirectory::new();
+        let source = root.path().join("network-broker");
+        fs::create_dir(&source).unwrap();
+        let mut directory_permissions = fs::metadata(&source).unwrap().permissions();
+        directory_permissions.set_mode(0o700);
+        fs::set_permissions(&source, directory_permissions).unwrap();
+
+        let socket = source.join("broker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut socket_permissions = fs::metadata(&socket).unwrap().permissions();
+        socket_permissions.set_mode(0o600);
+        fs::set_permissions(&socket, socket_permissions).unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 14];
+            stream.read_exact(&mut request).unwrap();
+            request_sender.send(request).unwrap();
+            stream.write_all(b"broker-response").unwrap();
+        });
+
+        let host_tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let host_port = host_tcp.local_addr().unwrap().port();
+        let manifest = manifest([selector(ResourceKind::NetworkOrigin, "release.status")]);
+        let broker = LinuxNetworkBrokerMount::new(
+            &source,
+            "/run/splash-network",
+            "broker.sock",
+            NetworkOriginAccess::from_manifest(&manifest).unwrap(),
+        )
+        .unwrap();
+        let python = fs::canonicalize("/usr/bin/python3").unwrap();
+        let script = format!(
+            r#"
+import socket
+
+broker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+broker.settimeout(2)
+broker.connect('/run/splash-network/broker.sock')
+broker.sendall(b'broker-request')
+if broker.recv(64) != b'broker-response':
+    raise RuntimeError('broker returned an unexpected response')
+broker.close()
+
+tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+tcp.settimeout(1)
+try:
+    tcp.connect(('127.0.0.1', {host_port}))
+except OSError:
+    pass
+else:
+    raise RuntimeError('worker reached the host TCP listener')
+finally:
+    tcp.close()
+
+print('network-broker-only')
+"#,
+        );
+        let mut policy = BubblewrapWorkerPolicy::new("/usr/bin/bwrap", python)
+            .unwrap()
+            .with_worker_arguments(["-B", "-c", script.as_str()]);
+        policy.add_runtime_mount(ReadOnlyMount::new("/usr", "/usr").unwrap());
+        add_linux_runtime_library_mounts(&mut policy);
+        policy.pin_mount_sources();
+        policy.set_linux_network_broker(broker);
+
+        let plan = policy.compile(&manifest).unwrap();
+        let (worker, mut standard_error) = plan.spawn_capturing_stderr().unwrap();
+        let (mut child, stdin, mut stdout) = worker.into_parts();
+        drop(stdin);
+
+        let status = child.wait().unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).unwrap();
+        let mut standard_error_output = String::new();
+        standard_error
+            .read_to_string(&mut standard_error_output)
+            .unwrap();
+
+        assert!(
+            status.success(),
+            "worker failed: {status}; stdout: {output:?}; stderr: {standard_error_output:?}"
+        );
+        assert_eq!(output, "network-broker-only\n");
+        assert_eq!(request_receiver.recv().unwrap(), *b"broker-request");
+        server.join().unwrap();
+        drop(host_tcp);
     }
 
     #[cfg(target_os = "linux")]

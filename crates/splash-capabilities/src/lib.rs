@@ -55,6 +55,11 @@ pub mod durable_audits;
 #[cfg(feature = "http-endpoint-catalog")]
 pub mod http_endpoint_catalog;
 
+/// Linux host broker that routes a contained worker's single private Unix
+/// socket through one exact reviewed HTTP endpoint or origin catalog.
+#[cfg(all(feature = "linux-network-broker", target_os = "linux"))]
+pub mod linux_network_broker;
+
 /// Read-only native credential-store resolver for endpoint-bound HTTPS secrets
 /// and optional capability-bound worker secret delivery.
 ///
