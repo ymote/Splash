@@ -618,12 +618,17 @@ This is deliberately narrower than a complete code-execution policy:
 - It must not be treated as complete mediation for special filesystems,
   pre-opened descriptors, or future execution mechanisms; layer mount,
   descriptor, cgroup, and syscall controls appropriate to the deployment.
-- It cannot currently be combined with
-  `WorkerSeccompProfile::StrictAllowlist`. Bubblewrap attaches that filter
-  before this runner runs, while the runner needs Landlock setup syscalls and a
-  separate pre-exec syscall policy does not exist yet. Compilation rejects the
-  combination. `DenyKnownEscapeSurface` remains compatible because it is
-  default-allow outside its fixed escape-surface deny set.
+- With `WorkerSeccompProfile::StrictAllowlist`, Splash stages the already
+  compiler-generated filter through this fixed runner. The runner validates the
+  bounded internal encoding, installs Landlock and verifies full enforcement,
+  marks nonstandard descriptors close-on-exec, attaches the strict filter, and
+  only then replaces itself with the fixed inner command. No public Splash
+  policy API accepts cBPF for this handoff, and Splash source, a manifest, and
+  worker input cannot select it. A malformed encoding, failed filter install,
+  failed Landlock setup, or failed exec stops worker startup without a
+  direct-worker or unfiltered fallback.
+  `DenyKnownEscapeSurface` remains Bubblewrap-delivered because its
+  compatibility profile permits the runner's setup path.
 
 ### Strict Worker Syscall Allowlist
 
@@ -646,15 +651,17 @@ syscall. The remaining argument-sensitive fixed guards still take precedence:
 namespace-creating legacy `clone` calls and `TIOCSTI` return `EPERM` even when
 the host lists ordinary `clone` or `ioctl`.
 
-A strict list must cover the entire post-filter execution path: Bubblewrap's
-fixed `execve`, any selected `splash-limit-runner`, the dynamic loader, and the
-exact fixed worker and libraries. It cannot currently select a
-`splash-landlock-runner`; policy compilation rejects that ordering conflict.
-Build and test it per target ABI with the same immutable runtime mounts deployed
-to production. Splash does not infer a list from source, profile a worker at
-runtime, or widen a list after launch. Policy compilation explicitly rejects a
-list without Bubblewrap's required `execve`; any other incomplete list stops
-the worker rather than weakening containment.
+A strict list must cover the entire post-filter execution path: the fixed
+`execve`, any selected `splash-limit-runner`, the dynamic loader, and the exact
+fixed worker and libraries. Without a Landlock runner, Bubblewrap attaches the
+filter before its final exec. With a Landlock runner, the runner attaches the
+same compiler-generated program after Landlock setup and descriptor cleanup,
+before its final fixed exec; its setup syscalls therefore do not need to appear
+in the strict list. Build and test the exact list per target ABI with the same
+immutable runtime mounts deployed to production. Splash does not infer a list
+from source, profile a worker at runtime, or widen a list after launch. Policy
+compilation explicitly rejects a list without `execve`; any other incomplete
+list stops the worker rather than weakening containment.
 
 This is a syscall boundary, not executable-path mediation. A working strict
 profile normally has to allow an execution syscall, so a compromised worker
@@ -731,9 +738,12 @@ The resulting command uses:
 - optional `--unshare-user --disable-userns` immediately after
   `--unshare-all`, requiring a usable user namespace and preventing the worker
   from creating further user namespaces;
-- optional host-generated `--seccomp FD` immediately before launch; Bubblewrap
-  consumes the anonymous descriptor and attaches the selected fixed profile
-  before it executes the worker;
+- optional host-generated `--seccomp FD` immediately before launch for the
+  compatibility profile and for strict policies without Landlock; Bubblewrap
+  consumes the anonymous descriptor and attaches that profile before its final
+  exec. A strict policy with Landlock instead uses the fixed runner's bounded
+  internal compiler-generated handoff after Landlock setup and descriptor
+  cleanup, immediately before the runner's final exec; and
 - `--clearenv`, so worker startup does not inherit host environment variables;
 - `--new-session` and `--die-with-parent` for terminal isolation and parent
   lifecycle binding;

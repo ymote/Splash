@@ -202,12 +202,13 @@ and keeps UI support optional rather than making UI the language boundary.
   whole worker process tree.
 - Optional Linux Bubblewrap seccomp profiles: a compatibility-oriented fixed
   deny set and a bounded host-selected strict syscall allowlist that kills
-  unlisted syscalls. Neither mediates executable paths or capability grants.
+  unlisted syscalls. With a Landlock executable runner, strict filtering is
+  staged after Landlock setup and immediately before the fixed inner exec.
+  Neither mediates executable paths or capability grants.
 - Optional Linux Landlock filesystem-backed executable allowlist for exact
   worker-visible files, installed by a fixed pre-exec runner with no
   unsupported-kernel fallback. It is not a complete code-loading, network,
-  secret, or capability boundary and is intentionally incompatible with the
-  current strict seccomp ordering.
+  secret, or capability boundary.
 - Optional Bubblewrap watchdog and generic bounded worker transport with
   host-selected per-invocation and total-session wall-clock deadlines; expiry
   or host termination poisons the session and remains indeterminate.

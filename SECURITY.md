@@ -418,14 +418,18 @@ for listed syscall numbers, and kills every other syscall. An empty, duplicate,
 oversized, or missing list is rejected rather than falling back to default-allow
 filtering. The list is trusted host configuration, never Splash source, worker
 input, LLM output, or caller-provided cBPF. Policy compilation rejects a list
-without Bubblewrap's required final `execve`; the host must additionally cover
-any fixed pre-exec runner and the exact worker runtime. It is a syscall boundary
-only: because execution must normally remain available, it does not mediate an
-executable path, a network origin, device access, secrets, or capability
-grants. A policy selecting `LandlockExecutableRunner` currently rejects this
-strict profile: Bubblewrap would attach it before the Landlock runner could
-create its required ruleset. Do not try to bypass that compile-time rejection
-by launching a worker directly; a staged pre-exec syscall policy is required.
+without the required `execve`; the host must additionally cover any fixed
+resource-limit runner and the exact worker runtime. With
+`LandlockExecutableRunner`, Splash does not give the strict program to
+Bubblewrap: it gives the fixed runner a bounded compiler-generated encoding,
+which the runner installs only after its fully enforced Landlock ruleset and
+descriptor cleanup, immediately before the fixed inner exec. This internal
+handoff is not Splash source, worker input, manifest data, or caller-provided
+cBPF in the Bubblewrap policy API, and launch has no direct-worker or
+unfiltered fallback. It is still a
+syscall boundary only: because execution must normally remain available, it
+does not mediate an executable path, a network origin, device access, secrets,
+or capability grants.
 
 `LandlockExecutableRunner` is an optional Linux-only defense-in-depth boundary
 for exact filesystem-backed executable targets. The host configures a distinct

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/splash-core",
+    "crates/splash-linux-seccomp",
     "crates/splash-linux-project-quota",
     "crates/splash-capabilities",
     "crates/splash-protocol",
@@ -14,6 +15,7 @@ members = [
 ]
 default-members = [
     "crates/splash-core",
+    "crates/splash-linux-seccomp",
     "crates/splash-linux-project-quota",
     "crates/splash-capabilities",
     "crates/splash-protocol",

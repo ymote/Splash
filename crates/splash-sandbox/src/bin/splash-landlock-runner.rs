@@ -37,15 +37,22 @@ mod linux {
         RulesetStatus,
     };
     use rustix::fs::{fstat, open, FileType, Mode, OFlags};
+    use splash_linux_seccomp::{
+        install_filter, validate_filter, SeccompInstallError, ValidatedFilter,
+        FILTER_INSTRUCTION_BYTES, MAX_FILTER_INSTRUCTIONS,
+    };
 
     const EXIT_USAGE: i32 = 64;
     const EXIT_LANDLOCK: i32 = 125;
     const EXIT_EXEC: i32 = 126;
+    const MAX_STAGED_SECCOMP_FILTER_HEX_BYTES: usize =
+        MAX_FILTER_INSTRUCTIONS * FILTER_INSTRUCTION_BYTES * 2;
     const MAX_ALLOWED_EXECUTABLES: usize =
         splash_sandbox::bubblewrap::MAX_LANDLOCK_EXECUTABLE_RUNNER_EXECUTABLES;
 
     struct RunnerConfiguration {
         allowed_executables: BTreeSet<PathBuf>,
+        staged_seccomp_filter: Option<ValidatedFilter>,
         command: PathBuf,
         arguments: Vec<OsString>,
     }
@@ -54,6 +61,7 @@ mod linux {
         fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, RunnerError> {
             let arguments = arguments.into_iter().collect::<Vec<_>>();
             let mut allowed_executables = BTreeSet::new();
+            let mut staged_seccomp_filter = None;
             let mut index = 0;
 
             while let Some(argument) = arguments.get(index) {
@@ -70,6 +78,7 @@ mod linux {
                     }
                     return Ok(Self {
                         allowed_executables,
+                        staged_seccomp_filter,
                         command,
                         arguments: arguments[index + 2..].to_vec(),
                     });
@@ -79,17 +88,28 @@ mod linux {
                 let Some(value) = arguments.get(index + 1) else {
                     return Err(RunnerError::MissingValue(option.to_owned()));
                 };
-                if option != "--allow-exec" {
-                    return Err(RunnerError::UnknownOption(option.to_owned()));
-                }
-                let executable = parse_executable_path(value)?;
-                if !allowed_executables.insert(executable.clone()) {
-                    return Err(RunnerError::DuplicateAllowedExecutable { executable });
-                }
-                if allowed_executables.len() > MAX_ALLOWED_EXECUTABLES {
-                    return Err(RunnerError::TooManyAllowedExecutables {
-                        maximum: MAX_ALLOWED_EXECUTABLES,
-                    });
+                match option {
+                    "--allow-exec" => {
+                        let executable = parse_executable_path(value)?;
+                        if !allowed_executables.insert(executable.clone()) {
+                            return Err(RunnerError::DuplicateAllowedExecutable { executable });
+                        }
+                        if allowed_executables.len() > MAX_ALLOWED_EXECUTABLES {
+                            return Err(RunnerError::TooManyAllowedExecutables {
+                                maximum: MAX_ALLOWED_EXECUTABLES,
+                            });
+                        }
+                    }
+                    "--strict-seccomp-filter-hex" => {
+                        if staged_seccomp_filter.is_some() {
+                            return Err(RunnerError::DuplicateStagedSeccompFilter);
+                        }
+                        let bytes = decode_staged_seccomp_filter(value)?;
+                        let filter = validate_filter(&bytes)
+                            .map_err(RunnerError::InvalidStagedSeccompFilter)?;
+                        staged_seccomp_filter = Some(filter);
+                    }
+                    _ => return Err(RunnerError::UnknownOption(option.to_owned())),
                 }
                 index += 2;
             }
@@ -100,12 +120,49 @@ mod linux {
 
     pub(super) fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), RunnerError> {
         let configuration = RunnerConfiguration::parse(arguments)?;
+        let mut command = Command::new(&configuration.command);
+        command.args(&configuration.arguments);
         install_executable_allowlist(&configuration.allowed_executables)?;
         mark_extra_file_descriptors_close_on_exec();
-        let error = Command::new(configuration.command)
-            .args(configuration.arguments)
-            .exec();
+        if let Some(filter) = &configuration.staged_seccomp_filter {
+            install_filter(filter).map_err(RunnerError::InstallStagedSeccompFilter)?;
+        }
+        let error = command.exec();
         Err(RunnerError::Exec(error))
+    }
+
+    fn decode_staged_seccomp_filter(value: &OsString) -> Result<Vec<u8>, RunnerError> {
+        let value = value
+            .to_str()
+            .ok_or(RunnerError::InvalidStagedSeccompFilterEncoding)?;
+        if value.len() > MAX_STAGED_SECCOMP_FILTER_HEX_BYTES {
+            return Err(RunnerError::StagedSeccompFilterTooLarge {
+                maximum_bytes: MAX_STAGED_SECCOMP_FILTER_HEX_BYTES,
+            });
+        }
+        if !value.len().is_multiple_of(2) {
+            return Err(RunnerError::InvalidStagedSeccompFilterEncoding);
+        }
+
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        for pair in value.as_bytes().chunks_exact(2) {
+            let Some(high) = decode_lower_hex(pair[0]) else {
+                return Err(RunnerError::InvalidStagedSeccompFilterEncoding);
+            };
+            let Some(low) = decode_lower_hex(pair[1]) else {
+                return Err(RunnerError::InvalidStagedSeccompFilterEncoding);
+            };
+            bytes.push((high << 4) | low);
+        }
+        Ok(bytes)
+    }
+
+    const fn decode_lower_hex(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            _ => None,
+        }
     }
 
     fn parse_executable_path(value: &OsString) -> Result<PathBuf, RunnerError> {
@@ -191,12 +248,18 @@ mod linux {
         DuplicateAllowedExecutable {
             executable: PathBuf,
         },
+        DuplicateStagedSeccompFilter,
         TooManyAllowedExecutables {
             maximum: usize,
+        },
+        StagedSeccompFilterTooLarge {
+            maximum_bytes: usize,
         },
         MissingAllowedExecutable,
         MissingCommand,
         InvalidExecutablePath,
+        InvalidStagedSeccompFilterEncoding,
+        InvalidStagedSeccompFilter(SeccompInstallError),
         CommandNotAllowed {
             command: PathBuf,
         },
@@ -212,6 +275,7 @@ mod linux {
         },
         Landlock(landlock::RulesetError),
         LandlockNotFullyEnforced,
+        InstallStagedSeccompFilter(SeccompInstallError),
         Exec(io::Error),
     }
 
@@ -222,16 +286,21 @@ mod linux {
                 | Self::UnknownOption(_)
                 | Self::MissingValue(_)
                 | Self::DuplicateAllowedExecutable { .. }
+                | Self::DuplicateStagedSeccompFilter
                 | Self::TooManyAllowedExecutables { .. }
+                | Self::StagedSeccompFilterTooLarge { .. }
                 | Self::MissingAllowedExecutable
                 | Self::MissingCommand
                 | Self::InvalidExecutablePath
+                | Self::InvalidStagedSeccompFilterEncoding
+                | Self::InvalidStagedSeccompFilter(_)
                 | Self::CommandNotAllowed { .. } => EXIT_USAGE,
                 Self::InspectAllowedExecutable { .. }
                 | Self::AllowedExecutableNotRegular { .. }
                 | Self::AllowedExecutableNotExecutable { .. }
                 | Self::Landlock(_)
-                | Self::LandlockNotFullyEnforced => EXIT_LANDLOCK,
+                | Self::LandlockNotFullyEnforced
+                | Self::InstallStagedSeccompFilter(_) => EXIT_LANDLOCK,
                 Self::Exec(_) => EXIT_EXEC,
             }
         }
@@ -248,9 +317,15 @@ mod linux {
                     "duplicate --allow-exec path {}",
                     executable.display()
                 ),
+                Self::DuplicateStagedSeccompFilter => formatter
+                    .write_str("--strict-seccomp-filter-hex may appear only once"),
                 Self::TooManyAllowedExecutables { maximum } => write!(
                     formatter,
                     "--allow-exec supports at most {maximum} paths"
+                ),
+                Self::StagedSeccompFilterTooLarge { maximum_bytes } => write!(
+                    formatter,
+                    "--strict-seccomp-filter-hex exceeds its {maximum_bytes}-byte encoded limit"
                 ),
                 Self::MissingAllowedExecutable => {
                     formatter.write_str("at least one --allow-exec path is required")
@@ -260,6 +335,13 @@ mod linux {
                 }
                 Self::InvalidExecutablePath => formatter.write_str(
                     "--allow-exec paths and the command must be absolute normalized paths",
+                ),
+                Self::InvalidStagedSeccompFilterEncoding => formatter.write_str(
+                    "--strict-seccomp-filter-hex must use an even number of lowercase hexadecimal characters",
+                ),
+                Self::InvalidStagedSeccompFilter(source) => write!(
+                    formatter,
+                    "--strict-seccomp-filter-hex has an invalid Linux cBPF shape: {source}"
                 ),
                 Self::CommandNotAllowed { command } => write!(
                     formatter,
@@ -287,6 +369,10 @@ mod linux {
                 Self::LandlockNotFullyEnforced => formatter.write_str(
                     "Landlock executable policy was not fully enforced; refusing to start the worker",
                 ),
+                Self::InstallStagedSeccompFilter(source) => write!(
+                    formatter,
+                    "could not install staged strict seccomp filter: {source}"
+                ),
                 Self::Exec(source) => write!(formatter, "could not execute allowed worker: {source}"),
             }
         }
@@ -297,15 +383,20 @@ mod linux {
             match self {
                 Self::InspectAllowedExecutable { source, .. } => Some(source),
                 Self::Landlock(source) => Some(source),
+                Self::InvalidStagedSeccompFilter(source)
+                | Self::InstallStagedSeccompFilter(source) => Some(source),
                 Self::Exec(source) => Some(source),
                 Self::InvalidOption
                 | Self::UnknownOption(_)
                 | Self::MissingValue(_)
                 | Self::DuplicateAllowedExecutable { .. }
+                | Self::DuplicateStagedSeccompFilter
                 | Self::TooManyAllowedExecutables { .. }
+                | Self::StagedSeccompFilterTooLarge { .. }
                 | Self::MissingAllowedExecutable
                 | Self::MissingCommand
                 | Self::InvalidExecutablePath
+                | Self::InvalidStagedSeccompFilterEncoding
                 | Self::CommandNotAllowed { .. }
                 | Self::AllowedExecutableNotRegular { .. }
                 | Self::AllowedExecutableNotExecutable { .. }
@@ -345,11 +436,93 @@ mod linux {
                     PathBuf::from("/opt/splash/worker"),
                 ])
             );
+            assert!(configuration.staged_seccomp_filter.is_none());
             assert_eq!(configuration.command, Path::new("/opt/splash/limit-runner"));
             assert_eq!(
                 configuration.arguments,
                 arguments(&["--open-files", "16", "--", "/opt/splash/worker"])
             );
+        }
+
+        #[test]
+        fn accepts_one_bounded_compiler_shaped_staged_seccomp_filter() {
+            // One native little-endian `BPF_RET | BPF_K` instruction returning
+            // `SECCOMP_RET_ALLOW`. The runner only accepts the bounded wire
+            // shape here; the kernel verifies the actual BPF program later.
+            let configuration = RunnerConfiguration::parse(arguments(&[
+                "--strict-seccomp-filter-hex",
+                "060000000000ff7f",
+                "--allow-exec",
+                "/opt/splash/worker",
+                "--",
+                "/opt/splash/worker",
+            ]))
+            .unwrap();
+
+            assert_eq!(
+                configuration
+                    .staged_seccomp_filter
+                    .as_ref()
+                    .map(ValidatedFilter::len),
+                Some(1)
+            );
+        }
+
+        #[test]
+        fn rejects_malformed_or_duplicated_staged_seccomp_filters() {
+            for values in [
+                arguments(&[
+                    "--strict-seccomp-filter-hex",
+                    "0",
+                    "--allow-exec",
+                    "/opt/splash/worker",
+                    "--",
+                    "/opt/splash/worker",
+                ]),
+                arguments(&[
+                    "--strict-seccomp-filter-hex",
+                    "0g",
+                    "--allow-exec",
+                    "/opt/splash/worker",
+                    "--",
+                    "/opt/splash/worker",
+                ]),
+                arguments(&[
+                    "--strict-seccomp-filter-hex",
+                    "",
+                    "--allow-exec",
+                    "/opt/splash/worker",
+                    "--",
+                    "/opt/splash/worker",
+                ]),
+                arguments(&[
+                    "--strict-seccomp-filter-hex",
+                    "060000000000ff7f",
+                    "--strict-seccomp-filter-hex",
+                    "060000000000ff7f",
+                    "--allow-exec",
+                    "/opt/splash/worker",
+                    "--",
+                    "/opt/splash/worker",
+                ]),
+            ] {
+                assert!(RunnerConfiguration::parse(values).is_err());
+            }
+
+            let oversized = "0".repeat(MAX_STAGED_SECCOMP_FILTER_HEX_BYTES + 1);
+            let values = vec![
+                OsString::from("--strict-seccomp-filter-hex"),
+                OsString::from(oversized),
+                OsString::from("--allow-exec"),
+                OsString::from("/opt/splash/worker"),
+                OsString::from("--"),
+                OsString::from("/opt/splash/worker"),
+            ];
+            assert!(matches!(
+                RunnerConfiguration::parse(values),
+                Err(RunnerError::StagedSeccompFilterTooLarge { maximum_bytes })
+                    if maximum_bytes == MAX_STAGED_SECCOMP_FILTER_HEX_BYTES
+            ));
         }
 
         #[test]

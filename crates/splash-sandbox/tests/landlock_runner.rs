@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use linux_raw_sys::ptrace;
+
 fn landlock_runner() -> &'static str {
     env!("CARGO_BIN_EXE_splash-landlock-runner")
 }
@@ -42,6 +44,22 @@ fn invoke_allowing(target: &Path, arguments: &[&str]) -> Output {
         .args(arguments)
         .output()
         .unwrap()
+}
+
+fn allow_all_filter_hex() -> String {
+    let code = (ptrace::BPF_RET | ptrace::BPF_K) as u16;
+    let mut bytes = [0_u8; 8];
+    bytes[..2].copy_from_slice(&code.to_ne_bytes());
+    bytes[4..].copy_from_slice(&ptrace::SECCOMP_RET_ALLOW.to_ne_bytes());
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn status_field<'a>(status: &'a str, field: &str) -> Option<&'a str> {
+    status.lines().find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| *name == field)
+            .map(|(_, value)| value.trim())
+    })
 }
 
 fn landlock_is_available() -> bool {
@@ -92,4 +110,45 @@ fn command_must_be_one_of_the_exact_allowed_paths() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(64), "{output:?}");
+}
+
+#[test]
+fn staged_filter_is_installed_after_landlock_and_persists_to_the_fixed_target() {
+    if !landlock_is_available() {
+        return;
+    }
+
+    let shell = fs::canonicalize("/bin/sh").unwrap();
+    let host_status = fs::read_to_string("/proc/self/status").unwrap();
+    let host_filter_count = status_field(&host_status, "Seccomp_filters")
+        .expect("Linux status must report a seccomp filter count")
+        .parse::<u32>()
+        .unwrap();
+
+    let mut command = Command::new(landlock_runner());
+    command
+        .arg("--strict-seccomp-filter-hex")
+        .arg(allow_all_filter_hex())
+        .arg("--allow-exec")
+        .arg(&shell);
+    if let Some(loader) = dynamic_loader() {
+        command.arg("--allow-exec").arg(loader);
+    }
+    let output = command
+        .arg("--")
+        .arg(&shell)
+        .args([
+            "-c",
+            "while IFS=: read -r name value; do if [ \"$name\" = Seccomp_filters ]; then printf '%s\\n' \"$value\"; exit 0; fi; done < /proc/self/status; exit 1",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let target_filter_count = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert_eq!(target_filter_count, host_filter_count + 1);
 }

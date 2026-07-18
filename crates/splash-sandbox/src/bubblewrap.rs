@@ -46,6 +46,8 @@ use splash_protocol::{
 const MAX_TMPFS_BYTES: usize = usize::MAX >> 1;
 const MAX_FINITE_RESOURCE_LIMIT: u64 = u64::MAX - 1;
 const MAX_LINUX_SECCOMP_FILTER_INSTRUCTIONS: usize = 4_096;
+const STAGED_SECCOMP_FILTER_HEX_OPTION: &str = "--strict-seccomp-filter-hex";
+const STAGED_SECCOMP_FILTER_DISPLAY_PLACEHOLDER: &str = "<staged-seccomp-filter>";
 
 /// Default maximum number of unique manifest-selected file roots in one
 /// Bubblewrap worker launch plan.
@@ -1304,11 +1306,13 @@ impl BubblewrapWorkerPolicy {
     /// This does not control `memfd` or other pathless execution mechanisms,
     /// dynamic-loader file reads, networking, secrets, or arbitrary runtime
     /// files. It is a defense-in-depth executable-path boundary, not general
-    /// process containment. It cannot
-    /// currently be combined with [`WorkerSeccompProfile::StrictAllowlist`]:
-    /// Bubblewrap applies that filter before this runner can install Landlock.
-    /// Compilation rejects the combination until Splash has a separate,
-    /// staged pre-exec seccomp policy.
+    /// process containment. With [`WorkerSeccompProfile::StrictAllowlist`],
+    /// Splash transfers its bounded compiler-generated cBPF program through
+    /// the fixed runner's internal argument protocol. The runner installs
+    /// Landlock first, closes inherited nonstandard descriptors, installs that
+    /// filter, and only then executes the fixed inner command. No Splash
+    /// source, manifest field, worker input, or public policy API can select
+    /// this handoff or supply raw cBPF.
     pub fn set_landlock_executable_runner(
         &mut self,
         runner: LandlockExecutableRunner,
@@ -1399,11 +1403,6 @@ impl BubblewrapWorkerPolicy {
         ensure_executable_source_binding_supported(self.executable_source_binding)?;
         if self.landlock_executable_runner.is_some() {
             ensure_landlock_executable_runner_supported()?;
-            if self.seccomp_profile == WorkerSeccompProfile::StrictAllowlist {
-                return Err(
-                    BubblewrapPolicyError::LandlockExecutableRunnerConflictsWithStrictSeccomp,
-                );
-            }
         }
         if self.executable_source_binding == ExecutableSourceBinding::DescriptorPinned
             && self.mount_source_binding != MountSourceBinding::DescriptorPinned
@@ -1715,6 +1714,17 @@ impl BubblewrapWorkerPolicy {
         }
         let seccomp_program =
             compile_seccomp_program(self.seccomp_profile, self.seccomp_allowlist.as_ref())?;
+        let seccomp_delivery = match (
+            seccomp_program.as_ref(),
+            self.seccomp_profile,
+            self.landlock_executable_runner.as_ref(),
+        ) {
+            (Some(_), WorkerSeccompProfile::StrictAllowlist, Some(_)) => {
+                Some(SeccompDelivery::LandlockRunner)
+            }
+            (Some(_), _, _) => Some(SeccompDelivery::Bubblewrap),
+            (None, _, _) => None,
+        };
 
         let mut mount_prefix_arguments = vec![
             OsString::from("--die-with-parent"),
@@ -1757,6 +1767,13 @@ impl BubblewrapWorkerPolicy {
             &landlock_allowed_executables,
         ) {
             mount_suffix_arguments.push(runner.program.clone().into_os_string());
+            if seccomp_delivery == Some(SeccompDelivery::LandlockRunner) {
+                let program = seccomp_program
+                    .as_ref()
+                    .expect("staged Landlock seccomp delivery has a compiled program");
+                mount_suffix_arguments.push(OsString::from(STAGED_SECCOMP_FILTER_HEX_OPTION));
+                mount_suffix_arguments.push(program.staged_runner_hex());
+            }
             for program in allowed_executables {
                 mount_suffix_arguments.push(OsString::from("--allow-exec"));
                 mount_suffix_arguments.push(program.clone().into_os_string());
@@ -1773,11 +1790,20 @@ impl BubblewrapWorkerPolicy {
         mount_suffix_arguments.push(self.worker_program.clone().into_os_string());
         mount_suffix_arguments.extend(self.worker_arguments.iter().cloned());
 
+        let mut display_mount_suffix_arguments = mount_suffix_arguments.clone();
+        if seccomp_delivery == Some(SeccompDelivery::LandlockRunner) {
+            let option_index = display_mount_suffix_arguments
+                .iter()
+                .position(|argument| argument == STAGED_SECCOMP_FILTER_HEX_OPTION)
+                .expect("staged Landlock seccomp delivery has a filter option");
+            display_mount_suffix_arguments[option_index + 1] =
+                OsString::from(STAGED_SECCOMP_FILTER_DISPLAY_PLACEHOLDER);
+        }
         let arguments = display_arguments(
             &mount_prefix_arguments,
             &mounts,
             &executable_overlays,
-            &mount_suffix_arguments,
+            &display_mount_suffix_arguments,
         );
 
         Ok(BubblewrapCommand {
@@ -1789,6 +1815,7 @@ impl BubblewrapWorkerPolicy {
             mount_suffix_arguments,
             manifest: manifest.clone(),
             seccomp_program,
+            seccomp_delivery,
             cgroup_v2_required: self.cgroup_v2_required,
         })
     }
@@ -1811,7 +1838,14 @@ pub struct BubblewrapCommand {
     mount_suffix_arguments: Vec<OsString>,
     manifest: CapabilityManifest,
     seccomp_program: Option<SeccompProgram>,
+    seccomp_delivery: Option<SeccompDelivery>,
     cgroup_v2_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeccompDelivery {
+    Bubblewrap,
+    LandlockRunner,
 }
 
 impl BubblewrapCommand {
@@ -1822,13 +1856,15 @@ impl BubblewrapCommand {
 
     /// Returns an inspectable representation of the fixed Bubblewrap arguments.
     ///
-    /// A selected seccomp profile contributes a launch-only `--seccomp FD`
-    /// pair that is intentionally omitted here because the anonymous descriptor
-    /// exists only during [`Self::spawn`]. Descriptor-pinned mount roots and
-    /// executable file overlays appear as `--bind-fd` or `--ro-bind-fd` with a
-    /// non-numeric launch-only placeholder rather than exposing a host source
-    /// path. The representation is not an executable command line when it
-    /// contains a launch-only placeholder.
+    /// A Bubblewrap-delivered seccomp profile contributes a launch-only
+    /// `--seccomp FD` pair that is intentionally omitted here because the
+    /// anonymous descriptor exists only during [`Self::spawn`]. A strict
+    /// profile staged through the Landlock runner instead shows an internal
+    /// filter placeholder, never raw cBPF bytes. Descriptor-pinned mount roots
+    /// and executable file overlays appear as `--bind-fd` or `--ro-bind-fd`
+    /// with a non-numeric launch-only placeholder rather than exposing a host
+    /// source path. The representation is not an executable command line when
+    /// it contains a launch-only placeholder.
     pub fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
@@ -1863,8 +1899,10 @@ impl BubblewrapCommand {
 
     /// Returns the selected host-owned seccomp hardening profile.
     ///
-    /// The profile's descriptor is created only while spawning the worker, so
-    /// it is intentionally absent from [`Self::arguments`].
+    /// A Bubblewrap-delivered profile gets a launch-only descriptor while
+    /// spawning. A strict profile staged through the Landlock runner appears
+    /// in [`Self::arguments`] only as an internal placeholder, never as raw
+    /// cBPF bytes.
     pub const fn seccomp_profile(&self) -> WorkerSeccompProfile {
         match self.seccomp_program {
             Some(ref program) => program.profile,
@@ -1937,11 +1975,14 @@ impl BubblewrapCommand {
         let arguments = self.spawn_arguments(&mut mount_descriptors)?;
         let (bwrap_program, bwrap_execution_descriptor) =
             self.bwrap_program.prepare_for_execution()?;
-        let seccomp_descriptor = self
-            .seccomp_program
-            .as_ref()
-            .map(SeccompProgram::open_for_bubblewrap)
-            .transpose()?;
+        let seccomp_descriptor = match self.seccomp_delivery {
+            Some(SeccompDelivery::Bubblewrap) => self
+                .seccomp_program
+                .as_ref()
+                .map(SeccompProgram::open_for_bubblewrap)
+                .transpose()?,
+            Some(SeccompDelivery::LandlockRunner) | None => None,
+        };
         let (cgroup_runner_program, cgroup_runner_descriptor) = if let Some(session) = &cgroup {
             if self.bwrap_program.is_descriptor_pinned() {
                 let runner =
@@ -2131,6 +2172,17 @@ struct SeccompProgram {
 }
 
 impl SeccompProgram {
+    fn staged_runner_hex(&self) -> OsString {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut encoded = String::with_capacity(self.bytes.len() * 2);
+        for &byte in &self.bytes {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        OsString::from(encoded)
+    }
+
     #[cfg(target_os = "linux")]
     fn open_for_bubblewrap(&self) -> Result<OwnedFd, BubblewrapSpawnError> {
         let (descriptor, mut producer) =
@@ -3363,7 +3415,6 @@ pub enum BubblewrapPolicyError {
         maximum: usize,
     },
     LandlockExecutableRunnerUnsupportedPlatform,
-    LandlockExecutableRunnerConflictsWithStrictSeccomp,
     LandlockExecutableRunnerMatchesWorker {
         program: PathBuf,
     },
@@ -3654,9 +3705,6 @@ impl Display for BubblewrapPolicyError {
             ),
             Self::LandlockExecutableRunnerUnsupportedPlatform => formatter
                 .write_str("Landlock executable runner is supported only on Linux"),
-            Self::LandlockExecutableRunnerConflictsWithStrictSeccomp => formatter.write_str(
-                "Landlock executable runner cannot use Bubblewrap's strict seccomp profile before staged pre-exec filtering is available",
-            ),
             Self::LandlockExecutableRunnerMatchesWorker { program } => write!(
                 formatter,
                 "Landlock executable runner {program:?} must not be the worker program"
@@ -3851,7 +3899,6 @@ impl std::error::Error for BubblewrapPolicyError {
             | Self::DuplicateLandlockAllowedExecutable { .. }
             | Self::TooManyLandlockAllowedExecutables { .. }
             | Self::LandlockExecutableRunnerUnsupportedPlatform
-            | Self::LandlockExecutableRunnerConflictsWithStrictSeccomp
             | Self::LandlockExecutableRunnerMatchesWorker { .. }
             | Self::LandlockExecutableRunnerMatchesResourceLimitRunner { .. }
             | Self::LandlockAllowedExecutableMatchesRunner { .. }
@@ -6894,7 +6941,7 @@ print("seccomp-active")
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn landlock_executable_runner_rejects_strict_seccomp_until_staged_filtering_exists() {
+    fn landlock_executable_runner_stages_strict_seccomp_after_allowlist_setup() {
         use linux_raw_sys::general;
 
         let root = TestDirectory::new();
@@ -6902,10 +6949,41 @@ print("seccomp-active")
         policy.set_landlock_executable_runner(landlock_executable_runner(&root));
         policy.set_seccomp_allowlist(WorkerSeccompAllowlist::new([general::__NR_execve]).unwrap());
 
-        assert!(matches!(
-            policy.compile(&manifest([])),
-            Err(BubblewrapPolicyError::LandlockExecutableRunnerConflictsWithStrictSeccomp)
+        let plan = policy.compile(&manifest([])).unwrap();
+        let program = plan.seccomp_program.as_ref().unwrap();
+        assert_eq!(
+            plan.seccomp_profile(),
+            WorkerSeccompProfile::StrictAllowlist
+        );
+        assert_eq!(plan.seccomp_delivery, Some(SeccompDelivery::LandlockRunner));
+
+        let arguments = argument_strings(&plan);
+        assert!(has_arguments(
+            &arguments,
+            &[
+                "--",
+                "/opt/splash/landlock-runner",
+                STAGED_SECCOMP_FILTER_HEX_OPTION,
+                STAGED_SECCOMP_FILTER_DISPLAY_PLACEHOLDER,
+                "--allow-exec",
+                "/opt/splash/worker",
+                "--",
+                "/opt/splash/worker",
+            ]
         ));
+        let raw_filter_index = plan
+            .mount_suffix_arguments
+            .iter()
+            .position(|argument| argument == STAGED_SECCOMP_FILTER_HEX_OPTION)
+            .unwrap();
+        let raw_filter = plan.mount_suffix_arguments[raw_filter_index + 1]
+            .to_str()
+            .unwrap();
+        assert!(!arguments.iter().any(|argument| argument == raw_filter));
+        assert_eq!(raw_filter.len(), program.bytes.len() * 2);
+        assert!(raw_filter
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
     }
 
     #[cfg(not(target_os = "linux"))]

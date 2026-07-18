@@ -620,6 +620,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "splash-linux-seccomp"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "linux-raw-sys",
+]
+
+[[package]]
 name = "splash-protocol"
 version = "0.1.0"
 dependencies = [
@@ -639,6 +647,7 @@ dependencies = [
  "linux-raw-sys",
  "rustix",
  "splash-linux-project-quota",
+ "splash-linux-seccomp",
  "splash-protocol",
 ]
 

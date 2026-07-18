@@ -20,11 +20,12 @@ cargo test --locked -p splash-sandbox --test landlock_runner
 ```
 
 That integration test verifies that an allowlisted fixed runner cannot execute
-an unlisted target. It treats a kernel without the hard-required Landlock API
-as an unavailable runtime rather than a passing enforcement result. The Windows
-check compiles the explicit unsupported-platform path and prevents Linux-only
-runner dependencies from leaking into non-Linux builds; it does not provide a
-Windows containment backend.
+an unlisted target and that a staged seccomp filter persists into its fixed
+target after Landlock setup. It treats a kernel without the hard-required
+Landlock API as an unavailable runtime rather than a passing enforcement
+result. The Windows check compiles the explicit unsupported-platform path and
+prevents Linux-only runner dependencies from leaking into non-Linux builds; it
+does not provide a Windows containment backend.
 
 To verify the positive Linux project-quota path, first provision one directory
 on a filesystem with generic project quotas: assign a nonzero project ID, set

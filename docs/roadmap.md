@@ -257,8 +257,9 @@
   host-reviewed worker-visible files, has no unsupported-kernel or direct-worker
   fallback, and inherits to worker descendants. It does not control dynamic
   loader reads, plugin/JIT code loading, special filesystems, networking,
-  credentials, or capability grants, and compilation rejects its current
-  ordering conflict with strict seccomp.
+  credentials, or capability grants. A strict seccomp allowlist is staged by
+  this fixed runner after Landlock setup and descriptor cleanup, immediately
+  before its fixed inner exec.
 - Optional host-selected Linux Bubblewrap strict seccomp allowlist with a
   bounded deterministic cBPF program, fixed escape-surface guards, and
   default-kill behavior for every unlisted syscall. It remains a
@@ -292,9 +293,9 @@
 - Per-platform containment backends for macOS, Windows, mobile, and embedded
   Linux.
 - An operating-system-enforced dynamic/origin-policy network boundary,
-  target-specific credential-provider and secret-delivery backends, a staged
-  pre-exec seccomp policy, and a complete audited code-execution policy beyond
-  Landlock's filesystem-execute action. The exact-origin catalog deliberately
+  target-specific credential-provider and secret-delivery backends, and a
+  complete audited code-execution policy beyond Landlock's filesystem-execute
+  action. The exact-origin catalog deliberately
   mediates only Splash-initiated HTTP requests and the worker secret broker
   deliberately mediates only a reviewed adapter's host-owned resolver; neither
   enforces egress or secret delivery at the operating-system boundary. Broader
