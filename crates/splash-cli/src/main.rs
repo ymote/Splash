@@ -6,8 +6,8 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use splash_capabilities::{
-    json, CapabilityLeaseGrant, CapabilityRuntime, JsonToolContract, JsonToolRequest, JsonValue,
-    ToolDescriptor, ToolError, ToolMetadata, ToolPolicy, ToolRequest,
+    json, CapabilityLeaseGrant, CapabilityModule, CapabilityRuntime, JsonToolContract,
+    JsonToolRequest, JsonValue, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy, ToolRequest,
 };
 use splash_core::{
     check_syntax_named, format_source_named, tool_call_hint_report_named,
@@ -30,6 +30,7 @@ const MAX_WORKFLOW_CLI_GRANTS: usize = 4_096;
 enum CliCommand {
     Evaluate(String),
     Catalog,
+    ModuleCatalog,
     Profile,
     Check {
         file: String,
@@ -148,6 +149,10 @@ fn run_options(options: CliOptions) -> Result<(), String> {
                     .tool_catalog_json()
                     .map_err(|error| error.to_string())?
             );
+            return Ok(());
+        }
+        CliCommand::ModuleCatalog => {
+            println!("{}", json!(runtime.capability_module_catalog()));
             return Ok(());
         }
         CliCommand::Profile => {
@@ -332,6 +337,12 @@ fn register_demo_tools(
                 demo_json_add_handler,
             )
             .map_err(|error| error.to_string())?;
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -357,6 +368,12 @@ fn build_demo_mobile_workflow(
                 ToolMetadata::new("Adds the integer left and right fields."),
                 json_add_contract()?,
                 demo_json_add_handler,
+            )
+            .map_err(|error| error.to_string())?;
+        builder
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
             )
             .map_err(|error| error.to_string())?;
     }
@@ -965,9 +982,8 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
                 }
             }
             "check" | "outline" | "tool-calls" | "workflow-review" | "workflow-schema"
-            | "workflow-run" | "eval" | "run" | "format" | "catalog" | "profile" => {
-                positional.push(argument)
-            }
+            | "workflow-run" | "eval" | "run" | "format" | "catalog" | "module-catalog"
+            | "profile" => positional.push(argument),
             _ => positional.push(argument),
         }
     }
@@ -1079,13 +1095,18 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
             allow_echo,
             allow_json_add,
         }),
+        [command] if command == "module-catalog" => Ok(CliOptions {
+            command: CliCommand::ModuleCatalog,
+            allow_echo,
+            allow_json_add,
+        }),
         [command] if command == "profile" => Ok(CliOptions {
             command: CliCommand::Profile,
             allow_echo,
             allow_json_add,
         }),
         _ => Err(
-            "usage: splash profile | splash workflow-schema | splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add]".to_owned(),
+            "usage: splash profile | splash workflow-schema | splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add] | splash module-catalog [--allow-json-add]".to_owned(),
         ),
     }
 }
@@ -1117,6 +1138,22 @@ mod tests {
             parse_args(vec!["catalog".to_owned(), "--allow-json-add".to_owned()]).unwrap(),
             CliOptions {
                 command: CliCommand::Catalog,
+                allow_echo: false,
+                allow_json_add: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_module_catalog_invocation() {
+        assert_eq!(
+            parse_args(vec![
+                "module-catalog".to_owned(),
+                "--allow-json-add".to_owned()
+            ])
+            .unwrap(),
+            CliOptions {
+                command: CliCommand::ModuleCatalog,
                 allow_echo: false,
                 allow_json_add: true,
             }
@@ -1833,6 +1870,34 @@ mod tests {
     }
 
     #[test]
+    fn workflow_run_executes_a_direct_module_with_its_underlying_step_grant() {
+        let (output, completed) = workflow_execution_output(
+            r#"{
+                "format_version": 1,
+                "steps": [{
+                    "id": "calculate",
+                    "source": "use mod.arithmetic\nuse mod.std.assert\nlet result = arithmetic.add({left: 20, right: 22})\nassert(result.total == 42)"
+                }]
+            }"#,
+            &[CliWorkflowGrant {
+                step_id: "calculate".to_owned(),
+                tool: "math.add".to_owned(),
+                max_calls: 1,
+            }],
+            false,
+            true,
+        )
+        .expect("direct module runs through the sealed demo workflow catalog");
+
+        assert!(completed);
+        assert_eq!(output["status"], json!("completed"));
+        assert_eq!(output["steps"][0]["status"], json!("succeeded"));
+        assert_eq!(output["audit"].as_array().map(Vec::len), Some(1));
+        assert_eq!(output["audit"][0]["tool"], json!("math.add"));
+        assert_eq!(output["audit"][0]["outcome"], json!("allowed"));
+    }
+
+    #[test]
     fn workflow_run_dataflow_uses_an_explicit_bounded_json_input() {
         let (output, completed) = workflow_execution_output_with_input(
             r#"{
@@ -2029,6 +2094,16 @@ mod tests {
         run(vec![
             "eval".to_owned(),
             "use mod.tool\nuse mod.std.assert\nlet raw = tool.call_json(\"math.add\", {left: 20, right: 22})\nlet response = raw.parse_json()\nassert(response.total == 42)".to_owned(),
+            "--allow-json-add".to_owned(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn runs_a_direct_module_when_its_capability_is_granted() {
+        run(vec![
+            "eval".to_owned(),
+            "use mod.arithmetic\nuse mod.std.assert\nlet response = arithmetic.add({left: 20, right: 22})\nassert(response.total == 42)".to_owned(),
             "--allow-json-add".to_owned(),
         ])
         .unwrap();

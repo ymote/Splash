@@ -301,8 +301,19 @@ This is host-configured syntax over the same contract-enforced capability, not
 general module loading or direct crate access. It retains the target tool's
 policy, audit, and capability-lease checks. See [Host Tool Catalog](docs/tool-catalog.md).
 
+The development CLI registers this reviewed facade together with its `math.add`
+demo capability:
+
 ```sh
-cargo run -p splash-cli -- eval --allow-echo 'use mod.tool; tool.call("text.echo", "hello")'
+cargo run -p splash-cli -- run --allow-json-add examples/direct_module_workflow.splash
+cargo run -p splash-cli -- module-catalog --allow-json-add
+```
+
+The catalog maps `arithmetic.add` to `math.add`; workflow policies and leases
+continue to grant the underlying `math.add` capability, never the facade name.
+
+```sh
+cargo run -p splash-cli -- run --allow-echo examples/tool_workflow.splash
 ```
 
 The deferred example is runnable with:

@@ -88,3 +88,33 @@ fn reviewed_dataflow_executes_only_with_an_explicit_step_grant() {
     assert_eq!(denied_stdout["dataflow"]["outputs"], serde_json::json!({}));
     assert!(stderr(&denied).contains("workflow execution failed"));
 }
+
+#[test]
+fn direct_module_catalog_is_explicit_and_the_demo_source_runs() {
+    let unavailable = run_splash(vec!["module-catalog".to_owned()]);
+    assert!(
+        unavailable.status.success(),
+        "stderr: {}",
+        stderr(&unavailable)
+    );
+    assert_eq!(json_stdout(&unavailable), serde_json::json!([]));
+
+    let catalog = run_splash(vec![
+        "module-catalog".to_owned(),
+        "--allow-json-add".to_owned(),
+    ]);
+    assert!(catalog.status.success(), "stderr: {}", stderr(&catalog));
+    let catalog = json_stdout(&catalog);
+    assert_eq!(catalog.as_array().map(Vec::len), Some(1));
+    assert_eq!(catalog[0]["name"], "arithmetic");
+    assert_eq!(catalog[0]["methods"][0]["name"], "add");
+    assert_eq!(catalog[0]["methods"][0]["tool"], "math.add");
+
+    let source = example_path("direct_module_workflow.splash");
+    let execution = run_splash(vec![
+        "run".to_owned(),
+        "--allow-json-add".to_owned(),
+        source,
+    ]);
+    assert!(execution.status.success(), "stderr: {}", stderr(&execution));
+}
