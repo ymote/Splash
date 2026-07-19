@@ -86,6 +86,9 @@ const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_LSP_MODULE_RECORD_FIELDS: usize = 1_024;
 const MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES: usize = 128;
 const MAX_LSP_MODULE_RECORD_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum nested object-field levels retained below one direct-module output
+/// field. This permits `result.summary.total`, but not deeper result paths.
+const MAX_LSP_MODULE_OUTPUT_FIELD_CHILD_DEPTH: usize = 1;
 /// Signature help scans only the current bounded source document and keeps its
 /// delimiter stack no larger than the canonical grammar nesting budget.
 const MAX_SIGNATURE_HELP_DELIMITER_DEPTH: usize = DEFAULT_MAX_SYNTAX_NESTING;
@@ -175,7 +178,7 @@ struct ModuleCatalogCompletion {
     call_mode: Option<ModuleCatalogCallMode>,
     call_shape: Option<ModuleCatalogCallShape>,
     input_fields: Option<Vec<ModuleCatalogRecordFieldCompletion>>,
-    output_fields: Option<Vec<ModuleCatalogRecordFieldCompletion>>,
+    output_fields: Option<Vec<ModuleCatalogOutputFieldCompletion>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +274,18 @@ struct ModuleCatalogRecordFieldCompletion {
     field_type: ModuleCatalogRecordFieldType,
     required: bool,
     description: String,
+}
+
+/// One compact, source-compatible output field supplied by the host for one
+/// exact direct-module method. It retains at most one explicit object-child
+/// level; it is presentation metadata, not a general type or schema model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleCatalogOutputFieldCompletion {
+    name: String,
+    field_type: ModuleCatalogRecordFieldType,
+    required: bool,
+    description: String,
+    fields: Option<Vec<ModuleCatalogOutputFieldCompletion>>,
 }
 
 /// A bounded, advisory projection of a host's known `mod.*` interface.
@@ -1268,7 +1283,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "use mod.fuzz.inspect\n",
     "let result = inspect.remote_add({left: 20, right: 22}).await()\n",
     "let alias = result\n",
-    "alias.total\n",
+    "alias.summary.total\n",
     "tool.call(\"\", \"\")\n",
     "workflow.input.request\n",
     "workflow.outputs.prepare.total"
@@ -1312,11 +1327,18 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                         description: "Fuzz-only right operand.".to_owned(),
                     },
                 ]),
-                output_fields: Some(vec![ModuleCatalogRecordFieldCompletion {
-                    name: "total".to_owned(),
-                    field_type: ModuleCatalogRecordFieldType::Integer,
+                output_fields: Some(vec![ModuleCatalogOutputFieldCompletion {
+                    name: "summary".to_owned(),
+                    field_type: ModuleCatalogRecordFieldType::Object,
                     required: true,
-                    description: "Fuzz-only total result.".to_owned(),
+                    description: "Fuzz-only result summary.".to_owned(),
+                    fields: Some(vec![ModuleCatalogOutputFieldCompletion {
+                        name: "total".to_owned(),
+                        field_type: ModuleCatalogRecordFieldType::Integer,
+                        required: true,
+                        description: "Fuzz-only nested total result.".to_owned(),
+                        fields: None,
+                    }]),
                 }]),
             },
             ModuleCatalogCompletion {
@@ -1778,7 +1800,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             None => None,
         };
         let output_fields = match object.get("outputFields") {
-            Some(value) => Some(parse_module_catalog_record_fields(
+            Some(value) => Some(parse_module_catalog_output_fields(
                 value,
                 &mut retained_bytes,
                 &mut retained_output_fields,
@@ -1853,6 +1875,9 @@ fn parse_module_catalog_record_fields(
     let mut fields = Vec::with_capacity(entries.len());
     for entry in entries {
         let field = entry.as_object()?;
+        if field.contains_key("fields") {
+            return None;
+        }
         let name = field.get("name")?.as_str()?;
         let field_type =
             ModuleCatalogRecordFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
@@ -1888,6 +1913,93 @@ fn parse_module_catalog_record_fields(
             field_type,
             required,
             description: description.to_owned(),
+        });
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(fields)
+}
+
+/// Retains one bounded nested-output record projection. A child `fields` list
+/// is allowed only on an explicit object field and only through the fixed
+/// direct-child depth, keeping this distinct from JSON Schema evaluation.
+fn parse_module_catalog_output_fields(
+    value: &serde_json::Value,
+    retained_bytes: &mut usize,
+    retained_fields: &mut usize,
+) -> Option<Vec<ModuleCatalogOutputFieldCompletion>> {
+    parse_module_catalog_output_fields_at_depth(
+        value,
+        retained_bytes,
+        retained_fields,
+        MAX_LSP_MODULE_OUTPUT_FIELD_CHILD_DEPTH,
+    )
+}
+
+fn parse_module_catalog_output_fields_at_depth(
+    value: &serde_json::Value,
+    retained_bytes: &mut usize,
+    retained_fields: &mut usize,
+    remaining_child_depth: usize,
+) -> Option<Vec<ModuleCatalogOutputFieldCompletion>> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_LSP_MODULE_RECORD_FIELDS {
+        return None;
+    }
+
+    let mut fields = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let field = entry.as_object()?;
+        let name = field.get("name")?.as_str()?;
+        let field_type =
+            ModuleCatalogRecordFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
+        let required = field.get("required")?.as_bool()?;
+        let description = match field.get("description") {
+            Some(value) => value.as_str()?,
+            None => "",
+        };
+        if name.len() > MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES
+            || !is_canonical_identifier(name)
+            || description.len() > MAX_LSP_MODULE_RECORD_FIELD_DESCRIPTION_BYTES
+            || fields
+                .iter()
+                .any(|existing: &ModuleCatalogOutputFieldCompletion| existing.name == name)
+        {
+            return None;
+        }
+        *retained_fields = retained_fields.checked_add(1)?;
+        if *retained_fields > MAX_LSP_MODULE_RECORD_FIELDS {
+            return None;
+        }
+        let entry_bytes = name
+            .len()
+            .checked_add(field_type.label().len())?
+            .checked_add(description.len())?
+            .checked_add(1)?;
+        *retained_bytes = retained_bytes.checked_add(entry_bytes)?;
+        if *retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES {
+            return None;
+        }
+        let child_fields = match field.get("fields") {
+            Some(value)
+                if field_type == ModuleCatalogRecordFieldType::Object
+                    && remaining_child_depth > 0 =>
+            {
+                Some(parse_module_catalog_output_fields_at_depth(
+                    value,
+                    retained_bytes,
+                    retained_fields,
+                    remaining_child_depth - 1,
+                )?)
+            }
+            Some(_) => return None,
+            None => None,
+        };
+        fields.push(ModuleCatalogOutputFieldCompletion {
+            name: name.to_owned(),
+            field_type,
+            required,
+            description: description.to_owned(),
+            fields: child_fields,
         });
     }
     fields.sort_by(|left, right| left.name.cmp(&right.name));
@@ -4017,8 +4129,8 @@ fn module_catalog_input_field_text(field: &ModuleCatalogRecordFieldCompletion) -
 
 /// Completes host-projected output fields on one exact direct-module result
 /// binding or its bounded exact local alias chain. This remains narrower than
-/// record shape support: nested member chains, mutations, and escapes all
-/// refuse the advisory output view.
+/// record shape support: only one direct object-child path is recognized, and
+/// mutations and escapes still refuse the advisory output view.
 fn module_catalog_output_field_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -4043,8 +4155,9 @@ fn module_catalog_output_field_completion(
     if imports.truncated || catalog.unavailable || aliases_truncated {
         return Some(empty());
     }
+    let parent_path = direct_module_output_member_parent_path(source, site)?;
     let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
-    let Some(fields) = module_catalog_output_fields_for_binding(
+    let Some(root_fields) = module_catalog_output_fields_for_binding(
         source,
         lexical,
         imports,
@@ -4052,6 +4165,9 @@ fn module_catalog_output_field_completion(
         catalog,
         output_binding,
     ) else {
+        return Some(empty());
+    };
+    let Some(fields) = module_catalog_output_fields_at_path(root_fields, &parent_path) else {
         return Some(empty());
     };
     let edit_range = span_range(source, site.member);
@@ -4087,7 +4203,7 @@ fn module_catalog_output_field_completion(
     })
 }
 
-fn module_catalog_output_field_text(field: &ModuleCatalogRecordFieldCompletion) -> String {
+fn module_catalog_output_field_text(field: &ModuleCatalogOutputFieldCompletion) -> String {
     let mut value = format!(
         "Advisory direct-module output field `{}`.\nType: {}\nRequired: {}",
         field.name,
@@ -4478,16 +4594,44 @@ fn module_catalog_output_fields_for_member<'catalog>(
     catalog: &'catalog ModuleCompletionCatalog,
     shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
-) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
+) -> Option<&'catalog [ModuleCatalogOutputFieldCompletion]> {
+    let parent_path = direct_module_output_member_parent_path(source, site)?;
     let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
-    module_catalog_output_fields_for_binding(
+    let fields = module_catalog_output_fields_for_binding(
         source,
         lexical,
         imports,
         shapes,
         catalog,
         output_binding,
-    )
+    )?;
+    module_catalog_output_fields_at_path(fields, &parent_path)
+}
+
+/// Extracts the direct retained object-field path between a result binding and
+/// the member being completed. The root result itself is represented by an
+/// empty path; only one explicit object child is retained.
+fn direct_module_output_member_parent_path(
+    source: &str,
+    site: MemberCompletionSite,
+) -> Option<Vec<&str>> {
+    let receiver = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
+    let receiver_chain =
+        source.get(site.receiver_chain.start_byte..site.receiver_chain.end_byte)?;
+    if receiver_chain == receiver {
+        return Some(Vec::new());
+    }
+    let suffix = receiver_chain.strip_prefix(receiver)?.strip_prefix('.')?;
+    let mut path = Vec::with_capacity(MAX_LSP_MODULE_OUTPUT_FIELD_CHILD_DEPTH);
+    for segment in suffix.split('.') {
+        if path.len() == MAX_LSP_MODULE_OUTPUT_FIELD_CHILD_DEPTH
+            || !is_canonical_identifier(segment)
+        {
+            return None;
+        }
+        path.push(segment);
+    }
+    Some(path)
 }
 
 fn direct_module_output_binding_for_member(
@@ -4497,7 +4641,7 @@ fn direct_module_output_binding_for_member(
     site: MemberCompletionSite,
 ) -> Option<DirectModuleOutputBinding> {
     if lexical.symbols_truncated
-        || !site.has_direct_receiver()
+        || direct_module_output_member_parent_path(source, site).is_none()
         || site.member.end_byte > lexical.valid_prefix_end_byte
         || site.member.end_byte > shapes.valid_prefix_end_byte
     {
@@ -4656,7 +4800,7 @@ fn module_catalog_output_fields_for_binding<'catalog>(
     shapes: &StaticRecordShapeReport,
     catalog: &'catalog ModuleCompletionCatalog,
     output_binding: DirectModuleOutputBinding,
-) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
+) -> Option<&'catalog [ModuleCatalogOutputFieldCompletion]> {
     if imports.truncated || catalog.unavailable {
         return None;
     }
@@ -4680,6 +4824,17 @@ fn module_catalog_output_fields_for_binding<'catalog>(
     module.output_fields.as_deref()
 }
 
+fn module_catalog_output_fields_at_path<'catalog>(
+    fields: &'catalog [ModuleCatalogOutputFieldCompletion],
+    path: &[&str],
+) -> Option<&'catalog [ModuleCatalogOutputFieldCompletion]> {
+    let Some((segment, remaining)) = path.split_first() else {
+        return Some(fields);
+    };
+    let field = fields.iter().find(|field| field.name == *segment)?;
+    module_catalog_output_fields_at_path(field.fields.as_deref()?, remaining)
+}
+
 fn module_catalog_output_field_for_member<'catalog>(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -4687,7 +4842,7 @@ fn module_catalog_output_field_for_member<'catalog>(
     catalog: &'catalog ModuleCompletionCatalog,
     shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
-) -> Option<&'catalog ModuleCatalogRecordFieldCompletion> {
+) -> Option<&'catalog ModuleCatalogOutputFieldCompletion> {
     let member_name = source.get(site.member.start_byte..site.member.end_byte)?;
     module_catalog_output_fields_for_member(source, lexical, imports, catalog, shapes, site)?
         .iter()
@@ -4851,7 +5006,7 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
         append_module_catalog_record_fields(&mut value, "input", fields);
     }
     if let Some(fields) = &module.output_fields {
-        append_module_catalog_record_fields(&mut value, "output", fields);
+        append_module_catalog_output_fields(&mut value, fields);
     }
     value.push_str(
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
@@ -4887,6 +5042,55 @@ fn append_module_catalog_record_fields(
         if !field.description.is_empty() {
             value.push_str("; ");
             value.push_str(&field.description);
+        }
+    }
+}
+
+fn append_module_catalog_output_fields(
+    value: &mut String,
+    fields: &[ModuleCatalogOutputFieldCompletion],
+) {
+    value.push_str("\n\nAdvisory output record fields:");
+    if fields.is_empty() {
+        value.push_str(" no source-compatible fields are projected.");
+        return;
+    }
+    for field in fields {
+        append_module_catalog_output_field(value, field, "", 0);
+    }
+}
+
+fn append_module_catalog_output_field(
+    value: &mut String,
+    field: &ModuleCatalogOutputFieldCompletion,
+    parent_path: &str,
+    depth: usize,
+) {
+    value.push('\n');
+    for _ in 0..depth {
+        value.push_str("  ");
+    }
+    value.push_str("- ");
+    let path = if parent_path.is_empty() {
+        field.name.clone()
+    } else {
+        format!("{parent_path}.{}", field.name)
+    };
+    value.push_str(&path);
+    value.push_str(": ");
+    value.push_str(field.field_type.label());
+    value.push_str(if field.required {
+        " (required)"
+    } else {
+        " (optional)"
+    });
+    if !field.description.is_empty() {
+        value.push_str("; ");
+        value.push_str(&field.description);
+    }
+    if let Some(fields) = &field.fields {
+        for field in fields {
+            append_module_catalog_output_field(value, field, &path, depth + 1);
         }
     }
 }
@@ -10612,6 +10816,131 @@ mod tests {
     }
 
     #[test]
+    fn completes_and_hovers_one_nested_advisory_direct_module_output_field_level() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.inspect",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [
+                    {
+                        "name": "summary",
+                        "type": "object",
+                        "required": true,
+                        "description": "Reviewed aggregate.",
+                        "fields": [
+                            {
+                                "name": "origin",
+                                "type": "string",
+                                "required": false
+                            },
+                            {
+                                "name": "total",
+                                "type": "integer",
+                                "required": true,
+                                "description": "Nested total."
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]));
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({left: 20})\n",
+            "result.summary."
+        );
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        server.open_document(document(1, source));
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("nested output completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["origin", "total"]
+        );
+        assert!(completion.items.iter().all(|item| {
+            item.detail.as_deref() == Some("advisory direct-module output field; optional")
+                || item.detail.as_deref() == Some("advisory direct-module output field; required")
+        }));
+
+        let alias_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({left: 20})\n",
+            "let alias = result\n",
+            "alias.summary."
+        );
+        let mut alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        alias_server.open_document(document(1, alias_source));
+        assert_eq!(
+            alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(alias_source, alias_source.len())
+                )
+                .expect("nested aliased output completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["origin", "total"]
+        );
+
+        let hover_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({left: 20})\n",
+            "result.summary.total"
+        );
+        let mut hover_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        hover_server.open_document(document(1, hover_source));
+        let total_start = hover_source.rfind("total").expect("nested field exists");
+        let hover = hover_server
+            .hover(&test_uri(), position_at_byte(hover_source, total_start + 1))
+            .expect("nested output hover succeeds")
+            .expect("nested output field has hover metadata");
+        assert_eq!(
+            hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory direct-module output field `total`.\nType: integer\nRequired: yes\n\nNested total.\n\nAdvisory metadata only; it does not inspect a runtime result or grant a capability.".to_owned(),
+            })
+        );
+
+        let deeper_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({left: 20})\n",
+            "result.summary.total."
+        );
+        let mut deeper_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        deeper_server.open_document(document(1, deeper_source));
+        assert!(deeper_server
+            .completion(
+                &test_uri(),
+                position_at_byte(deeper_source, deeper_source.len()),
+            )
+            .expect("unsupported nested output completion request succeeds")
+            .items
+            .is_empty());
+    }
+
+    #[test]
     fn module_catalog_projection_is_bounded_and_fails_closed_when_malformed() {
         let params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -10730,18 +11059,104 @@ mod tests {
         );
         assert_eq!(
             shaped_with_fields.modules[0].output_fields,
-            Some(vec![ModuleCatalogRecordFieldCompletion {
+            Some(vec![ModuleCatalogOutputFieldCompletion {
                 name: "total".to_owned(),
                 field_type: ModuleCatalogRecordFieldType::Integer,
                 required: true,
                 description: "Reviewed sum.".to_owned(),
+                fields: None,
             }])
+        );
+        let nested_output_fields = parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.inspect",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [
+                    {
+                        "name": "summary",
+                        "type": "object",
+                        "required": true,
+                        "description": "Reviewed aggregate.",
+                        "fields": [
+                            {"name": "origin", "type": "string", "required": false},
+                            {
+                                "name": "total",
+                                "type": "integer",
+                                "required": true,
+                                "description": "Nested total."
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]))
+        .expect("one nested output field level is retained");
+        assert_eq!(
+            nested_output_fields.modules[0].output_fields,
+            Some(vec![ModuleCatalogOutputFieldCompletion {
+                name: "summary".to_owned(),
+                field_type: ModuleCatalogRecordFieldType::Object,
+                required: true,
+                description: "Reviewed aggregate.".to_owned(),
+                fields: Some(vec![
+                    ModuleCatalogOutputFieldCompletion {
+                        name: "origin".to_owned(),
+                        field_type: ModuleCatalogRecordFieldType::String,
+                        required: false,
+                        description: String::new(),
+                        fields: None,
+                    },
+                    ModuleCatalogOutputFieldCompletion {
+                        name: "total".to_owned(),
+                        field_type: ModuleCatalogRecordFieldType::Integer,
+                        required: true,
+                        description: "Nested total.".to_owned(),
+                        fields: None,
+                    },
+                ]),
+            }])
+        );
+        assert!(
+            module_catalog_member_hover_text(&nested_output_fields.modules[0])
+                .contains("- summary.total: integer (required); Nested total.")
         );
         assert!(parse_module_completion_catalog(&serde_json::json!([
             {
                 "path": "mod.math.add",
                 "callMode": "synchronous",
                 "inputFields": []
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [{
+                    "name": "summary",
+                    "type": "object",
+                    "required": true,
+                    "fields": [
+                        {"name": "total", "type": "integer", "required": true},
+                        {"name": "total", "type": "integer", "required": false}
+                    ]
+                }]
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [{
+                    "name": "input",
+                    "type": "object",
+                    "required": true,
+                    "fields": []
+                }]
             }
         ]))
         .is_none());
@@ -10789,6 +11204,39 @@ mod tests {
             }
         ]))
         .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [{
+                    "name": "total",
+                    "type": "integer",
+                    "required": true,
+                    "fields": []
+                }]
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [{
+                    "name": "summary",
+                    "type": "object",
+                    "required": true,
+                    "fields": [{
+                        "name": "detail",
+                        "type": "object",
+                        "required": false,
+                        "fields": []
+                    }]
+                }]
+            }
+        ]))
+        .is_none());
         let record_fields = |start: usize, count: usize| {
             serde_json::Value::Array(
                 (start..start + count)
@@ -10817,6 +11265,20 @@ mod tests {
                     MAX_LSP_MODULE_RECORD_FIELDS / 2,
                     MAX_LSP_MODULE_RECORD_FIELDS / 2 + 1
                 )
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.nested_output",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [{
+                    "name": "summary",
+                    "type": "object",
+                    "required": false,
+                    "fields": record_fields(0, MAX_LSP_MODULE_RECORD_FIELDS)
+                }]
             }
         ]))
         .is_none());

@@ -17,8 +17,11 @@ unknown unrelated fields are ignored.
 not a runtime declaration. `callShape` explicitly says that a direct method
 has one JSON-compatible argument; it must appear with `callMode` and never
 creates a runtime contract. `inputFields` is a compact literal-record view for
-that one argument, while `outputFields` is the same compact view for the
-declared JSON result. Both require `callShape: "single_json"`. A path with
+that one argument, while `outputFields` is the compact view for the declared
+JSON result. Both require `callShape: "single_json"`. An `outputFields` entry
+whose `type` is `object` may contain one optional `fields` array describing its
+direct object children; `inputFields` never accepts `fields`, and a child entry
+cannot itself contain `fields`. A path with
 `callMode` must have at least three segments (`mod.<module>.<method>`) and
 cannot also be a parent of another catalog path.
 
@@ -46,10 +49,18 @@ cannot also be a parent of another catalog path.
         ],
         "outputFields": [
           {
-            "name": "temperature",
-            "type": "number",
+            "name": "summary",
+            "type": "object",
             "required": true,
-            "description": "Current temperature in the selected units."
+            "description": "Current forecast summary.",
+            "fields": [
+              {
+                "name": "temperature",
+                "type": "number",
+                "required": true,
+                "description": "Current temperature in the selected units."
+              }
+            ]
           }
         ]
       }
@@ -61,15 +72,17 @@ cannot also be a parent of another catalog path.
 Every path must start with `mod`, have at least one following canonical Splash
 identifier, contain at most 16 segments, and fit in 256 bytes. The LSP keeps at
 most 256 descriptors, 1,024 aggregate input fields, 1,024 aggregate output
-fields, and 512 KiB of retained path, description, call-mode, call-shape, and
-field bytes. A descriptor description and a field description each cap at 4
-KiB. Every input or output field requires a canonical Splash identifier up to
+fields (including retained output children), and 512 KiB of retained path,
+description, call-mode, call-shape, and field bytes. A descriptor description
+and a field description each cap at 4 KiB. Every input or output field requires
+a canonical Splash identifier up to
 128 bytes, one of the fixed
 `any`, `null`, `boolean`, `number`, `integer`, `string`, `array`, or `object`
-types, and an explicit Boolean `required` value. A malformed recognized
-`callMode`, `callShape`, `inputFields`, or `outputFields`, a mode on a
-non-method path, a shape without a mode, record fields without a shape,
-duplicate, malformed, or over-limit input is discarded as a whole;
+types, and an explicit Boolean `required` value. `fields` is valid only on a
+top-level `object` output field and retains at most one child level; duplicates
+at either retained level, `fields` on an input or non-object field, a deeper
+`fields` list, or any other malformed recognized `callMode`, `callShape`,
+`inputFields`, or `outputFields` discards the catalog as a whole;
 completion at a matching site then returns no candidates with `isIncomplete:
 true`.
 
@@ -86,11 +99,14 @@ entries; a direct method includes its host-selected `callMode` and
 explicit object with a `properties` map whose declared property and required
 names use canonical Splash identifiers, it also projects `inputFields` or
 `outputFields` with the schema field type, required bit, and optional plain-text
-description. Array, scalar, missing-properties, noncanonical-key, and otherwise
-incomplete record shapes omit the corresponding view rather than exposing a
-partial one. The runtime module is still configured separately during host
-setup; this returned list is only a bounded snapshot for editor completion,
-hover, and explicit signature metadata, not runtime discovery or authority.
+description. For an output property explicitly typed as `object` with its own
+complete `properties` map, the runtime also projects that one direct child level
+as `fields`; deeper object structure is omitted. Array, scalar,
+missing-properties, noncanonical-key, and otherwise incomplete retained record
+shapes omit the corresponding view rather than exposing a partial one. The
+runtime module is still configured separately during host setup; this returned
+list is only a bounded snapshot for editor completion, hover, and explicit
+signature metadata, not runtime discovery or authority.
 
 A host can replace the complete projection later through
 `workspace/didChangeConfiguration` using the same array under
@@ -175,22 +191,25 @@ infer a value or nested shape, read a runtime, validate a contract, or grant a
 capability.
 
 For an exact source binding on that same shaped leaf, the LSP can also use
-`outputFields` for a top-level result member: a synchronous leaf must appear
-exactly as `let result = weather.current(input)` or
+`outputFields` for a result member: a synchronous leaf must appear exactly as
+`let result = weather.current(input)` or
 `let result = weather_api.current(input)`, while a deferred leaf uses the same
-exact direct form ending in `.await()`. At
-`result.field`, it completes projected field names and hovers known fields with
-plain-text metadata. It also follows exact local `let alias = result` chains of
-at most 16 hops, so `alias.field` receives the same advisory metadata. The
-complete result-alias group, including aliases declared after the queried
-member, must remain stable; a capped alias report makes output completion empty
-and incomplete. The recognizer accepts exactly one completed balanced argument
-and one direct imported member call. It rejects zero or multiple arguments,
-parenthesized or computed initializers or aliases, deeper alias chains, other
-postfix chains, non-alias bare uses, mutations, possible escapes, nested result
-paths, shadowed imports, truncated metadata, and source beyond the first
-diagnostic. This is not result-type inference or runtime inspection; an output
-suggestion does not validate a result, load a module, or grant a capability.
+exact direct form ending in `.await()`. At `result.field`, it completes
+projected root fields and hovers known fields with plain-text metadata. For an
+explicit object root field with retained `fields`, it also completes and hovers
+one direct child path such as `result.summary.temperature`. Exact local
+`let alias = result` chains of at most 16 hops receive the same metadata, so
+`alias.summary.temperature` is equally eligible. The complete result-alias
+group, including aliases declared after the queried member, must remain stable;
+a capped alias report makes output completion empty and incomplete. The
+recognizer accepts exactly one completed balanced argument and one direct
+imported member call. It rejects zero or multiple arguments, parenthesized or
+computed initializers or aliases, deeper alias chains, other postfix chains,
+non-alias bare uses, mutations, possible escapes, `let selected = result.field`,
+deeper result paths such as `result.summary.temperature.unit`, shadowed imports,
+truncated metadata, and source beyond the first diagnostic. This is not
+result-type inference or runtime inspection; an output suggestion does not
+validate a result, load a module, or grant a capability.
 
 The server also advertises `textDocument/signatureHelp`. An exact visible leaf
 through the same import-or-qualifying-alias rule, with both `callMode` and
@@ -206,9 +225,9 @@ lists as hover; it does not resolve a module, inspect a runtime, validate an
 adapter contract, or authorize a call. The separate input-key completion is
 limited to the one top-level literal-record position described above. The
 separate output-field feature is limited to the exact result binding and
-bounded local alias chain described above and never follows arbitrary member
-chains. Neither feature performs JSON Schema evaluation, runtime value
-inspection, or contract validation.
+bounded local alias chain described above, plus one explicit object-child path;
+it never follows arbitrary member chains. Neither feature performs JSON Schema
+evaluation, runtime value inspection, or contract validation.
 
 `mod.tool` remains a fixed language surface: only a direct visible
 `use mod.tool` binding offers `call`, `call_json`, `start`, and `start_json`,

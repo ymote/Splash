@@ -153,9 +153,14 @@ pub const MAX_CAPABILITY_MODULE_INPUT_FIELDS: usize = 128;
 /// Maximum number of schema-derived literal-record fields published for one
 /// direct capability method's advisory output projection.
 ///
-/// Output metadata uses the same compact, fixed field representation as input
-/// metadata and never relaxes the executable JSON output contract.
+/// This counts every retained field, including one bounded nested output-object
+/// level, and never relaxes the executable JSON output contract.
 pub const MAX_CAPABILITY_MODULE_OUTPUT_FIELDS: usize = MAX_CAPABILITY_MODULE_INPUT_FIELDS;
+/// Maximum nested object-field levels retained below one direct output field.
+///
+/// A value of one permits `result.summary.total`, but not deeper result paths.
+/// This is advisory editor metadata, not general JSON Schema traversal.
+pub const MAX_CAPABILITY_MODULE_OUTPUT_FIELD_CHILD_DEPTH: usize = 1;
 /// Fixed aggregate ceiling for schema-derived input fields across the direct
 /// module interface. This matches the LSP's bounded catalog parser so a
 /// runtime-produced projection can be passed through unchanged.
@@ -710,8 +715,8 @@ impl CapabilityModuleRecordFieldType {
     }
 }
 
-/// One schema-derived direct-module input or output field retained for host and
-/// editor review.
+/// One schema-derived direct-module input field retained for host and editor
+/// review.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CapabilityModuleRecordFieldDescriptor {
     pub name: String,
@@ -724,8 +729,25 @@ pub struct CapabilityModuleRecordFieldDescriptor {
 
 /// Backward-compatible name for a direct-method input record field.
 pub use CapabilityModuleRecordFieldDescriptor as CapabilityModuleInputFieldDescriptor;
-/// Semantic name for a direct-method output record field.
-pub use CapabilityModuleRecordFieldDescriptor as CapabilityModuleOutputFieldDescriptor;
+
+/// One schema-derived direct-module output field retained for host and editor
+/// review.
+///
+/// `fields` is present only for an explicit object-valued field whose direct
+/// child record shape can be represented completely within the fixed nesting
+/// and aggregate-field limits. It is advisory metadata only and never changes
+/// executable output validation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapabilityModuleOutputFieldDescriptor {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub field_type: CapabilityModuleOutputFieldType,
+    pub required: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(rename = "fields", skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<CapabilityModuleOutputFieldDescriptor>>,
+}
 
 /// Stable host-facing description of one setup-defined direct capability
 /// module.
@@ -750,8 +772,9 @@ pub struct CapabilityModuleMethodDescriptor {
     #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
     pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
     /// Compact record-field metadata derived only from an explicit executable
-    /// object output contract. `None` deliberately makes no statement about
-    /// an array, scalar, missing-properties, or noncanonical-key output shape.
+    /// object output contract. One explicit object-child level may be retained
+    /// for editor metadata. `None` deliberately makes no statement about an
+    /// array, scalar, missing-properties, or noncanonical-key output shape.
     #[serde(rename = "outputFields", skip_serializing_if = "Option::is_none")]
     pub output_fields: Option<Vec<CapabilityModuleOutputFieldDescriptor>>,
 }
@@ -775,9 +798,9 @@ pub struct ModuleInterfaceDescriptor {
     /// partial field inference.
     #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
     pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
-    /// Compact advisory literal-record fields for one exact direct method's
-    /// result. This is absent unless a reviewed output contract can be
-    /// represented without partial field inference.
+    /// Compact advisory fields for one exact direct method's result. One
+    /// explicit object-child level may be present; this is absent unless the
+    /// retained output contract can be represented without partial inference.
     #[serde(rename = "outputFields", skip_serializing_if = "Option::is_none")]
     pub output_fields: Option<Vec<CapabilityModuleOutputFieldDescriptor>>,
 }
@@ -4478,10 +4501,10 @@ impl CapabilityRuntime {
         })
     }
 
-    /// Returns a bounded flat interface projection compatible with the LSP
-    /// `moduleCatalog` configuration shape. This remains host-selected,
-    /// advisory editor metadata; it does not let an editor query or authorize
-    /// a live runtime.
+    /// Returns a bounded interface projection compatible with the LSP
+    /// `moduleCatalog` configuration shape. It may retain one output-object
+    /// child level and remains host-selected advisory editor metadata; it does
+    /// not let an editor query or authorize a live runtime.
     pub fn module_interface_catalog(&self) -> Vec<ModuleInterfaceDescriptor> {
         module_interface_catalog(&self.capability_modules)
     }
@@ -4670,7 +4693,7 @@ impl CapabilityRuntime {
             .values()
             .flat_map(|module| module.methods.iter())
             .filter_map(|method| method.output_fields.as_ref())
-            .map(Vec::len)
+            .map(|fields| capability_module_output_field_count(fields))
             .sum::<usize>();
         if output_field_count > MAX_CAPABILITY_MODULE_INTERFACE_OUTPUT_FIELDS {
             return Err(
@@ -5493,7 +5516,7 @@ fn module_interface_catalog(
 }
 
 /// Projects only a complete, literal-record-shaped slice of an executable
-/// input or output schema. Returning `None` is deliberate: an editor must not infer a
+/// input schema. Returning `None` is deliberate: an editor must not infer a
 /// partial shape for scalar, array, missing-properties, noncanonical-key, or
 /// otherwise unsupported object contracts.
 fn direct_module_input_fields(
@@ -5510,12 +5533,112 @@ fn direct_module_input_fields(
 fn direct_module_output_fields(
     schema: Option<&JsonValue>,
 ) -> Option<Vec<CapabilityModuleOutputFieldDescriptor>> {
-    direct_module_record_fields(
-        schema,
+    let mut retained_fields = 0_usize;
+    direct_module_output_record_fields(
+        schema?,
         MAX_CAPABILITY_MODULE_OUTPUT_FIELDS,
         MAX_CAPABILITY_MODULE_OUTPUT_FIELD_NAME_BYTES,
         MAX_CAPABILITY_MODULE_OUTPUT_FIELD_DESCRIPTION_BYTES,
+        MAX_CAPABILITY_MODULE_OUTPUT_FIELD_CHILD_DEPTH,
+        &mut retained_fields,
     )
+}
+
+/// Projects one explicit output record shape and, at most, one exact object
+/// level below each direct output field. The executable contract stays at the
+/// capability boundary; this is only the compact editor view.
+fn direct_module_output_record_fields(
+    schema: &JsonValue,
+    maximum_fields: usize,
+    maximum_name_bytes: usize,
+    maximum_description_bytes: usize,
+    remaining_child_depth: usize,
+    retained_fields: &mut usize,
+) -> Option<Vec<CapabilityModuleOutputFieldDescriptor>> {
+    let schema = schema.as_object()?;
+    if schema.get("type")?.as_str()? != "object" {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.len() > maximum_fields.saturating_sub(*retained_fields) {
+        return None;
+    }
+
+    let mut required = BTreeSet::<String>::new();
+    if let Some(entries) = schema.get("required") {
+        for entry in entries.as_array()? {
+            let name = entry.as_str()?;
+            if !properties.contains_key(name)
+                || name.len() > maximum_name_bytes
+                || !is_canonical_identifier(name)
+                || !required.insert(name.to_owned())
+            {
+                return None;
+            }
+        }
+    }
+
+    let mut fields = Vec::with_capacity(properties.len());
+    for (name, field_schema_value) in properties {
+        if name.len() > maximum_name_bytes || !is_canonical_identifier(name) {
+            return None;
+        }
+        *retained_fields = retained_fields.checked_add(1)?;
+        if *retained_fields > maximum_fields {
+            return None;
+        }
+        let field_schema = field_schema_value.as_object()?;
+        let field_type = match field_schema.get("type") {
+            Some(value) => CapabilityModuleOutputFieldType::from_schema_type(value.as_str()?)?,
+            None => CapabilityModuleOutputFieldType::Any,
+        };
+        let description = match field_schema.get("description") {
+            Some(value) => {
+                let description = value.as_str()?;
+                if description.len() > maximum_description_bytes {
+                    return None;
+                }
+                description.to_owned()
+            }
+            None => String::new(),
+        };
+        let child_fields = if remaining_child_depth > 0
+            && field_type == CapabilityModuleOutputFieldType::Object
+            && field_schema.contains_key("properties")
+        {
+            Some(direct_module_output_record_fields(
+                field_schema_value,
+                maximum_fields,
+                maximum_name_bytes,
+                maximum_description_bytes,
+                remaining_child_depth - 1,
+                retained_fields,
+            )?)
+        } else {
+            None
+        };
+        fields.push(CapabilityModuleOutputFieldDescriptor {
+            name: name.clone(),
+            field_type,
+            required: required.contains(name.as_str()),
+            description,
+            fields: child_fields,
+        });
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(fields)
+}
+
+fn capability_module_output_field_count(fields: &[CapabilityModuleOutputFieldDescriptor]) -> usize {
+    fields.iter().fold(0_usize, |count, field| {
+        count.saturating_add(1).saturating_add(
+            field
+                .fields
+                .as_deref()
+                .map(capability_module_output_field_count)
+                .unwrap_or(0),
+        )
+    })
 }
 
 fn direct_module_record_fields(
@@ -6175,6 +6298,7 @@ mod tests {
                         field_type: CapabilityModuleOutputFieldType::Integer,
                         required: true,
                         description: String::new(),
+                        fields: None,
                     }]),
                 }],
             }]
@@ -6214,6 +6338,7 @@ mod tests {
                         field_type: CapabilityModuleOutputFieldType::Integer,
                         required: true,
                         description: String::new(),
+                        fields: None,
                     }]),
                 },
             ]
@@ -6309,7 +6434,22 @@ mod tests {
         );
         assert_eq!(
             direct_module_output_fields(Some(&compatible)),
-            direct_module_input_fields(Some(&compatible))
+            Some(vec![
+                CapabilityModuleOutputFieldDescriptor {
+                    name: "count".to_owned(),
+                    field_type: CapabilityModuleOutputFieldType::Integer,
+                    required: true,
+                    description: "Number of requested items.".to_owned(),
+                    fields: None,
+                },
+                CapabilityModuleOutputFieldDescriptor {
+                    name: "filter".to_owned(),
+                    field_type: CapabilityModuleOutputFieldType::String,
+                    required: false,
+                    description: String::new(),
+                    fields: None,
+                },
+            ])
         );
         assert!(direct_module_input_fields(Some(&json!({"type": "array"}))).is_none());
         assert!(direct_module_input_fields(Some(&json!({"type": "object"}))).is_none());
@@ -6329,6 +6469,153 @@ mod tests {
             "properties": {"not-valid": {"type": "integer"}}
         })))
         .is_none());
+    }
+
+    #[test]
+    fn direct_module_output_field_projection_retains_one_complete_object_child_level() {
+        let nested = json!({
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "description": "Reviewed state."
+                },
+                "summary": {
+                    "type": "object",
+                    "description": "Reviewed aggregate.",
+                    "properties": {
+                        "origin": {"type": "string"},
+                        "total": {
+                            "type": "integer",
+                            "description": "Nested total."
+                        }
+                    },
+                    "required": ["total"]
+                }
+            },
+            "required": ["summary"]
+        });
+
+        assert_eq!(
+            direct_module_output_fields(Some(&nested)),
+            Some(vec![
+                CapabilityModuleOutputFieldDescriptor {
+                    name: "state".to_owned(),
+                    field_type: CapabilityModuleOutputFieldType::String,
+                    required: false,
+                    description: "Reviewed state.".to_owned(),
+                    fields: None,
+                },
+                CapabilityModuleOutputFieldDescriptor {
+                    name: "summary".to_owned(),
+                    field_type: CapabilityModuleOutputFieldType::Object,
+                    required: true,
+                    description: "Reviewed aggregate.".to_owned(),
+                    fields: Some(vec![
+                        CapabilityModuleOutputFieldDescriptor {
+                            name: "origin".to_owned(),
+                            field_type: CapabilityModuleOutputFieldType::String,
+                            required: false,
+                            description: String::new(),
+                            fields: None,
+                        },
+                        CapabilityModuleOutputFieldDescriptor {
+                            name: "total".to_owned(),
+                            field_type: CapabilityModuleOutputFieldType::Integer,
+                            required: true,
+                            description: "Nested total.".to_owned(),
+                            fields: None,
+                        },
+                    ]),
+                },
+            ])
+        );
+
+        let unsupported_grandchild = json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "object",
+                    "properties": {
+                        "detail": {
+                            "type": "object",
+                            "properties": {"value": {"type": "integer"}}
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            direct_module_output_fields(Some(&unsupported_grandchild)),
+            Some(vec![CapabilityModuleOutputFieldDescriptor {
+                name: "summary".to_owned(),
+                field_type: CapabilityModuleOutputFieldType::Object,
+                required: false,
+                description: String::new(),
+                fields: Some(vec![CapabilityModuleOutputFieldDescriptor {
+                    name: "detail".to_owned(),
+                    field_type: CapabilityModuleOutputFieldType::Object,
+                    required: false,
+                    description: String::new(),
+                    fields: None,
+                }]),
+            }])
+        );
+
+        assert!(direct_module_output_fields(Some(&json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "object",
+                    "properties": {"not-valid": {"type": "integer"}}
+                }
+            }
+        })))
+        .is_none());
+
+        let mut too_many_child_fields = serde_json::Map::new();
+        for index in 0..MAX_CAPABILITY_MODULE_OUTPUT_FIELDS {
+            too_many_child_fields.insert(format!("field_{index}"), json!({"type": "integer"}));
+        }
+        assert!(direct_module_output_fields(Some(&json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "object",
+                    "properties": too_many_child_fields
+                }
+            }
+        })))
+        .is_none());
+
+        let wire_projection = direct_module_output_fields(Some(&nested))
+            .expect("nested output projection remains serializable");
+        assert_eq!(
+            serde_json::to_value(wire_projection).expect("nested output projection serializes"),
+            json!([
+                {
+                    "name": "state",
+                    "type": "string",
+                    "required": false,
+                    "description": "Reviewed state."
+                },
+                {
+                    "name": "summary",
+                    "type": "object",
+                    "required": true,
+                    "description": "Reviewed aggregate.",
+                    "fields": [
+                        {"name": "origin", "type": "string", "required": false},
+                        {
+                            "name": "total",
+                            "type": "integer",
+                            "required": true,
+                            "description": "Nested total."
+                        }
+                    ]
+                }
+            ])
+        );
     }
 
     #[test]
@@ -6389,9 +6676,9 @@ mod tests {
         let mut runtime = CapabilityRuntime::default();
 
         for module_index in 0..=module_count {
-            let mut properties = serde_json::Map::new();
-            for field_index in 0..MAX_CAPABILITY_MODULE_OUTPUT_FIELDS {
-                properties.insert(format!("field_{field_index}"), json!({"type": "integer"}));
+            let mut child_properties = serde_json::Map::new();
+            for field_index in 1..MAX_CAPABILITY_MODULE_OUTPUT_FIELDS {
+                child_properties.insert(format!("field_{field_index}"), json!({"type": "integer"}));
             }
             let contract = JsonToolContract::new(
                 json!({
@@ -6401,7 +6688,12 @@ mod tests {
                 }),
                 json!({
                     "type": "object",
-                    "properties": properties,
+                    "properties": {
+                        "summary": {
+                            "type": "object",
+                            "properties": child_properties
+                        }
+                    },
                     "additionalProperties": false
                 }),
             )

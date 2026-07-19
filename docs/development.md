@@ -257,12 +257,15 @@ Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
 4 KiB description and optional exact-leaf `callMode` of `synchronous` or
 `deferred`, plus an optional exact-leaf `callShape` of `single_json` and its
-optional compact `inputFields` and `outputFields` record views. A mode-bearing
+optional compact `inputFields` and `outputFields` record views. An object
+`outputFields` entry may carry one direct child `fields` list; input entries and
+output children cannot carry `fields`. A mode-bearing
 path must be at least `mod.<module>.<method>`; a shape requires a mode and
 record fields require that shape. Each field has a canonical identifier up to
 128 bytes, one fixed JSON type, an explicit Boolean `required` bit, and an
 optional 4 KiB description. The LSP retains at most 256 descriptors, 1,024
-aggregate input fields, 1,024 aggregate output fields, and 512 KiB of
+aggregate input fields, 1,024 aggregate output fields including direct object
+children, and 512 KiB of
 path/description/call-mode/call-shape/field bytes. Paths below the fixed
 `mod.tool` namespace are rejected. A malformed recognized call mode, shape, or
 field projection, a shape without a mode, record fields without a shape,
@@ -290,12 +293,14 @@ additionally complete an undeclared top-level key only in that leaf's first
 direct literal record argument from `inputFields`, after the same visible-import
 or qualifying-alias and exact-leaf checks. For an exact original binding such
 as `let result = receiver.method(input)`, where `receiver` is that import or
-qualifying alias, or the exact deferred `.await()` form, it also completes and hovers top-level
-`result.field` names from `outputFields`. It follows exact local
+qualifying alias, or the exact deferred `.await()` form, it also completes and
+hovers root `result.field` names from `outputFields`, plus one explicit object
+child path such as `result.summary.total`. It follows exact local
 `let alias = result` chains of at most 16 hops. The whole result-alias group,
 including later aliases, must remain stable throughout the source; incomplete
 alias metadata returns no output fields with incomplete completion. It rejects
-computed/deeper aliases, mutations and escapes, nested result chains,
+computed/deeper aliases, mutations and escapes, direct field-selection aliases,
+result paths below the one object-child level,
 parenthesized/computed initializers, extra arguments, mismatched call mode,
 and source beyond the safe diagnostic prefix. It does not inspect a runtime
 value, evaluate JSON Schema, or validate a contract.

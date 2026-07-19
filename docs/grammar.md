@@ -396,21 +396,23 @@ For an exact visible imported capability-module leaf, the optional advisory
 `moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,
 and compact `inputFields` and `outputFields`. Each field has a canonical
 identifier, one fixed JSON type, a required bit, and optional plain-text
-description. The LSP shows both bounded field lists in leaf hover and signature
+description. An object output field may carry one direct child `fields` list;
+input fields and output children cannot. The LSP shows both bounded field lists in leaf hover and signature
 help, and can complete an undeclared top-level key in the first direct
 literal-record argument from `inputFields`. For an exact source binding through
 a direct visible import or qualifying exact root alias, such as
 `let result = receiver.method(input)` on a synchronous leaf, or the exact
 `let result = receiver.method(input).await()` form on a deferred leaf, it also
-completes and hovers top-level `result.field` names from `outputFields`. It can
-follow exact local `let alias = result` chains of at most 16 hops and serves
-the same top-level fields at `alias.field`. The whole result-alias group,
-including aliases declared after the member site, must remain stable; truncated
-alias metadata makes output completion empty and incomplete. That bounded
-recognizer rejects parenthesized or computed aliases, deeper alias chains,
-mutations or escapes, parenthesized or computed initializers, extra arguments,
-other postfix chains, nested result chains, shadowed imports, and source beyond
-the safe diagnostic prefix. It does not complete nested record keys, evaluate
+completes and hovers root `result.field` names from `outputFields` and one
+retained object-child path such as `result.summary.total`. It can follow exact
+local `let alias = result` chains of at most 16 hops and serves the same paths
+at `alias.summary.total`. The whole result-alias group, including aliases
+declared after the member site, must remain stable; truncated alias metadata
+makes output completion empty and incomplete. That bounded recognizer rejects
+parenthesized or computed aliases, deeper alias chains, mutations or escapes,
+parenthesized or computed initializers, extra arguments, other postfix chains,
+result paths below that child level, shadowed imports, and source beyond the
+safe diagnostic prefix. It does not complete nested input-record keys, evaluate
 JSON Schema, read a runtime, validate a contract, or grant a capability. Record
 fields without the exact one-JSON-value call shape, and any malformed or
 over-limit field projection, fail closed with the rest of the advisory module

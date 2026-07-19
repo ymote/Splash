@@ -37,8 +37,8 @@ and keeps UI support optional rather than making UI the language boundary.
   same-document lexical definitions, references, binding-kind hover, and symbol
   highlights, lexical completion including the fixed `mod.tool` API and optional
   advisory tool and module metadata, bounded fixed/advisory capability signature
-  help, and version-bound guarded rename without reading files or evaluating
-  code.
+  help, one bounded direct-module output-object child level, and version-bound
+  guarded rename without reading files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, individual-string, tracked Splash-owned

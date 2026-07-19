@@ -32,9 +32,10 @@
   escapes, and truncated alias metadata fail closed; fixed `mod.tool` methods
   remain direct-import-only. Exact one-JSON-value leaves can present bounded
   schema-derived input and output record fields in hover/signature help, with
-  input-key completion only in the first direct literal record argument,
-  without module loading, resolution, runtime export inspection, or authority
-  inference.
+  input-key completion only in the first direct literal record argument and
+  result-field completion/hover at the root plus one explicit output-object
+  child level, without module loading, resolution, runtime export inspection,
+  or authority inference.
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context
@@ -349,10 +350,11 @@
 - Additional semantic editor features beyond lexical completion, fixed
   `mod.tool`, bounded direct literal/direct-alias record fields,
   catalog-backed chained lookup and static input/output contract presentation
-  from a visible imported-module binding, bounded direct-module result-field
-  completion/hover through stable exact local alias groups, and direct advisory
-  workflow-data fields. General module resolution, computed/deeper result
-  aliases and chains, and broader type-aware field semantics remain open.
+  from a visible imported-module binding, bounded direct-module root and one
+  object-child result-field completion/hover through stable exact local alias
+  groups, and direct advisory workflow-data fields. General module resolution,
+  computed/deeper result aliases and chains, and broader type-aware field
+  semantics remain open.
 - Sustained parser/VM differential fuzzing, LSP document and advisory
   configuration lifecycle fuzzing, expanded resource-exhaustion coverage, and
   corpus triage.

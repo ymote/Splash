@@ -1020,6 +1020,7 @@ mod tests {
                                 splash_capabilities::CapabilityModuleOutputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                     ]),
                 },

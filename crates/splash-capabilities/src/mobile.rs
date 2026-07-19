@@ -644,6 +644,7 @@ mod tests {
                         field_type: crate::CapabilityModuleOutputFieldType::Integer,
                         required: true,
                         description: String::new(),
+                        fields: None,
                     }]),
                 },
             ]
