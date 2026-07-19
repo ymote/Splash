@@ -23,6 +23,7 @@
 "math.pow("
 "math.sqrt("
 "math.pi"
+"assert("
 ".await()"
 "splash"
 "toolCatalog"

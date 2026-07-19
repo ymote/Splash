@@ -152,6 +152,12 @@ receiver, an unknown core-math member, or source outside the valid prefix gets
 no fixed-core result; a matching advisory catalog path cannot extend the core
 surface.
 
+An exact visible direct `use mod.std.assert` binding receives fixed plain-text
+hover and `assert(condition)` signature help. A direct `std.assert(...)` call
+after `use mod.std` receives the same fixed signature. This is compiled-in
+source metadata, not a host lookup or capability grant; aliases, shadowed
+bindings, and non-core imports receive no fixed assertion result.
+
 The same static projection completes `std` at a statement-position `use mod.`
 path and `assert`/`math` below `use mod.std.`. The frozen `mod.std` namespace
 has no advisory catalog children, so metadata cannot add `log`, `inspect`, or

@@ -271,6 +271,15 @@ const STANDARD_MATH_CONSTANTS: &[StandardMathConstant] = &[
 const STANDARD_MATH_AUTHORITY_NOTE: &str =
     "Effect-free Splash core helper; it does not access the host or grant authority.";
 
+const STANDARD_ASSERT_DESCRIPTION: &str = "Raises a script error when the condition is false.";
+const STANDARD_ASSERT_AUTHORITY_NOTE: &str =
+    "Fixed Splash core helper; it does not access the host or grant authority.";
+const STANDARD_ASSERT_DOCUMENTATION: &str = concat!(
+    "assert(condition)\n\n",
+    "Raises a script error when the condition is false.\n\n",
+    "Fixed Splash core helper; it does not access the host or grant authority."
+);
+
 /// One fixed path child in Splash's documented core import tree.
 ///
 /// This is intentionally separate from the host-owned advisory module catalog.
@@ -293,9 +302,8 @@ const FIXED_ROOT_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[FixedCore
 const FIXED_STANDARD_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[
     FixedCoreModulePathChild {
         name: "assert",
-        detail: "Splash core module; effect-free assertion helper",
-        documentation:
-            "Fixed Splash core assertion helper. It does not resolve a host module or grant authority.",
+        detail: "Splash core function; fixed assertion helper",
+        documentation: STANDARD_ASSERT_DOCUMENTATION,
     },
     FixedCoreModulePathChild {
         name: "math",
@@ -943,6 +951,20 @@ impl SplashLanguageServer {
             return Ok(None);
         };
 
+        if !report.truncated && symbol.kind == LexicalSymbolKind::Import {
+            let (_, lexical) = self.lexical_completions(uri)?;
+            let imports = self.module_imports(uri)?;
+            if is_visible_builtin_standard_assert_receiver(source, lexical, imports, occurrence) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::PlainText,
+                        value: standard_assert_documentation("assert"),
+                    }),
+                    range: Some(span_range(source, occurrence)),
+                }));
+            }
+        }
+
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -1217,6 +1239,28 @@ impl SplashLanguageServer {
         let Some(byte_offset) = byte_at_position(source, position) else {
             return Ok(None);
         };
+        if let Some(context) = direct_function_signature_help_call_context(source, byte_offset) {
+            let imports = self.module_imports(uri)?;
+            if imports.truncated
+                || context.callee.end_byte > lexical.valid_prefix_end_byte
+                || context.callee.end_byte > imports.valid_prefix_end_byte
+            {
+                return Ok(None);
+            }
+            if is_visible_builtin_standard_assert_receiver(source, lexical, imports, context.callee)
+            {
+                let callee = source
+                    .get(context.callee.start_byte..context.callee.end_byte)
+                    .ok_or_else(|| {
+                        "the direct signature-help callee has an invalid source span".to_owned()
+                    })?;
+                return Ok(Some(standard_assert_signature_help(
+                    callee,
+                    context.active_argument,
+                )));
+            }
+            return Ok(None);
+        }
         let Some(context) = signature_help_call_context(source, byte_offset) else {
             return Ok(None);
         };
@@ -1245,6 +1289,9 @@ impl SplashLanguageServer {
             )
         {
             return Ok(standard_math_signature_help(source, context));
+        }
+        if is_visible_builtin_standard_assert_member(source, lexical, imports, context.callee) {
+            return Ok(standard_assert_member_signature_help(source, context));
         }
         if self.module_catalog.unavailable {
             return Ok(None);
@@ -1511,12 +1558,16 @@ const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
 const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "use mod.tool\n",
     "use mod.fuzz.inspect\n",
+    "use mod.std\n",
+    "use mod.std.assert\n",
     "use mod.std.math\n",
     "let result = inspect.remote_add({left: 20, filters: {category: \"news\"}, right: 22}).await()\n",
     "let alias = result\n",
     "alias.summary.total\n",
     "let bounded = math.clamp(math.sqrt(81), 0, 8)\n",
     "math.pi\n",
+    "assert(true)\n",
+    "std.assert(true)\n",
     "tool.call(\"\", \"\")\n",
     "workflow.input.request\n",
     "workflow.outputs.prepare.total"
@@ -1668,6 +1719,7 @@ pub fn fuzz_exercise_document(source: &str) {
     );
     fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 4);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
@@ -1714,6 +1766,7 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
     server.refresh_advisory_configuration(settings);
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 2);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
@@ -1795,6 +1848,28 @@ fn fuzz_exercise_fixed_standard_math_requests(
         return;
     };
     let _ = server.signature_help(uri, position_at_byte(source, minimum_start + 1));
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_fixed_standard_assert_requests(
+    server: &SplashLanguageServer,
+    uri: &Uri,
+    source: &str,
+) {
+    let Some(direct_start) = source.find("assert(true)") else {
+        return;
+    };
+    let direct_argument = direct_start + "assert(".len();
+    let _ = server.hover(uri, position_at_byte(source, direct_start + 1));
+    let _ = server.signature_help(uri, position_at_byte(source, direct_argument));
+
+    let Some(member_start) = source.find("std.assert(true)") else {
+        return;
+    };
+    let member_assert_start = member_start + "std.".len();
+    let member_argument = member_start + "std.assert(".len();
+    let _ = server.hover(uri, position_at_byte(source, member_assert_start + 1));
+    let _ = server.signature_help(uri, position_at_byte(source, member_argument));
 }
 
 #[cfg(fuzzing)]
@@ -3105,6 +3180,12 @@ struct SignatureHelpCallContext {
     active_argument: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectFunctionSignatureHelpCallContext {
+    callee: SourceSpan,
+    active_argument: usize,
+}
+
 /// An exact root or direct child key position in the first literal-record
 /// argument to a direct module method. The scanner retains only prior key
 /// names so it can avoid proposing duplicate metadata fields without assigning
@@ -3603,11 +3684,7 @@ fn signature_help_call_context(
     source: &str,
     byte_offset: usize,
 ) -> Option<SignatureHelpCallContext> {
-    let delimiters = signature_help_delimiters_before(source, byte_offset)?;
-    let opening = delimiters
-        .iter()
-        .rev()
-        .find(|delimiter| delimiter.kind == SignatureHelpDelimiterKind::Round)?;
+    let opening = signature_help_opening_delimiter_before(source, byte_offset)?;
     let callee_end = skip_ascii_whitespace_backward(source, opening.opening_byte);
     let callee = direct_module_member_completion_site(source, callee_end)?;
     (callee.member.end_byte == callee_end).then_some(SignatureHelpCallContext {
@@ -3615,6 +3692,46 @@ fn signature_help_call_context(
         opening_byte: opening.opening_byte,
         active_argument: opening.argument_count,
     })
+}
+
+/// Finds the enclosing direct identifier call at a cursor without treating a
+/// member call, alias, or computed expression as a fixed core function.
+fn direct_function_signature_help_call_context(
+    source: &str,
+    byte_offset: usize,
+) -> Option<DirectFunctionSignatureHelpCallContext> {
+    let opening = signature_help_opening_delimiter_before(source, byte_offset)?;
+    let callee_end = skip_ascii_whitespace_backward(source, opening.opening_byte);
+    let callee_start = identifier_start_before(source, callee_end);
+    if callee_start == callee_end {
+        return None;
+    }
+    let prefix_end = skip_ascii_whitespace_backward(source, callee_start);
+    if prefix_end > 0 && source.as_bytes()[prefix_end - 1] == b'.' {
+        return None;
+    }
+    let callee = source.get(callee_start..callee_end)?;
+    if !is_canonical_identifier(callee) {
+        return None;
+    }
+    Some(DirectFunctionSignatureHelpCallContext {
+        callee: SourceSpan {
+            start_byte: callee_start,
+            end_byte: callee_end,
+        },
+        active_argument: opening.argument_count,
+    })
+}
+
+fn signature_help_opening_delimiter_before(
+    source: &str,
+    byte_offset: usize,
+) -> Option<SignatureHelpDelimiter> {
+    signature_help_delimiters_before(source, byte_offset)?
+        .iter()
+        .rev()
+        .find(|delimiter| delimiter.kind == SignatureHelpDelimiterKind::Round)
+        .copied()
 }
 
 /// Scans one bounded source prefix while preserving only delimiter state and
@@ -4584,6 +4701,12 @@ fn standard_math_constant(name: &str) -> Option<&'static StandardMathConstant> {
     STANDARD_MATH_CONSTANTS
         .iter()
         .find(|constant| constant.name == name)
+}
+
+fn standard_assert_documentation(callee: &str) -> String {
+    format!(
+        "{callee}(condition)\n\n{STANDARD_ASSERT_DESCRIPTION}\n\n{STANDARD_ASSERT_AUTHORITY_NOTE}"
+    )
 }
 
 fn standard_math_function_documentation(function: &StandardMathFunction, receiver: &str) -> String {
@@ -6000,6 +6123,26 @@ fn standard_math_signature_help(
     ))
 }
 
+fn standard_assert_signature_help(callee: &str, active_argument: usize) -> SignatureHelp {
+    signature_help_with_parameters(
+        format!("{callee}(condition)"),
+        standard_assert_documentation(callee),
+        &["condition"],
+        active_argument,
+    )
+}
+
+fn standard_assert_member_signature_help(
+    source: &str,
+    context: SignatureHelpCallContext,
+) -> Option<SignatureHelp> {
+    let callee = source.get(context.callee.receiver.start_byte..context.callee.member.end_byte)?;
+    Some(standard_assert_signature_help(
+        callee,
+        context.active_argument,
+    ))
+}
+
 fn module_catalog_signature_help(
     source: &str,
     module: &ModuleCatalogCompletion,
@@ -6117,6 +6260,29 @@ fn is_visible_builtin_standard_math_receiver(
 ) -> bool {
     visible_module_import_for_receiver(source, lexical, imports, receiver)
         .is_some_and(is_builtin_standard_math_module_import)
+}
+
+fn is_visible_builtin_standard_assert_receiver(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    receiver: SourceSpan,
+) -> bool {
+    visible_module_import_for_receiver(source, lexical, imports, receiver)
+        .is_some_and(is_builtin_standard_assert_module_import)
+}
+
+fn is_visible_builtin_standard_assert_member(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+) -> bool {
+    if source.get(site.member.start_byte..site.member.end_byte) != Some("assert") {
+        return false;
+    }
+    fixed_core_direct_import_path_for_member(source, lexical, imports, site)
+        .is_some_and(|path| module_path_matches(&path, &["mod", "std"]))
 }
 
 fn visible_module_import_for_receiver<'imports>(
@@ -6906,6 +7072,14 @@ fn is_builtin_standard_math_module_import(import: &ModuleImport) -> bool {
         .iter()
         .map(String::as_str)
         .eq(["mod", "std", "math"])
+}
+
+fn is_builtin_standard_assert_module_import(import: &ModuleImport) -> bool {
+    import
+        .path
+        .iter()
+        .map(String::as_str)
+        .eq(["mod", "std", "assert"])
 }
 
 fn require_complete_lexical_report(report: &LexicalSymbolReport) -> Result<(), String> {
@@ -7976,6 +8150,151 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn presents_fixed_standard_assert_hover_and_signature_help_without_authority() {
+        let direct_source = "use mod.std.assert\nassert(true)";
+        let mut direct_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.std.assert",
+                    "description": "Host metadata must not replace core assertions.",
+                    "callMode": "deferred",
+                    "callShape": "single_json"
+                }
+            ])),
+        );
+        direct_server.open_document(document(1, direct_source));
+        let direct_assert_start = direct_source.rfind("assert").expect("assert call exists");
+        let direct_hover = direct_server
+            .hover(
+                &test_uri(),
+                position_at_byte(direct_source, direct_assert_start + 1),
+            )
+            .expect("direct assertion hover succeeds")
+            .expect("direct assertion has fixed hover metadata");
+        assert_eq!(
+            direct_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: STANDARD_ASSERT_DOCUMENTATION.to_owned(),
+            })
+        );
+
+        let direct_argument = direct_source.find("true").expect("condition exists") + 1;
+        let direct_signature = direct_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(direct_source, direct_argument),
+            )
+            .expect("direct assertion signature help succeeds")
+            .expect("direct assertion has a fixed signature");
+        assert_eq!(direct_signature.signatures.len(), 1);
+        assert_eq!(direct_signature.signatures[0].label, "assert(condition)");
+        assert_eq!(direct_signature.active_signature, Some(0));
+        assert_eq!(direct_signature.active_parameter, Some(0));
+        assert_eq!(
+            direct_signature.signatures[0].parameters,
+            Some(vec![ParameterInformation {
+                label: ParameterLabel::Simple("condition".to_owned()),
+                documentation: None,
+            }])
+        );
+
+        let namespace_source = "use mod.std\nstd.assert(true)";
+        let mut namespace_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.std.assert",
+                    "description": "Host metadata must not replace core assertions.",
+                    "callMode": "deferred",
+                    "callShape": "single_json"
+                }
+            ])),
+        );
+        namespace_server.open_document(document(1, namespace_source));
+        let member_start = namespace_source.rfind("assert").expect("member exists");
+        let member_hover = namespace_server
+            .hover(
+                &test_uri(),
+                position_at_byte(namespace_source, member_start + 1),
+            )
+            .expect("namespace assertion hover succeeds")
+            .expect("namespace assertion has fixed hover metadata");
+        assert_eq!(
+            member_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: STANDARD_ASSERT_DOCUMENTATION.to_owned(),
+            })
+        );
+        let member_argument = namespace_source.find("true").expect("condition exists") + 1;
+        let member_signature = namespace_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(namespace_source, member_argument),
+            )
+            .expect("namespace assertion signature help succeeds")
+            .expect("namespace assertion has a fixed signature");
+        assert_eq!(
+            member_signature.signatures[0].label,
+            "std.assert(condition)"
+        );
+        let Some(Documentation::MarkupContent(MarkupContent { value, .. })) =
+            member_signature.signatures[0].documentation.as_ref()
+        else {
+            panic!("fixed assertion signature has plain-text documentation");
+        };
+        assert_eq!(value, &standard_assert_documentation("std.assert"));
+
+        let alias_source = "use mod.std.assert\nlet check = assert\ncheck(true)";
+        let mut alias_server = SplashLanguageServer::default();
+        alias_server.open_document(document(1, alias_source));
+        let alias_argument = alias_source.find("true").expect("condition exists") + 1;
+        assert!(alias_server
+            .signature_help(&test_uri(), position_at_byte(alias_source, alias_argument))
+            .expect("alias assertion signature request succeeds")
+            .is_none());
+
+        let shadowed_source = "use mod.std.assert\nlet assert = true\nassert(true)";
+        let mut shadowed_server = SplashLanguageServer::default();
+        shadowed_server.open_document(document(1, shadowed_source));
+        let shadowed_argument = shadowed_source.find("true)").expect("condition exists") + 1;
+        assert!(shadowed_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(shadowed_source, shadowed_argument),
+            )
+            .expect("shadowed assertion signature request succeeds")
+            .is_none());
+
+        let unrelated_source = "use mod.custom.assert\nassert(true)";
+        let mut unrelated_server = SplashLanguageServer::default();
+        unrelated_server.open_document(document(1, unrelated_source));
+        let unrelated_argument = unrelated_source.find("true").expect("condition exists") + 1;
+        assert!(unrelated_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(unrelated_source, unrelated_argument),
+            )
+            .expect("unrelated assertion signature request succeeds")
+            .is_none());
+
+        for source in [
+            "use mod.std.assert\nlet note = \"assert(true)\"",
+            "use mod.std.assert\n// assert(true)",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+            let argument = source.find("true").expect("non-code condition exists") + 1;
+            assert!(server
+                .signature_help(&test_uri(), position_at_byte(source, argument))
+                .expect("non-code assertion signature request succeeds")
+                .is_none());
+        }
     }
 
     #[test]
@@ -10259,7 +10578,7 @@ mod tests {
             .expect("fixed assertion module is present");
         assert_eq!(
             nested_assert.detail.as_deref(),
-            Some("Splash core module; effect-free assertion helper")
+            Some("Splash core function; fixed assertion helper")
         );
 
         let member_source = "use mod.std\nstd.";
@@ -10301,13 +10620,13 @@ mod tests {
             .expect("fixed assertion member is present");
         assert_eq!(
             assert_member.detail.as_deref(),
-            Some("Splash core module; effect-free assertion helper")
+            Some("Splash core function; fixed assertion helper")
         );
         assert_eq!(
             assert_member.documentation,
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::PlainText,
-                value: "Fixed Splash core assertion helper. It does not resolve a host module or grant authority.".to_owned(),
+                value: STANDARD_ASSERT_DOCUMENTATION.to_owned(),
             }))
         );
         let chained_member_source = "use mod.service\nservice.inspect.";

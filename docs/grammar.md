@@ -411,6 +411,12 @@ local alias, or derive a host capability. A shadowed binding, chained receiver,
 unknown member, or invalid source prefix has no fixed-math result, and advisory
 metadata cannot add members to this core module.
 
+An exact visible direct `use mod.std.assert` binding receives fixed plain-text
+hover and `assert(condition)` signature help. A direct `std.assert(...)` call
+after `use mod.std` receives the same fixed signature. These assertions are
+compiled-in source metadata, not a host lookup or capability grant; aliases,
+shadowed bindings, and non-core imports receive no fixed assertion result.
+
 The same compiled-in projection completes `std` at a statement-position `use
 mod.` path and `assert`/`math` below `use mod.std.`. The frozen `mod.std`
 namespace has no catalog descendants: advisory metadata cannot add `log`,

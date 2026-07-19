@@ -168,6 +168,9 @@ namespace: `use mod.` can suggest `std`, and `use mod.std.` can suggest only
 the documented `assert` and `math` core modules. The server suppresses advisory
 children below that namespace, matching the runtime's frozen `std` object; an
 integration must use a distinct host-owned `mod.*` namespace for capabilities.
+For an exact visible `use mod.std.assert` binding, and direct `std.assert(...)`
+after `use mod.std`, assertion hover and signature help are likewise compiled
+in and carry no catalog lookup, host access, or authority.
 Suggested names remain subject to runtime module binding, catalog, and lease
 checks. Guarded rename is advertised only to a client that supports versioned
 document edits. It never renames an
