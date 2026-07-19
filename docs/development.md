@@ -250,6 +250,8 @@ parenthesized/computed edges, and other escapes suppress all catalog metadata
 for the group. This bounded source-only rule covers member completion, hover,
 signature help, input-key completion, and shaped result fields. It does not
 alias the fixed `mod.tool` API, which remains direct-import-only.
+When alias metadata is capped, local-alias completion fails closed and is marked
+incomplete; direct imported-module completion remains independent of that cap.
 
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional

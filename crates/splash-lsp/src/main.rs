@@ -3928,7 +3928,14 @@ fn module_catalog_input_field_completion(
     site: DirectModuleInputRecordCompletionSite,
     is_incomplete: bool,
 ) -> CompletionList {
-    let is_incomplete = is_incomplete || catalog.unavailable;
+    let is_incomplete = is_incomplete
+        || catalog.unavailable
+        || module_catalog_alias_metadata_is_truncated_at_receiver(
+            source,
+            lexical,
+            shapes,
+            site.context.callee.receiver,
+        );
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
@@ -4022,7 +4029,15 @@ fn module_catalog_output_field_completion(
     is_incomplete: bool,
 ) -> Option<CompletionList> {
     let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
-    let is_incomplete = is_incomplete || imports.truncated || catalog.unavailable;
+    let is_incomplete = is_incomplete
+        || imports.truncated
+        || catalog.unavailable
+        || module_catalog_alias_metadata_is_truncated_at_receiver(
+            source,
+            lexical,
+            shapes,
+            output_binding.call.receiver,
+        );
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
@@ -4346,6 +4361,13 @@ fn module_catalog_member_completion(
     site: MemberCompletionSite,
     is_incomplete: bool,
 ) -> CompletionList {
+    let is_incomplete = is_incomplete
+        || module_catalog_alias_metadata_is_truncated_at_receiver(
+            source,
+            lexical,
+            shapes,
+            site.receiver,
+        );
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
@@ -5226,6 +5248,25 @@ fn visible_module_import_or_alias_for_catalog_receiver<'imports>(
     let import = aliases.imported_module_for_symbol(initial)?;
     let group = aliases.alias_group(import.binding.start_byte);
     imported_module_alias_group_is_stable(source, &aliases, &group, receiver).then_some(import)
+}
+
+/// Reports only the missing source metadata that can affect a local module
+/// alias. Direct imports do not depend on the static alias report, so their
+/// advisory completion remains complete when unrelated alias edges are capped.
+fn module_catalog_alias_metadata_is_truncated_at_receiver(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    shapes: &StaticRecordShapeReport,
+    receiver: SourceSpan,
+) -> bool {
+    if !shapes.aliases_truncated || receiver.end_byte > lexical.valid_prefix_end_byte {
+        return false;
+    }
+    let Some(receiver_name) = source.get(receiver.start_byte..receiver.end_byte) else {
+        return false;
+    };
+    visible_symbol_at(lexical, receiver_name, receiver.start_byte)
+        .is_some_and(|symbol| symbol.kind == LexicalSymbolKind::Let)
 }
 
 fn imported_module_alias_group_is_stable(
@@ -9576,7 +9617,22 @@ mod tests {
         let catalog = module_catalog(serde_json::json!([
             {
                 "path": "mod.arithmetic.add",
-                "callMode": "synchronous"
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {
+                        "name": "right",
+                        "type": "integer",
+                        "required": false
+                    }
+                ],
+                "outputFields": [
+                    {
+                        "name": "total",
+                        "type": "integer",
+                        "required": true
+                    }
+                ]
             }
         ]));
 
@@ -9668,24 +9724,87 @@ mod tests {
         assert!(truncated_import_completion.is_incomplete);
         assert!(truncated_import_completion.items.is_empty());
 
-        let mut truncated_alias_source = String::from("use mod.arithmetic\n");
+        let mut truncated_alias_prefix = String::from("use mod.arithmetic\n");
         for index in 0..=MAX_STATIC_RECORD_ALIASES {
-            truncated_alias_source.push_str(&format!("let alias_{index} = arithmetic\n"));
+            truncated_alias_prefix.push_str(&format!("let alias_{index} = arithmetic\n"));
         }
+
+        let mut direct_import_source = truncated_alias_prefix.clone();
+        direct_import_source.push_str("arithmetic.");
+        let mut direct_import_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        direct_import_server.open_document(document(1, &direct_import_source));
+        let direct_import_completion = direct_import_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&direct_import_source, direct_import_source.len()),
+            )
+            .expect("truncated alias direct-import completion request succeeds");
+        assert!(!direct_import_completion.is_incomplete);
+        assert_eq!(
+            direct_import_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["add"]
+        );
+
+        let mut truncated_alias_source = truncated_alias_prefix.clone();
         truncated_alias_source.push_str("alias_0.");
         let mut truncated_alias_server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
-            catalog,
+            catalog.clone(),
         );
         truncated_alias_server.open_document(document(1, &truncated_alias_source));
-        assert!(truncated_alias_server
+        let truncated_alias_completion = truncated_alias_server
             .completion(
                 &test_uri(),
                 position_at_byte(&truncated_alias_source, truncated_alias_source.len()),
             )
-            .expect("truncated alias completion request succeeds")
-            .items
-            .is_empty());
+            .expect("truncated alias completion request succeeds");
+        assert!(truncated_alias_completion.is_incomplete);
+        assert!(truncated_alias_completion.items.is_empty());
+
+        let mut truncated_input_source = truncated_alias_prefix.clone();
+        truncated_input_source.push_str("let result = alias_0.add({ri: 22})");
+        let mut truncated_input_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        truncated_input_server.open_document(document(1, &truncated_input_source));
+        let input_start = truncated_input_source
+            .rfind("ri:")
+            .expect("truncated input field exists");
+        let truncated_input_completion = truncated_input_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&truncated_input_source, input_start + "ri".len()),
+            )
+            .expect("truncated input alias completion request succeeds");
+        assert!(truncated_input_completion.is_incomplete);
+        assert!(truncated_input_completion.items.is_empty());
+
+        let mut truncated_output_source = truncated_alias_prefix;
+        truncated_output_source.push_str("let result = alias_0.add({})\nresult.to");
+        let mut truncated_output_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        truncated_output_server.open_document(document(1, &truncated_output_source));
+        let output_start = truncated_output_source
+            .rfind("to")
+            .expect("truncated output field exists");
+        let truncated_output_completion = truncated_output_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&truncated_output_source, output_start + "to".len()),
+            )
+            .expect("truncated output alias completion request succeeds");
+        assert!(truncated_output_completion.is_incomplete);
+        assert!(truncated_output_completion.items.is_empty());
 
         let tool_alias_source = concat!("use mod.tool\n", "let tool_alias = tool\n", "tool_alias.");
         let mut tool_alias_server = SplashLanguageServer::with_completion_catalogs(

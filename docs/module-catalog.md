@@ -152,6 +152,9 @@ parenthesized/computed edges, and other escapes make completion, hover,
 input-key completion, result-field metadata, and signature help fail closed.
 It never resolves a module, evaluates source, or creates authority. The fixed
 `mod.tool` API deliberately does not use this alias rule.
+When retained alias edges are capped, a local-alias completion returns no
+catalog metadata and marks the completion incomplete; a direct import remains
+independent of that alias report.
 
 Hovering an exact catalog leaf reached through the same visible import or
 qualifying alias path returns its canonical catalog path, any plain-text
