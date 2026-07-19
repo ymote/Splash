@@ -122,8 +122,9 @@ pub const DEFAULT_MAX_TOOL_CATALOG_BYTES: usize = 512 * 1024;
 pub const DEFAULT_MAX_CAPABILITY_MODULES: usize = 32;
 /// Default maximum number of methods across every direct capability module.
 pub const DEFAULT_MAX_CAPABILITY_MODULE_METHODS: usize = 128;
-/// Default maximum byte length of the host-visible direct module interface
-/// catalog.
+/// Default maximum byte length of every retained direct-module catalog
+/// representation, including host-visible projections and the mapping retained
+/// for capability lease fingerprints.
 pub const DEFAULT_MAX_CAPABILITY_MODULE_CATALOG_BYTES: usize = 256 * 1024;
 /// Fixed upper bound for direct capability modules in one runtime.
 pub const MAX_CAPABILITY_MODULES: usize = 128;
@@ -135,8 +136,9 @@ pub const MAX_CAPABILITY_MODULE_METHODS_PER_MODULE: usize = 64;
 /// Fixed upper bound for host-facing direct module and method interface
 /// descriptors. This matches the LSP module-catalog entry ceiling.
 pub const MAX_CAPABILITY_MODULE_INTERFACE_ENTRIES: usize = 256;
-/// Fixed upper bound for the serialized host-visible direct module interface
-/// catalog.
+/// Fixed upper bound for every serialized retained direct-module catalog
+/// representation, including host-visible projections and the mapping retained
+/// for capability lease fingerprints.
 pub const MAX_CAPABILITY_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 /// Maximum UTF-8 byte length of one direct capability module or method name.
 pub const MAX_CAPABILITY_MODULE_IDENTIFIER_BYTES: usize = 64;
@@ -491,7 +493,8 @@ impl Default for CapabilityCatalogLimits {
 /// A direct capability module is a host-reviewed, flat `mod.<name>` binding
 /// whose methods route only to existing validated synchronous JSON tools. Its
 /// limits are independent of [`CapabilityCatalogLimits`] so an embedded host
-/// can bound both its LLM tool catalog and its script-visible module interface.
+/// can bound both its LLM tool catalog and every retained direct-module
+/// representation, including material retained to bind capability leases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityModuleLimits {
     pub max_modules: usize,
@@ -3880,7 +3883,7 @@ impl CapabilityRuntime {
     }
 
     /// Creates a runtime with explicit pending-promise, tool-catalog, and
-    /// direct-module interface bounds.
+    /// direct-module catalog-projection bounds.
     ///
     /// Direct modules remain a setup-only, flat interface over existing
     /// contract-enforced synchronous JSON tools. Their metadata is host-facing
@@ -4342,9 +4345,11 @@ impl CapabilityRuntime {
         };
         let mut candidate_catalog = self.capability_modules.clone();
         candidate_catalog.insert(descriptor.name.clone(), descriptor.clone());
-        let actual = serde_json::to_vec(&module_interface_catalog(&candidate_catalog))
-            .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?
-            .len();
+        let interface_material = serde_json::to_vec(&module_interface_catalog(&candidate_catalog))
+            .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?;
+        let fingerprint_material = serde_json::to_vec(&candidate_catalog)
+            .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?;
+        let actual = interface_material.len().max(fingerprint_material.len());
         if actual > self.capability_module_limits.max_serialized_bytes {
             return Err(
                 CapabilityModuleRegistrationError::CatalogByteLimitExceeded {
@@ -4353,8 +4358,6 @@ impl CapabilityRuntime {
                 },
             );
         }
-        let fingerprint_material = serde_json::to_vec(&candidate_catalog)
-            .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?;
 
         let bindings = resolved_methods
             .into_iter()
@@ -8590,6 +8593,66 @@ mod tests {
             runtime.capability_module_catalog()[0].name,
             "first".to_owned()
         );
+    }
+
+    #[test]
+    fn capability_module_limits_bound_lease_fingerprint_material_before_vm_mutation() {
+        let module = CapabilityModule::new("m", "d").with_method("x", "math.add");
+        let mut reference = CapabilityRuntime::default();
+        reference
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("d"),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        reference
+            .register_capability_module(module.clone())
+            .unwrap();
+
+        let interface_bytes =
+            serde_json::to_vec(&module_interface_catalog(&reference.capability_modules))
+                .unwrap()
+                .len();
+        let fingerprint_bytes = serde_json::to_vec(&reference.capability_modules)
+            .unwrap()
+            .len();
+        assert!(fingerprint_bytes > interface_bytes);
+
+        let mut runtime = CapabilityRuntime::with_limits_pending_catalog_and_module_limits(
+            ExecutionLimits::default(),
+            1,
+            CapabilityCatalogLimits::default(),
+            CapabilityModuleLimits {
+                max_modules: 1,
+                max_methods: 1,
+                max_serialized_bytes: interface_bytes,
+            },
+        )
+        .unwrap();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("d"),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime.register_capability_module(module).unwrap_err(),
+            CapabilityModuleRegistrationError::CatalogByteLimitExceeded {
+                actual: fingerprint_bytes,
+                maximum: interface_bytes,
+            }
+        );
+        assert!(runtime.capability_module_catalog().is_empty());
+        let mut installed = false;
+        runtime.runtime.configure(|vm| {
+            installed = vm.module(LiveId::from_str("m")).index() != 0;
+        });
+        assert!(!installed);
     }
 
     #[test]

@@ -137,9 +137,12 @@ names, dynamic libraries,
 and script-selected crates remain unavailable.
 
 `CapabilityModuleLimits` defaults to 32 modules, 128 methods, and a 256 KiB
-host-facing interface projection, with fixed hard ceilings of 128 modules, 256
-methods, and 512 KiB. The combined module and method projection is also capped
-at 256 entries so it can be passed to the LSP unchanged.
+bound across every retained direct-module catalog representation, with fixed
+hard ceilings of 128 modules, 256 methods, and 512 KiB. That includes the
+host-visible LSP interface projection and the exact mapping serialization
+retained for capability-lease fingerprints. The combined module and method
+projection is also capped at 256 entries so it can be passed to the LSP
+unchanged.
 `CapabilityRuntime::with_limits_pending_catalog_and_module_limits` lets a
 constrained host lower those bounds. Every direct target's configured
 input and output byte limits must fit the runtime JSON bridge: the smaller of

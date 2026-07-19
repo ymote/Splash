@@ -78,9 +78,9 @@ impl MobileRuntimeBuilder {
         )
     }
 
-    /// Creates a builder with explicit bounds for the tool catalog and the
-    /// setup-defined direct module interface. Direct module methods remain
-    /// schema-bound facades over reviewed local JSON tools.
+    /// Creates a builder with explicit bounds for the tool catalog and
+    /// setup-defined direct-module catalog projections. Direct module methods
+    /// remain schema-bound facades over reviewed local JSON tools.
     pub fn with_limits_catalog_and_module_limits(
         limits: ExecutionLimits,
         max_pending_tools: usize,
@@ -321,7 +321,7 @@ impl MobileRuntime {
         self.catalog_limits
     }
 
-    /// Returns the immutable direct module interface limits selected during
+    /// Returns the immutable direct-module catalog limits selected during
     /// setup.
     pub const fn capability_module_limits(&self) -> CapabilityModuleLimits {
         self.capability_module_limits
