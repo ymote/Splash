@@ -30,8 +30,9 @@ pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 use vm::{
-    id, script_err_limit, script_err_not_allowed, script_err_unexpected, script_value, LiveId,
-    ScriptIp, ScriptValue,
+    id, id_lut, script_args_def, script_err_invalid_args, script_err_limit, script_err_not_allowed,
+    script_err_type_mismatch, script_err_unexpected, script_value, LiveId, ScriptIp, ScriptObject,
+    ScriptValue, NIL,
 };
 
 /// Stable identifier for the portable source contract enforced before normal
@@ -795,10 +796,14 @@ impl<H: Any, S: Any> Runtime<H, S> {
             vm.bx
                 .heap
                 .set_max_string_bytes(Some(limits.max_string_bytes));
-            vm.bx.heap.set_max_heap_bytes(Some(limits.max_heap_bytes));
             restrict_vendored_module_surface(vm);
             install_bounded_json_methods(vm, installed_limits);
-            vm.bx.heap.reconcile_heap_bytes();
+            // This fixed, trusted setup must complete before an exact retained
+            // heap cap is enabled. Otherwise a temporary collection growth can
+            // make a cap equal to the final bootstrap baseline fail and leave
+            // the VM partially configured. No generated source runs before
+            // the cap is installed below.
+            vm.bx.heap.set_max_heap_bytes(Some(limits.max_heap_bytes));
             let actual = vm.bx.heap.accounted_heap_bytes();
             let heap_limit_exceeded = vm.bx.heap.take_heap_limit_exceeded();
             let string_limit_exceeded = vm.bx.heap.take_string_limit_exceeded();
@@ -2431,8 +2436,9 @@ fn restrict_vendored_module_surface(vm: &mut vm::ScriptVm) {
             .heap
             .set_value_def(std, member.into(), ScriptValue::NIL);
     }
-    // The retained `assert` and VM-internal `Range` values are setup-owned
-    // language primitives, not a mutable cross-evaluation extension point.
+    install_standard_math_module(vm, std);
+    // Retained Splash core values and the VM-internal `Range` prototype are
+    // setup-owned language primitives, not mutable cross-evaluation points.
     vm.bx.heap.freeze(std);
     vm.bx.heap.freeze(vm.bx.code.builtins.range);
 
@@ -2452,6 +2458,229 @@ fn restrict_vendored_module_surface(vm: &mut vm::ScriptVm) {
             )
         },
     );
+}
+
+/// Installs a small Splash-owned scalar math module without restoring the
+/// broader Makepad shader module that used the same root name.
+fn install_standard_math_module(vm: &mut vm::ScriptVm, std_module: ScriptObject) {
+    let math = vm.bx.heap.new_with_proto(NIL);
+    vm.add_method(math, id!(abs), script_args_def!(value = NIL), |vm, args| {
+        standard_math_unary(vm, args, "abs", f64::abs)
+    });
+    vm.add_method(
+        math,
+        id!(ceil),
+        script_args_def!(value = NIL),
+        |vm, args| standard_math_unary(vm, args, "ceil", f64::ceil),
+    );
+    vm.add_method(
+        math,
+        id!(floor),
+        script_args_def!(value = NIL),
+        |vm, args| standard_math_unary(vm, args, "floor", f64::floor),
+    );
+    vm.add_method(
+        math,
+        id!(round),
+        script_args_def!(value = NIL),
+        |vm, args| standard_math_unary(vm, args, "round", f64::round),
+    );
+    vm.add_method(
+        math,
+        id!(sqrt),
+        script_args_def!(value = NIL),
+        |vm, args| standard_math_unary(vm, args, "sqrt", f64::sqrt),
+    );
+    vm.add_method(math, id!(sin), script_args_def!(value = NIL), |vm, args| {
+        standard_math_unary(vm, args, "sin", f64::sin)
+    });
+    vm.add_method(math, id!(cos), script_args_def!(value = NIL), |vm, args| {
+        standard_math_unary(vm, args, "cos", f64::cos)
+    });
+    vm.add_method(math, id!(tan), script_args_def!(value = NIL), |vm, args| {
+        standard_math_unary(vm, args, "tan", f64::tan)
+    });
+    vm.add_method(math, id!(exp), script_args_def!(value = NIL), |vm, args| {
+        standard_math_unary(vm, args, "exp", f64::exp)
+    });
+    vm.add_method(math, id!(ln), script_args_def!(value = NIL), |vm, args| {
+        standard_math_unary(vm, args, "ln", f64::ln)
+    });
+    vm.add_method(
+        math,
+        id!(log10),
+        script_args_def!(value = NIL),
+        |vm, args| standard_math_unary(vm, args, "log10", f64::log10),
+    );
+    vm.add_method(
+        math,
+        id!(pow),
+        script_args_def!(base = NIL, exponent = NIL),
+        |vm, args| {
+            standard_math_binary(
+                vm,
+                args,
+                "pow",
+                StandardMathBinaryParameters {
+                    left: (id!(base), "base"),
+                    right: (id!(exponent), "exponent"),
+                },
+                f64::powf,
+            )
+        },
+    );
+    vm.add_method(
+        math,
+        id!(min),
+        script_args_def!(left = NIL, right = NIL),
+        |vm, args| {
+            standard_math_binary(
+                vm,
+                args,
+                "min",
+                StandardMathBinaryParameters {
+                    left: (id!(left), "left"),
+                    right: (id!(right), "right"),
+                },
+                f64::min,
+            )
+        },
+    );
+    vm.add_method(
+        math,
+        id!(max),
+        script_args_def!(left = NIL, right = NIL),
+        |vm, args| {
+            standard_math_binary(
+                vm,
+                args,
+                "max",
+                StandardMathBinaryParameters {
+                    left: (id!(left), "left"),
+                    right: (id!(right), "right"),
+                },
+                f64::max,
+            )
+        },
+    );
+    vm.add_method(
+        math,
+        id!(atan2),
+        script_args_def!(y = NIL, x = NIL),
+        |vm, args| {
+            standard_math_binary(
+                vm,
+                args,
+                "atan2",
+                StandardMathBinaryParameters {
+                    left: (id!(y), "y"),
+                    right: (id!(x), "x"),
+                },
+                f64::atan2,
+            )
+        },
+    );
+    vm.add_method(
+        math,
+        id!(clamp),
+        script_args_def!(value = NIL, minimum = NIL, maximum = NIL),
+        standard_math_clamp,
+    );
+
+    vm.bx.heap.set_value_def(
+        math,
+        id!(pi).into(),
+        ScriptValue::from_f64(std::f64::consts::PI),
+    );
+    vm.bx.heap.set_value_def(
+        math,
+        id!(e).into(),
+        ScriptValue::from_f64(std::f64::consts::E),
+    );
+    vm.bx
+        .heap
+        .set_value_def(std_module, id!(math).into(), math.into());
+    vm.bx.heap.freeze(math);
+}
+
+fn standard_math_unary(
+    vm: &mut vm::ScriptVm,
+    args: ScriptObject,
+    function: &'static str,
+    operation: impl FnOnce(f64) -> f64,
+) -> ScriptValue {
+    match standard_math_number(vm, args, id!(value), function, "value") {
+        Ok(value) => standard_math_result(vm, operation(value)),
+        Err(error) => error,
+    }
+}
+
+struct StandardMathBinaryParameters {
+    left: (LiveId, &'static str),
+    right: (LiveId, &'static str),
+}
+
+fn standard_math_binary(
+    vm: &mut vm::ScriptVm,
+    args: ScriptObject,
+    function: &'static str,
+    parameters: StandardMathBinaryParameters,
+    operation: impl FnOnce(f64, f64) -> f64,
+) -> ScriptValue {
+    let left = match standard_math_number(vm, args, parameters.left.0, function, parameters.left.1)
+    {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match standard_math_number(vm, args, parameters.right.0, function, parameters.right.1) {
+        Ok(right) => standard_math_result(vm, operation(left, right)),
+        Err(error) => error,
+    }
+}
+
+fn standard_math_clamp(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = match standard_math_number(vm, args, id!(value), "clamp", "value") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let minimum = match standard_math_number(vm, args, id!(minimum), "clamp", "minimum") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let maximum = match standard_math_number(vm, args, id!(maximum), "clamp", "maximum") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if minimum > maximum {
+        return script_err_invalid_args!(
+            vm.bx.threads.cur_ref().trap,
+            "std.math.clamp requires minimum to be less than or equal to maximum"
+        );
+    }
+    standard_math_result(vm, value.clamp(minimum, maximum))
+}
+
+fn standard_math_number(
+    vm: &mut vm::ScriptVm,
+    args: ScriptObject,
+    parameter: LiveId,
+    function: &'static str,
+    parameter_name: &'static str,
+) -> Result<f64, ScriptValue> {
+    vm.bx
+        .heap
+        .value(args, parameter.into(), vm.bx.threads.cur_ref().trap.pass())
+        .as_number()
+        .ok_or_else(|| {
+            script_err_type_mismatch!(
+                vm.bx.threads.cur_ref().trap,
+                "std.math.{function} expects `{parameter_name}` to be a number"
+            )
+        })
+}
+
+fn standard_math_result(vm: &mut vm::ScriptVm, value: f64) -> ScriptValue {
+    ScriptValue::from_f64_traced_nan(value, vm.bx.threads.cur_ref().trap.ip)
 }
 
 fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJsonMethodLimits>>) {
@@ -6131,6 +6360,76 @@ compute(outer, 2)
             .unwrap();
         assert!(!report.succeeded());
         assert!(!report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exposes_frozen_effect_free_standard_math() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 use mod.std.math\n\
+                 assert(math.abs(-3) == 3)\n\
+                 assert(math.ceil(1.2) == 2)\n\
+                 assert(math.floor(1.8) == 1)\n\
+                 assert(math.round(1.5) == 2)\n\
+                 assert(math.sqrt(81) == 9)\n\
+                 assert(math.pow(2, 3) == 8)\n\
+                 assert(math.min(2, 3) == 2)\n\
+                 assert(math.max(2, 3) == 3)\n\
+                 assert(math.clamp(9, 0, 8) == 8)\n\
+                 assert(math.sin(0) == 0)\n\
+                 assert(math.cos(0) == 1)\n\
+                 assert(math.tan(0) == 0)\n\
+                 assert(math.atan2(0, 1) == 0)\n\
+                 assert(math.exp(0) == 1)\n\
+                 assert(math.log10(100) == 2)\n\
+                 assert(math.pi > 3)\n\
+                 assert(math.e > 2)\n\
+                 math.clamp(math.pow(3, 2), 0, 8) + math.sqrt(16)",
+            )
+            .unwrap();
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(report.value.as_number(), Some(12.0));
+
+        let mutation = runtime.eval("use mod.std.math\nmath.sqrt = || 0").unwrap();
+        assert!(!mutation.succeeded());
+        assert!(!mutation.diagnostics.is_empty());
+
+        let preserved = runtime.eval("use mod.std.math\nmath.sqrt(81)").unwrap();
+        assert!(preserved.completed(), "{:?}", preserved.diagnostics);
+        assert_eq!(preserved.value.as_number(), Some(9.0));
+
+        let mut invalid_arguments_runtime = Runtime::default();
+        let invalid_range = invalid_arguments_runtime
+            .eval("use mod.std.math\ntry math.clamp(1, 2, 0) catch 42")
+            .unwrap();
+        assert!(invalid_range.completed(), "{:?}", invalid_range.diagnostics);
+        assert_eq!(invalid_range.value.as_u40(), Some(42));
+
+        let wrong_type = invalid_arguments_runtime
+            .eval("use mod.std.math\ntry math.abs(\"blocked\") catch 7")
+            .unwrap();
+        assert!(wrong_type.completed(), "{:?}", wrong_type.diagnostics);
+        assert_eq!(wrong_type.value.as_u40(), Some(7));
+
+        let mut compatibility_runtime = Runtime::default();
+        let compatibility = compatibility_runtime
+            .eval_vm_compatibility("use mod.std.math\nmath.sqrt(9)")
+            .unwrap();
+        assert!(compatibility.completed(), "{:?}", compatibility.diagnostics);
+        assert_eq!(compatibility.value.as_number(), Some(3.0));
+
+        let mut undefined_domain_runtime = Runtime::default();
+        let undefined_domain = undefined_domain_runtime
+            .eval("use mod.std.math\nmath.sqrt(-1)")
+            .unwrap();
+        assert!(
+            undefined_domain.completed(),
+            "{:?}",
+            undefined_domain.diagnostics
+        );
+        assert!(undefined_domain.value.is_nan());
     }
 
     #[test]

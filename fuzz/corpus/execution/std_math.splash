@@ -1,0 +1,9 @@
+use mod.std.assert
+use mod.std.math
+
+let scaled = math.clamp(math.pow(2, 3), 0, 7)
+let recovered = try math.clamp(0, 2, 1) catch 7
+
+assert(scaled == 7)
+assert(recovered == 7)
+assert(math.sqrt(81) == 9)

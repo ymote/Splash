@@ -44,6 +44,9 @@ and keeps UI support optional rather than making UI the language boundary.
 - Standalone runtime initialization that masks inherited Makepad UI/debug and
   unbounded native entry points before source evaluation, leaving only the
   documented core plus trusted host-installed modules reachable from Splash.
+- A frozen, effect-free `mod.std.math` scalar helper module for common numeric
+  dataflow without restoring Makepad's broader shader-oriented `mod.math`
+  surface or granting host authority.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
@@ -236,6 +239,11 @@ general filesystem or network APIs. A capability check in the VM is not an OS
 sandbox; adapters that execute local tools or need egress isolation must run
 behind an appropriate target-specific containment boundary before they are
 suitable for untrusted workloads.
+
+For ordinary numeric dataflow, `use mod.std.math` provides a small frozen
+Splash-owned scalar library. It is separate from the masked Makepad
+`mod.math` shader module and cannot access files, processes, networking,
+clocks, entropy, or Rust crates.
 
 ## Example
 

@@ -340,6 +340,7 @@ The current profile supports:
 - Functions with `fn`, arguments, `return`, and lexical closures.
 - Numbers, strings, booleans, arrays, and record literals.
 - Field access, array operations, conditionals, loops, and assertions.
+- Frozen effect-free scalar math through `use mod.std.math`.
 - Recoverable `try protected catch fallback` expressions without an error
   binding or transactional rollback.
 - Module imports through `use mod.<name>`.
@@ -361,6 +362,28 @@ let summary = tool.call("text.echo", "summarize the release notes")
 summary
 ```
 
+## Core standard modules
+
+`use mod.std.assert` imports the core assertion helper. `use mod.std.math`
+imports a frozen Splash-owned scalar module with constants `math.pi` and
+`math.e`, plus:
+
+```text
+abs(value) ceil(value) floor(value) round(value) sqrt(value)
+sin(value) cos(value) tan(value) exp(value) ln(value) log10(value)
+pow(base, exponent) min(left, right) max(left, right) atan2(y, x)
+clamp(value, minimum, maximum)
+```
+
+Every argument must be numeric. Invalid argument types are ordinary
+recoverable script errors; `clamp` also rejects a `minimum` greater than its
+`maximum` rather than allowing a host panic. The methods use scalar `f64`
+semantics, so undefined domains can yield the VM's `NaN` value and overflow can
+yield infinity; non-finite values cannot cross a JSON tool boundary. The
+module has no I/O, clock, entropy, host-state, crate-loading, or capability
+access. It is deliberately distinct from the masked Makepad `mod.math`
+shader module.
+
 ## Effect rules
 
 The core runtime does not expose inherited `mod.fs`, `mod.run`, `mod.net`,
@@ -369,10 +392,11 @@ and HTML entry points. A script cannot acquire authority by importing a name.
 The host must create a runtime with a registered tool policy before `tool.call`
 or `tool.start` can succeed. Standalone initialization masks those vendored
 entry points before canonical and compatibility evaluation; it preserves only
-the documented core such as `mod.std.assert` and trusted host-installed
-modules. A host may intentionally install a reviewed direct capability module
-under a previously masked name, but that is a new capability binding subject to
-its normal policy and lease checks, not restoration of Makepad behavior.
+the documented core such as `mod.std.assert`, `mod.std.math`, and trusted
+host-installed modules. A host may intentionally install a reviewed direct
+capability module under a previously masked name, but that is a new capability
+binding subject to its normal policy and lease checks, not restoration of
+Makepad behavior.
 
 For an operator-approved execution, a host can issue a process-local
 `CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or

@@ -87,6 +87,14 @@ from becoming generated-source behavior. It does not alter a host that embeds
 the raw Makepad VM, and a trusted host can still install a reviewed capability
 under any otherwise-masked module name through the normal policy boundary.
 
+The only built-in numeric module added by Splash itself is frozen,
+effect-free `mod.std.math`. It provides bounded-arity scalar `f64` operations
+and constants, not the vendored shader-oriented `mod.math` module. It cannot
+perform I/O, access host state, read time or entropy, or load a Rust crate.
+Its floating-point results are ordinary script data rather than a portable
+bit-for-bit cross-platform numeric guarantee; non-finite results remain
+ineligible for the JSON capability boundary.
+
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatches with bounded JSON methods. The default
 direct-conversion ceiling is 64 KiB and 64 container levels, and a host may

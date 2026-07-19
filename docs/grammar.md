@@ -217,9 +217,10 @@ masks inherited Makepad UI, debug, shader, pod, GC, math, regex, HTML, and
 direct-output entry points. In particular, generated source cannot reach the
 vendored `std.log`, `std.print`, `std.println`, `std.regex`, or
 `String.parse_html()` APIs. `mod.std.assert`, normal language operations, and
-reviewed host-installed `mod.tool` or direct capability modules remain
-available. A trusted host that needs the broader Makepad surface must embed the
-raw Makepad VM itself; the compatibility APIs do not restore those bindings.
+the frozen Splash-owned `mod.std.math` scalar helpers remain available, along
+with reviewed host-installed `mod.tool` or direct capability modules. A trusted
+host that needs the broader Makepad surface must embed the raw Makepad VM
+itself; the compatibility APIs do not restore those bindings.
 
 The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
 fixture passes the bounded compatibility preflight to catch parser drift, but
