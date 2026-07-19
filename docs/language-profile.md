@@ -287,7 +287,8 @@ The current profile supports:
   `tool.start_json(name, value).await()`.
 - Setup-defined direct capability modules such as `use mod.arithmetic` and
   `arithmetic.add(value)`, when a trusted host explicitly maps that method to
-  a reviewed synchronous JSON tool.
+  a reviewed JSON tool. The host-selected method mode is either synchronous or
+  deferred; a deferred method returns a promise and uses `.await()`.
 
 Example:
 
@@ -330,13 +331,16 @@ allowing scripts to import crates directly.
 
 For a fixed, less stringly dataflow interface, a trusted host may additionally
 register a `CapabilityModule` before evaluation or lease issuance. Its flat
-`mod.<name>` methods each route to one existing synchronous JSON tool with an
-executable input/output contract. Calling the method serializes one bounded
-JSON-compatible argument, reserves the same target tool and lease grant, then
-returns decoded bounded JSON. It cannot target a deferred external tool, a text
-tool, an advisory-only schema, an arbitrary crate, or an ambient filesystem,
-process, network, or plugin API. The core language still does not resolve
-modules; the host supplies the binding. Its exact method-to-tool mapping is
+`mod.<name>` methods each route to one existing JSON tool with an executable
+input/output contract. `with_method` selects a synchronous host-pump target:
+it serializes one bounded JSON-compatible argument, reserves the same target
+tool and lease grant, then returns decoded bounded JSON. A host may instead
+select `with_deferred_method`; it uses the same bounded promise lifecycle as
+`tool.start_json`, permits a host-pump or external JSON target, and its
+`await()` returns decoded bounded JSON. Neither mode can target a text tool,
+an advisory-only schema, an arbitrary crate, or an ambient filesystem, process,
+network, or plugin API. The core language still does not resolve modules; the
+host supplies the binding. Its exact method-to-tool mapping and mode are
 included in every later capability-lease fingerprint. See
 [Host Tool Catalog](tool-catalog.md) for setup and bounds.
 

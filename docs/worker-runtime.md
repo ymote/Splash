@@ -457,9 +457,10 @@ manual lease, full-catalog approval, external claim/completion, or worker
 transport API. Local host-pump adapters are driven by workflow execution; a
 streaming/external policy is rejected during static setup. It can also bind a
 contract-enforced local JSON adapter as a fixed `mod.<name>` facade through
-`register_capability_module`; the facade retains the underlying tool's named
-step-policy grant, JSON contract, audit entry, and lease check. Hosts that
-need a tighter direct-module budget use
+`register_capability_module`; a host may select a synchronous method or a
+deferred host-pump method whose `await()` returns decoded bounded JSON. Either
+facade retains the underlying tool's named step-policy grant, JSON contract,
+audit entry, and lease check. Hosts that need a tighter direct-module budget use
 `with_limits_catalog_and_module_limits`; the sealed runtime exposes only the
 immutable mapping, advisory LSP projection, and a read-only
 `capability_module_call_hint_report` for mapping an exact direct facade call to

@@ -938,6 +938,7 @@ fn capability_module_call_hint_json(hint: &CapabilityModuleCallHint) -> JsonValu
         "module": hint.module,
         "method": hint.method,
         "tool": hint.tool,
+        "mode": hint.mode,
         "callee": {
             "line": hint.line,
             "column": hint.column,
@@ -1749,6 +1750,10 @@ mod tests {
         );
         assert_eq!(output["direct_module_calls"][0]["method"], json!("add"));
         assert_eq!(output["direct_module_calls"][0]["tool"], json!("math.add"));
+        assert_eq!(
+            output["direct_module_calls"][0]["mode"],
+            json!("synchronous")
+        );
         assert!(runtime.audit().is_empty());
     }
 
@@ -1851,6 +1856,10 @@ mod tests {
         assert_eq!(
             output["steps"][0]["direct_module_calls"][0]["tool"],
             json!("math.add")
+        );
+        assert_eq!(
+            output["steps"][0]["direct_module_calls"][0]["mode"],
+            json!("synchronous")
         );
         assert_eq!(
             output["steps"][0]["direct_module_calls_truncated"],

@@ -155,15 +155,17 @@
   and indeterminate-effect recovery.
 - Schema-required Serde host and worker bridges for statically linked,
   reviewed Rust adapters; JSON Schema remains the script-visible wire policy.
-- Setup-only bounded flat direct capability modules for existing synchronous,
-  contract-enforced JSON tools. Each method routes through the same target-tool
-  policy, audit, JSON boundary, and capability lease while returning decoded
-  bounded JSON. A bounded scope-resolved advisory review projection can map an
-  exact visible direct facade call back to its underlying target tool without
-  issuing authority. The reviewed module-to-tool mapping is part of the catalog
-  fingerprint recorded by each lease, and the interface seals before lease
-  issuance or evaluation. It does not add module loading, dynamic Rust crate
-  access, deferred-tool calls, or ambient operating-system authority.
+- Setup-only bounded flat direct capability modules for existing
+  contract-enforced JSON tools. A host chooses each method as synchronous over
+  a host-pump adapter or deferred through the existing bounded promise path;
+  either form routes through the same target-tool policy, audit, JSON boundary,
+  and capability lease, returning decoded bounded JSON immediately or from
+  `await()`. A bounded scope-resolved advisory review projection can map an
+  exact visible direct facade call back to its underlying target tool and mode
+  without issuing authority. The reviewed module-to-tool mapping and method
+  mode are part of the catalog fingerprint recorded by each lease, and the
+  interface seals before lease issuance or evaluation. It does not add module
+  loading, dynamic Rust crate access, or ambient operating-system authority.
 - Fenced rollback-protected storage extension and an authenticated worker
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of

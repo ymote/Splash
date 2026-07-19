@@ -314,6 +314,9 @@ cargo run -p splash-cli -- workflow-run --allow-json-add --grant calculate:math.
 
 The catalog maps `arithmetic.add` to `math.add`; workflow policies and leases
 continue to grant the underlying `math.add` capability, never the facade name.
+Hosts can also register a `with_deferred_method` facade over a reviewed JSON
+tool; its explicit `mode: "deferred"` returns the existing bounded promise and
+`await()` yields decoded JSON while preserving the same underlying grant.
 When the reviewed module catalog is configured, `tool-calls` and
 `workflow-review` add advisory `direct_module_calls` entries that expose this
 mapping for LLM and operator review. Those entries do not grant a tool or

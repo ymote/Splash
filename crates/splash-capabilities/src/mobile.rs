@@ -81,7 +81,9 @@ impl MobileRuntimeBuilder {
 
     /// Creates a builder with explicit bounds for the tool catalog and
     /// setup-defined direct-module catalog projections. Direct module methods
-    /// remain schema-bound facades over reviewed local JSON tools.
+    /// remain schema-bound facades over reviewed local JSON tools and may use
+    /// the sealed runtime's bounded host-pump promise path when the host
+    /// explicitly selects a deferred method.
     pub fn with_limits_catalog_and_module_limits(
         limits: ExecutionLimits,
         max_pending_tools: usize,
@@ -270,8 +272,9 @@ impl MobileRuntimeBuilder {
 
     /// Registers one setup-defined direct capability module for the sealed
     /// profile. Every method must map to an existing local JSON tool with an
-    /// executable contract; it retains that tool's policy, audit, and lease
-    /// checks instead of receiving ambient application authority.
+    /// executable contract; a host may explicitly select a synchronous or
+    /// deferred host-pump method. Both retain the target tool's policy, audit,
+    /// and lease checks instead of receiving ambient application authority.
     pub fn register_capability_module(
         &mut self,
         module: CapabilityModule,
@@ -546,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn seals_direct_capability_modules_for_mobile_dataflow() {
+    fn seals_direct_deferred_capability_modules_for_mobile_dataflow() {
         let mut builder = MobileRuntimeBuilder::new().expect("default limits are valid");
         builder
             .register_typed_json_tool(
@@ -563,7 +566,7 @@ mod tests {
         builder
             .register_capability_module(
                 CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
-                    .with_method("add", "math.add"),
+                    .with_deferred_method("add", "math.add"),
             )
             .expect("static direct module registers");
 
@@ -579,17 +582,29 @@ mod tests {
         assert_eq!(review.hints[0].module, "arithmetic");
         assert_eq!(review.hints[0].method, "add");
         assert_eq!(review.hints[0].tool, "math.add");
+        assert_eq!(
+            review.hints[0].mode,
+            crate::CapabilityModuleMethodMode::Deferred
+        );
         assert!(runtime.audit().is_empty());
-        let report = runtime
+        let initial = runtime
             .eval(
                 "use mod.arithmetic\n\
                  use mod.std.assert\n\
-                 let result = arithmetic.add({left: 20, right: 22})\n\
+                 let result = arithmetic.add({left: 20, right: 22}).await()\n\
                  assert(result.total == 42)",
             )
             .expect("direct module dataflow succeeds");
 
-        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert!(initial.suspended);
+        let pumped = runtime.pump().expect("local adapter pump succeeds");
+        assert_eq!(pumped.completed, 1);
+        assert_eq!(pumped.resumed.len(), 1);
+        assert!(
+            pumped.resumed[0].completed(),
+            "{:?}",
+            pumped.resumed[0].diagnostics
+        );
         assert_eq!(runtime.capability_module_catalog().len(), 1);
         assert_eq!(
             runtime.module_interface_catalog(),

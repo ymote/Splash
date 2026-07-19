@@ -491,10 +491,10 @@ impl Default for CapabilityCatalogLimits {
 /// Aggregate bounds for setup-defined direct capability modules.
 ///
 /// A direct capability module is a host-reviewed, flat `mod.<name>` binding
-/// whose methods route only to existing validated synchronous JSON tools. Its
-/// limits are independent of [`CapabilityCatalogLimits`] so an embedded host
-/// can bound both its LLM tool catalog and every retained direct-module
-/// representation, including material retained to bind capability leases.
+/// whose methods route only to existing validated JSON tools. Its limits are
+/// independent of [`CapabilityCatalogLimits`] so an embedded host can bound
+/// both its LLM tool catalog and every retained direct-module representation,
+/// including material retained to bind capability leases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapabilityModuleLimits {
     pub max_modules: usize,
@@ -537,10 +537,12 @@ impl Default for CapabilityModuleLimits {
 
 /// One setup-defined direct `mod.<name>` capability binding.
 ///
-/// Each method must reference exactly one existing synchronous JSON tool with
-/// an executable input/output contract. The binding is syntax only: every call
-/// continues through the target tool's policy, audit trail, output contract,
-/// and active capability lease.
+/// Each method must reference exactly one existing JSON tool with an executable
+/// input/output contract. A synchronous method requires a host-pump target and
+/// returns decoded bounded JSON. A deferred method returns an opaque bounded
+/// promise whose `await()` decodes the target's bounded JSON result. The
+/// binding is syntax only: every call continues through the target tool's
+/// policy, audit trail, output contract, and active capability lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityModule {
     pub name: String,
@@ -561,6 +563,20 @@ impl CapabilityModule {
         self.methods.push(CapabilityModuleMethod::new(name, tool));
         self
     }
+
+    /// Adds a direct method that starts one existing JSON capability and
+    /// returns a promise. The promise must be awaited before its decoded JSON
+    /// result can be used. The target remains subject to its underlying lease,
+    /// contract, call budget, audit trail, and external/local dispatch mode.
+    pub fn with_deferred_method(
+        mut self,
+        name: impl Into<String>,
+        tool: impl Into<String>,
+    ) -> Self {
+        self.methods
+            .push(CapabilityModuleMethod::deferred(name, tool));
+        self
+    }
 }
 
 /// One direct module method mapped to one registered capability name.
@@ -568,15 +584,42 @@ impl CapabilityModule {
 pub struct CapabilityModuleMethod {
     pub name: String,
     pub tool: String,
+    pub mode: CapabilityModuleMethodMode,
 }
 
 impl CapabilityModuleMethod {
+    /// Creates a synchronous direct module method.
     pub fn new(name: impl Into<String>, tool: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             tool: tool.into(),
+            mode: CapabilityModuleMethodMode::Synchronous,
         }
     }
+
+    /// Creates a deferred direct module method whose result is delivered by a
+    /// bounded tool promise.
+    pub fn deferred(name: impl Into<String>, tool: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            tool: tool.into(),
+            mode: CapabilityModuleMethodMode::Deferred,
+        }
+    }
+}
+
+/// Invocation behavior selected by a host for one direct module method.
+///
+/// This is part of the reviewed catalog and capability-lease fingerprint. It
+/// is never inferred from Splash source or the current adapter implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityModuleMethodMode {
+    /// Invoke a host-pump JSON tool immediately and return decoded JSON.
+    Synchronous,
+    /// Start a JSON tool and return a promise whose `await()` returns decoded
+    /// JSON after host pumping or external completion.
+    Deferred,
 }
 
 /// Stable host-facing description of one setup-defined direct capability
@@ -594,6 +637,7 @@ pub struct CapabilityModuleMethodDescriptor {
     pub name: String,
     pub tool: String,
     pub description: String,
+    pub mode: CapabilityModuleMethodMode,
 }
 
 /// One entry in the advisory `splash-lsp` `moduleCatalog` wire shape.
@@ -617,6 +661,7 @@ pub struct CapabilityModuleCallHint {
     pub module: String,
     pub method: String,
     pub tool: String,
+    pub mode: CapabilityModuleMethodMode,
     pub line: usize,
     pub column: usize,
     pub callee_start_byte: usize,
@@ -738,7 +783,7 @@ impl Display for CapabilityModuleRegistrationError {
             ),
             Self::ToolIsDeferred(name) => write!(
                 formatter,
-                "direct capability module requires a synchronous host-pump tool: {name}"
+                "synchronous direct capability module method requires a host-pump tool: {name}"
             ),
             Self::ToolContractNotEnforced(name) => write!(
                 formatter,
@@ -2011,6 +2056,16 @@ enum ExternalReconcileCompletion {
 struct ToolPromiseGc {
     pending: PendingTools,
     handle: ScriptHandle,
+    output: ToolPromiseOutput,
+}
+
+#[derive(Clone, Copy)]
+enum ToolPromiseOutput {
+    Text,
+    DecodedJson {
+        max_output_bytes: usize,
+        max_depth: usize,
+    },
 }
 
 impl ScriptHandleGc for ToolPromiseGc {
@@ -3863,9 +3918,10 @@ pub struct DeadlineReport {
 /// `tool.call` executes synchronously. `tool.start` creates an opaque promise
 /// and `promise.await()` suspends the script until a trusted host pump or
 /// external completion supplies its result. A direct capability module is a
-/// schema-bound synchronous JSON facade over one existing host-pump tool; it
-/// does not install a worker, filesystem, process, network, dynamic loader,
-/// or arbitrary Rust-crate API.
+/// schema-bound JSON facade over one existing tool. Its explicit method mode
+/// is either synchronous over a host-pump tool or deferred through the same
+/// bounded promise path as `tool.start_json`; it does not install a worker,
+/// filesystem, process, network, dynamic loader, or arbitrary Rust-crate API.
 pub struct CapabilityRuntime {
     runtime: Runtime<CapabilityHost, ()>,
     max_pending_tools: usize,
@@ -3914,8 +3970,9 @@ impl CapabilityRuntime {
     /// direct-module catalog-projection bounds.
     ///
     /// Direct modules remain a setup-only, flat interface over existing
-    /// contract-enforced synchronous JSON tools. Their metadata is host-facing
-    /// and never gives Splash source a way to discover or mint capabilities.
+    /// contract-enforced JSON tools. Their host-selected synchronous or
+    /// deferred mode is catalog material and never gives Splash source a way
+    /// to discover or mint capabilities.
     pub fn with_limits_pending_catalog_and_module_limits(
         limits: ExecutionLimits,
         max_pending_tools: usize,
@@ -4153,18 +4210,21 @@ impl CapabilityRuntime {
 
     /// Registers one setup-defined direct `mod.<name>` capability module.
     ///
-    /// Every method routes synchronously through exactly one already
-    /// registered, contract-enforced synchronous JSON tool. It therefore
-    /// consumes the same tool call budget, capability lease grant, audit entry, and
-    /// executable input/output contract as `tool.call_json`. The method
-    /// accepts one JSON record or array subject to the target contract and
-    /// returns decoded bounded JSON instead of a JSON string.
+    /// Every method routes through exactly one already registered,
+    /// contract-enforced JSON tool. Synchronous methods consume the same tool
+    /// call budget, capability lease grant, audit entry, and executable
+    /// input/output contract as `tool.call_json`. Deferred methods do the same
+    /// through `tool.start_json`'s bounded promise lifecycle. Both accept one
+    /// JSON record or array subject to the target contract and return decoded
+    /// bounded JSON, immediately or from `await()` respectively.
     ///
     /// Module registration is allowed only during runtime setup. The module
     /// interface freezes when a capability lease is issued or source is first
     /// evaluated, preventing a later syntactic alias from appearing under an
     /// existing approval. This API cannot install a dynamic library, select a
-    /// crate, or bind an external/deferred operation.
+    /// crate, or bind arbitrary ambient authority. Deferred methods retain the
+    /// same bounded promise path as `tool.start_json` and still require an
+    /// existing reviewed JSON capability.
     pub fn register_capability_module(
         &mut self,
         module: CapabilityModule,
@@ -4191,7 +4251,12 @@ impl CapabilityRuntime {
             ));
         }
 
-        install_capability_module(&mut self.runtime, module_id, bindings);
+        install_capability_module(
+            &mut self.runtime,
+            module_id,
+            bindings,
+            self.max_pending_tools,
+        );
         self.runtime
             .host_mut()
             .set_direct_module_catalog_fingerprint_material(fingerprint_material);
@@ -4249,6 +4314,7 @@ impl CapabilityRuntime {
                     module: module.name.clone(),
                     method: hint.method,
                     tool: method.tool.clone(),
+                    mode: method.mode,
                     line: hint.line,
                     column: hint.column,
                     callee_start_byte: hint.callee_start_byte,
@@ -4394,7 +4460,9 @@ impl CapabilityRuntime {
                     method.tool.clone(),
                 ));
             }
-            if tool.dispatch != ToolDispatch::HostPump {
+            if method.mode == CapabilityModuleMethodMode::Synchronous
+                && tool.dispatch != ToolDispatch::HostPump
+            {
                 return Err(CapabilityModuleRegistrationError::ToolIsDeferred(
                     method.tool.clone(),
                 ));
@@ -4412,7 +4480,7 @@ impl CapabilityRuntime {
                     },
                 );
             }
-            resolved_methods.insert(method.name.clone(), tool);
+            resolved_methods.insert(method.name.clone(), (tool, method.mode));
         }
 
         let descriptor = CapabilityModuleDescriptor {
@@ -4420,10 +4488,11 @@ impl CapabilityRuntime {
             description: module.description.clone(),
             methods: resolved_methods
                 .iter()
-                .map(|(name, tool)| CapabilityModuleMethodDescriptor {
+                .map(|(name, (tool, mode))| CapabilityModuleMethodDescriptor {
                     name: name.clone(),
                     tool: tool.name.clone(),
                     description: tool.metadata.description.clone(),
+                    mode: *mode,
                 })
                 .collect(),
         };
@@ -4445,9 +4514,10 @@ impl CapabilityRuntime {
 
         let bindings = resolved_methods
             .into_iter()
-            .map(|(method, tool)| CapabilityModuleBinding {
+            .map(|(method, (tool, mode))| CapabilityModuleBinding {
                 method: LiveId::from_str(&method),
                 tool: tool.name,
+                mode,
                 max_input_bytes: tool.max_input_bytes,
                 max_output_bytes: tool.max_output_bytes,
                 max_depth: max_bridge_depth,
@@ -5200,6 +5270,7 @@ impl Default for CapabilityRuntime {
 struct CapabilityModuleBinding {
     method: LiveId,
     tool: String,
+    mode: CapabilityModuleMethodMode,
     max_input_bytes: usize,
     max_output_bytes: usize,
     max_depth: usize,
@@ -5236,65 +5307,118 @@ fn install_capability_module(
     runtime: &mut Runtime<CapabilityHost, ()>,
     module_id: LiveId,
     bindings: Vec<CapabilityModuleBinding>,
+    max_pending_tools: usize,
 ) {
     runtime.configure(|vm| {
         let module = vm.new_module(module_id);
+        let promise_type = vm.handle_type(id_lut!(tool_promise));
         for binding in bindings {
             let CapabilityModuleBinding {
                 method,
                 tool,
+                mode,
                 max_input_bytes,
                 max_output_bytes,
                 max_depth,
             } = binding;
-            vm.add_method(
-                module,
-                method,
-                script_args_def!(input = NIL),
-                move |vm, args| {
-                    let input = match encode_bounded_script_json(
-                        vm,
-                        script_value!(vm, args.input),
-                        max_input_bytes,
-                        max_depth,
-                    ) {
-                        Ok(input) => input,
-                        Err(_) => {
-                            return script_err_not_allowed!(
-                                vm.bx.threads.cur_ref().trap,
-                                "direct capability module expects bounded JSON input"
-                            )
-                        }
-                    };
-                    let output = match vm.host.downcast_mut::<CapabilityHost>() {
-                        Some(host) => host.call_json(&tool, &input),
-                        None => {
-                            return script_err_unexpected!(
-                                vm.bx.threads.cur_ref().trap,
-                                "invalid Splash capability host"
-                            )
-                        }
-                    };
-
-                    match output {
-                        Ok(output) => match decode_bounded_script_json(
+            match mode {
+                CapabilityModuleMethodMode::Synchronous => vm.add_method(
+                    module,
+                    method,
+                    script_args_def!(input = NIL),
+                    move |vm, args| {
+                        let input = match encode_bounded_script_json(
                             vm,
-                            &output,
-                            max_output_bytes,
+                            script_value!(vm, args.input),
+                            max_input_bytes,
                             max_depth,
                         ) {
-                            Ok(value) => value,
-                            Err(_) => script_err_unexpected!(
-                                vm.bx.threads.cur_ref().trap,
-                                "direct capability module returned invalid bounded JSON"
-                            ),
-                        },
-                        Err(error) => {
-                            script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
+                            Ok(input) => input,
+                            Err(_) => {
+                                return script_err_not_allowed!(
+                                    vm.bx.threads.cur_ref().trap,
+                                    "direct capability module expects bounded JSON input"
+                                )
+                            }
+                        };
+                        let output = match vm.host.downcast_mut::<CapabilityHost>() {
+                            Some(host) => host.call_json(&tool, &input),
+                            None => {
+                                return script_err_unexpected!(
+                                    vm.bx.threads.cur_ref().trap,
+                                    "invalid Splash capability host"
+                                )
+                            }
+                        };
+
+                        match output {
+                            Ok(output) => match decode_bounded_script_json(
+                                vm,
+                                &output,
+                                max_output_bytes,
+                                max_depth,
+                            ) {
+                                Ok(value) => value,
+                                Err(_) => script_err_unexpected!(
+                                    vm.bx.threads.cur_ref().trap,
+                                    "direct capability module returned invalid bounded JSON"
+                                ),
+                            },
+                            Err(error) => {
+                                script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
+                            }
                         }
-                    }
-                },
-            );
+                    },
+                ),
+                CapabilityModuleMethodMode::Deferred => vm.add_method(
+                    module,
+                    method,
+                    script_args_def!(input = NIL),
+                    move |vm, args| {
+                        let input = match encode_bounded_script_json(
+                            vm,
+                            script_value!(vm, args.input),
+                            max_input_bytes,
+                            max_depth,
+                        ) {
+                            Ok(input) => input,
+                            Err(_) => {
+                                return script_err_not_allowed!(
+                                    vm.bx.threads.cur_ref().trap,
+                                    "direct capability module expects bounded JSON input"
+                                )
+                            }
+                        };
+                        let result = match vm.host.downcast_mut::<CapabilityHost>() {
+                            Some(host) => host.begin_async_json(&tool, &input, max_pending_tools),
+                            None => {
+                                return script_err_unexpected!(
+                                    vm.bx.threads.cur_ref().trap,
+                                    "invalid Splash capability host"
+                                )
+                            }
+                        };
+
+                        match result {
+                            Ok((ticket, pending, id, idempotency_key)) => new_tool_promise(
+                                vm,
+                                promise_type,
+                                id,
+                                ticket,
+                                pending,
+                                idempotency_key,
+                                ToolPromiseOutput::DecodedJson {
+                                    max_output_bytes,
+                                    max_depth,
+                                },
+                            ),
+                            Err(error) => {
+                                script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
+                            }
+                        }
+                    },
+                ),
+            }
         }
     });
 }
@@ -5314,6 +5438,15 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                         vm.bx.threads.cur_ref().trap,
                         "tool promise expected"
                     );
+                };
+                let promise_output = match vm.downcast_handle_gc::<ToolPromiseGc>(handle) {
+                    Some(promise) => promise.output,
+                    None => {
+                        return script_err_not_allowed!(
+                            vm.bx.threads.cur_ref().trap,
+                            "tool promise expected"
+                        )
+                    }
                 };
                 let pending = match vm.host.downcast_ref::<CapabilityHost>() {
                     Some(host) => host.pending(),
@@ -5360,9 +5493,26 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match ready {
-                    Some(Ok(output)) => {
-                        vm.new_string_with(|_, destination| destination.push_str(&output))
-                    }
+                    Some(Ok(output)) => match promise_output {
+                        ToolPromiseOutput::Text => {
+                            vm.new_string_with(|_, destination| destination.push_str(&output))
+                        }
+                        ToolPromiseOutput::DecodedJson {
+                            max_output_bytes,
+                            max_depth,
+                        } => match decode_bounded_script_json(
+                            vm,
+                            &output,
+                            max_output_bytes,
+                            max_depth,
+                        ) {
+                            Ok(value) => value,
+                            Err(_) => script_err_unexpected!(
+                                vm.bx.threads.cur_ref().trap,
+                                "direct capability module returned invalid bounded JSON"
+                            ),
+                        },
+                    },
                     Some(Err(error)) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
@@ -5454,9 +5604,15 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending, id, idempotency_key)) => {
-                        new_tool_promise(vm, promise_type, id, ticket, pending, idempotency_key)
-                    }
+                    Ok((ticket, pending, id, idempotency_key)) => new_tool_promise(
+                        vm,
+                        promise_type,
+                        id,
+                        ticket,
+                        pending,
+                        idempotency_key,
+                        ToolPromiseOutput::Text,
+                    ),
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
@@ -5485,9 +5641,15 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 };
 
                 match result {
-                    Ok((ticket, pending, id, idempotency_key)) => {
-                        new_tool_promise(vm, promise_type, id, ticket, pending, idempotency_key)
-                    }
+                    Ok((ticket, pending, id, idempotency_key)) => new_tool_promise(
+                        vm,
+                        promise_type,
+                        id,
+                        ticket,
+                        pending,
+                        idempotency_key,
+                        ToolPromiseOutput::Text,
+                    ),
                     Err(error) => {
                         script_err_not_allowed!(vm.bx.threads.cur_ref().trap, "{}", error)
                     }
@@ -5514,12 +5676,14 @@ fn new_tool_promise(
     ticket: ToolTicket,
     pending: PendingTools,
     idempotency_key: String,
+    output: ToolPromiseOutput,
 ) -> ScriptValue {
     let handle = vm.bx.heap.new_handle(
         promise_type,
         Box::new(ToolPromiseGc {
             pending: pending.clone(),
             handle: ScriptHandle::ZERO,
+            output,
         }),
     );
     let dispatch = match ticket.dispatch {
@@ -5709,6 +5873,7 @@ mod tests {
                     name: "add".to_owned(),
                     tool: "math.add".to_owned(),
                     description: "Adds two reviewed integers.".to_owned(),
+                    mode: CapabilityModuleMethodMode::Synchronous,
                 }],
             }]
         );
@@ -5768,6 +5933,150 @@ mod tests {
     }
 
     #[test]
+    fn direct_deferred_module_reuses_the_bounded_promise_lease_and_json_bridge() {
+        let mut policy = ToolPolicy::json("math.add");
+        policy.max_calls = 2;
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                policy,
+                ToolMetadata::new("Adds two reviewed integers asynchronously."),
+                add_contract(),
+                |request| {
+                    let left = request.input["left"]
+                        .as_i64()
+                        .ok_or_else(|| ToolError::Failed("missing left input".to_owned()))?;
+                    let right = request.input["right"]
+                        .as_i64()
+                        .ok_or_else(|| ToolError::Failed("missing right input".to_owned()))?;
+                    Ok(json!({"total": left + right}))
+                },
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed asynchronous arithmetic adapter.")
+                    .with_deferred_method("add", "math.add"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime.capability_module_catalog()[0].methods[0].mode,
+            CapabilityModuleMethodMode::Deferred
+        );
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
+            .unwrap();
+        let initial = runtime
+            .eval_with_capability_lease(
+                "use mod.arithmetic\n\
+                 use mod.std.assert\n\
+                 let result = arithmetic.add({left: 20, right: 22}).await()\n\
+                 assert(result.total == 42)",
+                &lease,
+            )
+            .unwrap();
+
+        assert!(initial.suspended);
+        assert_eq!(runtime.pending_tools(), 1);
+        assert!(runtime.audit().is_empty());
+
+        let pumped = runtime.pump().unwrap();
+        assert_eq!(pumped.completed, 1);
+        assert_eq!(pumped.resumed.len(), 1);
+        assert!(
+            pumped.resumed[0].completed(),
+            "{:?}",
+            pumped.resumed[0].diagnostics
+        );
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "math.add");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+
+        let retained_pending = runtime.pending_tools();
+        let denied_lease = runtime
+            .issue_capability_lease(std::iter::empty::<CapabilityLeaseGrant>())
+            .unwrap();
+        let denied = runtime
+            .eval_with_capability_lease(
+                "use mod.arithmetic\n\
+                 try {\n\
+                     arithmetic.add({left: 20, right: 22}).await()\n\
+                 } catch {\n\
+                     \"denied\"\n\
+                 }",
+                &denied_lease,
+            )
+            .unwrap();
+        assert!(denied.completed(), "{:?}", denied.diagnostics);
+        assert_eq!(
+            runtime.script_value_as_json(denied.value, 64, 4).unwrap(),
+            json!("denied")
+        );
+        assert_eq!(runtime.pending_tools(), retained_pending);
+        assert_eq!(runtime.audit().len(), 2);
+        assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn direct_deferred_module_accepts_a_validated_external_json_target() {
+        let mut policy = ToolPolicy::json("math.remote");
+        policy.max_calls = 1;
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_external_json_tool(
+                policy,
+                ToolMetadata::new("Completes reviewed arithmetic outside the interpreter."),
+                add_contract(),
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("remote_math", "Reviewed external arithmetic adapter.")
+                    .with_deferred_method("add", "math.remote"),
+            )
+            .unwrap();
+        let review = runtime
+            .capability_module_call_hint_report(
+                "use mod.remote_math\nremote_math.add({left: 20, right: 22})",
+            )
+            .unwrap();
+        assert_eq!(review.hints.len(), 1);
+        assert_eq!(review.hints[0].tool, "math.remote");
+        assert_eq!(review.hints[0].mode, CapabilityModuleMethodMode::Deferred);
+        assert!(runtime.audit().is_empty());
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.remote", 1)])
+            .unwrap();
+
+        let initial = runtime
+            .eval_with_capability_lease(
+                "use mod.remote_math\n\
+                 let result = remote_math.add({left: 20, right: 22}).await()\n\
+                 result.total",
+                &lease,
+            )
+            .unwrap();
+        assert!(initial.suspended);
+
+        let invocation = runtime.claim_next_external_tool().unwrap();
+        assert_eq!(invocation.name, "math.remote");
+        let resumed = runtime
+            .complete_external_tool(invocation.id, Ok("{\"total\":42}".to_owned()))
+            .unwrap()
+            .expect("awaiting direct module promise resumes the script");
+
+        assert!(resumed.completed(), "{:?}", resumed.diagnostics);
+        assert_eq!(
+            runtime.script_value_as_json(resumed.value, 64, 4).unwrap(),
+            json!(42)
+        );
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "math.remote");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
     fn capability_module_call_hints_resolve_only_visible_reviewed_mappings() {
         let mut runtime = CapabilityRuntime::default();
         runtime
@@ -5805,6 +6114,7 @@ mod tests {
                 module: "arithmetic".to_owned(),
                 method: "add".to_owned(),
                 tool: "math.add".to_owned(),
+                mode: CapabilityModuleMethodMode::Synchronous,
                 line: 3,
                 column: 1,
                 callee_start_byte,
@@ -5872,6 +6182,42 @@ mod tests {
     }
 
     #[test]
+    fn direct_module_method_mode_is_bound_into_capability_leases() {
+        let mut synchronous = CapabilityRuntime::default();
+        let mut deferred = CapabilityRuntime::default();
+        for runtime in [&mut synchronous, &mut deferred] {
+            runtime
+                .register_validated_json_tool(
+                    ToolPolicy::json("math.add"),
+                    ToolMetadata::new("Adds one reviewed JSON result."),
+                    add_contract(),
+                    |_| Ok(json!({"total": 42})),
+                )
+                .unwrap();
+        }
+        synchronous
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapter.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+        deferred
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapter.")
+                    .with_deferred_method("add", "math.add"),
+            )
+            .unwrap();
+
+        let lease = synchronous
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
+            .unwrap();
+        assert_ne!(
+            lease.catalog_fingerprint(),
+            deferred.capability_catalog_fingerprint().unwrap()
+        );
+    }
+
+    #[test]
     fn tool_only_catalog_fingerprint_keeps_the_v1_encoding() {
         let mut runtime = CapabilityRuntime::default();
         runtime
@@ -5932,7 +6278,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_capability_module_rejects_unreviewed_or_deferred_targets() {
+    fn synchronous_direct_module_rejects_unreviewed_or_external_targets() {
         let mut runtime = CapabilityRuntime::default();
         runtime
             .register_json_tool(ToolPolicy::json("math.unreviewed"), |_| {
@@ -7247,6 +7593,7 @@ mod tests {
         let mut gc = ToolPromiseGc {
             pending: pending.clone(),
             handle,
+            output: ToolPromiseOutput::Text,
         };
 
         gc.gc();

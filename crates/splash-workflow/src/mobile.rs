@@ -88,8 +88,9 @@ impl MobileWorkflowBuilder {
     /// setup-defined direct-module catalog representations.
     ///
     /// Direct module methods remain schema-bound facades over reviewed local
-    /// JSON adapters. Their mappings are configured before the workflow
-    /// runtime is sealed and remain subject to the underlying tool policy.
+    /// JSON adapters. A host may explicitly select a synchronous or deferred
+    /// host-pump method; its mapping is configured before the workflow runtime
+    /// is sealed and remains subject to the underlying tool policy.
     pub fn with_limits_catalog_and_module_limits(
         limits: ExecutionLimits,
         max_pending_tools: usize,
@@ -299,7 +300,8 @@ impl MobileWorkflowBuilder {
     ///
     /// Registration is available only during builder setup. Every method
     /// retains its mapped tool's executable JSON contract, call budget, audit
-    /// trail, and named workflow-step capability policy; it does not expose a
+    /// trail, and named workflow-step capability policy. Deferred local methods
+    /// use the existing workflow host-pump lifecycle; it does not expose a
     /// dynamic module, crate, filesystem, process, or network API.
     pub fn register_capability_module(
         &mut self,
@@ -932,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn seals_direct_capability_modules_behind_workflow_policy_approval() {
+    fn drives_direct_deferred_modules_behind_workflow_policy_approval() {
         let module_limits = CapabilityModuleLimits {
             max_modules: 1,
             max_methods: 1,
@@ -963,7 +965,7 @@ mod tests {
         builder
             .register_capability_module(
                 CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
-                    .with_method("add", "math.add"),
+                    .with_deferred_method("add", "math.add"),
             )
             .expect("static direct module registers");
 
@@ -973,6 +975,10 @@ mod tests {
         assert_eq!(
             runtime.capability_module_catalog()[0].methods[0].tool,
             "math.add"
+        );
+        assert_eq!(
+            runtime.capability_module_catalog()[0].methods[0].mode,
+            splash_capabilities::CapabilityModuleMethodMode::Deferred
         );
         assert_eq!(
             runtime.module_interface_catalog(),
@@ -998,6 +1004,10 @@ mod tests {
         assert_eq!(review.hints[0].module, "arithmetic");
         assert_eq!(review.hints[0].method, "add");
         assert_eq!(review.hints[0].tool, "math.add");
+        assert_eq!(
+            review.hints[0].mode,
+            splash_capabilities::CapabilityModuleMethodMode::Deferred
+        );
         assert!(runtime.audit().is_empty());
 
         let plan = runtime
@@ -1005,7 +1015,7 @@ mod tests {
                 "calculate",
                 "use mod.arithmetic\n\
                  use mod.std.assert\n\
-                 let result = arithmetic.add({left: 20, right: 22})\n\
+                 let result = arithmetic.add({left: 20, right: 22}).await()\n\
                  assert(result.total == 42)",
             )])
             .expect("trusted plan is valid");

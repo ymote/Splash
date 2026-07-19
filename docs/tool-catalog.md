@@ -127,14 +127,29 @@ result.total
 
 This is not a general import system or Rust package bridge. A direct module is
 setup-only, has one canonical identifier segment, and its methods map one-to-one
-to existing tools. Registration accepts only a synchronous `host_pump` JSON
-tool with an executable input/output contract. The method accepts one bounded
-JSON record or array subject to the target contract, returns decoded bounded
-JSON, and retains the target tool's call limit, metadata, audit entry, JSON
-validation, and active capability-lease check. Deferred `external` tools,
-prompt-only schemas, text tools, duplicate target aliases, existing VM module
-names, dynamic libraries,
-and script-selected crates remain unavailable.
+to existing tools. `with_method` accepts only a synchronous `host_pump` JSON
+tool with an executable input/output contract; it accepts one bounded JSON
+record or array and returns decoded bounded JSON. A host can instead choose
+`with_deferred_method` for an existing contract-enforced JSON tool. That
+method returns a bounded promise and `await()` returns decoded bounded JSON;
+it may use either host-pump or external dispatch, but still reserves the same
+underlying target tool. In both modes the target retains its call limit,
+metadata, audit entry, JSON validation, and active capability-lease check.
+Prompt-only schemas, text tools, duplicate target aliases, existing VM module
+names, dynamic libraries, and script-selected crates remain unavailable.
+
+```splash
+use mod.remote_math
+
+let result = remote_math.add({left: 20, right: 22}).await()
+result.total
+```
+
+The host decides the mode during setup; source cannot turn a synchronous method
+into a deferred one or select a dispatch backend. The host-visible module
+catalog and every `direct_module_calls` review hint include `mode` as either
+`"synchronous"` or `"deferred"`, and that mode is included in the capability
+lease fingerprint.
 
 `CapabilityModuleLimits` defaults to 32 modules, 128 methods, and a 256 KiB
 bound across every retained direct-module catalog representation, with fixed
@@ -150,9 +165,9 @@ input and output byte limits must fit the runtime JSON bridge: the smaller of
 bounded by the smaller of `max_syntax_nesting` and 64. The module catalog seals
 when a lease is issued or source is first evaluated, so a new syntax alias
 cannot appear under an existing approval. The stable module name, description,
-method name, and target tool are also included in the capability catalog
+method name, mode, and target tool are also included in the capability catalog
 fingerprint recorded by that lease, binding a reviewed direct call to its exact
-underlying capability.
+underlying capability and invocation behavior.
 
 `CapabilityRuntime::capability_module_catalog()` returns the reviewed mapping
 for a host prompt or operator UI. `module_interface_catalog()` returns the
