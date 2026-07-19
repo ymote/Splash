@@ -1,0 +1,5 @@
+use mod.std.assert
+use mod.std.json
+let decoded = json.parse("{\"answer\":42}")
+assert(decoded.answer == 42)
+json.stringify(decoded)

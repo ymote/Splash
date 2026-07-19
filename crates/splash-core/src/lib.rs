@@ -796,7 +796,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
             vm.bx
                 .heap
                 .set_max_string_bytes(Some(limits.max_string_bytes));
-            restrict_vendored_module_surface(vm);
+            restrict_vendored_module_surface(vm, installed_limits.clone());
             install_bounded_json_methods(vm, installed_limits);
             // This fixed, trusted setup must complete before an exact retained
             // heap cap is enabled. Otherwise a temporary collection growth can
@@ -2416,7 +2416,10 @@ fn evaluate_with_limits(
 /// the standalone Splash source surface. The VM still constructs its upstream
 /// bootstrap objects, but generated Splash can reach only the retained core and
 /// modules installed by trusted Rust setup code.
-fn restrict_vendored_module_surface(vm: &mut vm::ScriptVm) {
+fn restrict_vendored_module_surface(
+    vm: &mut vm::ScriptVm,
+    json_method_limits: Rc<Cell<ScriptJsonMethodLimits>>,
+) {
     let modules = vm.bx.heap.modules;
     for module in [id!(math), id!(gc), id!(pod), id!(shader)] {
         vm.bx
@@ -2437,6 +2440,7 @@ fn restrict_vendored_module_surface(vm: &mut vm::ScriptVm) {
             .set_value_def(std, member.into(), ScriptValue::NIL);
     }
     install_standard_math_module(vm, std);
+    install_standard_json_module(vm, std, json_method_limits);
     // Retained Splash core values and the VM-internal `Range` prototype are
     // setup-owned language primitives, not mutable cross-evaluation points.
     vm.bx.heap.freeze(std);
@@ -2603,6 +2607,38 @@ fn install_standard_math_module(vm: &mut vm::ScriptVm, std_module: ScriptObject)
     vm.bx.heap.freeze(math);
 }
 
+/// Installs a small Splash-owned JSON module that reuses the same bounded
+/// reader and writer as the existing `parse_json()` and `to_json()` methods.
+/// It adds no host lookup, filesystem, network, or adapter access.
+fn install_standard_json_module(
+    vm: &mut vm::ScriptVm,
+    std_module: ScriptObject,
+    limits: Rc<Cell<ScriptJsonMethodLimits>>,
+) {
+    let json = vm.bx.heap.new_with_proto(NIL);
+    let parse_limits = limits.clone();
+    vm.add_method(
+        json,
+        id!(parse),
+        script_args_def!(document = NIL),
+        move |vm, args| {
+            bounded_json_parse_value(vm, script_value!(vm, args.document), parse_limits.get())
+        },
+    );
+    vm.add_method(
+        json,
+        id!(stringify),
+        script_args_def!(value = NIL),
+        move |vm, args| {
+            bounded_json_stringify_value(vm, script_value!(vm, args.value), limits.get())
+        },
+    );
+    vm.bx
+        .heap
+        .set_value_def(std_module, id!(json).into(), json.into());
+    vm.bx.heap.freeze(json);
+}
+
 fn standard_math_unary(
     vm: &mut vm::ScriptVm,
     args: ScriptObject,
@@ -2709,12 +2745,7 @@ fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJso
             &[],
             move |vm, args| {
                 let value = script_value!(vm, args.self);
-                let limits = limits.get();
-                let mut writer = BoundedJsonWriter::new(limits.max_bytes);
-                match write_script_json(vm, value, limits.max_depth, &mut Vec::new(), &mut writer) {
-                    Ok(()) => vm.bx.heap.new_string_from_str(&writer.into_string()),
-                    Err(error) => bounded_json_method_error(vm, error),
-                }
+                bounded_json_stringify_value(vm, value, limits.get())
             },
         );
     }
@@ -2727,26 +2758,7 @@ fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJso
         &[],
         move |vm, args| {
             let value = script_value!(vm, args.self);
-            let limits = string_limits.get();
-            let document = vm
-                .bx
-                .heap
-                .string_with(value, |_, document| {
-                    if document.len() > limits.max_bytes {
-                        Err(RuntimeJsonError::TooLarge {
-                            actual: document.len(),
-                            maximum: limits.max_bytes,
-                        })
-                    } else {
-                        Ok(document.to_owned())
-                    }
-                })
-                .unwrap_or(Err(RuntimeJsonError::UnsupportedScriptValue));
-
-            match document.and_then(|document| parse_bounded_script_json(vm, &document, limits)) {
-                Ok(value) => value,
-                Err(error) => bounded_json_method_error(vm, error),
-            }
+            bounded_json_parse_value(vm, value, string_limits.get())
         },
     );
 
@@ -2757,31 +2769,70 @@ fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJso
         &[],
         move |vm, args| {
             let value = script_value!(vm, args.self);
-            let limits = limits.get();
-            let document = match value.as_array() {
-                Some(array) => match vm.bx.heap.array_storage(array) {
-                    vm::ScriptArrayStorage::U8(bytes) => {
-                        if bytes.len() > limits.max_bytes {
-                            Err(RuntimeJsonError::TooLarge {
-                                actual: bytes.len(),
-                                maximum: limits.max_bytes,
-                            })
-                        } else {
-                            String::from_utf8(bytes.clone())
-                                .map_err(|_| RuntimeJsonError::InvalidEncoding)
-                        }
-                    }
-                    _ => Err(RuntimeJsonError::UnsupportedScriptValue),
-                },
-                None => Err(RuntimeJsonError::UnsupportedScriptValue),
-            };
-
-            match document.and_then(|document| parse_bounded_script_json(vm, &document, limits)) {
-                Ok(value) => value,
-                Err(error) => bounded_json_method_error(vm, error),
-            }
+            bounded_json_parse_value(vm, value, limits.get())
         },
     );
+}
+
+fn bounded_json_stringify_value(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    limits: ScriptJsonMethodLimits,
+) -> ScriptValue {
+    let mut writer = BoundedJsonWriter::new(limits.max_bytes);
+    match write_script_json(vm, value, limits.max_depth, &mut Vec::new(), &mut writer) {
+        Ok(()) => vm.bx.heap.new_string_from_str(&writer.into_string()),
+        Err(error) => bounded_json_method_error(vm, error),
+    }
+}
+
+fn bounded_json_parse_value(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    limits: ScriptJsonMethodLimits,
+) -> ScriptValue {
+    match script_json_document(vm, value, limits)
+        .and_then(|document| parse_bounded_script_json(vm, &document, limits))
+    {
+        Ok(value) => value,
+        Err(error) => bounded_json_method_error(vm, error),
+    }
+}
+
+fn script_json_document(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    limits: ScriptJsonMethodLimits,
+) -> Result<String, RuntimeJsonError> {
+    if let Some(document) = vm.bx.heap.string_with(value, |_, document| {
+        if document.len() > limits.max_bytes {
+            Err(RuntimeJsonError::TooLarge {
+                actual: document.len(),
+                maximum: limits.max_bytes,
+            })
+        } else {
+            Ok(document.to_owned())
+        }
+    }) {
+        return document;
+    }
+
+    match value.as_array() {
+        Some(array) => match vm.bx.heap.array_storage(array) {
+            vm::ScriptArrayStorage::U8(bytes) => {
+                if bytes.len() > limits.max_bytes {
+                    Err(RuntimeJsonError::TooLarge {
+                        actual: bytes.len(),
+                        maximum: limits.max_bytes,
+                    })
+                } else {
+                    String::from_utf8(bytes.clone()).map_err(|_| RuntimeJsonError::InvalidEncoding)
+                }
+            }
+            _ => Err(RuntimeJsonError::UnsupportedScriptValue),
+        },
+        None => Err(RuntimeJsonError::UnsupportedScriptValue),
+    }
 }
 
 fn parse_bounded_script_json(
@@ -6360,6 +6411,87 @@ compute(outer, 2)
             .unwrap();
         assert!(!report.succeeded());
         assert!(!report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn exposes_frozen_bounded_standard_json() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 use mod.std.json\n\
+                 let parsed = json.parse(\"{\\\"answer\\\":42}\")\n\
+                 assert(parsed.answer == 42)\n\
+                 json.stringify(parsed)",
+            )
+            .unwrap();
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("{\"answer\":42}")
+        );
+
+        let bytes = runtime
+            .eval("use mod.std.json\njson.parse(\"{\\\"bytes\\\":true}\".to_bytes()).bytes")
+            .unwrap();
+        assert!(bytes.completed(), "{:?}", bytes.diagnostics);
+        assert_eq!(bytes.value.as_bool(), Some(true));
+
+        let mut namespace_runtime = Runtime::default();
+        let namespace = namespace_runtime
+            .eval("use mod.std\nstd.json.parse(\"{\\\"total\\\":42}\").total")
+            .unwrap();
+        assert!(namespace.completed(), "{:?}", namespace.diagnostics);
+        assert_eq!(namespace.value.as_number(), Some(42.0));
+
+        let mutation = runtime
+            .eval("use mod.std.json\njson.parse = || nil")
+            .unwrap();
+        assert!(!mutation.succeeded());
+        assert!(!mutation.diagnostics.is_empty());
+
+        let preserved = runtime
+            .eval("use mod.std.json\njson.stringify({preserved: true})")
+            .unwrap();
+        assert!(preserved.completed(), "{:?}", preserved.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    preserved.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("{\"preserved\":true}")
+        );
+
+        let mut bounded_source = String::from("use mod.std.json\nlet value = \"x\"\n");
+        for _ in 0..8 {
+            bounded_source.push_str("value += value\n");
+        }
+        bounded_source.push_str("try json.stringify(value) catch \"bounded\"");
+        let mut bounded_runtime = Runtime::default();
+        let mut limits = bounded_runtime.limits();
+        limits.max_source_bytes = bounded_source.len();
+        bounded_runtime.set_limits(limits).unwrap();
+        let bounded = bounded_runtime.eval(&bounded_source).unwrap();
+        assert!(bounded.completed(), "{:?}", bounded.diagnostics);
+        assert_eq!(
+            bounded_runtime
+                .script_value_as_json(
+                    bounded.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("bounded")
+        );
     }
 
     #[test]

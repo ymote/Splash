@@ -44,16 +44,17 @@ and keeps UI support optional rather than making UI the language boundary.
 - Standalone runtime initialization that masks inherited Makepad UI/debug and
   unbounded native entry points before source evaluation, leaving only the
   documented core plus trusted host-installed modules reachable from Splash.
-- A frozen, effect-free `mod.std.math` scalar helper module for common numeric
-  dataflow without restoring Makepad's broader shader-oriented `mod.math`
-  surface or granting host authority.
+- Frozen no-authority `mod.std.math` scalar helpers and `mod.std.json` bounded
+  JSON helpers for common dataflow without restoring Makepad's broader
+  shader-oriented `mod.math` surface or granting host authority.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
   opaque trusted Rust adapter allocations.
-- Direct `Runtime` JSON conversion: strict, byte- and depth-bounded
-  `.parse_json()` input plus cycle-aware, byte- and depth-bounded `.to_json()`
-  output, with ordinary script errors rather than unbounded VM work.
+- Direct `Runtime` JSON conversion through `.parse_json()`/`.to_json()` and
+  frozen `mod.std.json`: strict, byte- and depth-bounded input plus
+  cycle-aware, byte- and depth-bounded output, with ordinary script errors
+  rather than unbounded VM work.
 - Recoverable `try ... catch ...` control flow across Splash function calls,
   with hard resource stops kept uncatchable and no implicit effect rollback.
 - A deny-by-default tool host: scripts can call only explicitly registered
@@ -244,6 +245,12 @@ For ordinary numeric dataflow, `use mod.std.math` provides a small frozen
 Splash-owned scalar library. It is separate from the masked Makepad
 `mod.math` shader module and cannot access files, processes, networking,
 clocks, entropy, or Rust crates.
+
+For strict local JSON conversion, `use mod.std.json` provides only
+`json.parse(document)` and `json.stringify(value)`. They reuse the same
+byte/depth/cycle-bounded boundary as `.parse_json()` and `.to_json()` and have
+no host, adapter, filesystem, process, network, clock, entropy, or crate
+access.
 
 ## Example
 
@@ -541,10 +548,12 @@ For an exact visible `use mod.std.assert` binding, it also provides fixed
 plain-text hover and signature help for `assert(condition)`; `use mod.std`
 supports the same fixed signature at direct `std.assert(...)`. These fixed
 surfaces use no tool-catalog or adapter lookup, do not follow local aliases,
-and do not imply a capability grant. At a statement-position `use mod.` path,
-the same static projection completes `std`; below `use mod.std.` it completes
-`assert` and `math`. The frozen `mod.std` subtree cannot be extended by advisory
-catalog metadata. An integration may additionally supply a
+and do not imply a capability grant. For an exact visible `use mod.std.json`
+binding, it completes `parse` and `stringify` with fixed plain-text hover and
+signature help. At a statement-position `use mod.` path, the same static
+projection completes `std`; below `use mod.std.` it completes `assert`, `json`,
+and `math`. The frozen `mod.std` subtree cannot be extended by advisory catalog
+metadata. An integration may additionally supply a
 advisory tool-catalog projection through
 `initializationOptions.splash.toolCatalog` or a later
 `workspace/didChangeConfiguration` update; it accepts the `name`, `format`,

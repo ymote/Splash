@@ -216,11 +216,12 @@ Before either canonical or compatibility evaluation, standalone `Runtime`
 masks inherited Makepad UI, debug, shader, pod, GC, math, regex, HTML, and
 direct-output entry points. In particular, generated source cannot reach the
 vendored `std.log`, `std.print`, `std.println`, `std.regex`, or
-`String.parse_html()` APIs. `mod.std.assert`, normal language operations, and
-the frozen Splash-owned `mod.std.math` scalar helpers remain available, along
-with reviewed host-installed `mod.tool` or direct capability modules. A trusted
-host that needs the broader Makepad surface must embed the raw Makepad VM
-itself; the compatibility APIs do not restore those bindings.
+`String.parse_html()` APIs. `mod.std.assert`, normal language operations, the
+frozen Splash-owned `mod.std.math` scalar helpers, and the bounded
+`mod.std.json` data helpers remain available, along with reviewed
+host-installed `mod.tool` or direct capability modules. A trusted host that
+needs the broader Makepad surface must embed the raw Makepad VM itself; the
+compatibility APIs do not restore those bindings.
 
 The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
 fixture passes the bounded compatibility preflight to catch parser drift, but
@@ -411,6 +412,15 @@ local alias, or derive a host capability. A shadowed binding, chained receiver,
 unknown member, or invalid source prefix has no fixed-math result, and advisory
 metadata cannot add members to this core module.
 
+An exact visible direct `use mod.std.json` binding has a separate fixed core
+projection for only `json.parse(document)` and `json.stringify(value)`, with
+plain-text member hover and function signature help. Its descriptors are
+compiled into the LSP rather than read from a catalog, and describe the same
+bounded JSON data boundary as the runtime without resolving a host module or
+granting a capability. A shadowed binding, chained receiver, unknown member,
+or invalid source prefix has no fixed-JSON result, and advisory metadata cannot
+add members to this core module.
+
 An exact visible direct `use mod.std.assert` binding receives fixed plain-text
 hover and `assert(condition)` signature help. A direct `std.assert(...)` call
 after `use mod.std` receives the same fixed signature. These assertions are
@@ -418,12 +428,12 @@ compiled-in source metadata, not a host lookup or capability grant; aliases,
 shadowed bindings, and non-core imports receive no fixed assertion result.
 
 The same compiled-in projection completes `std` at a statement-position `use
-mod.` path and `assert`/`math` below `use mod.std.`. The frozen `mod.std`
+mod.` path and `assert`/`json`/`math` below `use mod.std.`. The frozen `mod.std`
 namespace has no catalog descendants: advisory metadata cannot add `log`,
-`inspect`, or children below `mod.std.assert` or `mod.std.math`. If an advisory
-catalog is unavailable, the fixed `std` root candidate remains visible but is
-incomplete because non-core `mod.*` siblings could be absent; the closed
-`mod.std` list remains complete.
+`inspect`, or children below `mod.std.assert`, `mod.std.json`, or
+`mod.std.math`. If an advisory catalog is unavailable, the fixed `std` root
+candidate remains visible but is incomplete because non-core `mod.*` siblings
+could be absent; the closed `mod.std` list remains complete.
 
 For an exact visible imported capability-module leaf, the optional advisory
 `moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,

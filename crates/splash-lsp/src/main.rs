@@ -174,6 +174,18 @@ struct StandardMathConstant {
     description: &'static str,
 }
 
+/// One fixed function in Splash's core bounded-JSON module.
+///
+/// Like core math, this table is compiled into the LSP and never derived from
+/// a host module catalog, adapter, or capability runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StandardJsonFunction {
+    name: &'static str,
+    parameters: &'static [&'static str],
+    result: &'static str,
+    description: &'static str,
+}
+
 const STANDARD_MATH_FUNCTIONS: &[StandardMathFunction] = &[
     StandardMathFunction {
         name: "abs",
@@ -268,8 +280,27 @@ const STANDARD_MATH_CONSTANTS: &[StandardMathConstant] = &[
     },
 ];
 
+const STANDARD_JSON_FUNCTIONS: &[StandardJsonFunction] = &[
+    StandardJsonFunction {
+        name: "parse",
+        parameters: &["document"],
+        result: "JSON value",
+        description:
+            "Parses strict JSON from a string or UTF-8 byte array through Splash's configured byte and nesting limits.",
+    },
+    StandardJsonFunction {
+        name: "stringify",
+        parameters: &["value"],
+        result: "string",
+        description:
+            "Serializes a JSON-safe value through Splash's configured byte, nesting, and cycle limits.",
+    },
+];
+
 const STANDARD_MATH_AUTHORITY_NOTE: &str =
     "Effect-free Splash core helper; it does not access the host or grant authority.";
+const STANDARD_JSON_AUTHORITY_NOTE: &str =
+    "Bounded Splash core data helper; it does not access the host or grant authority.";
 
 const STANDARD_ASSERT_DESCRIPTION: &str = "Raises a script error when the condition is false.";
 const STANDARD_ASSERT_AUTHORITY_NOTE: &str =
@@ -304,6 +335,12 @@ const FIXED_STANDARD_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[
         name: "assert",
         detail: "Splash core function; fixed assertion helper",
         documentation: STANDARD_ASSERT_DOCUMENTATION,
+    },
+    FixedCoreModulePathChild {
+        name: "json",
+        detail: "Splash core module; bounded JSON helpers",
+        documentation:
+            "Fixed Splash core JSON helpers. They use the runtime's bounded JSON boundary and do not access the host or grant authority.",
     },
     FixedCoreModulePathChild {
         name: "math",
@@ -911,6 +948,16 @@ impl SplashLanguageServer {
                 {
                     return Ok(standard_math_member_hover(source, site));
                 }
+                if site.has_direct_receiver()
+                    && is_visible_builtin_standard_json_receiver(
+                        source,
+                        lexical,
+                        imports,
+                        site.receiver,
+                    )
+                {
+                    return Ok(standard_json_member_hover(source, site));
+                }
                 if let Some(hover) = fixed_core_module_member_hover(source, lexical, imports, site)
                 {
                     return Ok(hover);
@@ -1115,6 +1162,22 @@ impl SplashLanguageServer {
                     is_incomplete,
                 ));
             }
+            if member_site.has_direct_receiver()
+                && is_visible_builtin_standard_json_receiver(
+                    source,
+                    report,
+                    imports,
+                    member_site.receiver,
+                )
+            {
+                return Ok(standard_json_module_member_completion(
+                    source,
+                    report,
+                    imports,
+                    member_site,
+                    is_incomplete,
+                ));
+            }
             if let Some(completion) = fixed_core_module_member_completion(
                 source,
                 report,
@@ -1289,6 +1352,16 @@ impl SplashLanguageServer {
             )
         {
             return Ok(standard_math_signature_help(source, context));
+        }
+        if context.callee.has_direct_receiver()
+            && is_visible_builtin_standard_json_receiver(
+                source,
+                lexical,
+                imports,
+                context.callee.receiver,
+            )
+        {
+            return Ok(standard_json_signature_help(source, context));
         }
         if is_visible_builtin_standard_assert_member(source, lexical, imports, context.callee) {
             return Ok(standard_assert_member_signature_help(source, context));
@@ -1560,12 +1633,15 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "use mod.fuzz.inspect\n",
     "use mod.std\n",
     "use mod.std.assert\n",
+    "use mod.std.json\n",
     "use mod.std.math\n",
     "let result = inspect.remote_add({left: 20, filters: {category: \"news\"}, right: 22}).await()\n",
     "let alias = result\n",
     "alias.summary.total\n",
     "let bounded = math.clamp(math.sqrt(81), 0, 8)\n",
     "math.pi\n",
+    "let parsed = json.parse(\"{\\\"answer\\\":42}\")\n",
+    "json.stringify(parsed)\n",
     "assert(true)\n",
     "std.assert(true)\n",
     "tool.call(\"\", \"\")\n",
@@ -1574,8 +1650,12 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
 );
 
 #[cfg(fuzzing)]
-const FUZZ_FIXED_CORE_IMPORT_PATH_SOURCES: &[&str] =
-    &["use mod.", "use mod.std.", "use mod.std.math."];
+const FUZZ_FIXED_CORE_IMPORT_PATH_SOURCES: &[&str] = &[
+    "use mod.",
+    "use mod.std.",
+    "use mod.std.json.",
+    "use mod.std.math.",
+];
 
 /// Fixed no-authority metadata used to exercise advisory module completion and
 /// hover through the production document lifecycle.
@@ -1719,6 +1799,7 @@ pub fn fuzz_exercise_document(source: &str) {
     );
     fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 4);
 
@@ -1766,6 +1847,7 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
     server.refresh_advisory_configuration(settings);
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 2);
 
@@ -1848,6 +1930,35 @@ fn fuzz_exercise_fixed_standard_math_requests(
         return;
     };
     let _ = server.signature_help(uri, position_at_byte(source, minimum_start + 1));
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_fixed_standard_json_requests(
+    server: &SplashLanguageServer,
+    uri: &Uri,
+    source: &str,
+) {
+    let Some(parse_start) = source.find("json.parse") else {
+        return;
+    };
+    let parse_argument = parse_start + "json.parse(\"".len();
+    let _ = server.completion(
+        uri,
+        position_at_byte(source, parse_start + "json.parse".len()),
+    );
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, parse_start + "json.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, parse_argument));
+
+    let Some(stringify_start) = source.find("json.stringify") else {
+        return;
+    };
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, stringify_start + "json.".len() + 1),
+    );
 }
 
 #[cfg(fuzzing)]
@@ -4641,6 +4752,54 @@ fn standard_math_module_member_completion(
     }
 }
 
+/// Completes only the fixed, documented core JSON module. It reuses no host
+/// module-catalog metadata, so these descriptions cannot imply JSON adapter
+/// availability or any capability authority.
+fn standard_json_module_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if !site.has_direct_receiver()
+        || site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+        || !is_visible_builtin_standard_json_receiver(source, lexical, imports, site.receiver)
+    {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.member);
+    let mut items = STANDARD_JSON_FUNCTIONS
+        .iter()
+        .map(|function| CompletionItem {
+            label: function.name.to_owned(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("mod.std.json function; bounded core data helper".to_owned()),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: standard_json_function_documentation(function, "json"),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                function.name.to_owned(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
 /// Completes only the direct, frozen `mod.std` tree. This is placed before
 /// advisory output-field recognition so retained fixed imports remain useful
 /// when a later oversized import list marks that advisory metadata incomplete.
@@ -4691,6 +4850,21 @@ fn standard_math_member_hover(source: &str, site: MemberCompletionSite) -> Optio
     })
 }
 
+fn standard_json_member_hover(source: &str, site: MemberCompletionSite) -> Option<Hover> {
+    if !site.has_direct_receiver() {
+        return None;
+    }
+    let member = source.get(site.member.start_byte..site.member.end_byte)?;
+    let function = standard_json_function(member)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: standard_json_function_documentation(function, "json"),
+        }),
+        range: Some(span_range(source, site.member)),
+    })
+}
+
 fn standard_math_function(name: &str) -> Option<&'static StandardMathFunction> {
     STANDARD_MATH_FUNCTIONS
         .iter()
@@ -4701,6 +4875,12 @@ fn standard_math_constant(name: &str) -> Option<&'static StandardMathConstant> {
     STANDARD_MATH_CONSTANTS
         .iter()
         .find(|constant| constant.name == name)
+}
+
+fn standard_json_function(name: &str) -> Option<&'static StandardJsonFunction> {
+    STANDARD_JSON_FUNCTIONS
+        .iter()
+        .find(|function| function.name == name)
 }
 
 fn standard_assert_documentation(callee: &str) -> String {
@@ -4722,6 +4902,16 @@ fn standard_math_constant_documentation(constant: &StandardMathConstant, receive
     format!(
         "{receiver}.{} -> number\n\n{}\n\n{STANDARD_MATH_AUTHORITY_NOTE}",
         constant.name, constant.description,
+    )
+}
+
+fn standard_json_function_documentation(function: &StandardJsonFunction, receiver: &str) -> String {
+    format!(
+        "{receiver}.{}({}) -> {}\n\n{}\n\n{STANDARD_JSON_AUTHORITY_NOTE}",
+        function.name,
+        function.parameters.join(", "),
+        function.result,
+        function.description,
     )
 }
 
@@ -5233,6 +5423,7 @@ fn fixed_core_module_path_children(
     } else if module_path_matches(prefix, &["mod", "std"]) {
         Some(FIXED_STANDARD_MODULE_PATH_CHILDREN)
     } else if module_path_starts_with(prefix, &["mod", "std", "assert"])
+        || module_path_starts_with(prefix, &["mod", "std", "json"])
         || module_path_starts_with(prefix, &["mod", "std", "math"])
     {
         Some(&[])
@@ -6123,6 +6314,25 @@ fn standard_math_signature_help(
     ))
 }
 
+fn standard_json_signature_help(
+    source: &str,
+    context: SignatureHelpCallContext,
+) -> Option<SignatureHelp> {
+    let member = source.get(context.callee.member.start_byte..context.callee.member.end_byte)?;
+    let function = standard_json_function(member)?;
+    let callee = source.get(context.callee.receiver.start_byte..context.callee.member.end_byte)?;
+    Some(signature_help_with_parameters(
+        format!(
+            "{callee}({}) -> {}",
+            function.parameters.join(", "),
+            function.result
+        ),
+        standard_json_function_documentation(function, callee),
+        function.parameters,
+        context.active_argument,
+    ))
+}
+
 fn standard_assert_signature_help(callee: &str, active_argument: usize) -> SignatureHelp {
     signature_help_with_parameters(
         format!("{callee}(condition)"),
@@ -6260,6 +6470,16 @@ fn is_visible_builtin_standard_math_receiver(
 ) -> bool {
     visible_module_import_for_receiver(source, lexical, imports, receiver)
         .is_some_and(is_builtin_standard_math_module_import)
+}
+
+fn is_visible_builtin_standard_json_receiver(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    receiver: SourceSpan,
+) -> bool {
+    visible_module_import_for_receiver(source, lexical, imports, receiver)
+        .is_some_and(is_builtin_standard_json_module_import)
 }
 
 fn is_visible_builtin_standard_assert_receiver(
@@ -7072,6 +7292,14 @@ fn is_builtin_standard_math_module_import(import: &ModuleImport) -> bool {
         .iter()
         .map(String::as_str)
         .eq(["mod", "std", "math"])
+}
+
+fn is_builtin_standard_json_module_import(import: &ModuleImport) -> bool {
+    import
+        .path
+        .iter()
+        .map(String::as_str)
+        .eq(["mod", "std", "json"])
 }
 
 fn is_builtin_standard_assert_module_import(import: &ModuleImport) -> bool {
@@ -8075,6 +8303,195 @@ mod tests {
                 Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_partial_range
             )
         }));
+    }
+
+    #[test]
+    fn completes_fixed_standard_json_members_without_host_metadata() {
+        let source = "use mod.std.json\nlet parsed = json.";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.std.json.untrusted",
+                    "description": "Must not extend the fixed core module."
+                }
+            ])),
+        );
+        server.open_document(document(1, source));
+        let member_start = source.len();
+        let expected_empty_range = Range::new(
+            position_at_byte(source, member_start),
+            position_at_byte(source, member_start),
+        );
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, member_start))
+            .expect("core JSON completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["parse", "stringify"]
+        );
+        assert!(completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::FUNCTION)
+                && item.detail.as_deref()
+                    == Some("mod.std.json function; bounded core data helper")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_empty_range
+                )
+        }));
+        let parse = completion
+            .items
+            .iter()
+            .find(|item| item.label == "parse")
+            .expect("parse is a fixed core helper");
+        assert_eq!(
+            parse.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "json.parse(document) -> JSON value\n\nParses strict JSON from a string or UTF-8 byte array through Splash's configured byte and nesting limits.\n\nBounded Splash core data helper; it does not access the host or grant authority.".to_owned(),
+            }))
+        );
+
+        let partial_source = "use mod.std.json\nlet parsed = json.st";
+        let mut partial_server = SplashLanguageServer::default();
+        partial_server.open_document(document(1, partial_source));
+        let partial_start = partial_source.rfind("st").expect("partial member exists");
+        let partial_end = partial_source.len();
+        let expected_partial_range = Range::new(
+            position_at_byte(partial_source, partial_start),
+            position_at_byte(partial_source, partial_end),
+        );
+        let partial = partial_server
+            .completion(&test_uri(), position_at_byte(partial_source, partial_end))
+            .expect("partial core JSON completion succeeds");
+        assert_eq!(partial.items.len(), 2);
+        assert!(partial.items.iter().all(|item| {
+            matches!(
+                &item.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_partial_range
+            )
+        }));
+    }
+
+    #[test]
+    fn presents_fixed_standard_json_hover_and_signature_help_without_authority() {
+        let source = concat!(
+            "use mod.std.json\n",
+            "let parsed = json.parse(\"{\\\"answer\\\":42}\")\n",
+            "json.stringify(parsed)"
+        );
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let parse_start = source.find("json.parse").expect("parse member exists") + "json.".len();
+        let parse_hover = server
+            .hover(&test_uri(), position_at_byte(source, parse_start + 1))
+            .expect("core JSON parse hover succeeds")
+            .expect("parse has fixed hover metadata");
+        assert_eq!(
+            parse_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "json.parse(document) -> JSON value\n\nParses strict JSON from a string or UTF-8 byte array through Splash's configured byte and nesting limits.\n\nBounded Splash core data helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let stringify_start = source.find("stringify").expect("stringify member exists");
+        let stringify_hover = server
+            .hover(&test_uri(), position_at_byte(source, stringify_start + 1))
+            .expect("core JSON stringify hover succeeds")
+            .expect("stringify has fixed hover metadata");
+        assert_eq!(
+            stringify_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "json.stringify(value) -> string\n\nSerializes a JSON-safe value through Splash's configured byte, nesting, and cycle limits.\n\nBounded Splash core data helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let parse_cursor = source.find("answer").expect("JSON document exists") + 1;
+        let parse_help = server
+            .signature_help(&test_uri(), position_at_byte(source, parse_cursor))
+            .expect("core JSON parse signature help succeeds")
+            .expect("parse has a fixed signature");
+        assert_eq!(parse_help.signatures.len(), 1);
+        assert_eq!(
+            parse_help.signatures[0].label,
+            "json.parse(document) -> JSON value"
+        );
+        assert_eq!(parse_help.active_signature, Some(0));
+        assert_eq!(parse_help.active_parameter, Some(0));
+        assert_eq!(
+            parse_help.signatures[0].parameters,
+            Some(vec![ParameterInformation {
+                label: ParameterLabel::Simple("document".to_owned()),
+                documentation: None,
+            }])
+        );
+
+        let stringify_cursor = source.rfind("parsed").expect("JSON value exists") + 1;
+        let stringify_help = server
+            .signature_help(&test_uri(), position_at_byte(source, stringify_cursor))
+            .expect("core JSON stringify signature help succeeds")
+            .expect("stringify has a fixed signature");
+        assert_eq!(
+            stringify_help.signatures[0].label,
+            "json.stringify(value) -> string"
+        );
+        assert_eq!(stringify_help.active_parameter, Some(0));
+
+        let hostile_catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.std.json.untrusted",
+                "description": "Must not extend the fixed core module.",
+                "callMode": "synchronous",
+                "callShape": "single_json"
+            }
+        ]));
+        let hostile_source = "use mod.std.json\njson.untrusted({})";
+        let mut hostile_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            hostile_catalog,
+        );
+        hostile_server.open_document(document(1, hostile_source));
+        let untrusted_start = hostile_source.find("untrusted").expect("member exists");
+        assert!(hostile_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hostile_source, untrusted_start + 1),
+            )
+            .expect("fixed JSON hover request succeeds")
+            .is_none());
+        let argument = hostile_source.find("{}").expect("call input exists") + 1;
+        assert!(hostile_server
+            .signature_help(&test_uri(), position_at_byte(hostile_source, argument))
+            .expect("fixed JSON signature request succeeds")
+            .is_none());
+
+        for source in [
+            "use mod.custom.json\njson.",
+            "use mod.std.json\nlet json = 1\njson.",
+            "use mod.std.json\nlet alias = json\nalias.",
+            "use mod.std.json\njson.parse.",
+            "use mod.std.json\nlet note = \"json.\"",
+            "use mod.std.json\n// json.",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("completion request succeeds");
+            assert!(
+                completion.items.is_empty(),
+                "unexpected fixed JSON completion for {source:?}"
+            );
+        }
     }
 
     #[test]
@@ -10569,7 +10986,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "math"]
+            ["assert", "json", "math"]
         );
         let nested_assert = nested_import_completion
             .items
@@ -10600,7 +11017,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "math"]
+            ["assert", "json", "math"]
         );
         assert!(member_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
@@ -10740,7 +11157,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "math"]
+            ["assert", "json", "math"]
         );
         assert!(standard_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::MODULE)
@@ -10765,7 +11182,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "math"]
+            ["assert", "json", "math"]
         );
         assert!(direct_standard_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
@@ -10799,6 +11216,7 @@ mod tests {
         let extension_catalog = module_catalog(serde_json::json!([
             {"path": "mod.std.math.untrusted", "description": "Must stay hidden."},
             {"path": "mod.std.assert.untrusted", "description": "Must stay hidden."},
+            {"path": "mod.std.json.untrusted", "description": "Must stay hidden."},
             {
                 "path": "mod.std.log",
                 "description": "Must stay hidden.",
@@ -10810,8 +11228,10 @@ mod tests {
         for source in [
             "use mod.std.math.",
             "use mod.std.assert.",
+            "use mod.std.json.",
             "use mod.std\nstd.math.",
             "use mod.std\nstd.assert.",
+            "use mod.std\nstd.json.",
             "use mod.std\nstd.log.",
         ] {
             let mut server = SplashLanguageServer::with_completion_catalogs(
@@ -10897,7 +11317,7 @@ mod tests {
             )
             .expect("unavailable standard catalog completion succeeds");
         assert!(!standard_completion.is_incomplete);
-        assert_eq!(standard_completion.items.len(), 2);
+        assert_eq!(standard_completion.items.len(), 3);
 
         let leaf_source = "use mod.std.math.";
         let mut unavailable_leaf = SplashLanguageServer::with_completion_catalogs(
@@ -13719,6 +14139,31 @@ mod tests {
     }
 
     #[test]
+    fn marks_standard_json_completion_incomplete_when_imports_are_truncated() {
+        let mut source = String::from("use mod.std.json\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("let output = json.");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, source.len()))
+            .expect("truncated core JSON completion succeeds");
+
+        assert!(completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["parse", "stringify"]
+        );
+    }
+
+    #[test]
     fn marks_fixed_standard_namespace_completion_incomplete_when_imports_are_truncated() {
         let mut source = String::from("use mod.std\n");
         for index in 0..=splash_core::MAX_MODULE_IMPORTS {
@@ -13739,7 +14184,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "math"]
+            ["assert", "json", "math"]
         );
     }
 

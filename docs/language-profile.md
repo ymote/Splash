@@ -152,6 +152,15 @@ receiver, an unknown core-math member, or source outside the valid prefix gets
 no fixed-core result; a matching advisory catalog path cannot extend the core
 surface.
 
+The LSP also separately recognizes an exact visible direct `use mod.std.json`
+binding. At a direct `json.` member site it completes only `parse` and
+`stringify`, with plain-text hover and fixed function signatures. This is a
+compiled-in description of the runtime's bounded JSON data boundary: it does
+not inspect module-catalog metadata, resolve a module, follow a local alias, or
+expose a host capability. A shadowed `json` binding, chained receiver, unknown
+member, or source outside the valid prefix gets no fixed-core result; a
+matching advisory catalog path cannot extend the core surface.
+
 An exact visible direct `use mod.std.assert` binding receives fixed plain-text
 hover and `assert(condition)` signature help. A direct `std.assert(...)` call
 after `use mod.std` receives the same fixed signature. This is compiled-in
@@ -159,12 +168,12 @@ source metadata, not a host lookup or capability grant; aliases, shadowed
 bindings, and non-core imports receive no fixed assertion result.
 
 The same static projection completes `std` at a statement-position `use mod.`
-path and `assert`/`math` below `use mod.std.`. The frozen `mod.std` namespace
-has no advisory catalog children, so metadata cannot add `log`, `inspect`, or
-any descendants below `mod.std.assert` or `mod.std.math`. When an advisory
-catalog is unavailable, the fixed `std` root candidate remains visible but is
-incomplete because non-core `mod.*` siblings could be omitted; the closed
-`mod.std` list remains complete.
+path and `assert`/`json`/`math` below `use mod.std.`. The frozen `mod.std`
+namespace has no advisory catalog children, so metadata cannot add `log`,
+`inspect`, or any descendants below `mod.std.assert`, `mod.std.json`, or
+`mod.std.math`. When an advisory catalog is unavailable, the fixed `std` root
+candidate remains visible but is incomplete because non-core `mod.*` siblings
+could be omitted; the closed `mod.std` list remains complete.
 
 For bounded static record metadata, Rust hosts can call
 `splash_core::static_record_shape_report` or its named, limit-aware variant.
@@ -365,6 +374,7 @@ The current profile supports:
 - Numbers, strings, booleans, arrays, and record literals.
 - Field access, array operations, conditionals, loops, and assertions.
 - Frozen effect-free scalar math through `use mod.std.math`.
+- Frozen bounded JSON conversion through `use mod.std.json`.
 - Recoverable `try protected catch fallback` expressions without an error
   binding or transactional rollback.
 - Module imports through `use mod.<name>`.
@@ -408,6 +418,15 @@ module has no I/O, clock, entropy, host-state, crate-loading, or capability
 access. It is deliberately distinct from the masked Makepad `mod.math`
 shader module.
 
+`use mod.std.json` imports a frozen Splash-owned data module with
+`json.parse(document)` and `json.stringify(value)`. They share the exact
+strict JSON reader and writer used by the direct `.parse_json()` and
+`.to_json()` methods: parsing accepts a string or UTF-8 byte array, while
+serialization accepts only JSON-safe Splash values. Both directions enforce
+the runtime's byte, nesting, cycle, duplicate-key, and encoding checks as
+ordinary recoverable script errors. The module has no I/O, clock, entropy,
+host-state, crate-loading, or capability access.
+
 ## Effect rules
 
 The core runtime does not expose inherited `mod.fs`, `mod.run`, `mod.net`,
@@ -416,11 +435,11 @@ and HTML entry points. A script cannot acquire authority by importing a name.
 The host must create a runtime with a registered tool policy before `tool.call`
 or `tool.start` can succeed. Standalone initialization masks those vendored
 entry points before canonical and compatibility evaluation; it preserves only
-the documented core such as `mod.std.assert`, `mod.std.math`, and trusted
-host-installed modules. A host may intentionally install a reviewed direct
-capability module under a previously masked name, but that is a new capability
-binding subject to its normal policy and lease checks, not restoration of
-Makepad behavior.
+the documented core such as `mod.std.assert`, `mod.std.math`, `mod.std.json`,
+and trusted host-installed modules. A host may intentionally install a reviewed
+direct capability module under a previously masked name, but that is a new
+capability binding subject to its normal policy and lease checks, not
+restoration of Makepad behavior.
 
 For an operator-approved execution, a host can issue a process-local
 `CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or
@@ -442,9 +461,10 @@ available for an explicitly bounded batch. The default pending-promise cap is
 `ToolPolicy::json` opts a capability into a structured boundary. The input and
 output must each be a JSON object or array. `call_json` and `start_json`
 serialize the supplied Splash record or array, while their results remain JSON
-strings that generated code must turn back into values with `parse_json()`.
-This preserves a simple Rust bridge through `serde_json::Value` without
-allowing scripts to import crates directly.
+strings that generated code must turn back into values with `json.parse(...)`
+after `use mod.std.json`, or with `parse_json()`. This preserves a simple Rust
+bridge through `serde_json::Value` without allowing scripts to import crates
+directly.
 
 For a fixed, less stringly dataflow interface, a trusted host may additionally
 register a `CapabilityModule` before evaluation or lease issuance. Its flat
@@ -463,10 +483,12 @@ included in every later capability-lease fingerprint. See
 
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatch with the same bounded JSON reader and writer
-used at the Rust data boundary. `parse_json()` accepts only strict JSON from a
-string or UTF-8 byte array, then reconstructs a Splash value from bounded
-canonical JSON; it does not accept Makepad's nonstandard JSON extensions.
-`to_json()` returns a JSON string only for JSON-safe values. Cycles,
+used at the Rust data boundary. The frozen `mod.std.json` module exposes that
+same boundary through `json.parse(document)` and `json.stringify(value)`.
+`parse_json()` and `json.parse()` accept only strict JSON from a string or
+UTF-8 byte array, then reconstruct a Splash value from bounded canonical JSON;
+they do not accept Makepad's nonstandard JSON extensions. `to_json()` and
+`json.stringify()` return a JSON string only for JSON-safe values. Cycles,
 unsupported values, non-finite numbers, and duplicate object keys are rejected
 on serialization; malformed or non-UTF-8 input is rejected on parsing. Either
 direction rejects excessive container depth and excessive input or output as
@@ -575,6 +597,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
   single-quoted strings, range operators, or whitespace-separated record
   members; `splash check` rejects it.
 - Import `mod.tool` before calling a tool.
+- Import `mod.std.json` before using `json.parse(...)` or
+  `json.stringify(...)`; these are bounded local data operations, not
+  capabilities.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
   fallback cannot inspect the error, and hard string-allocation,
   heap-allocation, operand-stack, call-frame, instruction, or deadline
@@ -601,5 +626,5 @@ or mutate its keys, input digest, worker observation, or restart policy.
   tool name comes from a computed string; it cannot be widened from Splash.
 - Await a deferred tool result before using it; do not assume `start` performs
   an effect until a host pump or external completion has delivered its result.
-- Use record or array envelopes for JSON tools, then call `parse_json()` on
-  their returned strings before reading fields.
+- Use record or array envelopes for JSON tools, then call `json.parse(...)`
+  (or `parse_json()` on the returned string) before reading fields.
