@@ -7,8 +7,8 @@
   regex, HTML, GC, pod, shader, and math entry points before evaluation while
   preserving the documented core, frozen Splash-owned `mod.std.math` scalar
   helpers, `mod.std.json` bounded data helpers, `mod.std.text` bounded text
-  helpers, `mod.std.array` bounded shallow-array helpers, and trusted
-  host-installed modules.
+  helpers, `mod.std.array` bounded shallow-array helpers, `mod.std.object`
+  bounded own-field record helpers, and trusted host-installed modules.
 - Bounded evaluation and canonical grammar diagnostics, including
   host-configurable per-string, tracked Splash-owned aggregate-heap,
   operand-stack, and active-call-frame ceilings.
@@ -28,8 +28,8 @@
   truncation, and fixed direct-import-only `mod.tool` methods plus documented
   `mod.std` import-path completion, `mod.std.math` function/constant completion,
   hover, and signature help, direct `mod.std.json`, `mod.std.text`, and
-  `mod.std.array` function completion, hover, and signature help, plus direct
-  `mod.std.assert` hover and signature help. The frozen core `mod.std`
+  `mod.std.array` and `mod.std.object` function completion, hover, and
+  signature help, plus direct `mod.std.assert` hover and signature help. The frozen core `mod.std`
   namespace cannot be extended
   by advisory metadata. These fixed surfaces are compiled-in source-only
   metadata, not host capability discovery. A bounded, initialization-time or

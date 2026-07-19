@@ -81,9 +81,9 @@ canonical and compatibility evaluation. The source surface cannot reach the
 vendored math, GC, pod, shader, regex, HTML, or direct standard-output APIs;
 `std.log`, `std.print`, `std.println`, `std.regex`, and `String.parse_html()`
 are specifically unavailable. `mod.std.assert`, the frozen no-authority
-`mod.std.math`, `mod.std.json`, `mod.std.text`, and `mod.std.array` modules,
-ordinary bounded language operations, and explicitly installed host modules
-remain available.
+`mod.std.math`, `mod.std.json`, `mod.std.text`, `mod.std.array`, and
+`mod.std.object` modules, ordinary bounded language operations, and explicitly
+installed host modules remain available.
 This avoids unreviewed native output and native allocations outside Splash's
 tracked heap from becoming generated-source behavior. It does not alter a host
 that embeds the raw Makepad VM, and a trusted host can still install a reviewed
@@ -119,6 +119,17 @@ traversal; `concat` also rejects a combined result over that bound. `len` is
 constant-time and does not traverse the array. The module cannot inspect
 adapters or host state, and cannot access files, processes, networks, clocks,
 entropy, or Rust crates.
+
+The frozen `mod.std.object` module exposes only `object.len(value)`,
+`object.keys(value)`, `object.values(value)`, and `object.merge(left, right)`.
+It accepts plain record or JSON-object data, reads own fields only, never
+follows prototypes, and invokes no callbacks or host hooks. `keys`, `values`,
+and `merge` reject source records over 4,096 own text-keyed fields; `merge`
+also rejects a combined source-field count over that bound. `len` is
+constant-time and does not traverse fields. Returned arrays and records are
+shallow VM data, not host handles. The module cannot inspect adapters or host
+state, and cannot access files, processes, networks, clocks, entropy, or Rust
+crates.
 
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatches with bounded JSON methods. The default
@@ -190,8 +201,8 @@ validates a referenced module, presents no partial projection after malformed or
 over-limit input, or lets module metadata replace the fixed `mod.tool` methods.
 It also carries a compiled-in projection of the frozen standalone `mod.std`
 namespace: `use mod.` can suggest `std`, and `use mod.std.` can suggest only
-the documented `array`, `assert`, `json`, `math`, and `text` core modules. The
-server
+the documented `array`, `assert`, `json`, `math`, `object`, and `text` core
+modules. The server
 suppresses advisory children below that namespace, matching the runtime's
 frozen `std` object; an integration must use a distinct host-owned `mod.*`
 namespace for capabilities.
@@ -199,7 +210,8 @@ For an exact visible `use mod.std.assert` binding, and direct `std.assert(...)`
 after `use mod.std`, assertion hover and signature help are likewise compiled
 in and carry no catalog lookup, host access, or authority. The same holds for
 fixed completion, hover, and signature help for direct `use mod.std.json`
-bindings, `use mod.std.text` bindings, and `use mod.std.array` bindings.
+bindings, `use mod.std.text` bindings, `use mod.std.array` bindings, and
+`use mod.std.object` bindings.
 Suggested names remain subject to runtime module binding, catalog, and lease
 checks. Guarded rename is advertised only to a client that supports versioned
 document edits. It never renames an

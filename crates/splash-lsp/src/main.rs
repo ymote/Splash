@@ -210,6 +210,18 @@ struct StandardArrayFunction {
     description: &'static str,
 }
 
+/// One fixed function in Splash's core bounded-object module.
+///
+/// Like the other core tables, this is static editor metadata rather than a
+/// host module catalog or a capability declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StandardObjectFunction {
+    name: &'static str,
+    parameters: &'static [&'static str],
+    result: &'static str,
+    description: &'static str,
+}
+
 const STANDARD_MATH_FUNCTIONS: &[StandardMathFunction] = &[
     StandardMathFunction {
         name: "abs",
@@ -399,6 +411,34 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
     },
 ];
 
+const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
+    StandardObjectFunction {
+        name: "len",
+        parameters: &["value"],
+        result: "number",
+        description: "Returns an own-field count without traversing the record.",
+    },
+    StandardObjectFunction {
+        name: "keys",
+        parameters: &["value"],
+        result: "array",
+        description: "Returns own text field names in stored field order.",
+    },
+    StandardObjectFunction {
+        name: "values",
+        parameters: &["value"],
+        result: "array",
+        description: "Returns shallow own field values in stored field order.",
+    },
+    StandardObjectFunction {
+        name: "merge",
+        parameters: &["left", "right"],
+        result: "object",
+        description:
+            "Returns a shallow merge that preserves first field positions and applies right-side values.",
+    },
+];
+
 const STANDARD_MATH_AUTHORITY_NOTE: &str =
     "Effect-free Splash core helper; it does not access the host or grant authority.";
 const STANDARD_JSON_AUTHORITY_NOTE: &str =
@@ -407,6 +447,8 @@ const STANDARD_TEXT_AUTHORITY_NOTE: &str =
     "Bounded Splash core text helper; it does not access the host or grant authority.";
 const STANDARD_ARRAY_AUTHORITY_NOTE: &str =
     "Bounded Splash core array helper; it does not access the host or grant authority.";
+const STANDARD_OBJECT_AUTHORITY_NOTE: &str =
+    "Bounded Splash core object helper; it does not access the host or grant authority.";
 
 const STANDARD_ASSERT_DESCRIPTION: &str = "Raises a script error when the condition is false.";
 const STANDARD_ASSERT_AUTHORITY_NOTE: &str =
@@ -459,6 +501,12 @@ const FIXED_STANDARD_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[
         detail: "Splash core module; effect-free scalar helpers",
         documentation:
             "Fixed Splash core scalar helpers. They do not resolve a host module or grant authority.",
+    },
+    FixedCoreModulePathChild {
+        name: "object",
+        detail: "Splash core module; bounded own-field helpers",
+        documentation:
+            "Fixed Splash core object helpers. They inspect bounded own record fields and do not access the host or grant authority.",
     },
     FixedCoreModulePathChild {
         name: "text",
@@ -1067,6 +1115,16 @@ impl SplashLanguageServer {
                     return Ok(standard_array_member_hover(source, site));
                 }
                 if site.has_direct_receiver()
+                    && is_visible_builtin_standard_object_receiver(
+                        source,
+                        lexical,
+                        imports,
+                        site.receiver,
+                    )
+                {
+                    return Ok(standard_object_member_hover(source, site));
+                }
+                if site.has_direct_receiver()
                     && is_visible_builtin_standard_math_receiver(
                         source,
                         lexical,
@@ -1301,6 +1359,22 @@ impl SplashLanguageServer {
                 ));
             }
             if member_site.has_direct_receiver()
+                && is_visible_builtin_standard_object_receiver(
+                    source,
+                    report,
+                    imports,
+                    member_site.receiver,
+                )
+            {
+                return Ok(standard_object_module_member_completion(
+                    source,
+                    report,
+                    imports,
+                    member_site,
+                    is_incomplete,
+                ));
+            }
+            if member_site.has_direct_receiver()
                 && is_visible_builtin_standard_math_receiver(
                     source,
                     report,
@@ -1522,6 +1596,16 @@ impl SplashLanguageServer {
             )
         {
             return Ok(standard_array_signature_help(source, context));
+        }
+        if context.callee.has_direct_receiver()
+            && is_visible_builtin_standard_object_receiver(
+                source,
+                lexical,
+                imports,
+                context.callee.receiver,
+            )
+        {
+            return Ok(standard_object_signature_help(source, context));
         }
         if context.callee.has_direct_receiver()
             && is_visible_builtin_standard_math_receiver(
@@ -1826,6 +1910,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "use mod.std.array\n",
     "use mod.std.json\n",
     "use mod.std.math\n",
+    "use mod.std.object\n",
     "use mod.std.text\n",
     "let result = inspect.remote_add({left: 20, filters: {category: \"news\"}, right: 22}).await()\n",
     "let alias = result\n",
@@ -1836,6 +1921,8 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "json.stringify(parsed)\n",
     "let sliced = array.slice([1, 2, 3], 1, 3)\n",
     "array.reverse(sliced)\n",
+    "let merged = object.merge({left: 1}, {right: 2})\n",
+    "object.keys(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
     "text.replace_all(normalized, \"splash\", \"Splash\")\n",
     "assert(true)\n",
@@ -1852,6 +1939,7 @@ const FUZZ_FIXED_CORE_IMPORT_PATH_SOURCES: &[&str] = &[
     "use mod.std.array.",
     "use mod.std.json.",
     "use mod.std.math.",
+    "use mod.std.object.",
     "use mod.std.text.",
 ];
 
@@ -1997,6 +2085,7 @@ pub fn fuzz_exercise_document(source: &str) {
     );
     fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_array_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_object_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
@@ -2040,6 +2129,7 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
     ));
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_array_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_object_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 
@@ -2049,6 +2139,7 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
     server.refresh_advisory_configuration(settings);
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_array_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_object_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
@@ -2191,6 +2282,35 @@ fn fuzz_exercise_fixed_standard_array_requests(
     let _ = server.hover(
         uri,
         position_at_byte(source, reverse_start + "array.".len() + 1),
+    );
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_fixed_standard_object_requests(
+    server: &SplashLanguageServer,
+    uri: &Uri,
+    source: &str,
+) {
+    let Some(merge_start) = source.find("object.merge") else {
+        return;
+    };
+    let merge_argument = merge_start + "object.merge({".len();
+    let _ = server.completion(
+        uri,
+        position_at_byte(source, merge_start + "object.merge".len()),
+    );
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, merge_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, merge_argument));
+
+    let Some(keys_start) = source.find("object.keys") else {
+        return;
+    };
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, keys_start + "object.".len() + 1),
     );
 }
 
@@ -5110,6 +5230,54 @@ fn standard_array_module_member_completion(
     }
 }
 
+/// Completes only the fixed, documented core object module. This does not use
+/// advisory catalog metadata, so its local data helpers cannot imply host
+/// adapter availability or capability authority.
+fn standard_object_module_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if !site.has_direct_receiver()
+        || site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+        || !is_visible_builtin_standard_object_receiver(source, lexical, imports, site.receiver)
+    {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.member);
+    let mut items = STANDARD_OBJECT_FUNCTIONS
+        .iter()
+        .map(|function| CompletionItem {
+            label: function.name.to_owned(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("mod.std.object function; bounded core object helper".to_owned()),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: standard_object_function_documentation(function, "object"),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                function.name.to_owned(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
 /// Completes only the fixed, documented core text module. This does not use
 /// advisory catalog metadata, so its local data helpers cannot imply host
 /// adapter availability or capability authority.
@@ -5238,6 +5406,21 @@ fn standard_array_member_hover(source: &str, site: MemberCompletionSite) -> Opti
     })
 }
 
+fn standard_object_member_hover(source: &str, site: MemberCompletionSite) -> Option<Hover> {
+    if !site.has_direct_receiver() {
+        return None;
+    }
+    let member = source.get(site.member.start_byte..site.member.end_byte)?;
+    let function = standard_object_function(member)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: standard_object_function_documentation(function, "object"),
+        }),
+        range: Some(span_range(source, site.member)),
+    })
+}
+
 fn standard_text_member_hover(source: &str, site: MemberCompletionSite) -> Option<Hover> {
     if !site.has_direct_receiver() {
         return None;
@@ -5273,6 +5456,12 @@ fn standard_json_function(name: &str) -> Option<&'static StandardJsonFunction> {
 
 fn standard_array_function(name: &str) -> Option<&'static StandardArrayFunction> {
     STANDARD_ARRAY_FUNCTIONS
+        .iter()
+        .find(|function| function.name == name)
+}
+
+fn standard_object_function(name: &str) -> Option<&'static StandardObjectFunction> {
+    STANDARD_OBJECT_FUNCTIONS
         .iter()
         .find(|function| function.name == name)
 }
@@ -5321,6 +5510,19 @@ fn standard_array_function_documentation(
 ) -> String {
     format!(
         "{receiver}.{}({}) -> {}\n\n{}\n\n{STANDARD_ARRAY_AUTHORITY_NOTE}",
+        function.name,
+        function.parameters.join(", "),
+        function.result,
+        function.description,
+    )
+}
+
+fn standard_object_function_documentation(
+    function: &StandardObjectFunction,
+    receiver: &str,
+) -> String {
+    format!(
+        "{receiver}.{}({}) -> {}\n\n{}\n\n{STANDARD_OBJECT_AUTHORITY_NOTE}",
         function.name,
         function.parameters.join(", "),
         function.result,
@@ -5849,6 +6051,7 @@ fn fixed_core_module_path_children(
         || module_path_starts_with(prefix, &["mod", "std", "assert"])
         || module_path_starts_with(prefix, &["mod", "std", "json"])
         || module_path_starts_with(prefix, &["mod", "std", "math"])
+        || module_path_starts_with(prefix, &["mod", "std", "object"])
         || module_path_starts_with(prefix, &["mod", "std", "text"])
     {
         Some(&[])
@@ -6777,6 +6980,25 @@ fn standard_array_signature_help(
     ))
 }
 
+fn standard_object_signature_help(
+    source: &str,
+    context: SignatureHelpCallContext,
+) -> Option<SignatureHelp> {
+    let member = source.get(context.callee.member.start_byte..context.callee.member.end_byte)?;
+    let function = standard_object_function(member)?;
+    let callee = source.get(context.callee.receiver.start_byte..context.callee.member.end_byte)?;
+    Some(signature_help_with_parameters(
+        format!(
+            "{callee}({}) -> {}",
+            function.parameters.join(", "),
+            function.result
+        ),
+        standard_object_function_documentation(function, callee),
+        function.parameters,
+        context.active_argument,
+    ))
+}
+
 fn standard_text_signature_help(
     source: &str,
     context: SignatureHelpCallContext,
@@ -6953,6 +7175,16 @@ fn is_visible_builtin_standard_array_receiver(
 ) -> bool {
     visible_module_import_for_receiver(source, lexical, imports, receiver)
         .is_some_and(is_builtin_standard_array_module_import)
+}
+
+fn is_visible_builtin_standard_object_receiver(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    receiver: SourceSpan,
+) -> bool {
+    visible_module_import_for_receiver(source, lexical, imports, receiver)
+        .is_some_and(is_builtin_standard_object_module_import)
 }
 
 fn is_visible_builtin_standard_text_receiver(
@@ -7791,6 +8023,14 @@ fn is_builtin_standard_array_module_import(import: &ModuleImport) -> bool {
         .iter()
         .map(String::as_str)
         .eq(["mod", "std", "array"])
+}
+
+fn is_builtin_standard_object_module_import(import: &ModuleImport) -> bool {
+    import
+        .path
+        .iter()
+        .map(String::as_str)
+        .eq(["mod", "std", "object"])
 }
 
 fn is_builtin_standard_text_module_import(import: &ModuleImport) -> bool {
@@ -9188,6 +9428,199 @@ mod tests {
             assert!(
                 completion.items.is_empty(),
                 "unexpected fixed array completion for {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completes_fixed_standard_object_members_without_host_metadata() {
+        let source = "use mod.std.object\nlet selected = object.";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.std.object.untrusted",
+                    "description": "Must not extend the fixed core module."
+                }
+            ])),
+        );
+        server.open_document(document(1, source));
+        let member_start = source.len();
+        let expected_empty_range = Range::new(
+            position_at_byte(source, member_start),
+            position_at_byte(source, member_start),
+        );
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, member_start))
+            .expect("core object completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["keys", "len", "merge", "values"]
+        );
+        assert!(completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::FUNCTION)
+                && item.detail.as_deref()
+                    == Some("mod.std.object function; bounded core object helper")
+                && matches!(
+                    &item.text_edit,
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_empty_range
+                )
+        }));
+        let merge = completion
+            .items
+            .iter()
+            .find(|item| item.label == "merge")
+            .expect("merge is a fixed core helper");
+        assert_eq!(
+            merge.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.merge(left, right) -> object\n\nReturns a shallow merge that preserves first field positions and applies right-side values.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            }))
+        );
+
+        let partial_source = "use mod.std.object\nlet selected = object.mer";
+        let mut partial_server = SplashLanguageServer::default();
+        partial_server.open_document(document(1, partial_source));
+        let partial_start = partial_source.rfind("mer").expect("partial member exists");
+        let partial_end = partial_source.len();
+        let expected_partial_range = Range::new(
+            position_at_byte(partial_source, partial_start),
+            position_at_byte(partial_source, partial_end),
+        );
+        let partial = partial_server
+            .completion(&test_uri(), position_at_byte(partial_source, partial_end))
+            .expect("partial core object completion succeeds");
+        assert_eq!(partial.items.len(), 4);
+        assert!(partial.items.iter().all(|item| {
+            matches!(
+                &item.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_partial_range
+            )
+        }));
+    }
+
+    #[test]
+    fn presents_fixed_standard_object_hover_and_signature_help_without_authority() {
+        let source = concat!(
+            "use mod.std.object\n",
+            "let merged = object.merge({left: 1}, {right: 2})\n",
+            "object.keys(merged)"
+        );
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let merge_start =
+            source.find("object.merge").expect("merge member exists") + "object.".len();
+        let merge_hover = server
+            .hover(&test_uri(), position_at_byte(source, merge_start + 1))
+            .expect("core object merge hover succeeds")
+            .expect("merge has fixed hover metadata");
+        assert_eq!(
+            merge_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.merge(left, right) -> object\n\nReturns a shallow merge that preserves first field positions and applies right-side values.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let keys_start = source.rfind("keys").expect("keys member exists");
+        let keys_hover = server
+            .hover(&test_uri(), position_at_byte(source, keys_start + 1))
+            .expect("core object keys hover succeeds")
+            .expect("keys has fixed hover metadata");
+        assert_eq!(
+            keys_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.keys(value) -> array\n\nReturns own text field names in stored field order.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let merge_cursor = source.find("{right").expect("merge right input exists") + 2;
+        let merge_help = server
+            .signature_help(&test_uri(), position_at_byte(source, merge_cursor))
+            .expect("core object merge signature help succeeds")
+            .expect("merge has a fixed signature");
+        assert_eq!(merge_help.signatures.len(), 1);
+        assert_eq!(
+            merge_help.signatures[0].label,
+            "object.merge(left, right) -> object"
+        );
+        assert_eq!(merge_help.active_signature, Some(0));
+        assert_eq!(merge_help.active_parameter, Some(1));
+        assert_eq!(
+            merge_help.signatures[0].parameters,
+            Some(vec![
+                ParameterInformation {
+                    label: ParameterLabel::Simple("left".to_owned()),
+                    documentation: None,
+                },
+                ParameterInformation {
+                    label: ParameterLabel::Simple("right".to_owned()),
+                    documentation: None,
+                },
+            ])
+        );
+
+        let keys_cursor = source.rfind("merged").expect("keys input exists") + 1;
+        let keys_help = server
+            .signature_help(&test_uri(), position_at_byte(source, keys_cursor))
+            .expect("core object keys signature help succeeds")
+            .expect("keys has a fixed signature");
+        assert_eq!(keys_help.signatures[0].label, "object.keys(value) -> array");
+        assert_eq!(keys_help.active_parameter, Some(0));
+
+        let hostile_catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.std.object.untrusted",
+                "description": "Must not extend the fixed core module.",
+                "callMode": "synchronous",
+                "callShape": "single_json"
+            }
+        ]));
+        let hostile_source = "use mod.std.object\nobject.untrusted({})";
+        let mut hostile_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            hostile_catalog,
+        );
+        hostile_server.open_document(document(1, hostile_source));
+        let untrusted_start = hostile_source.find("untrusted").expect("member exists");
+        assert!(hostile_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hostile_source, untrusted_start + 1),
+            )
+            .expect("fixed object hover request succeeds")
+            .is_none());
+        let argument = hostile_source.find("{}").expect("call input exists") + 1;
+        assert!(hostile_server
+            .signature_help(&test_uri(), position_at_byte(hostile_source, argument))
+            .expect("fixed object signature request succeeds")
+            .is_none());
+
+        for source in [
+            "use mod.custom.object\nobject.",
+            "use mod.std.object\nlet object = 1\nobject.",
+            "use mod.std.object\nlet alias = object\nalias.",
+            "use mod.std.object\nobject.merge.",
+            "use mod.std.object\nlet note = \"object.\"",
+            "use mod.std.object\n// object.",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("completion request succeeds");
+            assert!(
+                completion.items.is_empty(),
+                "unexpected fixed object completion for {source:?}"
             );
         }
     }
@@ -11896,7 +12329,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["array", "assert", "json", "math", "text"]
+            ["array", "assert", "json", "math", "object", "text"]
         );
         let nested_assert = nested_import_completion
             .items
@@ -11927,7 +12360,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["array", "assert", "json", "math", "text"]
+            ["array", "assert", "json", "math", "object", "text"]
         );
         assert!(member_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
@@ -12067,7 +12500,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["array", "assert", "json", "math", "text"]
+            ["array", "assert", "json", "math", "object", "text"]
         );
         assert!(standard_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::MODULE)
@@ -12092,7 +12525,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["array", "assert", "json", "math", "text"]
+            ["array", "assert", "json", "math", "object", "text"]
         );
         assert!(direct_standard_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
@@ -12129,6 +12562,7 @@ mod tests {
             {"path": "mod.std.assert.untrusted", "description": "Must stay hidden."},
             {"path": "mod.std.json.untrusted", "description": "Must stay hidden."},
             {"path": "mod.std.text.untrusted", "description": "Must stay hidden."},
+            {"path": "mod.std.object.untrusted", "description": "Must stay hidden."},
             {
                 "path": "mod.std.log",
                 "description": "Must stay hidden.",
@@ -12142,11 +12576,13 @@ mod tests {
             "use mod.std.math.",
             "use mod.std.assert.",
             "use mod.std.json.",
+            "use mod.std.object.",
             "use mod.std.text.",
             "use mod.std\nstd.array.",
             "use mod.std\nstd.math.",
             "use mod.std\nstd.assert.",
             "use mod.std\nstd.json.",
+            "use mod.std\nstd.object.",
             "use mod.std\nstd.text.",
             "use mod.std\nstd.log.",
         ] {
@@ -12233,7 +12669,7 @@ mod tests {
             )
             .expect("unavailable standard catalog completion succeeds");
         assert!(!standard_completion.is_incomplete);
-        assert_eq!(standard_completion.items.len(), 5);
+        assert_eq!(standard_completion.items.len(), 6);
 
         let leaf_source = "use mod.std.math.";
         let mut unavailable_leaf = SplashLanguageServer::with_completion_catalogs(
@@ -15105,6 +15541,31 @@ mod tests {
     }
 
     #[test]
+    fn marks_standard_object_completion_incomplete_when_imports_are_truncated() {
+        let mut source = String::from("use mod.std.object\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("let output = object.");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, source.len()))
+            .expect("truncated core object completion succeeds");
+
+        assert!(completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["keys", "len", "merge", "values"]
+        );
+    }
+
+    #[test]
     fn marks_standard_text_completion_incomplete_when_imports_are_truncated() {
         let mut source = String::from("use mod.std.text\n");
         for index in 0..=splash_core::MAX_MODULE_IMPORTS {
@@ -15159,7 +15620,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["array", "assert", "json", "math", "text"]
+            ["array", "assert", "json", "math", "object", "text"]
         );
     }
 

@@ -1,0 +1,3 @@
+use mod.std.object
+let merged = object.merge({left: 1}, {right: 2})
+object.keys(merged)

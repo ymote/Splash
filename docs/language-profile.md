@@ -170,6 +170,15 @@ expose a host capability. A shadowed `array` binding, chained receiver, unknown
 member, or source outside the valid prefix gets no fixed-core result; a matching
 advisory catalog path cannot extend the core surface.
 
+The LSP separately recognizes an exact visible direct `use mod.std.object`
+binding. At a direct `object.` member site it completes only `len`, `keys`,
+`values`, and `merge`, with plain-text hover and fixed function signatures.
+This is a compiled-in description of bounded own-field record shaping: it does
+not inspect module-catalog metadata, resolve a module, follow a local alias, or
+expose a host capability. A shadowed `object` binding, chained receiver,
+unknown member, or source outside the valid prefix gets no fixed-core result; a
+matching advisory catalog path cannot extend the core surface.
+
 The LSP separately recognizes an exact visible direct `use mod.std.text`
 binding. At a direct `text.` member site it completes only the documented
 bounded text functions, with plain-text hover and fixed function signatures.
@@ -186,10 +195,10 @@ source metadata, not a host lookup or capability grant; aliases, shadowed
 bindings, and non-core imports receive no fixed assertion result.
 
 The same static projection completes `std` at a statement-position `use mod.`
-path and `array`/`assert`/`json`/`math`/`text` below `use mod.std.`. The frozen
+path and `array`/`assert`/`json`/`math`/`object`/`text` below `use mod.std.`. The frozen
 `mod.std` namespace has no advisory catalog children, so metadata cannot add
 `log`, `inspect`, or any descendants below `mod.std.assert`, `mod.std.json`,
-`mod.std.math`, `mod.std.text`, or `mod.std.array`. When an advisory catalog is
+`mod.std.math`, `mod.std.object`, `mod.std.text`, or `mod.std.array`. When an advisory catalog is
 unavailable, the fixed `std` root candidate remains visible but is incomplete
 because non-core `mod.*` siblings could be omitted; the closed `mod.std` list
 remains complete.
@@ -396,6 +405,7 @@ The current profile supports:
 - Frozen bounded JSON conversion through `use mod.std.json`.
 - Frozen bounded literal text shaping through `use mod.std.text`.
 - Frozen bounded shallow-array shaping through `use mod.std.array`.
+- Frozen bounded own-field record shaping through `use mod.std.object`.
 - Recoverable `try protected catch fallback` expressions without an error
   binding or transactional rollback.
 - Module imports through `use mod.<name>`.
@@ -468,6 +478,17 @@ combined result over that bound. `len` is constant-time and uncapped. The
 module has no I/O, clock, entropy, host-state, crate-loading, or capability
 access.
 
+`use mod.std.object` imports a frozen Splash-owned module for local record
+shaping. It provides `object.len(value)`, `object.keys(value)`,
+`object.values(value)`, and `object.merge(left, right)`. It accepts plain
+record or JSON-object data only, reads own fields only, and does not traverse
+prototypes or invoke callbacks. `keys`, `values`, and `merge` process at most
+4,096 own text-keyed source fields; `merge` also rejects a combined source
+count over that bound. `keys` and `values` return shallow arrays in stored field
+order, while `merge` preserves first field positions and applies right-side
+values. `len` is constant-time and uncapped. The module has no I/O, clock,
+entropy, host-state, crate-loading, or capability access.
+
 ## Effect rules
 
 The core runtime does not expose inherited `mod.fs`, `mod.run`, `mod.net`,
@@ -477,10 +498,10 @@ The host must create a runtime with a registered tool policy before `tool.call`
 or `tool.start` can succeed. Standalone initialization masks those vendored
 entry points before canonical and compatibility evaluation; it preserves only
 the documented core such as `mod.std.assert`, `mod.std.math`, `mod.std.json`,
-`mod.std.text`, `mod.std.array`, and trusted host-installed modules. A host may
-intentionally install a reviewed direct capability module under a previously
-masked name, but that is a new capability binding subject to its normal policy
-and lease checks, not restoration of Makepad behavior.
+`mod.std.text`, `mod.std.array`, `mod.std.object`, and trusted host-installed
+modules. A host may intentionally install a reviewed direct capability module
+under a previously masked name, but that is a new capability binding subject to
+its normal policy and lease checks, not restoration of Makepad behavior.
 
 For an operator-approved execution, a host can issue a process-local
 `CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or
@@ -646,6 +667,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
 - Import `mod.std.array` before using `array.*`; transforms are bounded,
   callback-free shallow copies, not capabilities. Keep each source array and
   concatenated result at or below 4,096 items.
+- Import `mod.std.object` before using `object.*`; transforms are bounded
+  own-field operations over plain record or JSON-object data, not capabilities.
+  Keep transforming inputs and combined `merge` source fields at or below 4,096.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
   fallback cannot inspect the error, and hard string-allocation,
   heap-allocation, operand-stack, call-frame, instruction, or deadline

@@ -1,0 +1,6 @@
+use mod.std.assert
+use mod.std.object
+let merged = object.merge({left: 1}, {right: 2})
+assert(object.len(merged) == 2)
+assert(object.keys(merged) == ["left", "right"])
+object.values(merged)

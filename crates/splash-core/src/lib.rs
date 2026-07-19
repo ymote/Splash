@@ -11,7 +11,7 @@ mod profile;
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::time::Duration;
@@ -90,6 +90,11 @@ pub const DEFAULT_MAX_JSON_DATA_DEPTH: usize = 64;
 /// bounds native helper work over a host-provided array. `array.len` is
 /// constant-time and does not use this ceiling.
 pub const MAX_STANDARD_ARRAY_ITEMS: usize = 4_096;
+/// Maximum own fields processed by one transforming `mod.std.object` helper.
+///
+/// This independently bounds native traversal over a plain script record.
+/// `object.len` is constant-time and does not use this ceiling.
+pub const MAX_STANDARD_OBJECT_FIELDS: usize = 4_096;
 /// Maximum byte length of a host-selected injected-global identifier.
 pub const MAX_JSON_GLOBAL_NAME_BYTES: usize = 64;
 /// Maximum structured syntax diagnostics returned for one source check.
@@ -2450,6 +2455,7 @@ fn restrict_vendored_module_surface(
     install_standard_json_module(vm, std, json_method_limits);
     install_standard_text_module(vm, std);
     install_standard_array_module(vm, std);
+    install_standard_object_module(vm, std);
     // Retained Splash core values and the VM-internal `Range` prototype are
     // setup-owned language primitives, not mutable cross-evaluation points.
     vm.bx.heap.freeze(std);
@@ -3032,6 +3038,206 @@ fn standard_array_item_limit(vm: &mut vm::ScriptVm, function: &'static str) -> S
     script_err_limit!(
         vm.bx.threads.cur_ref().trap,
         "std.array.{function} supports at most {MAX_STANDARD_ARRAY_ITEMS} items"
+    )
+}
+
+/// Installs own-field-only record operations for bounded local dataflow. This
+/// module does not traverse prototypes, invoke callbacks, or expose host state.
+fn install_standard_object_module(vm: &mut vm::ScriptVm, std_module: ScriptObject) {
+    let object = vm.bx.heap.new_with_proto(NIL);
+    vm.add_method(
+        object,
+        id!(len),
+        script_args_def!(value = NIL),
+        standard_object_len,
+    );
+    vm.add_method(
+        object,
+        id!(keys),
+        script_args_def!(value = NIL),
+        standard_object_keys,
+    );
+    vm.add_method(
+        object,
+        id!(values),
+        script_args_def!(value = NIL),
+        standard_object_values,
+    );
+    vm.add_method(
+        object,
+        id!(merge),
+        script_args_def!(left = NIL, right = NIL),
+        standard_object_merge,
+    );
+    vm.bx
+        .heap
+        .set_value_def(std_module, id!(object).into(), object.into());
+    vm.bx.heap.freeze(object);
+}
+
+fn standard_object_len(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let (_, length) = match standard_object_input(vm, value, "len", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    ScriptValue::from_f64(length as f64)
+}
+
+fn standard_object_keys(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let entries = match standard_object_entries(vm, value, "keys", "value") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    standard_object_values_array(vm, entries.into_iter().map(|(key, _)| key))
+}
+
+fn standard_object_values(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let entries = match standard_object_entries(vm, value, "values", "value") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    standard_object_values_array(vm, entries.into_iter().map(|(_, value)| value))
+}
+
+fn standard_object_merge(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let left = script_value!(vm, args.left);
+    let right = script_value!(vm, args.right);
+    let left_entries = match standard_object_entries(vm, left, "merge", "left") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    let right_entries = match standard_object_entries(vm, right, "merge", "right") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    let Some(total_fields) = left_entries.len().checked_add(right_entries.len()) else {
+        return standard_object_field_limit(vm, "merge");
+    };
+    if total_fields > MAX_STANDARD_OBJECT_FIELDS {
+        return standard_object_field_limit(vm, "merge");
+    }
+
+    let entries = standard_object_merged_entries(left_entries, right_entries, total_fields);
+    let output = vm.bx.heap.new_object();
+    vm.bx.heap.set_string_keys(output);
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for (key, value) in entries {
+        vm.bx.heap.set_value(output, key, value, trap);
+    }
+    output.into()
+}
+
+fn standard_object_input(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    function: &'static str,
+    parameter: &'static str,
+) -> Result<(ScriptObject, usize), ScriptValue> {
+    let Some(object) = value.as_object() else {
+        return Err(standard_object_expected_record(vm, function, parameter));
+    };
+    let data = vm.bx.heap.object_data(object);
+    if vm.bx.heap.is_fn(object)
+        || vm.bx.heap.proto(object) != id!(object).into()
+        || !data.vec.is_empty()
+    {
+        return Err(standard_object_expected_record(vm, function, parameter));
+    }
+    Ok((object, data.map_len()))
+}
+
+fn standard_object_entries(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    function: &'static str,
+    parameter: &'static str,
+) -> Result<Vec<(ScriptValue, ScriptValue)>, ScriptValue> {
+    let (object, length) = standard_object_input(vm, value, function, parameter)?;
+    if length > MAX_STANDARD_OBJECT_FIELDS {
+        return Err(standard_object_field_limit(vm, function));
+    }
+    let mut entries = Vec::with_capacity(length);
+    vm.bx
+        .heap
+        .object_data(object)
+        .map_iter_ordered(|key, value| entries.push((key, value)));
+    for (key, _) in &mut entries {
+        *key = standard_object_text_key(vm, *key, function)?;
+    }
+    Ok(entries)
+}
+
+fn standard_object_text_key(
+    vm: &mut vm::ScriptVm,
+    key: ScriptValue,
+    function: &'static str,
+) -> Result<ScriptValue, ScriptValue> {
+    if let Some(identifier) = key.as_id() {
+        return identifier
+            .as_string(|name| name.map(|name| vm.bx.heap.new_string_from_str(name)))
+            .ok_or_else(|| standard_object_expected_text_key(vm, function));
+    }
+    vm.bx
+        .heap
+        .string_mut_self_with(key, |heap, value| heap.new_string_from_str(value))
+        .ok_or_else(|| standard_object_expected_text_key(vm, function))
+}
+
+fn standard_object_merged_entries(
+    left: Vec<(ScriptValue, ScriptValue)>,
+    right: Vec<(ScriptValue, ScriptValue)>,
+    capacity: usize,
+) -> Vec<(ScriptValue, ScriptValue)> {
+    let mut entries: Vec<(ScriptValue, ScriptValue)> = Vec::with_capacity(capacity);
+    let mut indices: HashMap<ScriptValue, usize> = HashMap::with_capacity(capacity);
+    for (key, value) in left.into_iter().chain(right) {
+        if let Some(index) = indices.get(&key).copied() {
+            entries[index].1 = value;
+        } else {
+            indices.insert(key, entries.len());
+            entries.push((key, value));
+        }
+    }
+    entries
+}
+
+fn standard_object_values_array(
+    vm: &mut vm::ScriptVm,
+    values: impl IntoIterator<Item = ScriptValue>,
+) -> ScriptValue {
+    let output = vm.bx.heap.new_array();
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for value in values {
+        vm.bx.heap.array_push(output, value, trap);
+    }
+    output.into()
+}
+
+fn standard_object_expected_record(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+    parameter: &'static str,
+) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.{function} expects `{parameter}` to be a plain record"
+    )
+}
+
+fn standard_object_expected_text_key(vm: &mut vm::ScriptVm, function: &'static str) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.{function} only supports text field keys"
+    )
+}
+
+fn standard_object_field_limit(vm: &mut vm::ScriptVm, function: &'static str) -> ScriptValue {
+    script_err_limit!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.{function} supports at most {MAX_STANDARD_OBJECT_FIELDS} fields"
     )
 }
 
@@ -7099,6 +7305,135 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("std.array.concat supports at most")));
+    }
+
+    #[test]
+    fn exposes_frozen_bounded_standard_object() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 use mod.std.json\n\
+                 use mod.std.object\n\
+                 let record = {first: 1, second: 2}\n\
+                 assert(object.len(record) == 2)\n\
+                 assert(object.keys(record) == [\"first\", \"second\"])\n\
+                 assert(object.values(record) == [1, 2])\n\
+                 let merged = object.merge(record, {second: 20, third: 3})\n\
+                 assert(merged.first == 1)\n\
+                 assert(merged.second == 20)\n\
+                 assert(merged.third == 3)\n\
+                 let json_record = json.parse(\"{\\\"second\\\":30,\\\"fourth\\\":4}\")\n\
+                 let mixed = object.merge(merged, json_record)\n\
+                 assert(mixed.second == 30)\n\
+                 assert(mixed.fourth == 4)\n\
+                 let nested = {answer: 1}\n\
+                 let copied = object.merge({nested: nested}, {})\n\
+                 copied.nested.answer = 2\n\
+                 assert(nested.answer == 2)\n\
+                 object.keys(mixed)",
+            )
+            .unwrap();
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!(["first", "second", "third", "fourth"])
+        );
+
+        let mut namespace_runtime = Runtime::default();
+        let namespace = namespace_runtime
+            .eval("use mod.std\nstd.object.len({first: 1, second: 2})")
+            .unwrap();
+        assert!(namespace.completed(), "{:?}", namespace.diagnostics);
+        assert_eq!(namespace.value.as_number(), Some(2.0));
+
+        let mutation = runtime
+            .eval("use mod.std.object\nobject.merge = || nil")
+            .unwrap();
+        assert!(!mutation.succeeded());
+        assert!(!mutation.diagnostics.is_empty());
+
+        let preserved = runtime
+            .eval("use mod.std.object\nobject.merge({left: 1}, {right: 2})")
+            .unwrap();
+        assert!(preserved.completed(), "{:?}", preserved.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    preserved.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!({"left": 1, "right": 2})
+        );
+
+        let invalid = runtime
+            .eval("use mod.std.object\ntry object.keys([1]) catch \"invalid\"")
+            .unwrap();
+        assert!(invalid.completed(), "{:?}", invalid.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let non_text_key = runtime
+            .eval(
+                "use mod.std.object\n\
+                 let record = {}\n\
+                 record[true] = 1\n\
+                 try object.keys(record) catch \"invalid-key\"",
+            )
+            .unwrap();
+        assert!(non_text_key.completed(), "{:?}", non_text_key.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    non_text_key.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-key")
+        );
+
+        let mut oversized_source =
+            String::from("use mod.std.assert\nuse mod.std.object\nlet values = {");
+        for index in 0..=MAX_STANDARD_OBJECT_FIELDS {
+            if index > 0 {
+                oversized_source.push_str(", ");
+            }
+            oversized_source.push_str(&format!("field_{index}: 0"));
+        }
+        oversized_source.push_str(&format!(
+            "}}\nassert(object.len(values) == {})\nobject.keys(values)",
+            MAX_STANDARD_OBJECT_FIELDS + 1
+        ));
+        let limits = ExecutionLimits {
+            instruction_limit: 1_000_000,
+            soft_timeout: Duration::from_secs(1),
+            hard_timeout: Duration::from_secs(2),
+            ..ExecutionLimits::default()
+        };
+        let mut oversized_runtime = Runtime::with_limits((), (), limits).unwrap();
+        let oversized = oversized_runtime.eval(&oversized_source).unwrap();
+        assert!(!oversized.completed());
+        assert!(oversized
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("std.object.keys supports at most")));
     }
 
     #[test]
