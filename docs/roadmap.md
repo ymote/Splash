@@ -26,8 +26,9 @@
   arbitrary module, type, or field inference. A separate bounded,
   initialization-time or configuration-refresh advisory module interface
   projection can complete direct `use mod.*` path segments and bounded catalog
-  paths below a direct visible imported-module binding without module loading,
-  resolution, runtime export inspection, or authority inference.
+  paths below a direct visible imported-module binding, and plainly hover an
+  exact visible catalog leaf, without module loading, resolution, runtime
+  export inspection, or authority inference.
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context

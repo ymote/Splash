@@ -169,8 +169,9 @@ or a later `settings.splash.moduleCatalog` update: a bounded list of canonical
 `callMode` of `synchronous` or `deferred`. This LSP-only projection can complete
 the current segment of a direct statement-position `use mod.*` path, or bounded
 catalog paths below a direct visible imported-module binding. A deferred leaf
-is only labeled as returning a promise; the LSP never inserts `await()` or
-changes source beyond the selected identifier. It is not part of the core
+is only labeled as returning a promise; an exact visible catalog leaf also has
+a plain-text advisory hover. The LSP never inserts `await()` or changes source
+beyond the selected identifier. It is not part of the core
 report and does not load a source file, resolve or validate a module, inspect
 runtime exports, infer arbitrary fields, or make a Rust adapter current or
 callable. `mod.tool` remains a fixed language surface and never receives

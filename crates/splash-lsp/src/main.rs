@@ -596,6 +596,20 @@ impl SplashLanguageServer {
                         range: Some(span_range(source, site.member)),
                     }));
                 }
+                if !self.module_catalog.modules.is_empty() {
+                    let (_, lexical) = self.lexical_completions(uri)?;
+                    let imports = self.module_imports(uri)?;
+                    if let Some(hover) = module_catalog_member_hover(
+                        source,
+                        report,
+                        lexical,
+                        imports,
+                        &self.module_catalog,
+                        site,
+                    ) {
+                        return Ok(Some(hover));
+                    }
+                }
             }
         }
         let Some((symbol, occurrence)) = symbol_occurrence_at_byte(report, byte_offset) else {
@@ -2862,7 +2876,10 @@ fn module_catalog_path_completion(
             label: child.name.clone(),
             kind: Some(CompletionItemKind::MODULE),
             detail: Some(module_catalog_path_detail(child.call_mode).to_owned()),
-            documentation: module_catalog_documentation(child.description, child.call_mode),
+            documentation: module_catalog_documentation(
+                child.description.as_deref(),
+                child.call_mode,
+            ),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                 edit_range, child.name,
             ))),
@@ -2888,33 +2905,10 @@ fn module_catalog_member_completion(
         is_incomplete,
         items: Vec::new(),
     };
-    if site.member.end_byte > lexical.valid_prefix_end_byte
-        || site.member.end_byte > imports.valid_prefix_end_byte
-    {
-        return empty();
-    }
-    let Some(import) = visible_module_import_for_receiver(source, lexical, imports, site.receiver)
+    let Some(resolved_path) = module_catalog_member_parent_path(source, lexical, imports, site)
     else {
         return empty();
     };
-
-    let mut resolved_path = import.path.clone();
-    if !site.has_direct_receiver() {
-        let Some(suffix) = source
-            .get(site.receiver.end_byte..site.receiver_chain.end_byte)
-            .and_then(|suffix| suffix.strip_prefix('.'))
-        else {
-            return empty();
-        };
-        for segment in suffix.split('.') {
-            if !is_canonical_identifier(segment)
-                || resolved_path.len() == MAX_LSP_MODULE_PATH_SEGMENTS
-            {
-                return empty();
-            }
-            resolved_path.push(segment.to_owned());
-        }
-    }
 
     let is_incomplete = is_incomplete || catalog.unavailable;
     let edit_range = span_range(source, site.member);
@@ -2924,7 +2918,10 @@ fn module_catalog_member_completion(
             label: child.name.clone(),
             kind: Some(CompletionItemKind::FIELD),
             detail: Some(module_catalog_member_detail(child.call_mode).to_owned()),
-            documentation: module_catalog_documentation(child.description, child.call_mode),
+            documentation: module_catalog_documentation(
+                child.description.as_deref(),
+                child.call_mode,
+            ),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                 edit_range, child.name,
             ))),
@@ -2936,6 +2933,76 @@ fn module_catalog_member_completion(
         is_incomplete,
         items,
     }
+}
+
+/// Resolves the catalog parent path for one member only when the receiver is
+/// an exact visible import. It never loads or validates a module.
+fn module_catalog_member_parent_path(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+) -> Option<Vec<String>> {
+    if site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let import = visible_module_import_for_receiver(source, lexical, imports, site.receiver)?;
+    let mut resolved_path = import.path.clone();
+    if site.has_direct_receiver() {
+        return Some(resolved_path);
+    }
+    let suffix = source
+        .get(site.receiver.end_byte..site.receiver_chain.end_byte)?
+        .strip_prefix('.')?;
+    for segment in suffix.split('.') {
+        if !is_canonical_identifier(segment) || resolved_path.len() == MAX_LSP_MODULE_PATH_SEGMENTS
+        {
+            return None;
+        }
+        resolved_path.push(segment.to_owned());
+    }
+    Some(resolved_path)
+}
+
+/// Returns plain-text advisory hover metadata for an exact catalog leaf. This
+/// path is deliberately separate from module resolution and runtime authority.
+fn module_catalog_member_hover(
+    source: &str,
+    symbols: &LexicalSymbolReport,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &ModuleCompletionCatalog,
+    site: MemberCompletionSite,
+) -> Option<Hover> {
+    if catalog.unavailable {
+        return None;
+    }
+    let receiver_name = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
+    if visible_symbol_in(&symbols.symbols, receiver_name, site.receiver.start_byte)
+        .is_none_or(|symbol| symbol.kind != LexicalSymbolKind::Import)
+    {
+        return None;
+    }
+    let mut path = module_catalog_member_parent_path(source, lexical, imports, site)?;
+    let member = source.get(site.member.start_byte..site.member.end_byte)?;
+    if !is_canonical_identifier(member) {
+        return None;
+    }
+    path.push(member.to_owned());
+    let module = catalog
+        .modules
+        .iter()
+        .find(|module| module.path.as_slice() == path.as_slice())?;
+    Some(Hover {
+        // Host-supplied descriptions remain plain text to prevent markup injection.
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: module_catalog_member_hover_text(module),
+        }),
+        range: Some(span_range(source, site.member)),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3005,11 +3072,11 @@ fn module_catalog_member_detail(call_mode: Option<ModuleCatalogCallMode>) -> &'s
     }
 }
 
-fn module_catalog_documentation(
-    description: Option<String>,
+fn module_catalog_advisory_text(
+    description: Option<&str>,
     call_mode: Option<ModuleCatalogCallMode>,
-) -> Option<Documentation> {
-    let mut value = description.unwrap_or_default();
+) -> Option<String> {
+    let mut value = description.unwrap_or_default().to_owned();
     let mode_note = match call_mode {
         Some(ModuleCatalogCallMode::Synchronous) => "Advisory synchronous method.",
         Some(ModuleCatalogCallMode::Deferred) => {
@@ -3021,10 +3088,37 @@ fn module_catalog_documentation(
         value.push_str("\n\n");
     }
     value.push_str(mode_note);
-    (!value.is_empty()).then_some(Documentation::MarkupContent(MarkupContent {
-        kind: MarkupKind::PlainText,
-        value,
-    }))
+    (!value.is_empty()).then_some(value)
+}
+
+fn module_catalog_documentation(
+    description: Option<&str>,
+    call_mode: Option<ModuleCatalogCallMode>,
+) -> Option<Documentation> {
+    module_catalog_advisory_text(description, call_mode).map(|value| {
+        Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value,
+        })
+    })
+}
+
+fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String {
+    let mut value = format!(
+        "Advisory imported-module member `{}`.",
+        module.path.join(".")
+    );
+    if let Some(details) = module_catalog_advisory_text(
+        (!module.description.is_empty()).then_some(module.description.as_str()),
+        module.call_mode,
+    ) {
+        value.push_str("\n\n");
+        value.push_str(&details);
+    }
+    value.push_str(
+        "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
+    );
+    value
 }
 
 fn tool_catalog_name_completion(
@@ -6488,6 +6582,99 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("host module binding required"))
         }));
+    }
+
+    #[test]
+    fn hovers_advisory_direct_module_leaves_without_authority() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.remote_add",
+                "description": "Adds two integers through a reviewed remote adapter.",
+                "callMode": "deferred"
+            },
+            {
+                "path": "mod.arithmetic.metrics.count",
+                "description": "Returns a reviewed metric count."
+            }
+        ]));
+        let source = "use mod.arithmetic\narithmetic.remote_add\narithmetic.metrics.count";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        server.open_document(document(1, source));
+
+        let deferred_member = source.find("remote_add").expect("deferred member exists");
+        let deferred_hover = server
+            .hover(&test_uri(), position_at_byte(source, deferred_member + 1))
+            .expect("direct module hover succeeds")
+            .expect("exact deferred catalog leaf has hover metadata");
+        assert_eq!(
+            deferred_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory imported-module member `mod.arithmetic.remote_add`.\n\nAdds two integers through a reviewed remote adapter.\n\nAdvisory deferred method; call returns a promise and must use await().\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.".to_owned(),
+            })
+        );
+        assert_eq!(
+            deferred_hover.range,
+            Some(Range::new(
+                position_at_byte(source, deferred_member),
+                position_at_byte(source, deferred_member + "remote_add".len()),
+            ))
+        );
+
+        let namespace = source.rfind("metrics").expect("namespace exists");
+        assert!(server
+            .hover(&test_uri(), position_at_byte(source, namespace + 1))
+            .expect("namespace hover request succeeds")
+            .is_none());
+        let nested_member = source.rfind("count").expect("nested member exists");
+        assert_eq!(
+            server
+                .hover(&test_uri(), position_at_byte(source, nested_member + 1))
+                .expect("nested direct module hover succeeds")
+                .expect("exact nested catalog leaf has hover metadata")
+                .contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory imported-module member `mod.arithmetic.metrics.count`.\n\nReturns a reviewed metric count.\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.".to_owned(),
+            })
+        );
+
+        let shadowed_source = "use mod.arithmetic\nlet arithmetic = 1\narithmetic.remote_add";
+        let mut shadowed_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {"path": "mod.arithmetic.remote_add", "callMode": "deferred"}
+            ])),
+        );
+        shadowed_server.open_document(document(1, shadowed_source));
+        let shadowed_member = shadowed_source.rfind("remote_add").unwrap();
+        assert!(shadowed_server
+            .hover(
+                &test_uri(),
+                position_at_byte(shadowed_source, shadowed_member + 1),
+            )
+            .expect("shadowed hover request succeeds")
+            .is_none());
+
+        let invalid_source = "use mod.arithmetic\narithmetic.remote_add\n@";
+        let mut invalid_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {"path": "mod.arithmetic.remote_add", "callMode": "deferred"}
+            ])),
+        );
+        invalid_server.open_document(document(1, invalid_source));
+        let invalid_member = invalid_source.find("remote_add").unwrap();
+        assert!(invalid_server
+            .hover(
+                &test_uri(),
+                position_at_byte(invalid_source, invalid_member + 1)
+            )
+            .expect("invalid-source hover request succeeds")
+            .is_none());
     }
 
     #[test]

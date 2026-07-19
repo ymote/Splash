@@ -545,13 +545,14 @@ An editor may also supply a separate advisory module-interface projection
 through `initializationOptions.splash.moduleCatalog` or a later
 `workspace/didChangeConfiguration` update. It completes the current segment in
 a direct statement-position `use mod.*` path and bounded catalog paths after a
-direct, visible imported module binding. It does not load a source file,
-resolve a module, inspect a runtime export, or override the fixed `mod.tool`
-API. Tool and module catalog keys refresh independently: an omitted key keeps
-its prior value, JSON `null` explicitly clears it, and a malformed or over-limit
-key value makes only that catalog unavailable. A malformed `settings` value or
-non-object `settings.splash` clears all advisory catalogs. Neither projection
-authorizes source. See [editor module-interface projection](docs/module-catalog.md)
+direct, visible imported module binding, and gives an exact catalog leaf a
+plain-text advisory hover. It does not load a source file, resolve a module,
+inspect a runtime export, or override the fixed `mod.tool` API. Tool and module
+catalog keys refresh independently: an omitted key keeps its prior value, JSON
+`null` explicitly clears it, and a malformed or over-limit key value makes only
+that catalog unavailable. A malformed `settings` value or non-object
+`settings.splash` clears all advisory catalogs. Neither projection authorizes
+source. See [editor module-interface projection](docs/module-catalog.md)
 for its exact format and bounds. A truncated lexical index can still serve
 retained, sound definitions and hover, but exhaustive reference, highlight, and
 rename requests fail instead of returning a partial set.

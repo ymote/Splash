@@ -82,7 +82,7 @@ empty array is a complete empty projection. Module refreshes do not alter
 `toolCatalog` or the atomic workflow-data pair. A malformed `settings` value or
 non-object `settings.splash` clears all advisory catalogs.
 
-## Completion behavior
+## Completion and hover behavior
 
 The LSP can complete the current segment in a direct statement-position import
 such as `use mod.` or `use mod.app.`. It also completes immediate static
@@ -104,6 +104,11 @@ leaf is labeled as synchronous. The LSP never inserts `await()` or changes
 source beyond the selected identifier segment. A chain has at most 16
 identifier segments, and it must begin at the visible binding from a direct
 `use mod.*` statement.
+
+Hovering an exact catalog leaf reached through the same visible-import path
+returns its canonical catalog path, any plain-text description or call-mode
+note, and the advisory authority boundary. Inferred namespaces and unresolved,
+shadowed, or non-direct paths have no catalog hover.
 
 `mod.tool` remains a fixed language surface: a visible `use mod.tool` binding
 offers only `call`, `call_json`, `start`, and `start_json`, regardless of this
