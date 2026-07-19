@@ -149,9 +149,9 @@ It retains exact direct `let binding = { ... }` shapes plus exact
 `valid_prefix_end_byte`. It also retains two exact child levels when a root
 field and its direct child are written as whole record literals; it never
 evaluates source, resolves an import, or creates a capability host. The LSP can
-use a lexical direct-alias chain of at most 16 hops, with at most one direct
-alias child selection, for same-document root and nested-field completion,
-hover, and definition. Target resolution is source-position-aware, so a
+use a lexical direct-alias chain of at most 16 hops, with at most two direct
+alias child selections in total, for same-document root and nested-field
+completion, hover, and definition. Target resolution is source-position-aware, so a
 shadowed name follows the binding visible at the alias initializer. The report
 caps root shapes at 1,024, aggregate retained literal fields at 4,096, and alias
 edges at 1,024. Duplicate fields at any retained literal level discard that
@@ -161,9 +161,9 @@ retained root or child alias that resolves to it. Shape truncation marks retaine
 completion incomplete; alias truncation returns no static fields, marks
 completion incomplete, and disables static field hover and definition. This is
 not general type inference: parenthesized or computed aliases, parenthesized or
-computed child values, deeper aliases or paths, assignments, control flow,
-returns, imports, and runtime values remain outside the claim and never grant
-authority.
+computed child values, alias or member paths beyond that two-level budget,
+assignments, control flow, returns, imports, and runtime values remain outside
+the claim and never grant authority.
 
 An editor may separately supply `initializationOptions.splash.moduleCatalog`
 or a later `settings.splash.moduleCatalog` update: a bounded list of canonical

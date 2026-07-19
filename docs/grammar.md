@@ -345,13 +345,13 @@ form `let binding = { ... }` plus exact `let alias = binding` and
 `let alias = binding.child` source edges. At a direct `binding.field` member
 site, or a direct `binding.child.grandchild.field` site where both child values
 are whole literals, including a lexical alias chain of at most 16 hops with at
-most one direct alias child selection, it offers the retained field names,
-hovers a known field, and defines it at the literal key. Alias targets resolve
+most two direct alias child selections in total, it offers the retained field
+names, hovers a known field, and defines it at the literal key. Alias targets resolve
 at their source position, preserving lexical shadowing. This is bounded source
 metadata, not general type inference: it does not follow parenthesized or
-computed aliases, parenthesized or computed child values, deeper aliases or
-member paths, assignments, control flow, function returns, imports, or runtime
-values.
+computed aliases, parenthesized or computed child values, alias or member paths
+beyond that two-level budget, assignments, control flow, function returns,
+imports, or runtime values.
 Duplicate fields at any retained literal level discard that level's nested
 shape. It retains at most 1,024 root shapes, 4,096 aggregate retained literal
 fields, and 1,024 alias edges. A truncated shape report marks its completion

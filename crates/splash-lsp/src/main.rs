@@ -5066,12 +5066,13 @@ enum StaticRecordAliasTarget {
 }
 
 /// One root literal-record view reached through an exact local alias chain.
-/// A view can carry one direct child selected by `let alias = root.child`, but
-/// never a deeper path or a computed member expression.
+/// A view can retain a bounded direct child path selected one edge at a time by
+/// `let alias = root.child`; it never follows a computed member expression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StaticRecordView {
     root_binding: SourceSpan,
-    direct_child: Option<SourceSpan>,
+    direct_children: [Option<SourceSpan>; MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH],
+    direct_child_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5144,7 +5145,8 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
         }
 
         let mut current = initial;
-        let mut direct_child = None;
+        let mut direct_children = [None; MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH];
+        let mut direct_child_count = 0_usize;
         let mut escaped = false;
         let mut visited = Vec::with_capacity(MAX_STATIC_RECORD_ALIAS_DEPTH + 1);
         for depth in 0..=MAX_STATIC_RECORD_ALIAS_DEPTH {
@@ -5155,7 +5157,8 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
                 }
                 return StaticRecordViewResolution::Found(StaticRecordView {
                     root_binding: current.definition,
-                    direct_child,
+                    direct_children,
+                    direct_child_count,
                 });
             }
             if visited.contains(&binding_start_byte) || depth == MAX_STATIC_RECORD_ALIAS_DEPTH {
@@ -5169,14 +5172,19 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
                     target_start_byte,
                     child,
                 }) => {
-                    if direct_child.is_some() {
-                        // A second child selector would be a deeper alias. It
-                        // is unsupported, but it still escapes the retained
-                        // child view. Keep following the bounded root chain so
-                        // callers can fail closed only for that root.
+                    if direct_child_count >= MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
+                        // A deeper child selector is unsupported, but it still
+                        // escapes the retained view. Keep following the bounded
+                        // root chain so callers can fail closed only for that
+                        // root.
                         escaped = true;
                     } else {
-                        direct_child = Some(child);
+                        // Alias traversal proceeds from the use site toward
+                        // the root. Insert each selected child at the front so
+                        // the retained path remains root-to-leaf.
+                        direct_children.copy_within(0..direct_child_count, 1);
+                        direct_children[0] = Some(child);
+                        direct_child_count += 1;
                     }
                     target_start_byte
                 }
@@ -5239,10 +5247,10 @@ fn visible_static_record_view<'shape>(
 }
 
 /// Returns static fields for the root literal or a bounded direct nested path.
-/// An exact `let alias = root.child` binding can carry one child selection
-/// through a bounded alias chain; a following direct member path may use the
-/// remaining literal-depth budget. Computed paths and deeper alias chains have
-/// no static metadata.
+/// Exact `let alias = root.child` bindings can collectively carry a bounded
+/// child path through an alias chain; a following direct member path may use
+/// the remaining literal-depth budget. Computed paths and deeper alias chains
+/// beyond that budget have no static metadata.
 fn visible_static_record_fields<'shape>(
     source: &str,
     symbols: &[LexicalSymbol],
@@ -5259,7 +5267,11 @@ fn visible_static_record_fields<'shape>(
     )?;
     let site_path = static_record_direct_child_path(source, site)?;
     let mut path = Vec::with_capacity(MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH);
-    if let Some(child) = view.direct_child {
+    for child in view.direct_children[..view.direct_child_count]
+        .iter()
+        .copied()
+    {
+        let child = child?;
         path.push(source.get(child.start_byte..child.end_byte)?);
     }
     if path.len().saturating_add(site_path.len()) > MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
@@ -6687,6 +6699,67 @@ mod tests {
             ["city", "zip"]
         );
 
+        let nested_child_alias_chain_source = concat!(
+            "let profile = {user: {address: {city: \"Paris\", zip: \"75000\"}}}\n",
+            "let selected = profile.user\n",
+            "let address = selected.address\n",
+            "address.city"
+        );
+        let mut nested_child_alias_chain_server = SplashLanguageServer::default();
+        nested_child_alias_chain_server.open_document(document(1, nested_child_alias_chain_source));
+        let nested_child_alias_chain_member = nested_child_alias_chain_source
+            .rfind("city")
+            .expect("nested alias-chain field exists");
+        assert_eq!(
+            nested_child_alias_chain_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(
+                        nested_child_alias_chain_source,
+                        nested_child_alias_chain_source.len(),
+                    ),
+                )
+                .expect("nested child alias-chain completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["city", "zip"]
+        );
+        assert!(nested_child_alias_chain_server
+            .hover(
+                &test_uri(),
+                position_at_byte(
+                    nested_child_alias_chain_source,
+                    nested_child_alias_chain_member + 1,
+                ),
+            )
+            .expect("nested child alias-chain hover succeeds")
+            .is_some());
+        assert_eq!(
+            nested_child_alias_chain_server
+                .definition(
+                    &test_uri(),
+                    position_at_byte(
+                        nested_child_alias_chain_source,
+                        nested_child_alias_chain_member + 1,
+                    ),
+                )
+                .expect("nested child alias-chain definition succeeds")
+                .expect("known nested alias-chain field has a definition")
+                .range,
+            Range::new(
+                position_at_byte(
+                    nested_child_alias_chain_source,
+                    nested_child_alias_chain_source.find("city:").unwrap(),
+                ),
+                position_at_byte(
+                    nested_child_alias_chain_source,
+                    nested_child_alias_chain_source.find("city:").unwrap() + "city".len(),
+                ),
+            )
+        );
+
         for unsupported_source in [
             "let profile = {user: ({name: \"Ada\"})}\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}.name}\nprofile.user.",
@@ -6695,9 +6768,9 @@ mod tests {
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user.name\nselected.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile[\"user\"]\nselected.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nselected.name.",
-            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nlet detail = selected.name\nprofile.user.",
             "let profile = {user: {address: {city: \"Paris\", city: \"Lyon\"}}}\nprofile.user.address.",
             "let profile = {user: {address: {city: {name: \"Ada\"}}}}\nprofile.user.address.city.",
+            "let profile = {user: {address: {city: \"Paris\"}}}\nlet selected = profile.user\nlet address = selected.address\nlet city = address.city\nprofile.user.address.",
         ] {
             let mut unsupported_server = SplashLanguageServer::default();
             unsupported_server.open_document(document(1, unsupported_source));
@@ -6813,11 +6886,12 @@ mod tests {
             ["inner"]
         );
 
-        let shadowed_child_source = "let profile = {user: {outer: true}}\n\
+        let shadowed_child_source = "let profile = {user: {address: {outer: true}}}\n\
                                     fn inspect() {\n\
-                                        let profile = {user: {inner: true}}\n\
+                                        let profile = {user: {address: {inner: true}}}\n\
                                         let selected = profile.user\n\
-                                        selected.inner\n\
+                                        let address = selected.address\n\
+                                        address.inner\n\
                                     }";
         let mut shadowed_child_server = SplashLanguageServer::default();
         shadowed_child_server.open_document(document(1, shadowed_child_source));
@@ -6928,6 +7002,7 @@ mod tests {
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nmutate(selected)\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nlet alias = selected\nalias[\"name\"]\nprofile.user.",
             "let profile = {user: {address: {city: \"Paris\"}}}\nprofile.user.address.city = \"Lyon\"\nprofile.user.address.",
+            "let profile = {user: {address: {city: \"Paris\"}}}\nlet selected = profile.user\nlet address = selected.address\naddress.city = \"Lyon\"\nprofile.user.address.",
         ] {
             let mut server = SplashLanguageServer::default();
             server.open_document(document(1, source));

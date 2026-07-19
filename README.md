@@ -531,8 +531,8 @@ also recognizes an exact visible direct `let binding = { ... }` initializer.
 At `binding.field`, a direct two-level literal path such as
 `binding.child.grandchild.field`, or through an exact
 `let alias = binding` / `let alias = binding.child` chain of at most 16 hops
-with at most one alias child selection, it offers the literal field names and
-supports hover and definition to the field key. Alias targets resolve at their
+with at most two alias child selections in total, it offers the literal field
+names and supports hover and definition to the field key. Alias targets resolve at their
 source position, so lexical shadowing remains intact. This metadata has
 1,024-shape, 4,096-field, and 1,024-direct-alias bounds. An omitted alias edge
 makes retained record completion empty and incomplete and disables static field
@@ -540,8 +540,8 @@ hover and definition. The LSP suppresses a shape after an earlier direct write
 or potentially mutating member, index, call, or escape path through the root or
 any retained root or child alias that resolves to it. It does not infer
 parenthesized or computed aliases, parenthesized or computed child values,
-deeper aliases or paths, assignments, control flow, function returns, imported
-values, or runtime data.
+alias or member paths beyond that two-level budget, assignments, control flow,
+function returns, imported values, or runtime data.
 It otherwise remains conservative: it does not infer forward references,
 general types, arbitrary record fields, builtins, arbitrary catalog data, or
 runtime-derived imported-module exports.
