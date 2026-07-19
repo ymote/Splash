@@ -188,10 +188,11 @@ that view. The LSP presents both views in direct-leaf hover and signature
 documentation, and can complete an undeclared top-level key in the first direct
 literal-record argument from `inputFields`. It can additionally complete and
 hover top-level `result.field` names from `outputFields` only for an exact
-original synchronous `let result = imported.method(input)` binding or its exact
-deferred `.await()` form. It never inserts `await()`, completes nested keys,
-follows aliases or arbitrary result chains, evaluates a schema, or gives an
-editor authority. Neither API is installed into Splash source. The sealed
+root synchronous `let result = imported.method(input)` binding or its exact
+deferred `.await()` form. It also follows exact local `let alias = result`
+chains of at most 16 hops. It never inserts `await()`, completes nested keys,
+follows computed/deeper aliases or arbitrary result chains, evaluates a schema,
+or gives an editor authority. Neither API is installed into Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,

@@ -274,11 +274,12 @@ direct literal record argument from `inputFields`, after the same visible-import
 and exact-leaf checks. For an exact original binding
 `let result = imported.method(input)` on a synchronous leaf, or the exact
 deferred `.await()` form, it also completes and hovers top-level
-`result.field` names from `outputFields`. It rejects aliases, mutations and
-escapes, nested result chains, parenthesized/computed initializers, extra
-arguments, mismatched call mode, and source beyond the safe diagnostic prefix.
-It does not inspect a runtime value, evaluate JSON Schema, or validate a
-contract.
+`result.field` names from `outputFields`. It follows exact local
+`let alias = result` chains of at most 16 hops, but rejects computed/deeper
+aliases, mutations and escapes, nested result chains, parenthesized/computed
+initializers, extra arguments, mismatched call mode, and source beyond the
+safe diagnostic prefix. It does not inspect a runtime value, evaluate JSON
+Schema, or validate a contract.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through

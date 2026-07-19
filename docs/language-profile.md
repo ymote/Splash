@@ -177,11 +177,12 @@ only labeled as returning a promise; an exact visible catalog leaf also has a
 plain-text advisory hover. For an exact shaped leaf, it can complete an
 undeclared top-level key in the first direct literal record argument from
 `inputFields`, and documents both input and output fields in hover and signature
-help. For an exact original `let result = imported.method(input)` binding on a
+help. For an exact root `let result = imported.method(input)` binding on a
 synchronous leaf, or its exact deferred `.await()` form, it can complete and
-hover top-level `result.field` names from `outputFields`. It does not complete
-nested keys, infer values, follow result aliases, or infer arbitrary
-result-binding members. The LSP never inserts `await()` or changes source
+hover top-level `result.field` names from `outputFields`. It also follows exact
+local `let alias = result` chains of at most 16 hops. It does not complete
+nested keys, infer values, follow computed or deeper aliases, or infer
+arbitrary result-binding members. The LSP never inserts `await()` or changes source
 beyond the selected identifier. It is not part of the core report and does not
 load a source file, resolve or validate a module, inspect runtime exports, infer
 arbitrary fields, or make a Rust adapter current or callable. `mod.tool` remains
@@ -205,11 +206,12 @@ load a module, inspect a runtime, validate a tool name, issue a lease, or
 authorize a call. When a shaped leaf has `inputFields` or `outputFields`, hover
 and signature documentation list those bounded field/type/required views, and
 the first direct literal-record argument can complete an undeclared top-level
-key from `inputFields`. The bounded output feature only serves the exact
-original result binding, requires a matching synchronous/deferred call form,
-and rejects aliases, mutation/escape, nested paths, and computed initializers.
-This is not nested-key completion, JSON Schema evaluation, runtime inspection,
-or proof that a contract remains installed.
+key from `inputFields`. The bounded output feature serves the exact result
+binding plus an exact local alias chain of at most 16 hops, requires a matching
+synchronous/deferred call form, and rejects computed/deeper aliases,
+mutation/escape, nested paths, and computed initializers. This is not
+nested-key completion, JSON Schema evaluation, runtime inspection, or proof
+that a contract remains installed.
 
 For dataflow authoring, an editor may instead supply the separate bounded
 `initializationOptions.splash.workflowDataCatalog` projection. It contains only

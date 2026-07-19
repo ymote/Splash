@@ -57,6 +57,9 @@ const DIAGNOSTIC_SOURCE: &str = "splash";
 /// This is intentionally much smaller than the independently capped alias
 /// report, so one member request has a fixed traversal bound.
 const MAX_STATIC_RECORD_ALIAS_DEPTH: usize = 16;
+/// Maximum exact local aliases followed for advisory direct-module result
+/// fields. This is intentionally separate from general value resolution.
+const MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH: usize = 16;
 /// Maximum retained metadata entries in the optional LSP tool-catalog projection.
 ///
 /// This intentionally matches the default host catalog count but remains local
@@ -700,6 +703,7 @@ impl SplashLanguageServer {
                         lexical,
                         imports,
                         &self.module_catalog,
+                        shapes,
                         site,
                     ) {
                         return Ok(Some(Hover {
@@ -884,6 +888,7 @@ impl SplashLanguageServer {
                 report,
                 imports,
                 &self.module_catalog,
+                shapes,
                 member_site,
                 is_incomplete,
             ) {
@@ -3932,19 +3937,20 @@ fn module_catalog_input_field_text(field: &ModuleCatalogRecordFieldCompletion) -
     value
 }
 
-/// Completes host-projected output fields only on the original local binding
-/// from one exact direct-module initializer. This remains narrower than record
-/// shape support: aliases, nested member chains, mutations, and escapes all
+/// Completes host-projected output fields on one exact direct-module result
+/// binding or its bounded exact local alias chain. This remains narrower than
+/// record shape support: nested member chains, mutations, and escapes all
 /// refuse the advisory output view.
 fn module_catalog_output_field_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
     catalog: &ModuleCompletionCatalog,
+    shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
     is_incomplete: bool,
 ) -> Option<CompletionList> {
-    let output_binding = direct_module_output_binding_for_member(source, lexical, site)?;
+    let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
     let is_incomplete = is_incomplete || imports.truncated || catalog.unavailable;
     let empty = || CompletionList {
         is_incomplete,
@@ -4353,39 +4359,187 @@ fn module_catalog_direct_member<'catalog>(
         .find(|module| module.path.as_slice() == path.as_slice())
 }
 
-/// Finds the compact output-field projection for one exact original local
-/// result binding. It relies on the same visible-import lookup as direct
-/// module completion, but recognizes neither aliases nor general expressions.
+/// Finds the compact output-field projection for one exact direct-module local
+/// result binding or its bounded exact alias group. It relies on the same
+/// visible-import lookup as direct module completion and never resolves
+/// general expressions.
 fn module_catalog_output_fields_for_member<'catalog>(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
     catalog: &'catalog ModuleCompletionCatalog,
+    shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
 ) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
-    let output_binding = direct_module_output_binding_for_member(source, lexical, site)?;
+    let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
     module_catalog_output_fields_for_binding(source, lexical, imports, catalog, output_binding)
 }
 
 fn direct_module_output_binding_for_member(
     source: &str,
     lexical: &LexicalCompletionReport,
+    shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
 ) -> Option<DirectModuleOutputBinding> {
     if lexical.symbols_truncated
         || !site.has_direct_receiver()
         || site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > shapes.valid_prefix_end_byte
     {
         return None;
     }
     let receiver_name = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
-    let binding = visible_symbol_at(lexical, receiver_name, site.receiver.start_byte)?;
-    if binding.kind != LexicalSymbolKind::Let
-        || !direct_module_output_binding_is_stable_at(source, binding, site.receiver.start_byte)
-    {
+    let initial = visible_symbol_at(lexical, receiver_name, site.receiver.start_byte)?;
+    if initial.kind != LexicalSymbolKind::Let {
         return None;
     }
-    direct_module_output_binding(source, binding, lexical.valid_prefix_end_byte)
+
+    if shapes.aliases_truncated {
+        return direct_module_output_binding(source, initial, lexical.valid_prefix_end_byte)
+            .filter(|_| {
+                direct_module_output_binding_is_stable_at(source, initial, site.receiver.start_byte)
+            });
+    }
+
+    let aliases = StaticRecordAliasIndex::new(source, &lexical.symbols, shapes);
+    let root = direct_module_output_alias_root(&aliases, initial)?;
+    let output_binding = direct_module_output_binding(source, root, lexical.valid_prefix_end_byte)?;
+    let group = direct_module_output_alias_group(shapes, &aliases, root, site.receiver.start_byte)?;
+    direct_module_output_alias_group_is_stable(
+        source,
+        shapes,
+        &aliases,
+        &group,
+        site.receiver.start_byte,
+    )
+    .then_some(output_binding)
+}
+
+/// Follows only exact source aliases from the static alias report. The root is
+/// intentionally just a `let` binding; callers still prove that its initializer
+/// is an exact direct module call before exposing output metadata.
+fn direct_module_output_alias_root<'symbol>(
+    aliases: &StaticRecordAliasIndex<'symbol>,
+    initial: &'symbol LexicalSymbol,
+) -> Option<&'symbol LexicalSymbol> {
+    let mut current = initial;
+    let mut visited = HashSet::with_capacity(MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH + 1);
+    for depth in 0..=MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+        let binding_start_byte = current.definition.start_byte;
+        if !visited.insert(binding_start_byte) {
+            return None;
+        }
+        let target_start_byte = match aliases.alias_targets.get(&binding_start_byte).copied() {
+            Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
+            Some(StaticRecordAliasTarget::NotStatic) | None => return Some(current),
+            Some(StaticRecordAliasTarget::Uncertain) => return None,
+        };
+        if depth == MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+            return None;
+        }
+        let target = aliases
+            .symbols_by_definition
+            .get(&target_start_byte)
+            .copied()?;
+        if target.kind != LexicalSymbolKind::Let {
+            return None;
+        }
+        current = target;
+    }
+    None
+}
+
+/// Builds every earlier exact alias that reaches the direct result root. It
+/// refuses a chain beyond the fixed alias depth instead of retaining a partial
+/// group, but never lets a later declaration affect metadata at this site.
+fn direct_module_output_alias_group(
+    shapes: &StaticRecordShapeReport,
+    aliases: &StaticRecordAliasIndex<'_>,
+    root: &LexicalSymbol,
+    site_start_byte: usize,
+) -> Option<HashSet<usize>> {
+    let root_start_byte = root.definition.start_byte;
+    let mut depths = HashMap::with_capacity(shapes.aliases.len() + 1);
+    depths.insert(root_start_byte, 0_usize);
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for alias in shapes
+            .aliases
+            .iter()
+            .filter(|alias| alias.binding.start_byte < site_start_byte)
+        {
+            let binding_start_byte = alias.binding.start_byte;
+            let Some(StaticRecordAliasTarget::Let(target_start_byte)) =
+                aliases.alias_targets.get(&binding_start_byte).copied()
+            else {
+                continue;
+            };
+            let Some(target_depth) = depths.get(&target_start_byte).copied() else {
+                continue;
+            };
+            if target_depth == MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+                return None;
+            }
+            let next_depth = target_depth.checked_add(1)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                depths.entry(binding_start_byte)
+            {
+                entry.insert(next_depth);
+                changed = true;
+            }
+        }
+    }
+
+    Some(depths.into_keys().collect())
+}
+
+/// Every earlier direct alias of a result participates in one stability group.
+/// An exact `let alias = binding` target read is allowed only for another
+/// member of that same group; all other bare reads remain possible value
+/// escapes.
+fn direct_module_output_alias_group_is_stable(
+    source: &str,
+    shapes: &StaticRecordShapeReport,
+    aliases: &StaticRecordAliasIndex<'_>,
+    group: &HashSet<usize>,
+    site_start_byte: usize,
+) -> bool {
+    group.iter().all(|binding_start_byte| {
+        let Some(symbol) = aliases
+            .symbols_by_definition
+            .get(binding_start_byte)
+            .copied()
+        else {
+            return false;
+        };
+        if symbol.definition.start_byte >= site_start_byte {
+            return true;
+        }
+        symbol
+            .references
+            .iter()
+            .copied()
+            .filter(|reference| reference.start_byte < site_start_byte)
+            .all(|reference| {
+                direct_module_output_reference_is_stable_read(source, reference)
+                    || direct_module_output_reference_is_group_alias_target(
+                        shapes, group, reference,
+                    )
+            })
+    })
+}
+
+fn direct_module_output_reference_is_group_alias_target(
+    shapes: &StaticRecordShapeReport,
+    group: &HashSet<usize>,
+    reference: SourceSpan,
+) -> bool {
+    shapes
+        .aliases
+        .iter()
+        .any(|alias| alias.target == reference && group.contains(&alias.binding.start_byte))
 }
 
 fn module_catalog_output_fields_for_binding<'catalog>(
@@ -4417,17 +4571,19 @@ fn module_catalog_output_field_for_member<'catalog>(
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
     catalog: &'catalog ModuleCompletionCatalog,
+    shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
 ) -> Option<&'catalog ModuleCatalogRecordFieldCompletion> {
     let member_name = source.get(site.member.start_byte..site.member.end_byte)?;
-    module_catalog_output_fields_for_member(source, lexical, imports, catalog, site)?
+    module_catalog_output_fields_for_member(source, lexical, imports, catalog, shapes, site)?
         .iter()
         .find(|field| field.name == member_name)
 }
 
-/// A direct result binding remains usable only while every earlier reference is
-/// a non-mutating direct member read. This purposely rejects aliases and all
-/// other possible value escapes instead of trying to infer their behavior.
+/// Used only when alias metadata is truncated: a direct result binding remains
+/// usable only while every earlier reference is a non-mutating direct member
+/// read. It rejects aliases and all other possible value escapes rather than
+/// trying to infer their behavior from an incomplete alias group.
 fn direct_module_output_binding_is_stable_at(
     source: &str,
     symbol: &LexicalSymbol,
@@ -8871,6 +9027,137 @@ mod tests {
             ["total"]
         );
 
+        let deferred_alias_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.remote_add({left: 20, right: 22}).await()\n",
+            "let alias = result\n",
+            "alias.to"
+        );
+        let mut deferred_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        deferred_alias_server.open_document(document(1, deferred_alias_source));
+        let deferred_alias_cursor = deferred_alias_source
+            .rfind("to")
+            .expect("aliased output field exists")
+            + "to".len();
+        assert_eq!(
+            deferred_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(deferred_alias_source, deferred_alias_cursor),
+                )
+                .expect("deferred aliased output completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
+        let alias_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "let first = result\n",
+            "let second = first\n",
+            "second.to"
+        );
+        let mut alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        alias_server.open_document(document(1, alias_source));
+        let alias_cursor = alias_source.rfind("to").expect("aliased field exists") + 2;
+        assert_eq!(
+            alias_server
+                .completion(&test_uri(), position_at_byte(alias_source, alias_cursor))
+                .expect("aliased output completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
+        let alias_hover_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "let alias = result\n",
+            "alias.total"
+        );
+        let mut alias_hover_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        alias_hover_server.open_document(document(1, alias_hover_source));
+        let alias_total_start = alias_hover_source
+            .rfind("total")
+            .expect("aliased output field exists");
+        assert!(alias_hover_server
+            .hover(
+                &test_uri(),
+                position_at_byte(alias_hover_source, alias_total_start + 1),
+            )
+            .expect("aliased output hover succeeds")
+            .is_some());
+
+        let root_after_alias_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "let alias = result\n",
+            "result.to"
+        );
+        let mut root_after_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        root_after_alias_server.open_document(document(1, root_after_alias_source));
+        assert_eq!(
+            root_after_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(root_after_alias_source, root_after_alias_source.len()),
+                )
+                .expect("root output completion after exact alias succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
+        let mut later_alias_source = String::from(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "result.to\n"
+        ));
+        let root_cursor = later_alias_source.rfind("to").expect("output field exists") + "to".len();
+        let mut previous = "result".to_owned();
+        for index in 0..=MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+            let alias = format!("later_alias_{index}");
+            later_alias_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        let mut later_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        later_alias_server.open_document(document(1, &later_alias_source));
+        assert_eq!(
+            later_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(&later_alias_source, root_cursor),
+                )
+                .expect("root completion ignores later aliases")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
         let assert_no_output_completion = |source: &str| {
             let mut server = SplashLanguageServer::with_completion_catalogs(
                 ToolCompletionCatalog::default(),
@@ -8915,8 +9202,22 @@ mod tests {
         assert_no_output_completion(concat!(
             "use mod.arithmetic\n",
             "let result = arithmetic.add({left: 20})\n",
+            "let alias = (result)\n",
+            "alias.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
             "let alias = result\n",
-            "result.to"
+            "alias.extra = 1\n",
+            "alias.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "let alias = result\n",
+            "send(alias)\n",
+            "alias.to"
         ));
         assert_no_output_completion(concat!(
             "use mod.arithmetic\n",
@@ -8940,6 +9241,56 @@ mod tests {
             " ".repeat(MAX_LSP_DIRECT_MODULE_OUTPUT_INITIALIZER_BYTES + 1),
         );
         assert_no_output_completion(&oversized_trivia_source);
+
+        let mut bounded_alias_source =
+            String::from("use mod.arithmetic\nlet result = arithmetic.add({left: 20})\n");
+        let mut previous = "result".to_owned();
+        for index in 0..MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            bounded_alias_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        bounded_alias_source.push_str(&format!("{previous}.to"));
+        let mut bounded_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        bounded_alias_server.open_document(document(1, &bounded_alias_source));
+        assert_eq!(
+            bounded_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(&bounded_alias_source, bounded_alias_source.len()),
+                )
+                .expect("bounded output alias completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
+        let mut too_deep_alias_source =
+            String::from("use mod.arithmetic\nlet result = arithmetic.add({left: 20})\n");
+        let mut previous = "result".to_owned();
+        for index in 0..=MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            too_deep_alias_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        too_deep_alias_source.push_str(&format!("{previous}.to"));
+        assert_no_output_completion(&too_deep_alias_source);
+
+        let mut truncated_alias_source =
+            String::from("use mod.arithmetic\nlet result = arithmetic.add({left: 20})\n");
+        let mut previous = "result".to_owned();
+        for index in 0..=MAX_STATIC_RECORD_ALIASES {
+            let alias = format!("truncated_alias_{index}");
+            truncated_alias_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        truncated_alias_source.push_str(&format!("{previous}.to"));
+        assert_no_output_completion(&truncated_alias_source);
 
         let no_output_source = concat!(
             "use mod.arithmetic\n",

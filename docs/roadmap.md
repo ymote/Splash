@@ -340,10 +340,10 @@
 - Additional semantic editor features beyond lexical completion, fixed
   `mod.tool`, bounded direct literal/direct-alias record fields,
   catalog-backed chained lookup and static input/output contract presentation
-  from a visible imported-module binding, bounded original direct-module
-  result-field completion/hover, and direct advisory workflow-data fields.
-  General module resolution, result aliases/chains, and broader type-aware
-  field semantics remain open.
+  from a visible imported-module binding, bounded direct-module result-field
+  completion/hover through exact local aliases, and direct advisory workflow-data
+  fields. General module resolution, computed/deeper result aliases and chains,
+  and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, LSP document lifecycle fuzzing,
   expanded resource-exhaustion coverage, and corpus triage.
 - Independent security review of effectful adapters.
