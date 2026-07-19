@@ -76,6 +76,11 @@ const MAX_LSP_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_LSP_MODULE_PATH_BYTES: usize = 256;
 const MAX_LSP_MODULE_PATH_SEGMENTS: usize = 16;
 const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum schema-derived input fields retained across an advisory module
+/// projection. This is presentation metadata only, never a schema loader.
+const MAX_LSP_MODULE_INPUT_FIELDS: usize = 1_024;
+const MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES: usize = 128;
+const MAX_LSP_MODULE_INPUT_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// Signature help scans only the current bounded source document and keeps its
 /// delimiter stack no larger than the canonical grammar nesting budget.
 const MAX_SIGNATURE_HELP_DELIMITER_DEPTH: usize = DEFAULT_MAX_SYNTAX_NESTING;
@@ -159,6 +164,7 @@ struct ModuleCatalogCompletion {
     description: String,
     call_mode: Option<ModuleCatalogCallMode>,
     call_shape: Option<ModuleCatalogCallShape>,
+    input_fields: Option<Vec<ModuleCatalogInputFieldCompletion>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,6 +208,58 @@ impl ModuleCatalogCallShape {
             Self::SingleJson => "single_json",
         }
     }
+}
+
+/// A compact source-compatible JSON record field supplied by the host for one
+/// exact direct-module method. It is intentionally narrower than JSON Schema:
+/// the LSP only uses it for plain-text hover and signature documentation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModuleCatalogInputFieldType {
+    Any,
+    Null,
+    Boolean,
+    Number,
+    Integer,
+    String,
+    Array,
+    Object,
+}
+
+impl ModuleCatalogInputFieldType {
+    fn from_catalog_value(value: &str) -> Option<Self> {
+        match value {
+            "any" => Some(Self::Any),
+            "null" => Some(Self::Null),
+            "boolean" => Some(Self::Boolean),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "string" => Some(Self::String),
+            "array" => Some(Self::Array),
+            "object" => Some(Self::Object),
+            _ => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Integer => "integer",
+            Self::String => "string",
+            Self::Array => "array",
+            Self::Object => "object",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModuleCatalogInputFieldCompletion {
+    name: String,
+    field_type: ModuleCatalogInputFieldType,
+    required: bool,
+    description: String,
 }
 
 /// A bounded, advisory projection of a host's known `mod.*` interface.
@@ -1160,6 +1218,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 description: "Fuzz-only advisory module.".to_owned(),
                 call_mode: None,
                 call_shape: None,
+                input_fields: None,
             },
             ModuleCatalogCompletion {
                 path: vec![
@@ -1171,6 +1230,20 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 description: "Fuzz-only deferred adapter.".to_owned(),
                 call_mode: Some(ModuleCatalogCallMode::Deferred),
                 call_shape: Some(ModuleCatalogCallShape::SingleJson),
+                input_fields: Some(vec![
+                    ModuleCatalogInputFieldCompletion {
+                        name: "left".to_owned(),
+                        field_type: ModuleCatalogInputFieldType::Integer,
+                        required: true,
+                        description: "Fuzz-only left operand.".to_owned(),
+                    },
+                    ModuleCatalogInputFieldCompletion {
+                        name: "right".to_owned(),
+                        field_type: ModuleCatalogInputFieldType::Integer,
+                        required: true,
+                        description: "Fuzz-only right operand.".to_owned(),
+                    },
+                ]),
             },
             ModuleCatalogCompletion {
                 path: vec![
@@ -1182,6 +1255,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 description: "Fuzz-only synchronous adapter.".to_owned(),
                 call_mode: Some(ModuleCatalogCallMode::Synchronous),
                 call_shape: Some(ModuleCatalogCallShape::SingleJson),
+                input_fields: Some(Vec::new()),
             },
         ],
         unavailable: false,
@@ -1549,6 +1623,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
     }
 
     let mut retained_bytes = 0_usize;
+    let mut retained_input_fields = 0_usize;
     let mut modules = Vec::with_capacity(entries.len());
     for entry in entries {
         let object = entry.as_object()?;
@@ -1573,6 +1648,19 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
         // A shape says more than presentation mode, so do not accept it on a
         // path that does not identify a callable method.
         if call_shape.is_some() && call_mode.is_none() {
+            return None;
+        }
+        let input_fields = match object.get("inputFields") {
+            Some(value) => Some(parse_module_catalog_input_fields(
+                value,
+                &mut retained_bytes,
+                &mut retained_input_fields,
+            )?),
+            None => None,
+        };
+        // Input fields are meaningful only for a fully explicit one-JSON-value
+        // direct method shape. Never infer record structure from a mode alone.
+        if input_fields.is_some() && call_shape != Some(ModuleCatalogCallShape::SingleJson) {
             return None;
         }
         if description.len() > MAX_LSP_MODULE_DESCRIPTION_BYTES {
@@ -1600,6 +1688,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             description: description.to_owned(),
             call_mode,
             call_shape,
+            input_fields,
         });
     }
     if modules.iter().any(|module| {
@@ -1616,6 +1705,63 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
         modules,
         unavailable: false,
     })
+}
+
+/// Retains a tiny source-compatible record-field projection. This accepts no
+/// schema syntax, nested shapes, defaults, or arbitrary property keys, so an
+/// editor can never treat configuration as a general JSON Schema evaluator.
+fn parse_module_catalog_input_fields(
+    value: &serde_json::Value,
+    retained_bytes: &mut usize,
+    retained_fields: &mut usize,
+) -> Option<Vec<ModuleCatalogInputFieldCompletion>> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_LSP_MODULE_INPUT_FIELDS {
+        return None;
+    }
+
+    let mut fields = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let field = entry.as_object()?;
+        let name = field.get("name")?.as_str()?;
+        let field_type =
+            ModuleCatalogInputFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
+        let required = field.get("required")?.as_bool()?;
+        let description = match field.get("description") {
+            Some(value) => value.as_str()?,
+            None => "",
+        };
+        if name.len() > MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES
+            || !is_canonical_identifier(name)
+            || description.len() > MAX_LSP_MODULE_INPUT_FIELD_DESCRIPTION_BYTES
+            || fields
+                .iter()
+                .any(|existing: &ModuleCatalogInputFieldCompletion| existing.name == name)
+        {
+            return None;
+        }
+        *retained_fields = retained_fields.checked_add(1)?;
+        if *retained_fields > MAX_LSP_MODULE_INPUT_FIELDS {
+            return None;
+        }
+        let entry_bytes = name
+            .len()
+            .checked_add(field_type.label().len())?
+            .checked_add(description.len())?
+            .checked_add(1)?;
+        *retained_bytes = retained_bytes.checked_add(entry_bytes)?;
+        if *retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES {
+            return None;
+        }
+        fields.push(ModuleCatalogInputFieldCompletion {
+            name: name.to_owned(),
+            field_type,
+            required,
+            description: description.to_owned(),
+        });
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(fields)
 }
 
 fn parse_module_catalog_path(path: &str) -> Option<Vec<String>> {
@@ -3470,6 +3616,28 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
     ) {
         value.push_str("\n\n");
         value.push_str(&details);
+    }
+    if let Some(fields) = &module.input_fields {
+        value.push_str("\n\nAdvisory input record fields:");
+        if fields.is_empty() {
+            value.push_str(" no source-compatible fields are projected.");
+        } else {
+            for field in fields {
+                value.push_str("\n- ");
+                value.push_str(&field.name);
+                value.push_str(": ");
+                value.push_str(field.field_type.label());
+                value.push_str(if field.required {
+                    " (required)"
+                } else {
+                    " (optional)"
+                });
+                if !field.description.is_empty() {
+                    value.push_str("; ");
+                    value.push_str(&field.description);
+                }
+            }
+        }
     }
     value.push_str(
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
@@ -7278,6 +7446,69 @@ mod tests {
     }
 
     #[test]
+    fn presents_advisory_direct_module_input_fields_in_hover_and_signature_help() {
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})"
+        );
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.arithmetic.add",
+                    "description": "Adds reviewed integers.",
+                    "callMode": "synchronous",
+                    "callShape": "single_json",
+                    "inputFields": [
+                        {
+                            "name": "left",
+                            "type": "integer",
+                            "required": true,
+                            "description": "First addend."
+                        },
+                        {
+                            "name": "right",
+                            "type": "integer",
+                            "required": false
+                        }
+                    ]
+                }
+            ])),
+        );
+        server.open_document(document(1, source));
+
+        let member_start = source.find("add").expect("direct method exists");
+        let hover = server
+            .hover(&test_uri(), position_at_byte(source, member_start + 1))
+            .expect("module hover succeeds")
+            .expect("visible shaped module method has hover metadata");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!("module hover should use plain-text markup");
+        };
+        assert!(value.contains("Advisory input record fields:"));
+        assert!(value.contains("- left: integer (required); First addend."));
+        assert!(value.contains("- right: integer (optional)"));
+        assert!(value.contains("capability authorization remain host-owned"));
+
+        let field_cursor = source.find("right:").expect("second field exists") + 1;
+        let signature = server
+            .signature_help(&test_uri(), position_at_byte(source, field_cursor))
+            .expect("module signature help succeeds")
+            .expect("visible shaped module method has a signature");
+        assert_eq!(
+            signature.signatures[0].label,
+            "arithmetic.add(input) -> JSON value"
+        );
+        let Some(Documentation::MarkupContent(MarkupContent { value, .. })) =
+            signature.signatures[0].documentation.as_ref()
+        else {
+            panic!("module signature should carry plain-text documentation");
+        };
+        assert!(value.contains("- left: integer (required); First addend."));
+        assert!(value.contains("- right: integer (optional)"));
+    }
+
+    #[test]
     fn module_catalog_projection_is_bounded_and_fails_closed_when_malformed() {
         let params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -7352,6 +7583,106 @@ mod tests {
             shaped.modules[0].call_shape,
             Some(ModuleCatalogCallShape::SingleJson)
         );
+        let shaped_with_fields = parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {
+                        "name": "left",
+                        "type": "integer",
+                        "required": true,
+                        "description": "Left addend."
+                    },
+                    {"name": "right", "type": "integer", "required": false}
+                ]
+            }
+        ]))
+        .expect("shaped input fields are retained");
+        assert_eq!(
+            shaped_with_fields.modules[0].input_fields,
+            Some(vec![
+                ModuleCatalogInputFieldCompletion {
+                    name: "left".to_owned(),
+                    field_type: ModuleCatalogInputFieldType::Integer,
+                    required: true,
+                    description: "Left addend.".to_owned(),
+                },
+                ModuleCatalogInputFieldCompletion {
+                    name: "right".to_owned(),
+                    field_type: ModuleCatalogInputFieldType::Integer,
+                    required: false,
+                    description: String::new(),
+                },
+            ])
+        );
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "inputFields": []
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [{"name": "not-valid", "type": "integer", "required": true}]
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [{"name": "left", "type": "unknown", "required": true}]
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [{"name": "left", "type": "integer"}]
+            }
+        ]))
+        .is_none());
+        let input_fields = |start: usize, count: usize| {
+            serde_json::Value::Array(
+                (start..start + count)
+                    .map(|index| {
+                        serde_json::json!({
+                            "name": format!("field_{index}"),
+                            "type": "integer",
+                            "required": false
+                        })
+                    })
+                    .collect(),
+            )
+        };
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.left",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": input_fields(0, MAX_LSP_MODULE_INPUT_FIELDS / 2)
+            },
+            {
+                "path": "mod.math.right",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": input_fields(
+                    MAX_LSP_MODULE_INPUT_FIELDS / 2,
+                    MAX_LSP_MODULE_INPUT_FIELDS / 2 + 1
+                )
+            }
+        ]))
+        .is_none());
         assert!(parse_module_completion_catalog(&serde_json::json!([
             {"path": "mod.std", "callMode": "deferred"}
         ]))

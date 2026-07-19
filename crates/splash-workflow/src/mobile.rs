@@ -988,12 +988,29 @@ mod tests {
                     description: "Reviewed arithmetic adapters.".to_owned(),
                     call_mode: None,
                     call_shape: None,
+                    input_fields: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integer fields.".to_owned(),
                     call_mode: Some(splash_capabilities::CapabilityModuleMethodMode::Deferred),
                     call_shape: Some(splash_capabilities::CapabilityModuleCallShape::SingleJson),
+                    input_fields: Some(vec![
+                        splash_capabilities::CapabilityModuleInputFieldDescriptor {
+                            name: "left".to_owned(),
+                            field_type:
+                                splash_capabilities::CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                        splash_capabilities::CapabilityModuleInputFieldDescriptor {
+                            name: "right".to_owned(),
+                            field_type:
+                                splash_capabilities::CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                    ]),
                 },
             ]
         );

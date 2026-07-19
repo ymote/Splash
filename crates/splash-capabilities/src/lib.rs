@@ -144,6 +144,22 @@ pub const MAX_CAPABILITY_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 pub const MAX_CAPABILITY_MODULE_IDENTIFIER_BYTES: usize = 64;
 /// Maximum UTF-8 byte length of a direct capability module description.
 pub const MAX_CAPABILITY_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum number of schema-derived literal-record fields published for one
+/// direct capability method's advisory editor projection.
+///
+/// This matches the executable schema property's hard limit. It is metadata
+/// only and never relaxes the runtime JSON contract.
+pub const MAX_CAPABILITY_MODULE_INPUT_FIELDS: usize = 128;
+/// Fixed aggregate ceiling for schema-derived input fields across the direct
+/// module interface. This matches the LSP's bounded catalog parser so a
+/// runtime-produced projection can be passed through unchanged.
+pub const MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS: usize = 1_024;
+/// Maximum UTF-8 byte length of one schema-derived direct-module input field
+/// name published to an editor.
+pub const MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of one schema-derived direct-module input field
+/// description published to an editor.
+pub const MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// Maximum UTF-8 byte length of a registered capability name.
 pub const MAX_TOOL_NAME_BYTES: usize = 128;
 /// Default number of recent capability audit events retained in memory.
@@ -634,6 +650,53 @@ pub enum CapabilityModuleCallShape {
     SingleJson,
 }
 
+/// A compact, schema-derived literal-record field for a direct capability
+/// method's advisory editor projection.
+///
+/// Only an explicit root object schema with entirely canonical property names
+/// is projected. The executable JSON schema remains the authority at the Rust
+/// boundary; this descriptor is not installed into Splash source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CapabilityModuleInputFieldType {
+    Any,
+    Null,
+    Boolean,
+    Number,
+    Integer,
+    String,
+    Array,
+    Object,
+}
+
+impl CapabilityModuleInputFieldType {
+    fn from_schema_type(value: &str) -> Option<Self> {
+        match value {
+            "any" => Some(Self::Any),
+            "null" => Some(Self::Null),
+            "boolean" => Some(Self::Boolean),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "string" => Some(Self::String),
+            "array" => Some(Self::Array),
+            "object" => Some(Self::Object),
+            _ => None,
+        }
+    }
+}
+
+/// One schema-derived direct-module input field retained for host and editor
+/// review.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapabilityModuleInputFieldDescriptor {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub field_type: CapabilityModuleInputFieldType,
+    pub required: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
 /// Stable host-facing description of one setup-defined direct capability
 /// module.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -651,6 +714,11 @@ pub struct CapabilityModuleMethodDescriptor {
     pub description: String,
     pub mode: CapabilityModuleMethodMode,
     pub call_shape: CapabilityModuleCallShape,
+    /// Compact record-field metadata derived only from an explicit executable
+    /// object input contract. `None` deliberately makes no statement about
+    /// an array, scalar, missing-properties, or noncanonical-key input shape.
+    #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
+    pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
 }
 
 /// One entry in the advisory `splash-lsp` `moduleCatalog` wire shape.
@@ -667,6 +735,11 @@ pub struct ModuleInterfaceDescriptor {
     /// method. A mode alone never claims an editor-callable signature.
     #[serde(rename = "callShape", skip_serializing_if = "Option::is_none")]
     pub call_shape: Option<CapabilityModuleCallShape>,
+    /// Compact advisory literal-record fields for one exact direct method.
+    /// This is absent unless a reviewed contract can be represented without
+    /// partial field inference.
+    #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
+    pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
 }
 
 /// One host-resolved advisory direct capability-module call site.
@@ -743,6 +816,9 @@ pub enum CapabilityModuleRegistrationError {
         maximum: usize,
     },
     InterfaceEntryLimitExceeded {
+        maximum: usize,
+    },
+    InterfaceInputFieldLimitExceeded {
         maximum: usize,
     },
     CatalogEncoding,
@@ -825,6 +901,10 @@ impl Display for CapabilityModuleRegistrationError {
             Self::InterfaceEntryLimitExceeded { maximum } => write!(
                 formatter,
                 "direct capability module interface exceeds {maximum} module and method entries"
+            ),
+            Self::InterfaceInputFieldLimitExceeded { maximum } => write!(
+                formatter,
+                "direct capability module interface exceeds {maximum} schema-derived input fields"
             ),
             Self::CatalogEncoding => {
                 formatter.write_str("direct capability module catalog could not be encoded")
@@ -4514,11 +4594,25 @@ impl CapabilityRuntime {
                     description: tool.metadata.description.clone(),
                     mode: *mode,
                     call_shape: CapabilityModuleCallShape::SingleJson,
+                    input_fields: direct_module_input_fields(tool.metadata.input_schema.as_ref()),
                 })
                 .collect(),
         };
         let mut candidate_catalog = self.capability_modules.clone();
         candidate_catalog.insert(descriptor.name.clone(), descriptor.clone());
+        let input_field_count = candidate_catalog
+            .values()
+            .flat_map(|module| module.methods.iter())
+            .filter_map(|method| method.input_fields.as_ref())
+            .map(Vec::len)
+            .sum::<usize>();
+        if input_field_count > MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS {
+            return Err(
+                CapabilityModuleRegistrationError::InterfaceInputFieldLimitExceeded {
+                    maximum: MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS,
+                },
+            );
+        }
         let interface_material = serde_json::to_vec(&module_interface_catalog(&candidate_catalog))
             .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?;
         let fingerprint_material = serde_json::to_vec(&candidate_catalog)
@@ -5312,6 +5406,7 @@ fn module_interface_catalog(
             description: module.description.clone(),
             call_mode: None,
             call_shape: None,
+            input_fields: None,
         });
         entries.extend(
             module
@@ -5322,10 +5417,74 @@ fn module_interface_catalog(
                     description: method.description.clone(),
                     call_mode: Some(method.mode),
                     call_shape: Some(method.call_shape),
+                    input_fields: method.input_fields.clone(),
                 }),
         );
     }
     entries
+}
+
+/// Projects only a complete, literal-record-shaped slice of an executable
+/// input schema. Returning `None` is deliberate: an editor must not infer a
+/// partial shape for scalar, array, missing-properties, noncanonical-key, or
+/// otherwise unsupported object contracts.
+fn direct_module_input_fields(
+    input_schema: Option<&JsonValue>,
+) -> Option<Vec<CapabilityModuleInputFieldDescriptor>> {
+    let schema = input_schema?.as_object()?;
+    if schema.get("type")?.as_str()? != "object" {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.len() > MAX_CAPABILITY_MODULE_INPUT_FIELDS {
+        return None;
+    }
+
+    let mut required = BTreeSet::<String>::new();
+    if let Some(entries) = schema.get("required") {
+        for entry in entries.as_array()? {
+            let name = entry.as_str()?;
+            if !properties.contains_key(name)
+                || name.len() > MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES
+                || !is_canonical_identifier(name)
+                || !required.insert(name.to_owned())
+            {
+                return None;
+            }
+        }
+    }
+
+    let mut fields = Vec::with_capacity(properties.len());
+    for (name, field_schema) in properties {
+        if name.len() > MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES
+            || !is_canonical_identifier(name)
+        {
+            return None;
+        }
+        let field_schema = field_schema.as_object()?;
+        let field_type = match field_schema.get("type") {
+            Some(value) => CapabilityModuleInputFieldType::from_schema_type(value.as_str()?)?,
+            None => CapabilityModuleInputFieldType::Any,
+        };
+        let description = match field_schema.get("description") {
+            Some(value) => {
+                let description = value.as_str()?;
+                if description.len() > MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES {
+                    return None;
+                }
+                description.to_owned()
+            }
+            None => String::new(),
+        };
+        fields.push(CapabilityModuleInputFieldDescriptor {
+            name: name.clone(),
+            field_type,
+            required: required.contains(name.as_str()),
+            description,
+        });
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(fields)
 }
 
 fn install_capability_module(
@@ -5900,6 +6059,20 @@ mod tests {
                     description: "Adds two reviewed integers.".to_owned(),
                     mode: CapabilityModuleMethodMode::Synchronous,
                     call_shape: CapabilityModuleCallShape::SingleJson,
+                    input_fields: Some(vec![
+                        CapabilityModuleInputFieldDescriptor {
+                            name: "left".to_owned(),
+                            field_type: CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                        CapabilityModuleInputFieldDescriptor {
+                            name: "right".to_owned(),
+                            field_type: CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                    ]),
                 }],
             }]
         );
@@ -5911,12 +6084,27 @@ mod tests {
                     description: "Reviewed arithmetic adapters.".to_owned(),
                     call_mode: None,
                     call_shape: None,
+                    input_fields: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integers.".to_owned(),
                     call_mode: Some(CapabilityModuleMethodMode::Synchronous),
                     call_shape: Some(CapabilityModuleCallShape::SingleJson),
+                    input_fields: Some(vec![
+                        CapabilityModuleInputFieldDescriptor {
+                            name: "left".to_owned(),
+                            field_type: CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                        CapabilityModuleInputFieldDescriptor {
+                            name: "right".to_owned(),
+                            field_type: CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                    ]),
                 },
             ]
         );
@@ -5924,6 +6112,13 @@ mod tests {
         assert!(lsp_projection[0].get("callMode").is_none());
         assert_eq!(lsp_projection[1]["callMode"], json!("synchronous"));
         assert_eq!(lsp_projection[1]["callShape"], json!("single_json"));
+        assert_eq!(
+            lsp_projection[1]["inputFields"],
+            json!([
+                {"name": "left", "type": "integer", "required": true},
+                {"name": "right", "type": "integer", "required": true}
+            ])
+        );
 
         let lease = runtime
             .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
@@ -5964,6 +6159,102 @@ mod tests {
         assert_eq!(runtime.audit().len(), 2);
         assert_eq!(runtime.audit()[1].tool, "math.add");
         assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn direct_module_input_field_projection_requires_a_complete_source_record_shape() {
+        let compatible = json!({
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "description": "Number of requested items."
+                },
+                "filter": {"type": "string"}
+            },
+            "required": ["count"]
+        });
+        assert_eq!(
+            direct_module_input_fields(Some(&compatible)),
+            Some(vec![
+                CapabilityModuleInputFieldDescriptor {
+                    name: "count".to_owned(),
+                    field_type: CapabilityModuleInputFieldType::Integer,
+                    required: true,
+                    description: "Number of requested items.".to_owned(),
+                },
+                CapabilityModuleInputFieldDescriptor {
+                    name: "filter".to_owned(),
+                    field_type: CapabilityModuleInputFieldType::String,
+                    required: false,
+                    description: String::new(),
+                },
+            ])
+        );
+        assert!(direct_module_input_fields(Some(&json!({"type": "array"}))).is_none());
+        assert!(direct_module_input_fields(Some(&json!({"type": "object"}))).is_none());
+        assert!(direct_module_input_fields(Some(&json!({
+            "type": "object",
+            "properties": {"not-valid": {"type": "integer"}}
+        })))
+        .is_none());
+        assert!(direct_module_input_fields(Some(&json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["missing"]
+        })))
+        .is_none());
+    }
+
+    #[test]
+    fn direct_module_input_field_projection_stays_within_the_lsp_aggregate_bound() {
+        let module_count =
+            MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS / MAX_CAPABILITY_MODULE_INPUT_FIELDS;
+        let mut runtime = CapabilityRuntime::default();
+
+        for module_index in 0..=module_count {
+            let mut properties = serde_json::Map::new();
+            for field_index in 0..MAX_CAPABILITY_MODULE_INPUT_FIELDS {
+                properties.insert(format!("field_{field_index}"), json!({"type": "integer"}));
+            }
+            let contract = JsonToolContract::new(
+                json!({
+                    "type": "object",
+                    "properties": properties,
+                    "additionalProperties": false
+                }),
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            )
+            .expect("generated object contract is valid");
+            let tool = format!("math.fields_{module_index}");
+            runtime
+                .register_validated_json_tool(
+                    ToolPolicy::json(tool.clone()),
+                    ToolMetadata::default(),
+                    contract,
+                    |_| Ok(json!({})),
+                )
+                .expect("reviewed generated tool registers");
+
+            let module = CapabilityModule::new(format!("fields_{module_index}"), "Fields.")
+                .with_method("inspect", tool);
+            if module_index < module_count {
+                runtime
+                    .register_capability_module(module)
+                    .expect("projection remains within the aggregate field bound");
+            } else {
+                assert_eq!(
+                    runtime.register_capability_module(module).unwrap_err(),
+                    CapabilityModuleRegistrationError::InterfaceInputFieldLimitExceeded {
+                        maximum: MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS,
+                    }
+                );
+            }
+        }
     }
 
     #[test]

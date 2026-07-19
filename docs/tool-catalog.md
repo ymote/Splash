@@ -157,7 +157,9 @@ hard ceilings of 128 modules, 256 methods, and 512 KiB. That includes the
 host-visible LSP interface projection and the exact mapping serialization
 retained for capability-lease fingerprints. The combined module and method
 projection is also capped at 256 entries so it can be passed to the LSP
-unchanged.
+unchanged. Schema-derived input-field metadata is independently capped at
+1,024 aggregate fields so the generated LSP projection stays within the same
+fail-closed editor bound.
 `CapabilityRuntime::with_limits_pending_catalog_and_module_limits` lets a
 constrained host lower those bounds. Every direct target's configured
 input and output byte limits must fit the runtime JSON bridge: the smaller of
@@ -165,19 +167,26 @@ input and output byte limits must fit the runtime JSON bridge: the smaller of
 bounded by the smaller of `max_syntax_nesting` and 64. The module catalog seals
 when a lease is issued or source is first evaluated, so a new syntax alias
 cannot appear under an existing approval. The stable module name, description,
-method name, mode, target tool, and call shape are also included in the
-capability catalog fingerprint recorded by that lease, binding a reviewed direct
-call to its exact underlying capability and invocation behavior.
+method name, mode, target tool, call shape, and any compact schema-derived
+input-field projection are also included in the capability catalog fingerprint
+recorded by that lease, binding a reviewed direct call to its exact underlying
+capability and invocation behavior.
 
 `CapabilityRuntime::capability_module_catalog()` returns the reviewed mapping
 for a host prompt or operator UI. `module_interface_catalog()` returns the
-bounded flat `{path, description, callMode?, callShape?}` entries accepted by
+bounded flat `{path, description, callMode?, callShape?, inputFields?}` entries accepted by
 the advisory LSP `moduleCatalog` projection. Direct method entries carry their
 host-selected `synchronous` or `deferred` mode and `single_json` call shape, so
 the editor can label a deferred call as returning a promise and offer a bounded
-one-value signature without guessing its argument contract; the projection
-never inserts `await()` or gives an editor authority. Neither API is installed
-into Splash source. The sealed
+one-value signature without guessing its argument contract. When the executable
+input schema is an explicit object whose entire property set uses canonical
+Splash identifiers and defines a `properties` map, the projection also carries
+a bounded field/type/required view with optional plain-text property
+descriptions. Scalar, array, missing-properties, noncanonical-key, and partial
+shapes omit that view. The LSP presents it only
+in direct-leaf hover and signature documentation; it never inserts `await()`,
+completes record keys, evaluates a schema, or gives an editor authority. Neither
+API is installed into Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,

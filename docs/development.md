@@ -212,7 +212,10 @@ projection through `initializationOptions.splash.moduleCatalog` or a later
         "path": "mod.app.weather.current",
         "description": "Returns current forecast data.",
         "callMode": "deferred",
-        "callShape": "single_json"
+        "callShape": "single_json",
+        "inputFields": [
+          {"name": "location", "type": "string", "required": true}
+        ]
       }
     ]
   }
@@ -234,12 +237,16 @@ catalogs so the server cannot retain stale metadata.
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
 4 KiB description and optional exact-leaf `callMode` of `synchronous` or
-`deferred`, plus an optional exact-leaf `callShape` of `single_json`. A
-mode-bearing path must be at least `mod.<module>.<method>`; a shape requires a
-mode. The LSP retains at most 256 descriptors and 512 KiB of
-path/description/call-mode/call-shape bytes. Paths below the fixed `mod.tool`
-namespace are rejected. A malformed recognized call mode or shape, a shape
-without a mode, duplicate path, malformed descriptor, or over-limit projection
+`deferred`, plus an optional exact-leaf `callShape` of `single_json` and its
+optional compact `inputFields` record view. A mode-bearing path must be at
+least `mod.<module>.<method>`; a shape requires a mode and input fields require
+that shape. Each field has a canonical identifier up to 128 bytes, one fixed
+JSON type, an explicit Boolean `required` bit, and an optional 4 KiB
+description. The LSP retains at most 256 descriptors, 1,024 aggregate input
+fields, and 512 KiB of path/description/call-mode/call-shape/input-field bytes.
+Paths below the fixed `mod.tool` namespace are rejected. A malformed recognized
+call mode, shape, or field projection, a shape without a mode, input fields
+without a shape, duplicate path, malformed descriptor, or over-limit projection
 is discarded as a whole and marks matching completion `isIncomplete`; no
 partial interface is presented. See [Editor module interface
 projection](module-catalog.md) for the complete contract. A deferred member is
@@ -255,7 +262,11 @@ metadata still completes and hovers, but has no assumed arity. The cursor
 scanner accepts an in-progress string argument, but rejects a cursor inside a
 comment, mismatched delimiters, deep nesting, shadowed receivers, truncated
 scope/import metadata, and unknown paths. It never reads a runtime, resolves a
-module, or grants authority.
+module, or grants authority. When a shaped leaf also supplies `inputFields`,
+its plain-text hover and signature documentation list only those bounded
+field names, fixed JSON types, required bits, and optional descriptions. This
+is not record-key completion, JSON Schema evaluation, a runtime value view, or
+contract validation.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through
@@ -337,9 +348,10 @@ rename across at most 33 UTF-8-boundary positions plus an invalid UTF-16
 position, replaces the whole document to invalidate lazy reports, repeats the
 requests, and closes the document. It accepts at most 16 KiB of fuzzer source
 and has reviewed baseline and module-catalog `.splash` seeds. The server uses a
-fixed bounded advisory module catalog only to exercise catalog completion and
-hover: the target never starts stdio, reads the URI, resolves modules,
-evaluates Splash, creates a capability host, or invokes an adapter.
+fixed bounded advisory module catalog, including shaped direct-method input
+field metadata, only to exercise catalog completion, hover, and signature help:
+the target never starts stdio, reads the URI, resolves modules, evaluates
+Splash, creates a capability host, or invokes an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 8 KiB individual-string cap, 1,024 live operand values, 256 active call

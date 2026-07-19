@@ -313,8 +313,9 @@ supports `textDocument/didOpen`, `textDocument/didChange`,
 `textDocument/didClose`, `textDocument/formatting`,
 `textDocument/documentSymbol`, `textDocument/definition`,
 `textDocument/references`, `textDocument/hover`, and
-`textDocument/documentHighlight`, and `textDocument/completion`. When the client
-supports versioned `documentChanges`, it also advertises
+`textDocument/documentHighlight`, `textDocument/completion`, and
+`textDocument/signatureHelp`. When the client supports versioned
+`documentChanges`, it also advertises
 `textDocument/prepareRename` and `textDocument/rename`. Document symbols list
 only top-level `fn` and `let` declarations after canonical syntax succeeds. The
 other semantic requests use a grammar-aware same-document lexical index for the
@@ -375,6 +376,16 @@ projection, and a suggestion does not make a capability installed, approved,
 or callable. An omitted key retains prior metadata, JSON `null` explicitly
 clears it, and malformed, duplicate, or over-limit input is discarded as a
 whole rather than presented partially.
+
+For an exact visible imported capability-module leaf, the optional advisory
+`moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,
+and compact `inputFields`. Each field has a canonical identifier, one fixed
+JSON type, a required bit, and optional plain-text description. The LSP shows
+that bounded field list only in leaf hover and signature help; it does not
+complete record keys, evaluate JSON Schema, read a runtime, validate a
+contract, or grant a capability. `inputFields` without the exact one-JSON-value
+call shape, and any malformed or over-limit field projection, fails closed with
+the rest of the advisory module metadata.
 
 For host-managed dataflow authoring, an editor may separately provide the
 bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP

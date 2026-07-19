@@ -165,11 +165,15 @@
   exact visible direct facade call back to its underlying target tool and mode
   without issuing authority. Its advisory LSP interface projection carries the
   same mode as an exact-leaf `callMode` label and an explicit `single_json`
-  call shape without inserting source or authorizing a call. The reviewed
-  module-to-tool mapping, method mode, and call shape are part of the catalog
-  fingerprint recorded by each lease, and the interface seals before lease
-  issuance or evaluation. It does not add module loading, dynamic Rust crate
-  access, or ambient operating-system authority.
+  call shape without inserting source or authorizing a call. An explicit,
+  source-compatible executable object input contract can additionally project
+  bounded field/type/required metadata into direct-leaf hover and signature
+  help; arrays, scalars, missing-properties, noncanonical-key, and partial
+  shapes are omitted. The reviewed module-to-tool mapping, method mode, call shape, and
+  any compact field projection are part of the catalog fingerprint recorded by
+  each lease, and the interface seals before lease issuance or evaluation. It
+  does not add module loading, dynamic Rust crate access, or ambient
+  operating-system authority.
 - Fenced rollback-protected storage extension and an authenticated worker
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of

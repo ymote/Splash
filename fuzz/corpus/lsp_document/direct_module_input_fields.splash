@@ -1,0 +1,7 @@
+use mod.fuzz.inspect
+
+let result = inspect.remote_add({
+    left: 20,
+    right: 22
+})
+inspect.status({})

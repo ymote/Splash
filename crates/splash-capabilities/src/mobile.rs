@@ -615,12 +615,27 @@ mod tests {
                     description: "Reviewed arithmetic adapters.".to_owned(),
                     call_mode: None,
                     call_shape: None,
+                    input_fields: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integer fields.".to_owned(),
                     call_mode: Some(crate::CapabilityModuleMethodMode::Deferred),
                     call_shape: Some(crate::CapabilityModuleCallShape::SingleJson),
+                    input_fields: Some(vec![
+                        crate::CapabilityModuleInputFieldDescriptor {
+                            name: "left".to_owned(),
+                            field_type: crate::CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                        crate::CapabilityModuleInputFieldDescriptor {
+                            name: "right".to_owned(),
+                            field_type: crate::CapabilityModuleInputFieldType::Integer,
+                            required: true,
+                            description: String::new(),
+                        },
+                    ]),
                 },
             ]
         );
