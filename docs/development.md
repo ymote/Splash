@@ -60,8 +60,9 @@ separate behavioral coverage for the imported VM.
 Pull-request CI runs short 128-input smoke campaigns for every fuzz target.
 The separate `Sustained Fuzzing` workflow runs daily and can be started
 manually from GitHub Actions. It gives the differential `syntax` target and
-the bounded `execution` target ten minutes each, the source-only
-`lsp_document` target two minutes, and the variable-limit `execution_limits`
+the bounded `execution` target ten minutes each, the `lsp_document` target two
+minutes for source and bounded advisory initialization/configuration-refresh
+parsing, and the variable-limit `execution_limits`
 target and no-spawn `bubblewrap_policy` target three minutes each, all with
 per-input timeout and RSS ceilings. A failure uploads its ignored
 `fuzz/artifacts` directory for 14 days.

@@ -1251,6 +1251,21 @@ const MAX_FUZZ_LSP_SOURCE_BYTES: usize = 16 * 1024;
 /// The inclusive sampling range produces at most 33 UTF-8 boundary positions.
 #[cfg(fuzzing)]
 const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
+/// Fixed source used to exercise arbitrary advisory catalog configuration.
+///
+/// Its names cover direct tool, direct-module result, and workflow-data
+/// metadata without giving the fuzzer a capability host or runtime authority.
+#[cfg(fuzzing)]
+const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
+    "use mod.tool\n",
+    "use mod.fuzz.inspect\n",
+    "let result = inspect.remote_add({left: 20, right: 22}).await()\n",
+    "let alias = result\n",
+    "alias.total\n",
+    "tool.call(\"\", \"\")\n",
+    "workflow.input.request\n",
+    "workflow.outputs.prepare.total"
+);
 
 /// Fixed no-authority metadata used to exercise advisory module completion and
 /// hover through the production document lifecycle.
@@ -1352,6 +1367,49 @@ pub fn fuzz_exercise_document(source: &str) {
     replacement.push('\n');
     let _ = server.replace_document(uri.clone(), 2, replacement.clone());
     fuzz_exercise_semantic_requests(&server, &uri, &replacement);
+
+    let _ = server.close_document(DidCloseTextDocumentParams {
+        text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
+    });
+    let _ = server.completion(&uri, Position::new(u32::MAX, u32::MAX));
+}
+
+/// Exercises advisory initialization and configuration parsing using one
+/// already-decoded JSON value. The projection remains editor-local: this hook
+/// does not connect to a runtime, load a module, or grant a capability.
+#[cfg(fuzzing)]
+pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
+    use std::str::FromStr;
+
+    let params = InitializeParams {
+        initialization_options: Some(settings.clone()),
+        ..InitializeParams::default()
+    };
+    let (tool_catalog, module_catalog, workflow_data_catalog, workflow_data_step_context) =
+        completion_catalogs_from_initialize_options(&params);
+    let Ok(uri) = Uri::from_str("file:///splash-fuzz/configuration.splash") else {
+        return;
+    };
+
+    let mut server = SplashLanguageServer::with_completion_catalogs_and_workflow_data(
+        tool_catalog,
+        module_catalog,
+        workflow_data_catalog,
+        workflow_data_step_context,
+    );
+    let _ = server.open_document(TextDocumentItem::new(
+        uri.clone(),
+        "splash".to_owned(),
+        1,
+        FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
+    ));
+    fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+
+    // The same untrusted value crosses the independent refresh boundary after
+    // initialization, so malformed and over-limit replacements cannot leave
+    // stale catalog state available to semantic requests.
+    server.refresh_advisory_configuration(settings);
+    fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),

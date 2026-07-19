@@ -361,15 +361,19 @@ fn configure_linux_project_quota_aggregate(
     if control.try_invalid_linux_project_quota_aggregate {
         assert!(matches!(
             policy.set_maximum_aggregate_linux_project_quota(0, LINUX_PROJECT_QUOTA_INODES),
-            Err(BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaByteLimit {
-                maximum_bytes: 0,
-            })
+            Err(
+                BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaByteLimit {
+                    maximum_bytes: 0,
+                }
+            )
         ));
         assert!(matches!(
             policy.set_maximum_aggregate_linux_project_quota(LINUX_PROJECT_QUOTA_BYTES, 0),
-            Err(BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaInodeLimit {
-                maximum_inodes: 0,
-            })
+            Err(
+                BubblewrapPolicyError::InvalidAggregateLinuxProjectQuotaInodeLimit {
+                    maximum_inodes: 0,
+                }
+            )
         ));
     }
     if control.linux_project_quota_aggregate {

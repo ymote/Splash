@@ -8,6 +8,7 @@ vendor/makepad/target/
 !/fuzz/corpus/lsp_document/
 /fuzz/corpus/lsp_document/*
 !/fuzz/corpus/lsp_document/*.splash
+!/fuzz/corpus/lsp_document/*.json
 !/fuzz/corpus/execution/
 /fuzz/corpus/execution/*
 !/fuzz/corpus/execution/*.splash

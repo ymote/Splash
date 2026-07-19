@@ -1,0 +1,30 @@
+{
+  "splash": {
+    "toolCatalog": [
+      {"name": "text.echo", "format": "text", "description": "Reviewed text adapter."}
+    ],
+    "moduleCatalog": [
+      {
+        "path": "mod.fuzz.inspect.remote_add",
+        "description": "Reviewed deferred adapter.",
+        "callMode": "deferred",
+        "callShape": "single_json",
+        "inputFields": [
+          {"name": "left", "type": "integer", "required": true},
+          {"name": "right", "type": "integer", "required": true}
+        ],
+        "outputFields": [
+          {"name": "total", "type": "integer", "required": true}
+        ]
+      }
+    ],
+    "workflowDataCatalog": {
+      "inputFields": [{"name": "request", "type": "string"}],
+      "outputs": [{"stepId": "prepare", "fields": [{"name": "total", "type": "integer"}]}]
+    },
+    "workflowDataStepContext": {
+      "currentStepId": "prepare",
+      "completedOutputStepIds": []
+    }
+  }
+}
