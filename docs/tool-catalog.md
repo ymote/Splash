@@ -158,8 +158,11 @@ underlying capability.
 for a host prompt or operator UI. `module_interface_catalog()` returns the
 bounded flat `{path, description}` entries accepted by the advisory LSP
 `moduleCatalog` projection. Neither API is installed into Splash source or
-gives an editor authority. The sealed mobile and embedded builder exposes the
-same registration path before `build`.
+gives an editor authority. The sealed
+`mobile::MobileRuntimeBuilder` and
+`splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
+path before `build`; the workflow facade retains only its immutable mapping,
+metadata projections, and named step-policy approval surface.
 
 For an approval flow, a host can issue a `CapabilityLease` from a selected
 subset of this catalog and call `eval_with_capability_lease`, or pass that lease

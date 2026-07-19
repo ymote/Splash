@@ -99,8 +99,8 @@ and keeps UI support optional rather than making UI the language boundary.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
   bounded JSON dataflow and schema contracts, host-owned plans, named per-step
   policies, checkpoints, and execution, including setup-only fixed-file and
-  fixed-endpoint/origin catalog adapters, without exposing mutable capability
-  registration.
+  fixed-endpoint/origin catalog adapters and direct capability modules, without
+  exposing mutable capability registration.
 - Deferred-only external tools that hosts claim, complete, or cancel without
   installing an in-process handler.
 - Per-tool deferred deadlines with host-driven expiry and auditable timeout
@@ -577,7 +577,7 @@ both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-
   checkpointing, durable operation records, optional fenced Bubblewrap
   post-stop reconciliation, a multiplexed-worker completion sink, sequential
   execution, and a sealed mobile/embedded workflow facade for static local
-  adapters.
+  adapters and direct capability modules.
 - `splash-cli`: local development CLI.
 - `splash-lsp`: host-only stdio diagnostics, canonical formatting, top-level
   declaration symbols, and bounded same-document lexical navigation, hover, and

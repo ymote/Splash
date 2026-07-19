@@ -99,8 +99,9 @@
   not a platform credential store, secret-delivery sandbox, or OS boundary.
 - Sealed static-catalog mobile and embedded profile for app-provided local
   adapters, with no post-build registration or external-dispatch API.
-- Sealed mobile and embedded workflow facade for static local adapters, with
-  named per-step policy approval and no mutable runtime escape.
+- Sealed mobile and embedded workflow facade for static local adapters and
+  setup-only direct capability modules, with named per-step policy approval
+  and no mutable runtime escape.
 - Host-owned plan, approval, and sequential workflow execution.
 - Approval-bound, catalog-fingerprinted capability leases with dynamic-call
   enforcement across deferred continuation and workflow resume, including

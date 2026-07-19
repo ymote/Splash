@@ -17,8 +17,10 @@ use std::num::NonZeroUsize;
 use serde::{de::DeserializeOwned, Serialize};
 use splash_capabilities::{
     fixed_file_catalog::FixedFileCatalog, AuditEventBatch, AuditEventCursorError, AuditLog,
-    CapabilityCatalogLimits, CapabilityRuntime, JsonToolContract, JsonValue, ToolDescriptor,
-    ToolError, ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
+    CapabilityCatalogLimits, CapabilityModule, CapabilityModuleDescriptor, CapabilityModuleLimits,
+    CapabilityModuleRegistrationError, CapabilityRuntime, JsonToolContract, JsonValue,
+    ModuleInterfaceDescriptor, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy,
+    ToolRegistrationError, ToolRequest,
 };
 use splash_core::{ExecutionLimits, RuntimeError};
 
@@ -38,6 +40,7 @@ pub struct MobileWorkflowBuilder {
     runtime: CapabilityRuntime,
     limits: ExecutionLimits,
     catalog_limits: CapabilityCatalogLimits,
+    capability_module_limits: CapabilityModuleLimits,
     max_events: NonZeroUsize,
 }
 
@@ -73,15 +76,37 @@ impl MobileWorkflowBuilder {
         max_pending_tools: usize,
         catalog_limits: CapabilityCatalogLimits,
     ) -> Result<Self, RuntimeError> {
-        let runtime = CapabilityRuntime::with_limits_pending_and_catalog(
+        Self::with_limits_catalog_and_module_limits(
             limits,
             max_pending_tools,
             catalog_limits,
+            CapabilityModuleLimits::default(),
+        )
+    }
+
+    /// Creates a builder with explicit bounds for the tool catalog and
+    /// setup-defined direct-module catalog representations.
+    ///
+    /// Direct module methods remain schema-bound facades over reviewed local
+    /// JSON adapters. Their mappings are configured before the workflow
+    /// runtime is sealed and remain subject to the underlying tool policy.
+    pub fn with_limits_catalog_and_module_limits(
+        limits: ExecutionLimits,
+        max_pending_tools: usize,
+        catalog_limits: CapabilityCatalogLimits,
+        capability_module_limits: CapabilityModuleLimits,
+    ) -> Result<Self, RuntimeError> {
+        let runtime = CapabilityRuntime::with_limits_pending_catalog_and_module_limits(
+            limits,
+            max_pending_tools,
+            catalog_limits,
+            capability_module_limits,
         )?;
         Ok(Self {
             runtime,
             limits,
             catalog_limits,
+            capability_module_limits,
             max_events: NonZeroUsize::new(DEFAULT_MAX_WORKFLOW_EVENTS)
                 .expect("default workflow event capacity is nonzero"),
         })
@@ -269,6 +294,20 @@ impl MobileWorkflowBuilder {
             .register_typed_json_tool_with_metadata(policy, metadata, contract, handler)
     }
 
+    /// Registers one setup-defined direct `mod.<name>` facade over reviewed
+    /// local JSON adapters.
+    ///
+    /// Registration is available only during builder setup. Every method
+    /// retains its mapped tool's executable JSON contract, call budget, audit
+    /// trail, and named workflow-step capability policy; it does not expose a
+    /// dynamic module, crate, filesystem, process, or network API.
+    pub fn register_capability_module(
+        &mut self,
+        module: CapabilityModule,
+    ) -> Result<(), CapabilityModuleRegistrationError> {
+        self.runtime.register_capability_module(module)
+    }
+
     /// Seals the catalog and creates a workflow-only mobile runtime.
     ///
     /// The returned type does not expose adapter registration, external
@@ -278,6 +317,7 @@ impl MobileWorkflowBuilder {
             runtime,
             limits,
             catalog_limits,
+            capability_module_limits,
             max_events,
         } = self;
         let engine = WorkflowEngine::with_event_history_capacity(runtime, max_events)
@@ -286,6 +326,7 @@ impl MobileWorkflowBuilder {
             engine,
             limits,
             catalog_limits,
+            capability_module_limits,
             max_events,
         }
     }
@@ -301,6 +342,7 @@ pub struct MobileWorkflowRuntime {
     engine: WorkflowEngine,
     limits: ExecutionLimits,
     catalog_limits: CapabilityCatalogLimits,
+    capability_module_limits: CapabilityModuleLimits,
     max_events: NonZeroUsize,
 }
 
@@ -313,6 +355,11 @@ impl MobileWorkflowRuntime {
     /// Returns the immutable aggregate tool-catalog limits selected at setup.
     pub const fn catalog_limits(&self) -> CapabilityCatalogLimits {
         self.catalog_limits
+    }
+
+    /// Returns the immutable direct-module catalog limits selected at setup.
+    pub const fn capability_module_limits(&self) -> CapabilityModuleLimits {
+        self.capability_module_limits
     }
 
     /// Returns the immutable workflow-event capacity selected at setup.
@@ -339,6 +386,19 @@ impl MobileWorkflowRuntime {
     /// Serializes the sealed host-visible catalog for an LLM or operator UI.
     pub fn tool_catalog_json(&self) -> Result<String, ToolError> {
         self.engine.runtime().tool_catalog_json()
+    }
+
+    /// Returns the reviewed direct-module mapping selected before the mobile
+    /// or embedded workflow runtime was sealed.
+    pub fn capability_module_catalog(&self) -> Vec<CapabilityModuleDescriptor> {
+        self.engine.runtime().capability_module_catalog()
+    }
+
+    /// Returns the advisory LSP `moduleCatalog` projection for the sealed
+    /// direct-module mapping. This data is host-facing and grants no workflow
+    /// or capability authority.
+    pub fn module_interface_catalog(&self) -> Vec<ModuleInterfaceDescriptor> {
+        self.engine.runtime().module_interface_catalog()
     }
 
     /// Returns the bounded capability-audit view.
@@ -842,6 +902,90 @@ mod tests {
             runtime.events().last(),
             Some(WorkflowEvent::Completed { plan_id }) if *plan_id == plan.id()
         ));
+    }
+
+    #[test]
+    fn seals_direct_capability_modules_behind_workflow_policy_approval() {
+        let module_limits = CapabilityModuleLimits {
+            max_modules: 1,
+            max_methods: 1,
+            max_serialized_bytes: 8 * 1024,
+        };
+        let mut builder = MobileWorkflowBuilder::with_limits_catalog_and_module_limits(
+            ExecutionLimits::default(),
+            1,
+            CapabilityCatalogLimits {
+                max_tools: 1,
+                max_serialized_bytes: 8 * 1024,
+            },
+            module_limits,
+        )
+        .expect("mobile limits are valid");
+        builder
+            .register_typed_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integer fields."),
+                add_contract(),
+                |input: AddInput| {
+                    Ok(AddOutput {
+                        total: input.left + input.right,
+                    })
+                },
+            )
+            .expect("static adapter registers");
+        builder
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .expect("static direct module registers");
+
+        let mut runtime = builder.build();
+        assert_eq!(runtime.capability_module_limits(), module_limits);
+        assert_eq!(runtime.capability_module_catalog().len(), 1);
+        assert_eq!(
+            runtime.capability_module_catalog()[0].methods[0].tool,
+            "math.add"
+        );
+        assert_eq!(
+            runtime.module_interface_catalog(),
+            vec![
+                ModuleInterfaceDescriptor {
+                    path: "mod.arithmetic".to_owned(),
+                    description: "Reviewed arithmetic adapters.".to_owned(),
+                },
+                ModuleInterfaceDescriptor {
+                    path: "mod.arithmetic.add".to_owned(),
+                    description: "Adds two reviewed integer fields.".to_owned(),
+                },
+            ]
+        );
+
+        let plan = runtime
+            .plan(vec![WorkflowStep::new(
+                "calculate",
+                "use mod.arithmetic\n\
+                 use mod.std.assert\n\
+                 let result = arithmetic.add({left: 20, right: 22})\n\
+                 assert(result.total == 42)",
+            )])
+            .expect("trusted plan is valid");
+        let approval = runtime
+            .approve_with_step_capability_policies(
+                &plan,
+                vec![WorkflowStepCapabilityPolicy::new(
+                    "calculate",
+                    [CapabilityLeaseGrant::new("math.add", 1)],
+                )],
+            )
+            .expect("policy is within the sealed catalog");
+
+        runtime.execute(&plan, approval).expect("workflow succeeds");
+
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "math.add");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+        assert!(!runtime.has_suspended_execution());
     }
 
     #[test]

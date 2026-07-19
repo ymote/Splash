@@ -451,7 +451,13 @@ bounded `WorkflowDraft`, issue only named `WorkflowStepCapabilityPolicy`
 grants, checkpoint, and execute. It has no mutable `CapabilityRuntime`,
 manual lease, full-catalog approval, external claim/completion, or worker
 transport API. Local host-pump adapters are driven by workflow execution; a
-streaming/external policy is rejected during static setup.
+streaming/external policy is rejected during static setup. It can also bind a
+contract-enforced local JSON adapter as a fixed `mod.<name>` facade through
+`register_capability_module`; the facade retains the underlying tool's named
+step-policy grant, JSON contract, audit entry, and lease check. Hosts that
+need a tighter direct-module budget use
+`with_limits_catalog_and_module_limits`; the sealed runtime exposes only the
+immutable mapping and advisory LSP projection.
 
 ```rust
 use splash_capabilities::{CapabilityLeaseGrant, ToolMetadata, ToolPolicy};
