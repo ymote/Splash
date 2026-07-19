@@ -121,6 +121,12 @@ pub const MAX_LEXICAL_COMPLETION_SITES: usize = 4_096;
 /// static editor metadata bounded even for generated documents with many
 /// records.
 pub const MAX_STATIC_RECORD_SHAPES: usize = 1_024;
+/// Maximum exact literal-record child levels retained below a static root.
+///
+/// This keeps advisory member-path traversal fixed while covering direct
+/// `root.child.grandchild` paths. It does not authorize broader type inference
+/// or arbitrary runtime member resolution.
+pub const MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH: usize = 2;
 /// Maximum retained direct root or child aliases of a static record binding per
 /// source snapshot.
 ///
@@ -129,9 +135,9 @@ pub const MAX_STATIC_RECORD_SHAPES: usize = 1_024;
 pub const MAX_STATIC_RECORD_ALIASES: usize = 1_024;
 /// Maximum direct literal-record fields retained across one source snapshot.
 ///
-/// This includes fields from one-level exact child literals. When this
-/// aggregate cap is reached, later complete record shapes are omitted instead
-/// of returning a partial field list for a binding.
+/// This includes fields from every retained exact nested child literal. When
+/// this aggregate cap is reached, later complete record shapes are omitted
+/// instead of returning a partial field list for a binding.
 pub const MAX_STATIC_RECORD_FIELDS: usize = 4_096;
 
 /// Bounds applied to one source evaluation.
@@ -523,16 +529,19 @@ pub struct StaticRecordField {
     pub definition: SourceSpan,
 }
 
-/// Fields of one exact direct child literal in a static record shape.
+/// Fields and child shapes of one exact nested literal-record field.
 ///
 /// `field` identifies the outer field whose entire source value is a record
-/// literal. This is deliberately limited to one child level: it does not model
-/// computed values, parenthesized records, or deeper record paths. Exact child
-/// aliases are represented separately by [`StaticRecordAlias`].
+/// literal. `direct_field_shapes` retains the next literal level only while the
+/// fixed [`MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH`] budget remains. This does
+/// not model computed values, parenthesized records, or deeper paths beyond
+/// that bound. Exact child aliases are represented separately by
+/// [`StaticRecordAlias`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticRecordNestedShape {
     pub field: StaticRecordField,
     pub fields: Vec<StaticRecordField>,
+    pub direct_field_shapes: Vec<StaticRecordNestedShape>,
 }
 
 /// One direct `let name = { ... }` literal-record shape.
@@ -540,8 +549,9 @@ pub struct StaticRecordNestedShape {
 /// `binding` is the exact declaration identifier span. Shapes are collected
 /// only for a whole direct literal initializer, never aliases, expressions,
 /// function returns, imported values, or runtime results. `direct_field_shapes`
-/// retains one exact child-literal level only when the parent record has unique
-/// field names and that child's own fields are unique.
+/// retains exact nested child-literal levels only through
+/// [`MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH`] when every represented parent
+/// record has unique field names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StaticRecordShape {
     pub binding: SourceSpan,
@@ -567,12 +577,12 @@ pub struct StaticRecordAlias {
 /// Bounded static literal-record metadata for one source snapshot.
 ///
 /// The report is intentionally not general type inference. It retains completed
-/// direct record literals, their one-level exact child literals, and exact
+/// direct record literals, their bounded exact nested child literals, and exact
 /// direct root or child alias edges ending at or before `valid_prefix_end_byte`,
-/// allowing editor features to remain useful before a trailing syntax
-/// diagnostic without assigning meaning to later recovery tokens. `truncated`
-/// means one or more complete shapes were omitted at the fixed shape or
-/// aggregate-field bound.
+/// allowing editor features to remain useful before a trailing syntax diagnostic
+/// without assigning meaning to later recovery tokens. `truncated` means one or
+/// more complete shapes were omitted at the fixed shape or aggregate-field
+/// bound.
 /// `aliases_truncated` means one or more direct alias edges were omitted at
 /// [`MAX_STATIC_RECORD_ALIASES`]; consumers that need whole-alias-group
 /// stability must fail closed.
@@ -4120,18 +4130,19 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
     }
 
     #[test]
-    fn static_record_metadata_retains_only_exact_unambiguous_direct_child_literals() {
+    fn static_record_metadata_retains_only_exact_unambiguous_direct_nested_literals() {
         let source = "let exact = {\n\
-                      child: {value: 1, nested: {ignored: true}},\n\
+                      child: {value: 1, nested: {ignored: {too_deep: true}}},\n\
                       parenthesized: ({value: 1}),\n\
                       computed: {value: 1}.value\n\
                       }\n\
                       let duplicate = {child: {first: true}, child: {second: true}}\n\
                       let scalar = {value: true}\n\
-                      let child_duplicate = {child: {first: true, first: false}}";
+                      let child_duplicate = {child: {first: true, first: false}}\n\
+                      let grandchild_duplicate = {child: {nested: {first: true, first: false}}}";
         let report = static_record_shape_report(source).expect("source is within default limits");
 
-        assert_eq!(report.shapes.len(), 4);
+        assert_eq!(report.shapes.len(), 5);
         let exact = &report.shapes[0];
         assert_eq!(exact.direct_field_shapes.len(), 1);
         let child = &exact.direct_field_shapes[0];
@@ -4144,9 +4155,20 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                 .collect::<Vec<_>>(),
             ["value", "nested"]
         );
+        assert_eq!(child.direct_field_shapes.len(), 1);
+        let nested = &child.direct_field_shapes[0];
+        assert_eq!(nested.field.name, "nested");
+        assert_eq!(
+            nested
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ignored"]
+        );
         assert!(
-            child.fields.iter().all(|field| field.name != "ignored"),
-            "direct child metadata must not recursively infer a grandchild literal"
+            nested.direct_field_shapes.is_empty(),
+            "static record metadata must stop after two direct child levels"
         );
         assert!(exact
             .direct_field_shapes
@@ -4155,6 +4177,10 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
         assert!(report.shapes[1].direct_field_shapes.is_empty());
         assert!(report.shapes[2].direct_field_shapes.is_empty());
         assert!(report.shapes[3].direct_field_shapes.is_empty());
+        assert_eq!(report.shapes[4].direct_field_shapes.len(), 1);
+        assert!(report.shapes[4].direct_field_shapes[0]
+            .direct_field_shapes
+            .is_empty());
     }
 
     #[test]
@@ -4236,6 +4262,20 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
             static_record_shape_report(&too_many_child_fields).unwrap();
         assert!(child_field_bounded_report.shapes.is_empty());
         assert!(child_field_bounded_report.truncated);
+
+        let mut too_many_grandchild_fields =
+            String::from("let oversized_grandchild = {child: {grandchild: {");
+        for index in 0..MAX_STATIC_RECORD_FIELDS {
+            if index > 0 {
+                too_many_grandchild_fields.push_str(", ");
+            }
+            too_many_grandchild_fields.push_str(&format!("field_{index}: {index}"));
+        }
+        too_many_grandchild_fields.push_str("}}}");
+        let grandchild_field_bounded_report =
+            static_record_shape_report(&too_many_grandchild_fields).unwrap();
+        assert!(grandchild_field_bounded_report.shapes.is_empty());
+        assert!(grandchild_field_bounded_report.truncated);
     }
 
     #[test]

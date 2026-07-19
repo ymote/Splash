@@ -1,4 +1,4 @@
-let profile = {user: {name: "Ada", active: true}}
+let profile = {user: {address: {city: "Paris", zip: "75000"}}}
 let selected = profile.user
 let alias = selected
-alias.name
+alias.address.city

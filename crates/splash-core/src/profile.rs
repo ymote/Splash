@@ -13,8 +13,8 @@ use super::{
     StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind,
     TopLevelDeclaration, TopLevelDeclarationKind, MAX_IMPORTED_MODULE_CALL_HINTS,
     MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
-    MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES,
-    MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH,
+    MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 pub(super) struct ProfileReport {
@@ -443,7 +443,17 @@ impl DirectRecordShape {
         self.direct_field_shapes
             .iter()
             .fold(self.fields.len(), |count, child| {
-                count.saturating_add(child.fields.len())
+                count.saturating_add(child.retained_field_count())
+            })
+    }
+}
+
+impl StaticRecordNestedShape {
+    fn retained_field_count(&self) -> usize {
+        self.direct_field_shapes
+            .iter()
+            .fold(self.fields.len(), |count, child| {
+                count.saturating_add(child.retained_field_count())
             })
     }
 }
@@ -1711,7 +1721,8 @@ fn direct_record_shape_from_tokens(
         return None;
     }
 
-    let record = direct_record_fields(tokens, opening_index, true)?;
+    let record =
+        direct_record_fields(tokens, opening_index, MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH)?;
     let closing_index = record.closing_index;
     if !matches!(
         &tokens.get(closing_index + 1)?.kind,
@@ -1779,7 +1790,7 @@ fn direct_record_alias_from_tokens(
 fn direct_record_fields(
     tokens: &[Token],
     opening_index: usize,
-    collect_direct_field_shapes: bool,
+    remaining_child_depth: usize,
 ) -> Option<ParsedDirectRecord> {
     if !matches!(&tokens.get(opening_index)?.kind, TokenKind::OpenCurly) {
         return None;
@@ -1841,8 +1852,8 @@ fn direct_record_fields(
             has_duplicate_fields = true;
         }
 
-        if collect_direct_field_shapes && field_is_unique {
-            if let Some(child) = direct_record_fields(tokens, index, false) {
+        if remaining_child_depth > 0 && field_is_unique {
+            if let Some(child) = direct_record_fields(tokens, index, remaining_child_depth - 1) {
                 if !child.has_duplicate_fields
                     && matches!(
                         &tokens.get(child.closing_index + 1)?.kind,
@@ -1852,6 +1863,7 @@ fn direct_record_fields(
                     direct_field_shapes.push(StaticRecordNestedShape {
                         field: field_metadata,
                         fields: child.fields,
+                        direct_field_shapes: child.direct_field_shapes,
                     });
                 }
             }

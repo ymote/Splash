@@ -6,9 +6,10 @@ use splash_core::{
     is_canonical_identifier, lexical_completion_report_named, lexical_symbol_report_named,
     module_import_report_named, static_record_shape_report_named, tool_call_hint_report_named,
     top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
-    ModuleImportReport, RuntimeError, StaticRecordShapeReport, ToolCallHint, TopLevelDeclaration,
-    TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
-    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS,
+    ModuleImportReport, RuntimeError, StaticRecordField, StaticRecordNestedShape,
+    StaticRecordShapeReport, ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
+    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
+    MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH,
     MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
@@ -342,54 +343,14 @@ fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShap
             retained_fields += 1;
         }
 
-        let mut previous_child_field_start = shape.binding.end_byte;
-        let mut child_names = std::collections::BTreeSet::new();
-        for child in &shape.direct_field_shapes {
-            assert!(
-                shape.fields.iter().any(|field| field == &child.field),
-                "direct child shape is not rooted at a retained parent field: {shape:?}"
-            );
-            assert!(
-                previous_child_field_start <= child.field.definition.start_byte,
-                "direct child shapes are not source ordered: {shape:?}"
-            );
-            assert!(
-                child_names.insert(child.field.name.as_str()),
-                "direct child shapes are not deduplicated: {shape:?}"
-            );
-
-            let mut previous_nested_field_start = child.field.definition.end_byte;
-            let mut nested_field_names = std::collections::BTreeSet::new();
-            for field in &child.fields {
-                assert!(
-                    previous_nested_field_start <= field.definition.start_byte
-                        && field.definition.start_byte < field.definition.end_byte
-                        && field.definition.end_byte <= report.valid_prefix_end_byte,
-                    "direct child static record field span is unordered or exceeds the safe prefix: {shape:?}"
-                );
-                assert!(
-                    source.is_char_boundary(field.definition.start_byte)
-                        && source.is_char_boundary(field.definition.end_byte),
-                    "direct child static record field span is not a UTF-8 boundary: {shape:?}"
-                );
-                assert_eq!(
-                    &source[field.definition.start_byte..field.definition.end_byte],
-                    field.name,
-                    "direct child static record field span does not match its name: {shape:?}"
-                );
-                assert!(
-                    is_canonical_identifier(&field.name),
-                    "direct child static record field is not a canonical identifier: {shape:?}"
-                );
-                assert!(
-                    nested_field_names.insert(field.name.as_str()),
-                    "direct child static record fields are not deduplicated: {shape:?}"
-                );
-                previous_nested_field_start = field.definition.end_byte;
-                retained_fields += 1;
-            }
-            previous_child_field_start = child.field.definition.end_byte;
-        }
+        retained_fields += assert_static_record_nested_shape_invariants(
+            source,
+            &shape.fields,
+            &shape.direct_field_shapes,
+            shape.binding.end_byte,
+            report.valid_prefix_end_byte,
+            1,
+        );
         previous_binding_start = shape.binding.start_byte;
     }
     assert!(retained_fields <= MAX_STATIC_RECORD_FIELDS);
@@ -435,6 +396,88 @@ fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShap
     if report.aliases_truncated {
         assert_eq!(report.aliases.len(), MAX_STATIC_RECORD_ALIASES);
     }
+}
+
+fn assert_static_record_nested_shape_invariants(
+    source: &str,
+    parent_fields: &[StaticRecordField],
+    shapes: &[StaticRecordNestedShape],
+    parent_start_byte: usize,
+    valid_prefix_end_byte: usize,
+    depth: usize,
+) -> usize {
+    assert!(
+        depth <= MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH,
+        "static record nested shape exceeded its fixed depth: {shapes:?}"
+    );
+
+    let mut retained_fields = 0_usize;
+    let mut previous_child_field_start = parent_start_byte;
+    let mut child_names = std::collections::BTreeSet::new();
+    for child in shapes {
+        assert!(
+            parent_fields.iter().any(|field| field == &child.field),
+            "nested static record shape is not rooted at a retained parent field: {child:?}"
+        );
+        assert!(
+            previous_child_field_start <= child.field.definition.start_byte,
+            "nested static record shapes are not source ordered: {child:?}"
+        );
+        assert!(
+            child_names.insert(child.field.name.as_str()),
+            "nested static record shapes are not deduplicated: {child:?}"
+        );
+
+        let mut previous_field_start = child.field.definition.end_byte;
+        let mut field_names = std::collections::BTreeSet::new();
+        for field in &child.fields {
+            assert!(
+                previous_field_start <= field.definition.start_byte
+                    && field.definition.start_byte < field.definition.end_byte
+                    && field.definition.end_byte <= valid_prefix_end_byte,
+                "nested static record field span is unordered or exceeds the safe prefix: {child:?}"
+            );
+            assert!(
+                source.is_char_boundary(field.definition.start_byte)
+                    && source.is_char_boundary(field.definition.end_byte),
+                "nested static record field span is not a UTF-8 boundary: {child:?}"
+            );
+            assert_eq!(
+                &source[field.definition.start_byte..field.definition.end_byte],
+                field.name,
+                "nested static record field span does not match its name: {child:?}"
+            );
+            assert!(
+                is_canonical_identifier(&field.name),
+                "nested static record field is not a canonical identifier: {child:?}"
+            );
+            assert!(
+                field_names.insert(field.name.as_str()),
+                "nested static record fields are not deduplicated: {child:?}"
+            );
+            previous_field_start = field.definition.end_byte;
+            retained_fields += 1;
+        }
+
+        if depth == MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
+            assert!(
+                child.direct_field_shapes.is_empty(),
+                "nested static record metadata exceeded its fixed depth: {child:?}"
+            );
+        } else {
+            retained_fields += assert_static_record_nested_shape_invariants(
+                source,
+                &child.fields,
+                &child.direct_field_shapes,
+                child.field.definition.end_byte,
+                valid_prefix_end_byte,
+                depth + 1,
+            );
+        }
+        previous_child_field_start = child.field.definition.end_byte;
+    }
+
+    retained_fields
 }
 
 fn assert_tool_call_hint_invariants(source: &str, hints: &[ToolCallHint]) {

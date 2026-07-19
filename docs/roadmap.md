@@ -43,19 +43,18 @@
   plan, or grant a capability. A complete JSON-null pair atomically clears
   terminal or unavailable metadata instead of retaining stale fields.
 - Bounded direct literal-record field metadata for exact visible
-  `let binding = { ... }` initializers, one exact direct `child: { ... }`
-  literal level, and lexical exact `let alias = binding` or
+  `let binding = { ... }` initializers, two exact direct nested literal levels,
+  and lexical exact `let alias = binding` or
   `let alias = binding.child` chains of at most 16 hops with at most one child
   selection, with same-document completion, hover, and definition. It is
   advisory and does not infer parenthesized or computed aliases, parenthesized
-  or computed child values, deeper child aliases or paths, assignments, control
-  flow, imported values, function returns, or runtime types. Duplicate parent
-  fields discard every child shape, and duplicate child fields discard that
-  child shape. An earlier direct write or potentially mutating member, index,
-  call, or escape path through the root or any retained root or child alias
-  suppresses it. Independent 1,024-root-shape and 4,096-aggregate-field caps
-  mark retained completion incomplete; the 1,024-alias cap fails closed for
-  omitted alias edges.
+  or computed child values, deeper aliases or paths, assignments, control flow,
+  imported values, function returns, or runtime types. Duplicate fields at any
+  retained literal level discard that level's nested shape. An earlier direct
+  write or potentially mutating member, index, call, or escape path through the
+  root or any retained root or child alias suppresses it. Independent
+  1,024-root-shape and 4,096-aggregate-field caps mark retained completion
+  incomplete; the 1,024-alias cap fails closed for omitted alias edges.
 - Version-bound same-document rename with canonical identifier validation,
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.

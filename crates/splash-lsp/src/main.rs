@@ -45,9 +45,10 @@ use splash_core::{
     lexical_completion_report_named, lexical_symbol_report_named, module_import_report_named,
     static_record_shape_report_named, top_level_declarations_named, ExecutionLimits,
     LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
-    ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordShape, StaticRecordShapeReport,
-    SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
-    DEFAULT_MAX_SYNTAX_NESTING, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
+    ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordNestedShape, StaticRecordShape,
+    StaticRecordShapeReport, SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind,
+    DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_SYNTAX_NESTING, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH, MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -5237,10 +5238,11 @@ fn visible_static_record_view<'shape>(
         .map(|shape| (shape, view))
 }
 
-/// Returns static fields for either the root literal or one exact direct child
-/// literal. An exact `let alias = root.child` binding can carry that one child
-/// through a bounded alias chain, but computed paths and deeper chains have no
-/// static metadata.
+/// Returns static fields for the root literal or a bounded direct nested path.
+/// An exact `let alias = root.child` binding can carry one child selection
+/// through a bounded alias chain; a following direct member path may use the
+/// remaining literal-depth budget. Computed paths and deeper alias chains have
+/// no static metadata.
 fn visible_static_record_fields<'shape>(
     source: &str,
     symbols: &[LexicalSymbol],
@@ -5255,35 +5257,60 @@ fn visible_static_record_fields<'shape>(
         shapes,
         site.receiver,
     )?;
-    let site_child = static_record_direct_child_name(source, site)?;
-    let selected_child = match (view.direct_child, site_child) {
-        (None, None) => return Some(&shape.fields),
-        (None, Some(child_name)) => child_name,
-        (Some(child), None) => source.get(child.start_byte..child.end_byte)?,
-        (Some(_), Some(_)) => return None,
-    };
-    shape
-        .direct_field_shapes
-        .iter()
-        .find(|child| child.field.name == selected_child)
-        .map(|child| child.fields.as_slice())
+    let site_path = static_record_direct_child_path(source, site)?;
+    let mut path = Vec::with_capacity(MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH);
+    if let Some(child) = view.direct_child {
+        path.push(source.get(child.start_byte..child.end_byte)?);
+    }
+    if path.len().saturating_add(site_path.len()) > MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
+        return None;
+    }
+    path.extend(site_path);
+    static_record_fields_at_path(shape, &path)
 }
 
-/// Extracts the one optional direct child identifier between a root binding
-/// and a member being completed. The lexical member recognizer has already
-/// rejected strings, comments, indexes, calls, and non-identifier segments.
-fn static_record_direct_child_name(
-    source: &str,
-    site: MemberCompletionSite,
-) -> Option<Option<&str>> {
+/// Extracts the bounded direct child identifiers between a root binding and a
+/// member being completed. The lexical member recognizer has already rejected
+/// strings, comments, indexes, calls, and non-identifier segments.
+fn static_record_direct_child_path(source: &str, site: MemberCompletionSite) -> Option<Vec<&str>> {
     let root = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
     let chain = source.get(site.receiver_chain.start_byte..site.receiver_chain.end_byte)?;
     if chain == root {
-        return Some(None);
+        return Some(Vec::new());
     }
 
-    let child = chain.strip_prefix(root)?.strip_prefix('.')?;
-    (!child.contains('.') && is_canonical_identifier(child)).then_some(Some(child))
+    let suffix = chain.strip_prefix(root)?.strip_prefix('.')?;
+    let mut path = Vec::with_capacity(MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH);
+    for child in suffix.split('.') {
+        if path.len() == MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH || !is_canonical_identifier(child) {
+            return None;
+        }
+        path.push(child);
+    }
+    Some(path)
+}
+
+fn static_record_fields_at_path<'shape>(
+    shape: &'shape StaticRecordShape,
+    path: &[&str],
+) -> Option<&'shape [StaticRecordField]> {
+    if path.is_empty() {
+        return Some(&shape.fields);
+    }
+    static_record_nested_fields_at_path(&shape.direct_field_shapes, path)
+}
+
+fn static_record_nested_fields_at_path<'shape>(
+    shapes: &'shape [StaticRecordNestedShape],
+    path: &[&str],
+) -> Option<&'shape [StaticRecordField]> {
+    let (name, remaining) = path.split_first()?;
+    let shape = shapes.iter().find(|shape| shape.field.name == *name)?;
+    if remaining.is_empty() {
+        Some(&shape.fields)
+    } else {
+        static_record_nested_fields_at_path(&shape.direct_field_shapes, remaining)
+    }
 }
 
 fn static_record_alias_group_is_stable(
@@ -6475,7 +6502,7 @@ mod tests {
     }
 
     #[test]
-    fn completes_and_navigates_one_level_direct_static_record_child_fields() {
+    fn completes_and_navigates_bounded_static_record_nested_fields() {
         let source = "let profile = {user: {name: \"Ada\", active: true}}\nprofile.user.name";
         let mut server = SplashLanguageServer::default();
         server.open_document(document(1, source));
@@ -6520,6 +6547,53 @@ mod tests {
                 value: "**static record field** `name`".to_owned(),
             })
         );
+
+        let nested_source = concat!(
+            "let profile = {user: {address: {city: \"Paris\", zip: \"75000\"}}}\n",
+            "profile.user.address.city"
+        );
+        let mut nested_server = SplashLanguageServer::default();
+        nested_server.open_document(document(1, nested_source));
+        let nested_member = nested_source
+            .rfind("city")
+            .expect("nested static field exists");
+        assert_eq!(
+            nested_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(nested_source, nested_source.len()),
+                )
+                .expect("nested static record completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["city", "zip"]
+        );
+        assert_eq!(
+            nested_server
+                .definition(
+                    &test_uri(),
+                    position_at_byte(nested_source, nested_member + 1),
+                )
+                .expect("nested static field definition succeeds")
+                .expect("known nested static field has a definition")
+                .range,
+            Range::new(
+                position_at_byte(nested_source, nested_source.find("city:").unwrap()),
+                position_at_byte(
+                    nested_source,
+                    nested_source.find("city:").unwrap() + "city".len(),
+                ),
+            )
+        );
+        assert!(nested_server
+            .hover(
+                &test_uri(),
+                position_at_byte(nested_source, nested_member + 1),
+            )
+            .expect("nested static field hover succeeds")
+            .is_some());
 
         let alias_source = "let profile = {user: {name: \"Ada\"}}\n\
                             let alias = profile\n\
@@ -6592,16 +6666,38 @@ mod tests {
             .expect("direct child alias hover succeeds")
             .is_some());
 
+        let nested_child_alias_source = concat!(
+            "let profile = {user: {address: {city: \"Paris\", zip: \"75000\"}}}\n",
+            "let selected = profile.user\n",
+            "selected.address.city"
+        );
+        let mut nested_child_alias_server = SplashLanguageServer::default();
+        nested_child_alias_server.open_document(document(1, nested_child_alias_source));
+        assert_eq!(
+            nested_child_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(nested_child_alias_source, nested_child_alias_source.len(),),
+                )
+                .expect("nested child alias completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["city", "zip"]
+        );
+
         for unsupported_source in [
             "let profile = {user: ({name: \"Ada\"})}\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}.name}\nprofile.user.",
-            "let profile = {user: {name: {deeper: true}}}\nprofile.user.name.",
             "let profile = {user: {name: \"Ada\"}, user: {other: true}}\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = (profile.user)\nselected.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user.name\nselected.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile[\"user\"]\nselected.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nselected.name.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nlet detail = selected.name\nprofile.user.",
+            "let profile = {user: {address: {city: \"Paris\", city: \"Lyon\"}}}\nprofile.user.address.",
+            "let profile = {user: {address: {city: {name: \"Ada\"}}}}\nprofile.user.address.city.",
         ] {
             let mut unsupported_server = SplashLanguageServer::default();
             unsupported_server.open_document(document(1, unsupported_source));
@@ -6831,6 +6927,7 @@ mod tests {
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nselected.name = \"Grace\"\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nmutate(selected)\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nlet alias = selected\nalias[\"name\"]\nprofile.user.",
+            "let profile = {user: {address: {city: \"Paris\"}}}\nprofile.user.address.city = \"Lyon\"\nprofile.user.address.",
         ] {
             let mut server = SplashLanguageServer::default();
             server.open_document(document(1, source));
