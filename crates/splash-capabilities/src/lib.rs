@@ -189,6 +189,8 @@ pub const MIN_CAPABILITY_SESSION_NONCE_BYTES: usize = 16;
 pub const MAX_CAPABILITY_SESSION_NONCE_BYTES: usize = 64;
 
 const CAPABILITY_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"splash-capability-catalog-v1";
+const CAPABILITY_CATALOG_WITH_DIRECT_MODULES_FINGERPRINT_DOMAIN: &[u8] =
+    b"splash-capability-catalog-v2";
 const CAPABILITY_SESSION_NONCE_DOMAIN: &[u8] = b"splash-capability-session-nonce-v1";
 const CAPABILITY_AUDIT_LABEL_DOMAIN: &[u8] = b"splash-capability-audit-label-v1";
 const UNRECOGNIZED_AUDIT_TOOL_PREFIX: &str = "unrecognized:";
@@ -765,11 +767,13 @@ pub struct ToolDescriptor {
     pub metadata: ToolMetadata,
 }
 
-/// Stable BLAKE3 identity of the complete host-visible capability catalog.
+/// Stable BLAKE3 identity of the complete host-visible capability catalog and
+/// setup-defined direct module mappings.
 ///
 /// This is process-local policy identity, not a credential. It includes every
-/// published descriptor field, including executable-contract status, and is
-/// used to invalidate an approval when a runtime catalog changes.
+/// published tool descriptor field, including executable-contract status, plus
+/// every direct module name, method, target tool, and description. It is used
+/// to invalidate an approval when the reviewed runtime interface changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityCatalogFingerprint(String);
 
@@ -2008,6 +2012,7 @@ pub struct CapabilityHost {
     session_nonce: Option<String>,
     catalog_limits: CapabilityCatalogLimits,
     tools: BTreeMap<String, RegisteredTool>,
+    direct_module_catalog_fingerprint_material: Vec<u8>,
     active_lease: Option<Rc<RefCell<CapabilityLeaseState>>>,
     audit: VecDeque<AuditEvent>,
     max_audit_events: NonZeroUsize,
@@ -2069,6 +2074,7 @@ impl CapabilityHost {
                 .map(|session_nonce| capability_session_nonce(session_id, session_nonce)),
             catalog_limits,
             tools: BTreeMap::new(),
+            direct_module_catalog_fingerprint_material: Vec::new(),
             active_lease: None,
             audit: VecDeque::new(),
             max_audit_events: NonZeroUsize::new(DEFAULT_MAX_AUDIT_EVENTS)
@@ -2784,13 +2790,26 @@ impl CapabilityHost {
         })
     }
 
+    fn set_direct_module_catalog_fingerprint_material(&mut self, material: Vec<u8>) {
+        self.direct_module_catalog_fingerprint_material = material;
+    }
+
     fn catalog_fingerprint(&self) -> Result<CapabilityCatalogFingerprint, CapabilityLeaseError> {
         let catalog = serde_json::to_vec(&self.tool_catalog())
             .map_err(|_| CapabilityLeaseError::CatalogEncoding)?;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(CAPABILITY_CATALOG_FINGERPRINT_DOMAIN);
+        let direct_modules = &self.direct_module_catalog_fingerprint_material;
+        hasher.update(if direct_modules.is_empty() {
+            CAPABILITY_CATALOG_FINGERPRINT_DOMAIN
+        } else {
+            CAPABILITY_CATALOG_WITH_DIRECT_MODULES_FINGERPRINT_DOMAIN
+        });
         hasher.update(&(catalog.len() as u64).to_be_bytes());
         hasher.update(&catalog);
+        if !direct_modules.is_empty() {
+            hasher.update(&(direct_modules.len() as u64).to_be_bytes());
+            hasher.update(direct_modules);
+        }
         Ok(CapabilityCatalogFingerprint(
             hasher.finalize().to_hex().to_string(),
         ))
@@ -3967,10 +3986,10 @@ impl CapabilityRuntime {
     /// Returns a stable identity for the complete current capability catalog.
     ///
     /// The fingerprint is suitable for binding host approvals to one runtime's
-    /// exact names, limits, dispatch modes, metadata, and contract status. It
-    /// is not an authorization token. Setup-defined direct module facades are
-    /// intentionally excluded because the runtime freezes that separate
-    /// interface before it issues any lease.
+    /// exact names, limits, dispatch modes, metadata, contract status, and
+    /// setup-defined direct module mappings. It is not an authorization token.
+    /// A lease records this exact fingerprint, so an approved direct facade
+    /// remains bound to the tool it reviewed.
     pub fn capability_catalog_fingerprint(
         &self,
     ) -> Result<CapabilityCatalogFingerprint, CapabilityLeaseError> {
@@ -4128,7 +4147,8 @@ impl CapabilityRuntime {
             ));
         }
 
-        let (descriptor, bindings) = self.prepare_capability_module(&module)?;
+        let (descriptor, bindings, fingerprint_material) =
+            self.prepare_capability_module(&module)?;
         let module_id = LiveId::from_str(&module.name);
         let mut occupied = false;
         self.runtime.configure(|vm| {
@@ -4141,6 +4161,9 @@ impl CapabilityRuntime {
         }
 
         install_capability_module(&mut self.runtime, module_id, bindings);
+        self.runtime
+            .host_mut()
+            .set_direct_module_catalog_fingerprint_material(fingerprint_material);
         self.capability_modules
             .insert(descriptor.name.clone(), descriptor);
         Ok(())
@@ -4164,7 +4187,11 @@ impl CapabilityRuntime {
         &self,
         module: &CapabilityModule,
     ) -> Result<
-        (CapabilityModuleDescriptor, Vec<CapabilityModuleBinding>),
+        (
+            CapabilityModuleDescriptor,
+            Vec<CapabilityModuleBinding>,
+            Vec<u8>,
+        ),
         CapabilityModuleRegistrationError,
     > {
         if !is_valid_capability_module_identifier(&module.name) {
@@ -4326,6 +4353,8 @@ impl CapabilityRuntime {
                 },
             );
         }
+        let fingerprint_material = serde_json::to_vec(&candidate_catalog)
+            .map_err(|_| CapabilityModuleRegistrationError::CatalogEncoding)?;
 
         let bindings = resolved_methods
             .into_iter()
@@ -4337,7 +4366,7 @@ impl CapabilityRuntime {
                 max_depth: max_bridge_depth,
             })
             .collect();
-        Ok((descriptor, bindings))
+        Ok((descriptor, bindings, fingerprint_material))
     }
 
     pub fn register_tool<F>(
@@ -5649,6 +5678,68 @@ mod tests {
         assert_eq!(runtime.audit().len(), 2);
         assert_eq!(runtime.audit()[1].tool, "math.add");
         assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn direct_module_target_mapping_is_bound_into_capability_leases() {
+        let mut first = CapabilityRuntime::default();
+        let mut second = CapabilityRuntime::default();
+        for runtime in [&mut first, &mut second] {
+            for name in ["math.first", "math.second"] {
+                runtime
+                    .register_validated_json_tool(
+                        ToolPolicy::json(name),
+                        ToolMetadata::new("Returns one reviewed integer result."),
+                        add_contract(),
+                        |_| Ok(json!({"total": 42})),
+                    )
+                    .unwrap();
+            }
+        }
+
+        first
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapter.")
+                    .with_method("add", "math.first"),
+            )
+            .unwrap();
+        second
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapter.")
+                    .with_method("add", "math.second"),
+            )
+            .unwrap();
+
+        let first_fingerprint = first.capability_catalog_fingerprint().unwrap();
+        assert_ne!(
+            first_fingerprint,
+            second.capability_catalog_fingerprint().unwrap()
+        );
+        let lease = first
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.first", 1)])
+            .unwrap();
+        assert_eq!(lease.catalog_fingerprint(), first_fingerprint);
+    }
+
+    #[test]
+    fn tool_only_catalog_fingerprint_keeps_the_v1_encoding() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |request| {
+                Ok(request.input.clone())
+            })
+            .unwrap();
+
+        let catalog = serde_json::to_vec(&runtime.tool_catalog()).unwrap();
+        let mut expected = blake3::Hasher::new();
+        expected.update(CAPABILITY_CATALOG_FINGERPRINT_DOMAIN);
+        expected.update(&(catalog.len() as u64).to_be_bytes());
+        expected.update(&catalog);
+
+        assert_eq!(
+            runtime.capability_catalog_fingerprint().unwrap(),
+            CapabilityCatalogFingerprint(expected.finalize().to_hex().to_string())
+        );
     }
 
     #[test]

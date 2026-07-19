@@ -157,9 +157,10 @@
 - Setup-only bounded flat direct capability modules for existing synchronous,
   contract-enforced JSON tools. Each method routes through the same target-tool
   policy, audit, JSON boundary, and capability lease while returning decoded
-  bounded JSON. The interface seals before lease issuance or evaluation and
-  does not add module loading, dynamic Rust crate access, deferred-tool calls,
-  or ambient operating-system authority.
+  bounded JSON. The reviewed module-to-tool mapping is part of the catalog
+  fingerprint recorded by each lease, and the interface seals before lease
+  issuance or evaluation. It does not add module loading, dynamic Rust crate
+  access, deferred-tool calls, or ambient operating-system authority.
 - Fenced rollback-protected storage extension and an authenticated worker
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of

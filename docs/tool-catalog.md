@@ -131,9 +131,9 @@ to existing tools. Registration accepts only a synchronous `host_pump` JSON
 tool with an executable input/output contract. The method accepts one bounded
 JSON record or array subject to the target contract, returns decoded bounded
 JSON, and retains the target tool's call limit, metadata, audit entry, JSON
-validation, and active
-capability-lease check. Deferred `external` tools, prompt-only schemas, text
-tools, duplicate target aliases, existing VM module names, dynamic libraries,
+validation, and active capability-lease check. Deferred `external` tools,
+prompt-only schemas, text tools, duplicate target aliases, existing VM module
+names, dynamic libraries,
 and script-selected crates remain unavailable.
 
 `CapabilityModuleLimits` defaults to 32 modules, 128 methods, and a 256 KiB
@@ -146,7 +146,10 @@ input and output byte limits must fit the runtime JSON bridge: the smaller of
 `ExecutionLimits::max_source_bytes` and 64 KiB. JSON container depth is also
 bounded by the smaller of `max_syntax_nesting` and 64. The module catalog seals
 when a lease is issued or source is first evaluated, so a new syntax alias
-cannot appear under an existing approval.
+cannot appear under an existing approval. The stable module name, description,
+method name, and target tool are also included in the capability catalog
+fingerprint recorded by that lease, binding a reviewed direct call to its exact
+underlying capability.
 
 `CapabilityRuntime::capability_module_catalog()` returns the reviewed mapping
 for a host prompt or operator UI. `module_interface_catalog()` returns the
@@ -158,11 +161,12 @@ same registration path before `build`.
 For an approval flow, a host can issue a `CapabilityLease` from a selected
 subset of this catalog and call `eval_with_capability_lease`, or pass that lease
 to `WorkflowEngine::approve_with_capability_lease`. A lease is local to one
-runtime and records a catalog fingerprint, allowed names, and narrower
-per-tool call limits. A dynamic Splash value used as a tool name is checked
-when the call is reserved, not inferred from source text. Changing the catalog
-after issuing a lease invalidates it before execution; an active suspended
-evaluation also prevents catalog registration until it finishes.
+runtime and records a catalog fingerprint, including direct module mappings,
+allowed names, and narrower per-tool call limits. A dynamic Splash value used
+as a tool name is checked when the call is reserved, not inferred from source
+text. Changing the catalog after issuing a lease invalidates it before
+execution; an active suspended evaluation also prevents catalog registration
+until it finishes.
 
 `WorkflowEngine::approve_with_step_capability_leases` accepts an ordered
 vector with one lease per plan step. It validates every lease before approving

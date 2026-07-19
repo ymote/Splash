@@ -296,11 +296,11 @@ with a registered tool policy before `tool.call` or `tool.start` can succeed.
 For an operator-approved execution, a host can issue a process-local
 `CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or
 place the lease in a workflow approval. The lease can only narrow registered
-tool names and call budgets, records the exact host catalog fingerprint, and
-checks every call when it is reserved. Consequently, using a computed string
-as the `name` argument does not bypass approval. A lease remains active across
-`await` and the resulting continuation; it is a host-side authority object,
-not a Splash value or a serialized credential.
+tool names and call budgets, records the exact host catalog and direct-module
+mapping fingerprint, and checks every call when it is reserved. Consequently,
+using a computed string as the `name` argument does not bypass approval. A
+lease remains active across `await` and the resulting continuation; it is a
+host-side authority object, not a Splash value or a serialized credential.
 
 The v0.1 tool contract accepts string input and returns string output.
 `tool.call` is synchronous. `tool.start` reserves the same capability and
@@ -325,8 +325,9 @@ JSON-compatible argument, reserves the same target tool and lease grant, then
 returns decoded bounded JSON. It cannot target a deferred external tool, a text
 tool, an advisory-only schema, an arbitrary crate, or an ambient filesystem,
 process, network, or plugin API. The core language still does not resolve
-modules; the host supplies the binding. See [Host Tool Catalog](tool-catalog.md)
-for setup and bounds.
+modules; the host supplies the binding. Its exact method-to-tool mapping is
+included in every later capability-lease fingerprint. See
+[Host Tool Catalog](tool-catalog.md) for setup and bounds.
 
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatch with the same bounded JSON reader and writer
