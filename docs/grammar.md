@@ -212,6 +212,15 @@ profile rejection returns before the inherited tokenizer or parser sees the
 source. The development CLI performs canonical preflight automatically for
 `eval` and `run`.
 
+Before either canonical or compatibility evaluation, standalone `Runtime`
+masks inherited Makepad UI, debug, shader, pod, GC, math, regex, HTML, and
+direct-output entry points. In particular, generated source cannot reach the
+vendored `std.log`, `std.print`, `std.println`, `std.regex`, or
+`String.parse_html()` APIs. `mod.std.assert`, normal language operations, and
+reviewed host-installed `mod.tool` or direct capability modules remain
+available. A trusted host that needs the broader Makepad surface must embed the
+raw Makepad VM itself; the compatibility APIs do not restore those bindings.
+
 The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
 fixture passes the bounded compatibility preflight to catch parser drift, but
 it remains outside this grammar and cannot run through `splash-cli`. It

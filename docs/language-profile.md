@@ -363,9 +363,16 @@ summary
 
 ## Effect rules
 
-The core runtime does not install `mod.fs`, `mod.run`, or `mod.net`. A script
-cannot acquire authority by importing a name. The host must create a runtime
-with a registered tool policy before `tool.call` or `tool.start` can succeed.
+The core runtime does not expose inherited `mod.fs`, `mod.run`, `mod.net`,
+Makepad UI/debug modules, direct standard-output methods, or unbounded regex
+and HTML entry points. A script cannot acquire authority by importing a name.
+The host must create a runtime with a registered tool policy before `tool.call`
+or `tool.start` can succeed. Standalone initialization masks those vendored
+entry points before canonical and compatibility evaluation; it preserves only
+the documented core such as `mod.std.assert` and trusted host-installed
+modules. A host may intentionally install a reviewed direct capability module
+under a previously masked name, but that is a new capability binding subject to
+its normal policy and lease checks, not restoration of Makepad behavior.
 
 For an operator-approved execution, a host can issue a process-local
 `CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or

@@ -2,9 +2,10 @@
 
 //! Host-neutral execution primitives for Splash.
 //!
-//! The vendored VM exposes pure language modules only. This crate owns runtime
-//! limits and diagnostic capture; effectful APIs belong to a separate host
-//! crate and must be explicitly installed by trusted Rust code.
+//! This crate masks the vendored VM down to the standalone Splash source
+//! surface, then owns runtime limits and diagnostic capture. Effectful APIs
+//! belong to a separate host crate and must be explicitly installed by trusted
+//! Rust code.
 
 mod profile;
 
@@ -29,7 +30,8 @@ pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 use vm::{
-    id, script_err_limit, script_err_unexpected, script_value, LiveId, ScriptIp, ScriptValue,
+    id, script_err_limit, script_err_not_allowed, script_err_unexpected, script_value, LiveId,
+    ScriptIp, ScriptValue,
 };
 
 /// Stable identifier for the portable source contract enforced before normal
@@ -794,6 +796,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
                 .heap
                 .set_max_string_bytes(Some(limits.max_string_bytes));
             vm.bx.heap.set_max_heap_bytes(Some(limits.max_heap_bytes));
+            restrict_vendored_module_surface(vm);
             install_bounded_json_methods(vm, installed_limits);
             vm.bx.heap.reconcile_heap_bytes();
             let actual = vm.bx.heap.accounted_heap_bytes();
@@ -860,7 +863,9 @@ impl<H: Any, S: Any> Runtime<H, S> {
         &mut self.host
     }
 
-    /// Installs trusted native bindings. Do not expose ambient OS APIs here;
+    /// Installs trusted native bindings. The standalone `std` module is frozen,
+    /// so setup code should use a distinct host-owned module rather than
+    /// extending the core surface. Do not expose ambient OS APIs here;
     /// effectful bindings must apply their own capability policy.
     pub fn configure(&mut self, configure: impl FnOnce(&mut vm::ScriptVm)) {
         self.with_vm(configure);
@@ -2400,6 +2405,53 @@ fn evaluate_with_limits(
         diagnostics,
         suspended,
     }
+}
+
+/// Removes inherited Makepad UI, debug, and unbounded native entry points from
+/// the standalone Splash source surface. The VM still constructs its upstream
+/// bootstrap objects, but generated Splash can reach only the retained core and
+/// modules installed by trusted Rust setup code.
+fn restrict_vendored_module_surface(vm: &mut vm::ScriptVm) {
+    let modules = vm.bx.heap.modules;
+    for module in [id!(math), id!(gc), id!(pod), id!(shader)] {
+        vm.bx
+            .heap
+            .set_value_def(modules, module.into(), ScriptValue::NIL);
+    }
+
+    let std = vm.bx.heap.module(id!(std));
+    for member in [
+        id!(log),
+        id!(print),
+        id!(println),
+        id!(regex),
+        id!(set_type_default),
+    ] {
+        vm.bx
+            .heap
+            .set_value_def(std, member.into(), ScriptValue::NIL);
+    }
+    // The retained `assert` and VM-internal `Range` values are setup-owned
+    // language primitives, not a mutable cross-evaluation extension point.
+    vm.bx.heap.freeze(std);
+    vm.bx.heap.freeze(vm.bx.code.builtins.range);
+
+    // Makepad's HTML parser is registered as a string method rather than a
+    // module. Override it explicitly: its native backing storage is outside
+    // Splash's tracked VM-heap budget and it is not part of the published
+    // standalone language profile.
+    vm.bx.code.native.borrow_mut().add_type_method(
+        &mut vm.bx.heap,
+        vm::ScriptValueType::REDUX_STRING,
+        id!(parse_html),
+        &[],
+        |vm, _| {
+            script_err_not_allowed!(
+                vm.bx.threads.cur_ref().trap,
+                "unreviewed Makepad platform APIs are unavailable in Splash"
+            )
+        },
+    );
 }
 
 fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJsonMethodLimits>>) {
@@ -6042,11 +6094,23 @@ compute(outer, 2)
     }
 
     #[test]
-    fn does_not_load_makepad_effect_modules() {
+    fn does_not_expose_unreviewed_makepad_platform_or_debug_apis() {
         for source in [
             "use mod.fs\nfs.read(\"/etc/passwd\")",
             "use mod.run\nrun.child({cmd:\"whoami\"})",
             "use mod.net\nnet.socket_stream(\"example.com\", 443)",
+            "use mod.std.print\nprint(\"blocked\")",
+            "use mod.std.println\nprintln(\"blocked\")",
+            "use mod.std.log\nlog(\"blocked\")",
+            "use mod.std.regex\nregex(\".\").test(\"blocked\")",
+            "use mod.std.set_type_default\nset_type_default({})",
+            "use mod.std\nstd.assert = || nil",
+            "use mod.std\nstd.Range.blocked = true",
+            "\"<p>blocked</p>\".parse_html()",
+            "use mod.gc\ngc.run()",
+            "use mod.math\nmath.sin(0)",
+            "use mod.shader\nshader.instance(0)",
+            "use mod.pod\npod.f32",
         ] {
             let mut runtime = Runtime::default();
             let report = runtime.eval(source).unwrap();
@@ -6054,6 +6118,19 @@ compute(outer, 2)
             assert!(!report.succeeded(), "unexpectedly evaluated: {source}");
             assert!(!report.diagnostics.is_empty());
         }
+
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval("use mod.std.assert\nassert(true)\nlet result = {total: 42}\nresult")
+            .unwrap();
+        assert!(report.completed(), "{:?}", report.diagnostics);
+
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval_vm_compatibility("use mod.std.print\nprint(\"blocked\")")
+            .unwrap();
+        assert!(!report.succeeded());
+        assert!(!report.diagnostics.is_empty());
     }
 
     #[test]

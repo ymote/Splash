@@ -41,6 +41,9 @@ and keeps UI support optional rather than making UI the language boundary.
   guarded rename without reading files or evaluating code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
+- Standalone runtime initialization that masks inherited Makepad UI/debug and
+  unbounded native entry points before source evaluation, leaving only the
+  documented core plus trusted host-installed modules reachable from Splash.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
@@ -225,12 +228,14 @@ and keeps UI support optional rather than making UI the language boundary.
 - A small `splash` CLI for local evaluation and the workflow example.
 
 No ambient filesystem, subprocess, raw socket, HTTP client/server, or Makepad
-platform module is loaded by default. The optional fixed-file and fixed-endpoint
-catalogs are explicit, bounded tools rather than general filesystem or network
-APIs. A capability check in the VM is not an OS sandbox; adapters that execute
-local tools or need egress isolation must run behind an appropriate
-target-specific containment boundary before they are suitable for untrusted
-workloads.
+platform/debug module is source-reachable by default. The vendored VM bootstrap
+retains compatibility objects internally, but `Runtime` masks their source
+entry points before either canonical or compatibility evaluation. The optional
+fixed-file and fixed-endpoint catalogs are explicit, bounded tools rather than
+general filesystem or network APIs. A capability check in the VM is not an OS
+sandbox; adapters that execute local tools or need egress isolation must run
+behind an appropriate target-specific containment boundary before they are
+suitable for untrusted workloads.
 
 ## Example
 

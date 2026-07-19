@@ -25,6 +25,7 @@ separate portable language contract and host model:
 | Source contract | Broad compatibility parser | Published canonical v0.2 grammar, preflighted before execution |
 | Primary use | UI/runtime embedding | Dynamic workflows, dataflow, and reviewed tool calls |
 | Effects | Determined by the embedding host | Deny-by-default registered capabilities only |
+| Native platform surface | Inherited UI/debug modules may be available | Inherited UI/debug and direct-output entries masked before source evaluation |
 | Async behavior | VM-host integration detail | Bounded host-pumped promises and explicit external lifecycle |
 | Error recovery | Inherited frame-local `try` form | Canonical cross-function `try/catch` with uncatchable hard limits and no rollback |
 | Rust integration | Native bindings chosen by app | Schema-checked, policy-bound Rust adapters, typed Serde bridges, and setup-defined direct module facades |

@@ -6292,6 +6292,49 @@ mod tests {
     }
 
     #[test]
+    fn masked_makepad_module_names_remain_available_for_reviewed_capability_facades() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integers."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("math", "Reviewed math facade.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
+            .unwrap();
+        let report = runtime
+            .eval_with_capability_lease(
+                "use mod.math\nlet result = math.add({left: 20, right: 22})\nresult.total",
+                &lease,
+            )
+            .unwrap();
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH
+                )
+                .unwrap(),
+            json!(42)
+        );
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
     fn direct_capability_module_keeps_json_contract_lease_and_audit_checks() {
         let mut policy = ToolPolicy::json("math.add");
         policy.max_calls = 2;
@@ -7462,11 +7505,11 @@ mod tests {
         assert_eq!(
             occupied
                 .register_capability_module(
-                    CapabilityModule::new("math", "Conflicts with the VM math module.")
+                    CapabilityModule::new("tool", "Conflicts with the fixed tool module.")
                         .with_method("add", "math.add"),
                 )
                 .unwrap_err(),
-            CapabilityModuleRegistrationError::ModuleNameOccupied("math".to_owned())
+            CapabilityModuleRegistrationError::ModuleNameOccupied("tool".to_owned())
         );
     }
 

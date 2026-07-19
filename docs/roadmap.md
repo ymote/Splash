@@ -3,6 +3,9 @@
 ## Baseline complete
 
 - Standalone VM workspace with upstream provenance.
+- Standalone source surface that masks inherited Makepad UI/debug, direct-output,
+  regex, HTML, GC, pod, shader, and math entry points before evaluation while
+  preserving the documented core and trusted host-installed modules.
 - Bounded evaluation and canonical grammar diagnostics, including
   host-configurable per-string, tracked Splash-owned aggregate-heap,
   operand-stack, and active-call-frame ceilings.

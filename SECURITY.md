@@ -76,6 +76,17 @@ before evaluation. The runtime carries executable canonical-fixture regression
 coverage, but the two parsers are not formally proven equivalent. Parser/VM
 differential fuzzing is required before a stable language release.
 
+Standalone `Runtime` masks inherited Makepad platform/debug entry points before
+canonical and compatibility evaluation. The source surface cannot reach the
+vendored math, GC, pod, shader, regex, HTML, or direct standard-output APIs;
+`std.log`, `std.print`, `std.println`, `std.regex`, and `String.parse_html()`
+are specifically unavailable. `mod.std.assert`, ordinary bounded language
+operations, and explicitly installed host modules remain available. This avoids
+unreviewed native output and native allocations outside Splash's tracked heap
+from becoming generated-source behavior. It does not alter a host that embeds
+the raw Makepad VM, and a trusted host can still install a reviewed capability
+under any otherwise-masked module name through the normal policy boundary.
+
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatches with bounded JSON methods. The default
 direct-conversion ceiling is 64 KiB and 64 container levels, and a host may
