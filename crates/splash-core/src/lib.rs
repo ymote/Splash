@@ -32,7 +32,7 @@ use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 use vm::{
     id, id_lut, script_args_def, script_err_invalid_args, script_err_limit, script_err_not_allowed,
     script_err_type_mismatch, script_err_unexpected, script_value, LiveId, ScriptIp, ScriptObject,
-    ScriptValue, NIL,
+    ScriptStringSink, ScriptValue, NIL,
 };
 
 /// Stable identifier for the portable source contract enforced before normal
@@ -2441,6 +2441,7 @@ fn restrict_vendored_module_surface(
     }
     install_standard_math_module(vm, std);
     install_standard_json_module(vm, std, json_method_limits);
+    install_standard_text_module(vm, std);
     // Retained Splash core values and the VM-internal `Range` prototype are
     // setup-owned language primitives, not mutable cross-evaluation points.
     vm.bx.heap.freeze(std);
@@ -2637,6 +2638,208 @@ fn install_standard_json_module(
         .heap
         .set_value_def(std_module, id!(json).into(), json.into());
     vm.bx.heap.freeze(json);
+}
+
+/// Installs the compact, pure text surface for local workflow data shaping.
+/// Every constructed result uses the VM's bounded string builder, and this
+/// module has no regex, host, filesystem, network, or adapter access.
+fn install_standard_text_module(vm: &mut vm::ScriptVm, std_module: ScriptObject) {
+    let text = vm.bx.heap.new_with_proto(NIL);
+    vm.add_method(
+        text,
+        id!(trim),
+        script_args_def!(value = NIL),
+        standard_text_trim,
+    );
+    vm.add_method(
+        text,
+        id!(lower),
+        script_args_def!(value = NIL),
+        standard_text_lower,
+    );
+    vm.add_method(
+        text,
+        id!(upper),
+        script_args_def!(value = NIL),
+        standard_text_upper,
+    );
+    vm.add_method(
+        text,
+        id!(len),
+        script_args_def!(value = NIL),
+        standard_text_len,
+    );
+    vm.add_method(
+        text,
+        id!(contains),
+        script_args_def!(value = NIL, needle = NIL),
+        |vm, args| {
+            let needle = script_value!(vm, args.needle);
+            standard_text_binary_predicate(
+                vm,
+                args,
+                "contains",
+                needle,
+                "needle",
+                |value, needle| value.contains(needle),
+            )
+        },
+    );
+    vm.add_method(
+        text,
+        id!(starts_with),
+        script_args_def!(value = NIL, prefix = NIL),
+        |vm, args| {
+            let prefix = script_value!(vm, args.prefix);
+            standard_text_binary_predicate(
+                vm,
+                args,
+                "starts_with",
+                prefix,
+                "prefix",
+                |value, prefix| value.starts_with(prefix),
+            )
+        },
+    );
+    vm.add_method(
+        text,
+        id!(ends_with),
+        script_args_def!(value = NIL, suffix = NIL),
+        |vm, args| {
+            let suffix = script_value!(vm, args.suffix);
+            standard_text_binary_predicate(
+                vm,
+                args,
+                "ends_with",
+                suffix,
+                "suffix",
+                |value, suffix| value.ends_with(suffix),
+            )
+        },
+    );
+    vm.add_method(
+        text,
+        id!(replace_all),
+        script_args_def!(value = NIL, from = NIL, to = NIL),
+        standard_text_replace_all,
+    );
+    vm.bx
+        .heap
+        .set_value_def(std_module, id!(text).into(), text.into());
+    vm.bx.heap.freeze(text);
+}
+
+fn standard_text_trim(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    match vm.string_with(value, |vm, value| {
+        vm.bx.heap.new_string_from_str(value.trim())
+    }) {
+        Some(result) => result,
+        None => standard_text_expected_string(vm, "trim", "value"),
+    }
+}
+
+fn standard_text_lower(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    standard_text_case(vm, args, "lower", char::to_lowercase)
+}
+
+fn standard_text_upper(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    standard_text_case(vm, args, "upper", char::to_uppercase)
+}
+
+fn standard_text_case<I>(
+    vm: &mut vm::ScriptVm,
+    args: ScriptObject,
+    function: &'static str,
+    map: impl Fn(char) -> I,
+) -> ScriptValue
+where
+    I: IntoIterator<Item = char>,
+{
+    let value = script_value!(vm, args.value);
+    match vm.string_with(value, |vm, value| {
+        vm.bx.heap.new_bounded_string_with(|_, output| {
+            'characters: for character in value.chars() {
+                for mapped in map(character) {
+                    output.append_char(mapped);
+                    if output.is_full() {
+                        break 'characters;
+                    }
+                }
+            }
+        })
+    }) {
+        Some(result) => result,
+        None => standard_text_expected_string(vm, function, "value"),
+    }
+}
+
+fn standard_text_len(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    match vm.string_with(value, |_, value| value.chars().count()) {
+        Some(length) => ScriptValue::from_f64(length as f64),
+        None => standard_text_expected_string(vm, "len", "value"),
+    }
+}
+
+fn standard_text_binary_predicate(
+    vm: &mut vm::ScriptVm,
+    args: ScriptObject,
+    function: &'static str,
+    pattern: ScriptValue,
+    pattern_name: &'static str,
+    predicate: impl FnOnce(&str, &str) -> bool,
+) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    match vm.string_with(value, |vm, value| {
+        vm.string_with(pattern, |_, pattern| predicate(value, pattern))
+    }) {
+        Some(Some(result)) => result.into(),
+        Some(None) => standard_text_expected_string(vm, function, pattern_name),
+        None => standard_text_expected_string(vm, function, "value"),
+    }
+}
+
+fn standard_text_replace_all(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let from = script_value!(vm, args.from);
+    let to = script_value!(vm, args.to);
+    match vm.string_with(value, |vm, value| {
+        vm.string_with(from, |vm, from| {
+            vm.string_with(to, |vm, to| {
+                vm.bx.heap.new_bounded_string_with(|_, output| {
+                    let mut first = true;
+                    for segment in value.split(from) {
+                        if !first {
+                            output.append_str(to);
+                            if output.is_full() {
+                                break;
+                            }
+                        }
+                        output.append_str(segment);
+                        if output.is_full() {
+                            break;
+                        }
+                        first = false;
+                    }
+                })
+            })
+        })
+    }) {
+        Some(Some(Some(result))) => result,
+        _ => standard_text_expected_string(vm, "replace_all", "value, from, and to"),
+    }
+}
+
+fn standard_text_expected_string(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+    parameter: &'static str,
+) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.{function} expects `{parameter}` to be a string"
+    )
 }
 
 fn standard_math_unary(
@@ -6492,6 +6695,88 @@ compute(outer, 2)
                 .unwrap(),
             serde_json::json!("bounded")
         );
+    }
+
+    #[test]
+    fn exposes_frozen_bounded_standard_text() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 use mod.std.text\n\
+                 let value = text.trim(\"  MiXeD  \")\n\
+                 assert(value == \"MiXeD\")\n\
+                 assert(text.lower(value) == \"mixed\")\n\
+                 assert(text.upper(\"abc\") == \"ABC\")\n\
+                 assert(text.len(\"🙂\") == 1)\n\
+                 assert(text.contains(value, \"Xe\"))\n\
+                 assert(text.starts_with(value, \"Mi\"))\n\
+                 assert(text.ends_with(value, \"eD\"))\n\
+                 text.replace_all(\"a-b-a\", \"a\", \"x\")",
+            )
+            .unwrap();
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("x-b-x")
+        );
+
+        let mut namespace_runtime = Runtime::default();
+        let namespace = namespace_runtime
+            .eval("use mod.std\nstd.text.starts_with(\"splash\", \"spl\")")
+            .unwrap();
+        assert!(namespace.completed(), "{:?}", namespace.diagnostics);
+        assert_eq!(namespace.value.as_bool(), Some(true));
+
+        let mutation = runtime
+            .eval("use mod.std.text\ntext.trim = || nil")
+            .unwrap();
+        assert!(!mutation.succeeded());
+        assert!(!mutation.diagnostics.is_empty());
+
+        let preserved = runtime
+            .eval("use mod.std.text\ntext.replace_all(\"splash\", \"s\", \"S\")")
+            .unwrap();
+        assert!(preserved.completed(), "{:?}", preserved.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    preserved.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("SplaSh")
+        );
+
+        let invalid_predicate = runtime
+            .eval("use mod.std.text\ntext.starts_with(\"splash\", 1)")
+            .unwrap();
+        assert!(!invalid_predicate.succeeded());
+        assert!(invalid_predicate
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("`prefix`")));
+
+        let limits = ExecutionLimits {
+            max_string_bytes: 4,
+            ..ExecutionLimits::default()
+        };
+        let mut bounded_runtime = Runtime::with_limits((), (), limits).unwrap();
+        let bounded = bounded_runtime
+            .eval("use mod.std.text\ntext.replace_all(\"aa\", \"a\", \"xxxx\")")
+            .unwrap();
+        assert!(!bounded.completed());
+        assert!(bounded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("string allocation limit")));
     }
 
     #[test]

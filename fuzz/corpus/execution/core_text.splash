@@ -1,0 +1,5 @@
+use mod.std.assert
+use mod.std.text
+let value = text.trim("  Splash  ")
+assert(text.lower(value) == "splash")
+text.replace_all(value, "S", "s")

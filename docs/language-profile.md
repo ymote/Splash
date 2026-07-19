@@ -161,6 +161,15 @@ expose a host capability. A shadowed `json` binding, chained receiver, unknown
 member, or source outside the valid prefix gets no fixed-core result; a
 matching advisory catalog path cannot extend the core surface.
 
+The LSP separately recognizes an exact visible direct `use mod.std.text`
+binding. At a direct `text.` member site it completes only the documented
+bounded text functions, with plain-text hover and fixed function signatures.
+This is a compiled-in description of local string data shaping: it does not
+inspect module-catalog metadata, resolve a module, follow a local alias, or
+expose a host capability. A shadowed `text` binding, chained receiver, unknown
+member, or source outside the valid prefix gets no fixed-core result; a
+matching advisory catalog path cannot extend the core surface.
+
 An exact visible direct `use mod.std.assert` binding receives fixed plain-text
 hover and `assert(condition)` signature help. A direct `std.assert(...)` call
 after `use mod.std` receives the same fixed signature. This is compiled-in
@@ -168,12 +177,13 @@ source metadata, not a host lookup or capability grant; aliases, shadowed
 bindings, and non-core imports receive no fixed assertion result.
 
 The same static projection completes `std` at a statement-position `use mod.`
-path and `assert`/`json`/`math` below `use mod.std.`. The frozen `mod.std`
-namespace has no advisory catalog children, so metadata cannot add `log`,
-`inspect`, or any descendants below `mod.std.assert`, `mod.std.json`, or
-`mod.std.math`. When an advisory catalog is unavailable, the fixed `std` root
-candidate remains visible but is incomplete because non-core `mod.*` siblings
-could be omitted; the closed `mod.std` list remains complete.
+path and `assert`/`json`/`math`/`text` below `use mod.std.`. The frozen
+`mod.std` namespace has no advisory catalog children, so metadata cannot add
+`log`, `inspect`, or any descendants below `mod.std.assert`, `mod.std.json`,
+`mod.std.math`, or `mod.std.text`. When an advisory catalog is unavailable,
+the fixed `std` root candidate remains visible but is incomplete because
+non-core `mod.*` siblings could be omitted; the closed `mod.std` list remains
+complete.
 
 For bounded static record metadata, Rust hosts can call
 `splash_core::static_record_shape_report` or its named, limit-aware variant.
@@ -375,6 +385,7 @@ The current profile supports:
 - Field access, array operations, conditionals, loops, and assertions.
 - Frozen effect-free scalar math through `use mod.std.math`.
 - Frozen bounded JSON conversion through `use mod.std.json`.
+- Frozen bounded literal text shaping through `use mod.std.text`.
 - Recoverable `try protected catch fallback` expressions without an error
   binding or transactional rollback.
 - Module imports through `use mod.<name>`.
@@ -427,6 +438,16 @@ the runtime's byte, nesting, cycle, duplicate-key, and encoding checks as
 ordinary recoverable script errors. The module has no I/O, clock, entropy,
 host-state, crate-loading, or capability access.
 
+`use mod.std.text` imports a frozen Splash-owned module for local string data
+shaping. It provides `text.trim(value)`, `text.lower(value)`,
+`text.upper(value)`, Unicode-scalar `text.len(value)`, literal
+`text.contains(value, needle)`, `text.starts_with(value, prefix)`,
+`text.ends_with(value, suffix)`, and
+`text.replace_all(value, from, to)`. Casing and replacement build results
+through the configured individual-string bound; a limit hit is the same hard
+resource failure as any other new script string. It does not expose regexes,
+I/O, clock, entropy, host-state, crate-loading, or capability access.
+
 ## Effect rules
 
 The core runtime does not expose inherited `mod.fs`, `mod.run`, `mod.net`,
@@ -436,10 +457,10 @@ The host must create a runtime with a registered tool policy before `tool.call`
 or `tool.start` can succeed. Standalone initialization masks those vendored
 entry points before canonical and compatibility evaluation; it preserves only
 the documented core such as `mod.std.assert`, `mod.std.math`, `mod.std.json`,
-and trusted host-installed modules. A host may intentionally install a reviewed
-direct capability module under a previously masked name, but that is a new
-capability binding subject to its normal policy and lease checks, not
-restoration of Makepad behavior.
+`mod.std.text`, and trusted host-installed modules. A host may intentionally
+install a reviewed direct capability module under a previously masked name, but
+that is a new capability binding subject to its normal policy and lease checks,
+not restoration of Makepad behavior.
 
 For an operator-approved execution, a host can issue a process-local
 `CapabilityLease` and use `CapabilityRuntime::eval_with_capability_lease`, or
@@ -600,6 +621,8 @@ or mutate its keys, input digest, worker observation, or restart policy.
 - Import `mod.std.json` before using `json.parse(...)` or
   `json.stringify(...)`; these are bounded local data operations, not
   capabilities.
+- Import `mod.std.text` before using `text.*`; its operations are bounded,
+  literal local data shaping, not regex processing or capabilities.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
   fallback cannot inspect the error, and hard string-allocation,
   heap-allocation, operand-stack, call-frame, instruction, or deadline

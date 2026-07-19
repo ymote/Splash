@@ -6,8 +6,8 @@
 - Standalone source surface that masks inherited Makepad UI/debug, direct-output,
   regex, HTML, GC, pod, shader, and math entry points before evaluation while
   preserving the documented core, frozen Splash-owned `mod.std.math` scalar
-  helpers, `mod.std.json` bounded data helpers, and trusted host-installed
-  modules.
+  helpers, `mod.std.json` bounded data helpers, `mod.std.text` bounded text
+  helpers, and trusted host-installed modules.
 - Bounded evaluation and canonical grammar diagnostics, including
   host-configurable per-string, tracked Splash-owned aggregate-heap,
   operand-stack, and active-call-frame ceilings.
@@ -26,11 +26,12 @@
   exact-token edits, conservative invalid-prefix support, independent site
   truncation, and fixed direct-import-only `mod.tool` methods plus documented
   `mod.std` import-path completion, `mod.std.math` function/constant completion,
-  hover, and signature help, direct `mod.std.json` function completion, hover,
-  and signature help, plus direct `mod.std.assert` hover and signature help.
-  The frozen core `mod.std` namespace cannot be extended by advisory metadata.
-  These fixed surfaces are compiled-in source-only metadata, not host capability
-  discovery. A bounded, initialization-time or configuration-refresh
+  hover, and signature help, direct `mod.std.json` and `mod.std.text` function
+  completion, hover, and signature help, plus direct `mod.std.assert` hover
+  and signature help. The frozen core `mod.std` namespace cannot be extended
+  by advisory metadata. These fixed surfaces are compiled-in source-only
+  metadata, not host capability discovery. A bounded, initialization-time or
+  configuration-refresh
   advisory catalog projection can complete literal names in direct tool calls
   without a runtime/catalog lookup or authority inference; it performs no
   arbitrary module, type, or field inference. A separate bounded,

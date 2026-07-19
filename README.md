@@ -44,9 +44,10 @@ and keeps UI support optional rather than making UI the language boundary.
 - Standalone runtime initialization that masks inherited Makepad UI/debug and
   unbounded native entry points before source evaluation, leaving only the
   documented core plus trusted host-installed modules reachable from Splash.
-- Frozen no-authority `mod.std.math` scalar helpers and `mod.std.json` bounded
-  JSON helpers for common dataflow without restoring Makepad's broader
-  shader-oriented `mod.math` surface or granting host authority.
+- Frozen no-authority `mod.std.math` scalar helpers, `mod.std.json` bounded
+  JSON helpers, and `mod.std.text` bounded text helpers for common dataflow
+  without restoring Makepad's broader shader-oriented `mod.math` surface or
+  granting host authority.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
@@ -251,6 +252,11 @@ For strict local JSON conversion, `use mod.std.json` provides only
 byte/depth/cycle-bounded boundary as `.parse_json()` and `.to_json()` and have
 no host, adapter, filesystem, process, network, clock, entropy, or crate
 access.
+
+For local text shaping, `use mod.std.text` provides `trim`, `lower`, `upper`,
+Unicode-scalar `len`, literal predicates, and literal `replace_all`. Results
+use Splash's configured string bound; the module does not expose regexes,
+host state, filesystem, process, network, clock, entropy, or crate access.
 
 ## Example
 
@@ -550,10 +556,12 @@ supports the same fixed signature at direct `std.assert(...)`. These fixed
 surfaces use no tool-catalog or adapter lookup, do not follow local aliases,
 and do not imply a capability grant. For an exact visible `use mod.std.json`
 binding, it completes `parse` and `stringify` with fixed plain-text hover and
-signature help. At a statement-position `use mod.` path, the same static
-projection completes `std`; below `use mod.std.` it completes `assert`, `json`,
-and `math`. The frozen `mod.std` subtree cannot be extended by advisory catalog
-metadata. An integration may additionally supply a
+signature help. For an exact visible `use mod.std.text` binding, it completes
+the fixed text functions with plain-text hover and signature help. At a
+statement-position `use mod.` path, the same static projection completes `std`;
+below `use mod.std.` it completes `assert`, `json`, `math`, and `text`. The
+frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An
+integration may additionally supply a
 advisory tool-catalog projection through
 `initializationOptions.splash.toolCatalog` or a later
 `workspace/didChangeConfiguration` update; it accepts the `name`, `format`,

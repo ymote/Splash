@@ -81,11 +81,11 @@ canonical and compatibility evaluation. The source surface cannot reach the
 vendored math, GC, pod, shader, regex, HTML, or direct standard-output APIs;
 `std.log`, `std.print`, `std.println`, `std.regex`, and `String.parse_html()`
 are specifically unavailable. `mod.std.assert`, the frozen no-authority
-`mod.std.math` and `mod.std.json` modules, ordinary bounded language
-operations, and explicitly installed host modules remain available. This
-avoids unreviewed native output and native allocations outside Splash's tracked
-heap from becoming generated-source behavior. It does not alter a host that
-embeds the raw Makepad VM, and a trusted host can still install a reviewed
+`mod.std.math`, `mod.std.json`, and `mod.std.text` modules, ordinary bounded
+language operations, and explicitly installed host modules remain available.
+This avoids unreviewed native output and native allocations outside Splash's
+tracked heap from becoming generated-source behavior. It does not alter a host
+that embeds the raw Makepad VM, and a trusted host can still install a reviewed
 capability under any otherwise-masked module name through the normal policy
 boundary.
 
@@ -102,6 +102,13 @@ The frozen `mod.std.json` module exposes only `json.parse(document)` and
 cycle-bounded JSON boundary; they do not inspect adapters, host state, files,
 processes, networks, clocks, entropy, or Rust crates. A JSON helper therefore
 does not grant authority beyond pure bounded data conversion.
+
+The frozen `mod.std.text` module exposes a small literal string-shaping
+surface. Its casing and replacement functions stream output through the VM's
+configured string bound, while predicates only inspect supplied strings. It
+does not expose regex matching, adapters, host state, files, processes,
+networks, clocks, entropy, or Rust crates; it grants no authority beyond local
+bounded data conversion.
 
 `Runtime` replaces inherited direct `value.to_json()` and
 `document.parse_json()` dispatches with bounded JSON methods. The default
@@ -173,15 +180,15 @@ validates a referenced module, presents no partial projection after malformed or
 over-limit input, or lets module metadata replace the fixed `mod.tool` methods.
 It also carries a compiled-in projection of the frozen standalone `mod.std`
 namespace: `use mod.` can suggest `std`, and `use mod.std.` can suggest only
-the documented `assert`, `json`, and `math` core modules. The server suppresses
-advisory children below that namespace, matching the runtime's frozen `std`
-object; an integration must use a distinct host-owned `mod.*` namespace for
-capabilities.
+the documented `assert`, `json`, `math`, and `text` core modules. The server
+suppresses advisory children below that namespace, matching the runtime's
+frozen `std` object; an integration must use a distinct host-owned `mod.*`
+namespace for capabilities.
 For an exact visible `use mod.std.assert` binding, and direct `std.assert(...)`
 after `use mod.std`, assertion hover and signature help are likewise compiled
 in and carry no catalog lookup, host access, or authority. The same holds for
 fixed completion, hover, and signature help for direct `use mod.std.json`
-bindings.
+bindings and `use mod.std.text` bindings.
 Suggested names remain subject to runtime module binding, catalog, and lease
 checks. Guarded rename is advertised only to a client that supports versioned
 document edits. It never renames an
