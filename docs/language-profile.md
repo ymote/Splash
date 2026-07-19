@@ -185,9 +185,9 @@ or direct member call; writes, member extraction, parenthesized/computed edges,
 escapes, and truncated alias metadata fail closed. A deferred leaf is only
 labeled as returning a promise; an exact visible catalog leaf also has a
 plain-text advisory hover. For an exact shaped leaf, it can complete an
-undeclared root key or one direct object-child key in the first direct literal
-record argument from `inputFields`, and documents both input and output fields
-in hover and signature help. For an exact root
+undeclared root key or one direct object-child key and hover an exact known key
+in the first direct literal record argument from `inputFields`, and documents
+both input and output fields in hover and signature help. For an exact root
 `let result = receiver.method(input)` binding on a synchronous leaf, where
 `receiver` is that import or qualifying alias, or its
 exact deferred `.await()` form, it can complete and hover root `result.field`
@@ -224,7 +224,8 @@ load a module, inspect a runtime, validate a tool name, issue a lease, or
 authorize a call. When a shaped leaf has `inputFields` or `outputFields`, hover
 and signature documentation list those bounded field/type/required views, and
 the first direct literal-record argument can complete an undeclared root key or
-one direct object-child key from `inputFields`. The bounded output feature
+one direct object-child key from `inputFields`; exact known input keys have
+plain-text advisory hover. The bounded output feature
 serves the exact result binding plus an exact local alias chain of at most 16 hops, requires a matching
 synchronous/deferred call form, and retains at most one explicit object-child
 output path. It rejects computed/deeper aliases, mutation/escape, input or

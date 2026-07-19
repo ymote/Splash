@@ -248,7 +248,7 @@ each group reference must remain another exact group alias or a direct member
 call; writes, member extraction,
 parenthesized/computed edges, and other escapes suppress all catalog metadata
 for the group. This bounded source-only rule covers member completion, hover,
-signature help, input-key completion, and shaped result fields. It does not
+signature help, input-key completion/hover, and shaped result fields. It does not
 alias the fixed `mod.tool` API, which remains direct-import-only.
 When alias metadata is capped, local-alias completion fails closed and is marked
 incomplete; direct imported-module completion remains independent of that cap.
@@ -289,10 +289,11 @@ scope/import metadata, and unknown paths. It never reads a runtime, resolves a
 module, or grants authority. When a shaped leaf also supplies `inputFields` or
 `outputFields`, its plain-text hover and signature documentation list bounded
 field names, fixed JSON types, required bits, and optional descriptions. It can
-additionally complete an undeclared root key or one direct object-child key only
-in that leaf's first direct literal record argument from `inputFields`, after
-the same visible-import-or-qualifying-alias and exact-leaf checks. For an exact
-original binding such as `let result = receiver.method(input)`, where `receiver` is that import or
+additionally complete an undeclared root key or one direct object-child key and
+hover an exact known key only in that leaf's first direct literal record
+argument from `inputFields`, after the same visible-import-or-qualifying-alias
+and exact-leaf checks. For an exact original binding such as
+`let result = receiver.method(input)`, where `receiver` is that import or
 qualifying alias, or the exact deferred `.await()` form, it also completes and
 hovers root `result.field` names from `outputFields`, plus one explicit object
 child path such as `result.summary.total`. It follows exact local
@@ -390,9 +391,9 @@ For a parsed JSON value, it also exercises the bounded initialization and
 configuration-refresh projection around a fixed document. The server uses a
 fixed bounded advisory module catalog, including shaped direct-method input
 field metadata, only to exercise catalog completion, root/direct-child input-key
-completion, hover, and signature help: the target never starts stdio, reads
-the URI, resolves modules, evaluates Splash, creates a capability host, or
-invokes an adapter.
+completion/hover, and signature help: the target never starts stdio, reads the
+URI, resolves modules, evaluates Splash, creates a capability host, or invokes
+an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 8 KiB individual-string cap, 1,024 live operand values, 256 active call

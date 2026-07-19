@@ -174,7 +174,8 @@ metadata. Other than the active queried receiver, every reference in the
 resolved import-alias group must remain an exact group alias or direct member
 call; writes, member extraction,
 parenthesized/computed edges, and other escapes make completion, hover,
-input-key completion, result-field metadata, and signature help fail closed.
+input-key completion/hover, result-field metadata, and signature help fail
+closed.
 It never resolves a module, evaluates source, or creates authority. The fixed
 `mod.tool` API deliberately does not use this alias rule.
 When retained alias edges are capped, a local-alias completion returns no
@@ -192,9 +193,10 @@ the server also completes an undeclared root key or one direct object-child key
 while the cursor is in the first direct literal-record argument, such as
 `weather.current({loc})`, `weather_api.current({loc})`, or
 `weather.current({filters: {sta}})`. It replaces only that key identifier and
-does not insert an object, a value, or `await()`. The recognizer rejects a path
-below that direct child level, second argument, string or comment cursor,
-mismatched/deep delimiters,
+does not insert an object, a value, or `await()`. Hovering an exact known root
+or direct child key presents the same plain-text advisory field metadata. The
+recognizer rejects a path below that direct child level, second argument, string
+or comment cursor, mismatched/deep delimiters,
 duplicate prior key, truncated import metadata, shadowed receiver, malformed
 record prefix, or unknown/unshaped leaf. It does not evaluate JSON Schema,
 infer a value or deeper/arbitrary nested shape, read a runtime, validate a
@@ -232,8 +234,9 @@ cursor inside a comment, mismatched/deep delimiters, truncated scope or import
 metadata, shadowed receivers, and unknown or unshaped paths. Signature help
 uses the same plain-text advisory description and compact input/output field
 lists as hover; it does not resolve a module, inspect a runtime, validate an
-adapter contract, or authorize a call. The separate input-key completion is
-limited to root keys and one direct object-child literal-record position. The
+adapter contract, or authorize a call. The separate input-key completion and
+hover are limited to root keys and one direct object-child literal-record
+position. The
 separate output-field feature is limited to the exact result binding and
 bounded local alias chain described above, plus one explicit object-child path;
 it never follows arbitrary member chains. Neither feature performs JSON Schema

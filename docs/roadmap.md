@@ -32,10 +32,11 @@
   escapes, and truncated alias metadata fail closed; fixed `mod.tool` methods
   remain direct-import-only. Exact one-JSON-value leaves can present bounded
   schema-derived input and output record fields in hover/signature help, with
-  input-key completion at the root plus one explicit input-object child level
-  in the first direct literal record argument and result-field completion/hover
-  at the root plus one explicit output-object child level, without module
-  loading, resolution, runtime export inspection, or authority inference.
+  input-key completion/hover at the root plus one explicit input-object child
+  level in the first direct literal record argument and result-field
+  completion/hover at the root plus one explicit output-object child level,
+  without module loading, resolution, runtime export inspection, or authority
+  inference.
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context

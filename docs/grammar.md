@@ -399,8 +399,8 @@ identifier, one fixed JSON type, a required bit, and optional plain-text
 description. An object input or output field may carry one direct child
 `fields` list; children cannot. The LSP shows both bounded field lists in leaf
 hover and signature help, and can complete an undeclared root key or one direct
-object-child key in the first direct literal-record argument from
-`inputFields`. For an exact source binding through
+object-child key and hover an exact known key in the first direct literal-record
+argument from `inputFields`. For an exact source binding through
 a direct visible import or qualifying exact root alias, such as
 `let result = receiver.method(input)` on a synchronous leaf, or the exact
 `let result = receiver.method(input).await()` form on a deferred leaf, it also

@@ -194,7 +194,8 @@ omitted. Scalar, array, missing-properties, noncanonical-key, and partial
 retained shapes omit that view. The LSP presents both views in direct-leaf hover and signature
 documentation, and can complete an undeclared root key or one direct
 object-child key in the first direct literal-record argument from `inputFields`.
-It can additionally complete and hover root `result.field` names and one
+Exact known input keys have plain-text advisory hover. It can additionally
+complete and hover root `result.field` names and one
 explicit object-child path such as
 `result.summary.total` from `outputFields` only for an exact root synchronous
 `let result = imported.method(input)` binding or its exact deferred `.await()`

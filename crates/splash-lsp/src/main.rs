@@ -683,6 +683,30 @@ impl SplashLanguageServer {
         };
         let shapes = self.static_record_shapes(uri)?;
         if !report.truncated {
+            if !self.module_catalog.modules.is_empty() {
+                if let Some(site) = direct_module_input_record_completion_site(source, byte_offset)
+                {
+                    let (_, lexical) = self.lexical_completions(uri)?;
+                    let imports = self.module_imports(uri)?;
+                    if let Some(field) = module_catalog_input_field_for_site(
+                        source,
+                        lexical,
+                        imports,
+                        shapes,
+                        &self.module_catalog,
+                        &site,
+                    ) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                // Host-supplied descriptions stay plain text.
+                                kind: MarkupKind::PlainText,
+                                value: module_catalog_input_field_text(field),
+                            }),
+                            range: Some(span_range(source, site.field)),
+                        }));
+                    }
+                }
+            }
             if let Some(site) = direct_module_member_completion_site(source, byte_offset) {
                 if let Some((field, context)) = workflow_data_field_for_member(
                     source,
@@ -1281,7 +1305,7 @@ const MAX_FUZZ_LSP_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
 /// Fixed source used to exercise arbitrary advisory catalog configuration.
 ///
-/// Its names cover direct tool, direct-module result, and workflow-data
+/// Its names cover direct tool, direct-module input/result, and workflow-data
 /// metadata without giving the fuzzer a capability host or runtime authority.
 #[cfg(fuzzing)]
 const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
@@ -1427,6 +1451,16 @@ pub fn fuzz_exercise_document(source: &str) {
     let _ = server.replace_document(uri.clone(), 2, replacement.clone());
     fuzz_exercise_semantic_requests(&server, &uri, &replacement);
 
+    // Exercise exact root and direct-child input field sites independently of
+    // the arbitrary source offsets above, so the fixed advisory catalog keeps
+    // this bounded hover and completion path under sanitizer coverage.
+    let _ = server.replace_document(
+        uri.clone(),
+        3,
+        FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
+    );
+    fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
     });
@@ -1504,6 +1538,23 @@ fn fuzz_exercise_semantic_requests(server: &SplashLanguageServer, uri: &Uri, sou
     let _ = server.references(uri, invalid_position, true);
     let _ = server.document_highlights(uri, invalid_position);
     let _ = server.prepare_rename(uri, invalid_position);
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_advisory_input_field_requests(
+    server: &SplashLanguageServer,
+    uri: &Uri,
+    source: &str,
+) {
+    for field_name in ["filters", "category"] {
+        let Some(start_byte) = source.find(field_name) else {
+            return;
+        };
+        let position = position_at_byte(source, start_byte + 1);
+        let _ = server.completion(uri, position);
+        let _ = server.hover(uri, position);
+        let _ = server.signature_help(uri, position);
+    }
 }
 
 #[cfg(fuzzing)]
@@ -4219,32 +4270,8 @@ fn module_catalog_input_field_completion(
         is_incomplete,
         items: Vec::new(),
     };
-    if imports.truncated
-        || catalog.unavailable
-        || site.context.callee.member.end_byte > lexical.valid_prefix_end_byte
-        || site.field.end_byte > lexical.valid_prefix_end_byte
-        || site.context.callee.member.end_byte > imports.valid_prefix_end_byte
-    {
-        return empty();
-    }
-    let Some(module) = module_catalog_direct_member(
-        source,
-        lexical,
-        imports,
-        shapes,
-        catalog,
-        site.context.callee,
-    ) else {
-        return empty();
-    };
-    if module.call_mode.is_none() || module.call_shape != Some(ModuleCatalogCallShape::SingleJson) {
-        return empty();
-    }
-    let Some(root_fields) = &module.input_fields else {
-        return empty();
-    };
     let Some(fields) =
-        module_catalog_input_fields_at_parent(root_fields, site.parent_field.as_deref())
+        module_catalog_input_fields_for_site(source, lexical, imports, shapes, catalog, &site)
     else {
         return empty();
     };
@@ -4297,6 +4324,64 @@ fn module_catalog_input_field_text(field: &ModuleCatalogRecordFieldCompletion) -
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
     );
     value
+}
+
+/// Finds the retained input-field list at one exact direct literal-record
+/// source site. Both completion and hover use this narrow advisory lookup so
+/// neither can resolve modules, interpret a schema, or diverge on alias and
+/// safe-prefix checks.
+fn module_catalog_input_fields_for_site<'catalog>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
+    catalog: &'catalog ModuleCompletionCatalog,
+    site: &DirectModuleInputRecordCompletionSite,
+) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
+    if imports.truncated
+        || catalog.unavailable
+        || site.context.callee.member.end_byte > lexical.valid_prefix_end_byte
+        || site.field.end_byte > lexical.valid_prefix_end_byte
+        || site.context.callee.member.end_byte > imports.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let module = module_catalog_direct_member(
+        source,
+        lexical,
+        imports,
+        shapes,
+        catalog,
+        site.context.callee,
+    )?;
+    if module.call_mode.is_none() || module.call_shape != Some(ModuleCatalogCallShape::SingleJson) {
+        return None;
+    }
+    let root_fields = module.input_fields.as_deref()?;
+    module_catalog_input_fields_at_parent(root_fields, site.parent_field.as_deref())
+}
+
+/// Finds the one exact host-projected input field named by a complete source
+/// key. A duplicate prior source key is deliberately not hoverable: no
+/// advisory type should appear for a malformed retained record prefix.
+fn module_catalog_input_field_for_site<'catalog>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
+    catalog: &'catalog ModuleCompletionCatalog,
+    site: &DirectModuleInputRecordCompletionSite,
+) -> Option<&'catalog ModuleCatalogRecordFieldCompletion> {
+    if lexical.symbols_truncated || lexical.sites_truncated {
+        return None;
+    }
+    let field_name = source.get(site.field.start_byte..site.field.end_byte)?;
+    if !is_canonical_identifier(field_name) || site.declared_fields.contains(field_name) {
+        return None;
+    }
+    module_catalog_input_fields_for_site(source, lexical, imports, shapes, catalog, site)?
+        .iter()
+        .find(|field| field.name == field_name)
 }
 
 fn module_catalog_input_fields_at_parent<'catalog>(
@@ -10574,6 +10659,61 @@ mod tests {
         assert!(value.contains("Requested category."));
         assert!(value.contains("capability authorization remain host-owned"));
 
+        let hover_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({filters: {category: \"news\"}})"
+        );
+        let mut hover_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        hover_server.open_document(document(1, hover_source));
+        let filters_start = hover_source.find("filters:").expect("root field exists");
+        let filters_hover = hover_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hover_source, filters_start + 1),
+            )
+            .expect("root input-field hover succeeds")
+            .expect("reviewed root input field has hover metadata");
+        assert_eq!(
+            filters_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory direct-module input field `filters`.\nType: object\nRequired: yes\n\nReviewed filters.\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.".to_owned(),
+            })
+        );
+        assert_eq!(
+            filters_hover.range,
+            Some(Range::new(
+                position_at_byte(hover_source, filters_start),
+                position_at_byte(hover_source, filters_start + "filters".len()),
+            ))
+        );
+
+        let category_start = hover_source.find("category:").expect("child field exists");
+        let category_hover = hover_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hover_source, category_start + 1),
+            )
+            .expect("child input-field hover succeeds")
+            .expect("reviewed child input field has hover metadata");
+        assert_eq!(
+            category_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory direct-module input field `category`.\nType: string\nRequired: yes\n\nRequested category.\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.".to_owned(),
+            })
+        );
+        assert_eq!(
+            category_hover.range,
+            Some(Range::new(
+                position_at_byte(hover_source, category_start),
+                position_at_byte(hover_source, category_start + "category".len()),
+            ))
+        );
+
         let empty_source = concat!(
             "use mod.arithmetic\n",
             "let result = arithmetic.inspect({filters: {}})"
@@ -10662,6 +10802,16 @@ mod tests {
             .expect("duplicate child record completion request succeeds")
             .items
             .is_empty());
+        let duplicate_key_start = duplicate_source
+            .rfind("category:")
+            .expect("second duplicate child field exists");
+        assert!(duplicate_server
+            .hover(
+                &test_uri(),
+                position_at_byte(duplicate_source, duplicate_key_start + 1),
+            )
+            .expect("duplicate child hover request succeeds")
+            .is_none());
 
         let deeper_source = concat!(
             "use mod.arithmetic\n",
