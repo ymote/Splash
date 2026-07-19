@@ -24,9 +24,9 @@ use makepad_script::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub use serde_json::{json, Value as JsonValue};
 use splash_core::{
-    decode_bounded_script_json, encode_bounded_script_json, is_canonical_identifier, vm,
-    Evaluation, ExecutionLimits, Runtime, RuntimeError, DEFAULT_MAX_JSON_DATA_BYTES,
-    DEFAULT_MAX_JSON_DATA_DEPTH,
+    decode_bounded_script_json, encode_bounded_script_json, imported_module_call_hint_report_named,
+    is_canonical_identifier, vm, Evaluation, ExecutionLimits, Runtime, RuntimeError,
+    DEFAULT_MAX_JSON_DATA_BYTES, DEFAULT_MAX_JSON_DATA_DEPTH,
 };
 pub use splash_protocol::{
     canonical_operation_input_bytes, AuthenticatedWorkerMessage, CapabilityManifest,
@@ -604,6 +604,34 @@ pub struct CapabilityModuleMethodDescriptor {
 pub struct ModuleInterfaceDescriptor {
     pub path: String,
     pub description: String,
+}
+
+/// One host-resolved advisory direct capability-module call site.
+///
+/// The mapping is taken from the runtime's setup-defined module catalog. It
+/// does not issue a lease, approve a workflow, or prove that the call will be
+/// reached at runtime; the returned `tool` still needs an explicit capability
+/// grant before evaluation can reserve it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityModuleCallHint {
+    pub module: String,
+    pub method: String,
+    pub tool: String,
+    pub line: usize,
+    pub column: usize,
+    pub callee_start_byte: usize,
+    pub callee_end_byte: usize,
+}
+
+/// Bounded host-resolved direct capability-module call review output.
+///
+/// `truncated` propagates an incomplete source-level lexical/import report.
+/// It never changes runtime authority, which remains enforced by the active
+/// capability lease and target-tool policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CapabilityModuleCallHintReport {
+    pub hints: Vec<CapabilityModuleCallHint>,
+    pub truncated: bool,
 }
 
 /// Rejection while a host configures a direct capability module.
@@ -4178,6 +4206,62 @@ impl CapabilityRuntime {
         self.capability_modules.values().cloned().collect()
     }
 
+    /// Resolves exact visible direct capability-module calls in canonical
+    /// source against this runtime's current setup-defined module catalog.
+    ///
+    /// This is an effect-free review aid. It neither evaluates source nor
+    /// seals the catalog, issues a lease, or treats a source hint as authority.
+    /// Hosts must still grant the returned target tool before execution.
+    pub fn capability_module_call_hint_report(
+        &self,
+        source: &str,
+    ) -> Result<CapabilityModuleCallHintReport, RuntimeError> {
+        self.capability_module_call_hint_report_named("inline.splash", source)
+    }
+
+    /// Resolves exact visible direct capability-module calls in named
+    /// canonical source against this runtime's current setup-defined catalog.
+    ///
+    /// Only flat `use mod.<name>` imports that match a registered direct
+    /// capability module, and methods that match its reviewed mapping, appear
+    /// in the output. Unknown modules and methods remain absent rather than
+    /// being inferred. The result is advisory and can become stale if the host
+    /// changes its setup catalog before issuing a later lease.
+    pub fn capability_module_call_hint_report_named(
+        &self,
+        file: &str,
+        source: &str,
+    ) -> Result<CapabilityModuleCallHintReport, RuntimeError> {
+        let report = imported_module_call_hint_report_named(file, source, self.runtime.limits())?;
+        let hints = report
+            .hints
+            .into_iter()
+            .filter_map(|hint| {
+                if hint.module_path.len() != 2 || hint.module_path[0] != "mod" {
+                    return None;
+                }
+                let module = self.capability_modules.get(&hint.module_path[1])?;
+                let method = module
+                    .methods
+                    .iter()
+                    .find(|method| method.name == hint.method)?;
+                Some(CapabilityModuleCallHint {
+                    module: module.name.clone(),
+                    method: hint.method,
+                    tool: method.tool.clone(),
+                    line: hint.line,
+                    column: hint.column,
+                    callee_start_byte: hint.callee_start_byte,
+                    callee_end_byte: hint.callee_end_byte,
+                })
+            })
+            .collect();
+        Ok(CapabilityModuleCallHintReport {
+            hints,
+            truncated: report.truncated,
+        })
+    }
+
     /// Returns a bounded flat interface projection compatible with the LSP
     /// `moduleCatalog` configuration shape. This remains host-selected,
     /// advisory editor metadata; it does not let an editor query or authorize
@@ -5681,6 +5765,69 @@ mod tests {
         assert_eq!(runtime.audit().len(), 2);
         assert_eq!(runtime.audit()[1].tool, "math.add");
         assert_eq!(runtime.audit()[1].outcome, AuditOutcome::Denied);
+    }
+
+    #[test]
+    fn capability_module_call_hints_resolve_only_visible_reviewed_mappings() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integers."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+
+        let source = "use mod.arithmetic\n\
+                      use mod.tool\n\
+                      arithmetic.add({left: 20, right: 22})\n\
+                      tool.call_json(\"math.add\", {left: 20, right: 22})\n\
+                      let arithmetic = {}\n\
+                      arithmetic.add({})\n\
+                      use mod.unknown\n\
+                      unknown.add({})";
+        let report = runtime
+            .capability_module_call_hint_report(source)
+            .expect("canonical source resolves reviewed direct module calls");
+        let callee_start_byte = source.find("arithmetic.add").unwrap();
+
+        assert!(!report.truncated);
+        assert_eq!(
+            report.hints,
+            vec![CapabilityModuleCallHint {
+                module: "arithmetic".to_owned(),
+                method: "add".to_owned(),
+                tool: "math.add".to_owned(),
+                line: 3,
+                column: 1,
+                callee_start_byte,
+                callee_end_byte: callee_start_byte + "arithmetic.add".len(),
+            }]
+        );
+        assert!(runtime.audit().is_empty());
+
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.other"),
+                ToolMetadata::new("Returns another reviewed integer result."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("other", "Another reviewed adapter.")
+                    .with_method("add", "math.other"),
+            )
+            .expect("review metadata must not seal the setup catalog");
+        assert_eq!(runtime.capability_module_catalog().len(), 2);
     }
 
     #[test]

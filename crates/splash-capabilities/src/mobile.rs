@@ -21,9 +21,10 @@ use splash_core::{Evaluation, ExecutionLimits, RuntimeError};
 
 use crate::{
     fixed_file_catalog::FixedFileCatalog, CapabilityCatalogLimits, CapabilityModule,
-    CapabilityModuleDescriptor, CapabilityModuleLimits, CapabilityModuleRegistrationError,
-    CapabilityRuntime, JsonToolContract, JsonValue, ModuleInterfaceDescriptor, PumpReport,
-    ToolError, ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
+    CapabilityModuleCallHintReport, CapabilityModuleDescriptor, CapabilityModuleLimits,
+    CapabilityModuleRegistrationError, CapabilityRuntime, JsonToolContract, JsonValue,
+    ModuleInterfaceDescriptor, PumpReport, ToolError, ToolMetadata, ToolPolicy,
+    ToolRegistrationError, ToolRequest,
 };
 
 /// Setup-only builder for a static mobile or embedded capability catalog.
@@ -375,6 +376,30 @@ impl MobileRuntime {
         self.runtime.capability_module_catalog()
     }
 
+    /// Resolves exact visible direct capability-module calls against the
+    /// sealed setup catalog for an LLM or operator review surface.
+    ///
+    /// This is read-only advisory metadata. It does not evaluate source,
+    /// expose registration, issue a lease, or grant the returned target tool.
+    pub fn capability_module_call_hint_report(
+        &self,
+        source: &str,
+    ) -> Result<CapabilityModuleCallHintReport, RuntimeError> {
+        self.runtime.capability_module_call_hint_report(source)
+    }
+
+    /// Resolves exact visible direct capability-module calls in named source
+    /// against the sealed setup catalog. The result remains advisory metadata
+    /// and cannot widen the sealed capability surface.
+    pub fn capability_module_call_hint_report_named(
+        &self,
+        file: &str,
+        source: &str,
+    ) -> Result<CapabilityModuleCallHintReport, RuntimeError> {
+        self.runtime
+            .capability_module_call_hint_report_named(file, source)
+    }
+
     /// Returns the advisory LSP `moduleCatalog` projection for the sealed
     /// direct module interface. This data is host-facing and does not grant a
     /// capability to an editor.
@@ -543,6 +568,18 @@ mod tests {
             .expect("static direct module registers");
 
         let mut runtime = builder.build();
+        let review = runtime
+            .capability_module_call_hint_report(
+                "use mod.arithmetic\n\
+                 arithmetic.add({left: 20, right: 22})",
+            )
+            .expect("sealed direct module review succeeds");
+        assert!(!review.truncated);
+        assert_eq!(review.hints.len(), 1);
+        assert_eq!(review.hints[0].module, "arithmetic");
+        assert_eq!(review.hints[0].method, "add");
+        assert_eq!(review.hints[0].tool, "math.add");
+        assert!(runtime.audit().is_empty());
         let report = runtime
             .eval(
                 "use mod.arithmetic\n\

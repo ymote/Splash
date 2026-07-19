@@ -7,13 +7,14 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
-    ModuleImportReport, SourceSpan, StaticRecordAlias, StaticRecordField, StaticRecordNestedShape,
-    StaticRecordShape, StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport,
-    ToolCallKind, TopLevelDeclaration, TopLevelDeclarationKind, MAX_LEXICAL_COMPLETION_SITES,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES,
-    MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
-    MAX_TOOL_CALL_HINTS,
+    ImportedModuleCallHint, ImportedModuleCallHintReport, LexicalCompletionReport, LexicalSymbol,
+    LexicalSymbolKind, LexicalSymbolReport, ModuleImport, ModuleImportReport, SourceSpan,
+    StaticRecordAlias, StaticRecordField, StaticRecordNestedShape, StaticRecordShape,
+    StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind,
+    TopLevelDeclaration, TopLevelDeclarationKind, MAX_IMPORTED_MODULE_CALL_HINTS,
+    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
+    MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_SHAPES,
+    MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
 };
 
 pub(super) struct ProfileReport {
@@ -194,6 +195,31 @@ pub(super) fn collect_tool_call_hints(source: &str, max_tokens: usize) -> ToolCa
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
     tool_call_hints_from_tokens(source, &tokens)
+}
+
+/// Extracts direct member calls only when the receiver has an exact, visible
+/// `use mod.<path>` binding in the complete bounded lexical report. The caller
+/// has already confirmed canonical VM-compatible source, so this stays an
+/// effect-free source metadata pass rather than a module resolver.
+pub(super) fn collect_imported_module_call_hints(
+    source: &str,
+    max_tokens: usize,
+    symbols: &LexicalSymbolReport,
+    imports: &ModuleImportReport,
+) -> ImportedModuleCallHintReport {
+    // An omitted definition can shadow a retained import, and an omitted
+    // import can hide a later matching call. Do not publish partial mappings
+    // as if they were scope-resolved.
+    if symbols.truncated || imports.truncated {
+        return ImportedModuleCallHintReport {
+            hints: Vec::new(),
+            truncated: true,
+        };
+    }
+
+    let lexer = ProfileLexer::new(source, max_tokens);
+    let (tokens, _, _) = lexer.tokenize();
+    imported_module_call_hints_from_tokens(source, &tokens, &symbols.symbols, &imports.imports)
 }
 
 /// Formats source after validating the canonical grammar without evaluating it.
@@ -631,6 +657,91 @@ fn tool_call_hints_from_tokens(source: &str, tokens: &[Token]) -> ToolCallHintRe
     }
 
     ToolCallHintReport { hints, truncated }
+}
+
+fn imported_module_call_hints_from_tokens(
+    source: &str,
+    tokens: &[Token],
+    symbols: &[LexicalSymbol],
+    imports: &[ModuleImport],
+) -> ImportedModuleCallHintReport {
+    let mut hints = Vec::new();
+    let mut truncated = false;
+
+    for index in 0..tokens.len() {
+        let Some(receiver) = tokens.get(index) else {
+            continue;
+        };
+        let TokenKind::Identifier(_) = &receiver.kind else {
+            continue;
+        };
+        let Some(separator) = tokens.get(index + 1) else {
+            continue;
+        };
+        let Some(method) = tokens.get(index + 2) else {
+            continue;
+        };
+        let Some(opening) = tokens.get(index + 3) else {
+            continue;
+        };
+        let TokenKind::Identifier(method_name) = &method.kind else {
+            continue;
+        };
+        if !is_operator(&separator.kind, ".")
+            || !matches!(opening.kind, TokenKind::OpenRound)
+            || (index > 0 && is_operator(&tokens[index - 1].kind, "."))
+        {
+            continue;
+        }
+
+        let receiver_span = SourceSpan {
+            start_byte: receiver.start_byte,
+            end_byte: receiver.end_byte,
+        };
+        let Some(import) = visible_import_for_receiver(source, symbols, imports, receiver_span)
+        else {
+            continue;
+        };
+
+        if hints.len() == MAX_IMPORTED_MODULE_CALL_HINTS {
+            truncated = true;
+            break;
+        }
+        hints.push(ImportedModuleCallHint {
+            module_path: import.path.clone(),
+            method: method_name.clone(),
+            line: receiver.line,
+            column: receiver.column,
+            callee_start_byte: receiver.start_byte,
+            callee_end_byte: method.end_byte,
+        });
+    }
+
+    ImportedModuleCallHintReport { hints, truncated }
+}
+
+fn visible_import_for_receiver<'imports>(
+    source: &str,
+    symbols: &[LexicalSymbol],
+    imports: &'imports [ModuleImport],
+    receiver: SourceSpan,
+) -> Option<&'imports ModuleImport> {
+    let receiver_name = source.get(receiver.start_byte..receiver.end_byte)?;
+    let symbol = symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.name == receiver_name
+                && symbol.visibility_start_byte <= receiver.start_byte
+                && receiver.start_byte < symbol.visibility_end_byte
+        })
+        .max_by_key(|symbol| (symbol.visibility_start_byte, symbol.definition.start_byte))?;
+    (symbol.kind == LexicalSymbolKind::Import)
+        .then(|| {
+            imports
+                .iter()
+                .find(|import| import.binding == symbol.definition)
+        })
+        .flatten()
 }
 
 fn direct_tool_call_kind(tokens: &[Token], index: usize) -> Option<ToolCallKind> {

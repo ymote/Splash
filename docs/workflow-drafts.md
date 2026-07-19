@@ -207,6 +207,14 @@ without echoing raw source or an invalid step ID. The command exits nonzero for
 either kind of rejection. It does not print or infer grants and never evaluates
 the draft.
 
+The default command creates no capability runtime. A host that has already
+selected a direct-module catalog may add a separate advisory projection for
+exact direct module calls and their mapped underlying tools. The development
+CLI demonstrates that bounded projection with `--allow-json-add`, which adds
+`direct_module_calls` and `direct_module_calls_truncated` to each valid step.
+It still does not create a grant: the host must select the underlying tool name
+when it later approves the plan.
+
 ## CLI Demonstration Execution
 
 The development CLI also exposes a deliberately narrow local execution path:

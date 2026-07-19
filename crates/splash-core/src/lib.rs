@@ -19,11 +19,11 @@ pub use makepad_script as vm;
 #[cfg(any(fuzzing, test))]
 use profile::check_canonical_profile;
 use profile::{
-    canonical_parser_prefix_end_byte, collect_lexical_completions, collect_lexical_symbols,
-    collect_module_imports, collect_static_record_shapes, collect_tool_call_hints,
-    collect_top_level_declarations, format_canonical_source,
-    is_canonical_identifier as profile_is_canonical_identifier, lower_canonical_source_for_vm,
-    ProfileFormatError, ProfileReport,
+    canonical_parser_prefix_end_byte, collect_imported_module_call_hints,
+    collect_lexical_completions, collect_lexical_symbols, collect_module_imports,
+    collect_static_record_shapes, collect_tool_call_hints, collect_top_level_declarations,
+    format_canonical_source, is_canonical_identifier as profile_is_canonical_identifier,
+    lower_canonical_source_for_vm, ProfileFormatError, ProfileReport,
 };
 pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
@@ -90,6 +90,14 @@ pub const MAX_SYNTAX_DIAGNOSTICS: usize = 32;
 /// source and token limits. Use [`ToolCallHintReport::truncated`] to detect
 /// when a source contains additional direct call sites.
 pub const MAX_TOOL_CALL_HINTS: usize = 1_024;
+/// Maximum scope-resolved imported-module member-call hints retained for one
+/// canonical source document.
+///
+/// This is independent of [`MAX_TOOL_CALL_HINTS`] because a host may present
+/// direct `mod.tool` and reviewed direct-module calls as separate advisory
+/// review surfaces. Use [`ImportedModuleCallHintReport::truncated`] to detect
+/// omitted sites or a lexical/import index that could not resolve every site.
+pub const MAX_IMPORTED_MODULE_CALL_HINTS: usize = 1_024;
 /// Maximum complete `use mod.<path>` declarations retained in one
 /// source-only import report.
 ///
@@ -683,6 +691,35 @@ pub struct ToolCallHintReport {
     pub truncated: bool,
 }
 
+/// A bounded, scope-resolved hint for an exact direct member call on a visible
+/// `use mod.<path>` binding.
+///
+/// `module_path` is the source import path, including its initial `"mod"`
+/// segment. The callee span covers the direct `binding.method` spelling. This
+/// is source metadata only: it does not load the import, prove the module is
+/// installed, or grant the method any authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedModuleCallHint {
+    pub module_path: Vec<String>,
+    pub method: String,
+    pub line: usize,
+    pub column: usize,
+    pub callee_start_byte: usize,
+    pub callee_end_byte: usize,
+}
+
+/// Bounded direct imported-module member-call review output.
+///
+/// `truncated` is true when additional matching sites were omitted or when
+/// the bounded lexical/import metadata cannot resolve the complete source.
+/// Callers must treat that state as incomplete. The report is advisory and is
+/// never an authorization decision.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportedModuleCallHintReport {
+    pub hints: Vec<ImportedModuleCallHint>,
+    pub truncated: bool,
+}
+
 impl Evaluation {
     pub fn succeeded(&self) -> bool {
         !self.value.is_err()
@@ -938,6 +975,16 @@ impl<H: Any, S: Any> Runtime<H, S> {
     /// direct call sites were omitted at the fixed review limit.
     pub fn tool_call_hint_report(&self, source: &str) -> Result<ToolCallHintReport, RuntimeError> {
         tool_call_hint_report_named("inline.splash", source, self.limits)
+    }
+
+    /// Lists bounded exact member calls on visible `use mod.<path>` bindings
+    /// without evaluating bytecode, loading a module, or entering a host
+    /// binding. This is advisory source metadata only.
+    pub fn imported_module_call_hint_report(
+        &self,
+        source: &str,
+    ) -> Result<ImportedModuleCallHintReport, RuntimeError> {
+        imported_module_call_hint_report_named("inline.splash", source, self.limits)
     }
 
     /// Builds bounded source-only import metadata without evaluating bytecode,
@@ -1212,6 +1259,23 @@ pub fn tool_call_hints(source: &str) -> Result<Vec<ToolCallHint>, RuntimeError> 
 /// sites; `truncated` records whether later direct sites were omitted.
 pub fn tool_call_hint_report(source: &str) -> Result<ToolCallHintReport, RuntimeError> {
     tool_call_hint_report_named("inline.splash", source, ExecutionLimits::default())
+}
+
+/// Lists bounded exact member calls on visible `use mod.<path>` bindings in
+/// valid canonical Splash without evaluating source, loading a module, or
+/// creating a capability host.
+///
+/// This is an LLM and operator-review aid, not static authorization. It
+/// resolves only the receiver's visible lexical import binding and does not
+/// infer aliases, computed receivers, module exports, method types, control
+/// flow, reachability, or runtime values. Invalid or VM-incompatible source
+/// produces no hints. `truncated` means the result is incomplete, either
+/// because matching sites exceeded [`MAX_IMPORTED_MODULE_CALL_HINTS`] or the
+/// bounded lexical/import metadata could not resolve every site.
+pub fn imported_module_call_hint_report(
+    source: &str,
+) -> Result<ImportedModuleCallHintReport, RuntimeError> {
+    imported_module_call_hint_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
 /// Formats canonical Splash source with default bounds without evaluating it.
@@ -1589,6 +1653,41 @@ pub fn tool_call_hint_report_named(
     }
 
     Ok(collect_tool_call_hints(source, limits.max_syntax_tokens))
+}
+
+/// Lists bounded exact member calls on visible `use mod.<path>` bindings in
+/// named canonical Splash source.
+///
+/// This applies the same source, token, nesting, canonical-profile, and
+/// vendored parser-compatibility checks as [`check_syntax_named`]. It reports
+/// no hints for invalid source, never loads an import or resolves a runtime
+/// module, and cannot grant authority. Hosts must still validate every actual
+/// operation at their capability boundary.
+pub fn imported_module_call_hint_report_named(
+    file: &str,
+    source: &str,
+    limits: ExecutionLimits,
+) -> Result<ImportedModuleCallHintReport, RuntimeError> {
+    let limits = limits.validate()?;
+    let syntax = check_syntax_named(file, source, limits)?;
+    if !syntax.valid {
+        return Ok(ImportedModuleCallHintReport::default());
+    }
+
+    let imports = collect_module_imports(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+        source.len(),
+    );
+    let symbols =
+        collect_lexical_symbols(source, limits.max_syntax_tokens, limits.max_syntax_nesting);
+    Ok(collect_imported_module_call_hints(
+        source,
+        limits.max_syntax_tokens,
+        &symbols,
+        &imports,
+    ))
 }
 
 /// Formats named canonical Splash source without evaluating it.
@@ -3689,6 +3788,93 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
 
         let runtime = Runtime::default();
         assert_eq!(runtime.tool_call_hint_report(&source).unwrap(), report);
+    }
+
+    #[test]
+    fn outlines_scope_resolved_imported_module_calls() {
+        let source = "use mod.arithmetic\n\
+                      use mod.tool\n\
+                      arithmetic.add({left: 20, right: 22})\n\
+                      tool.call(\"text.echo\", \"review\")\n\
+                      let arithmetic = {}\n\
+                      arithmetic.add({})\n\
+                      fn nested() {\n\
+                          use mod.catalog.client\n\
+                          client.lookup({id: 42})\n\
+                      }";
+
+        let report = imported_module_call_hint_report(source)
+            .expect("canonical source has imported-module call hints");
+
+        assert!(!report.truncated);
+        assert_eq!(report.hints.len(), 3);
+        assert_eq!(report.hints[0].module_path, ["mod", "arithmetic"]);
+        assert_eq!(report.hints[0].method, "add");
+        assert_eq!(report.hints[1].module_path, ["mod", "tool"]);
+        assert_eq!(report.hints[1].method, "call");
+        assert_eq!(report.hints[2].module_path, ["mod", "catalog", "client"]);
+        assert_eq!(report.hints[2].method, "lookup");
+        assert_eq!(
+            report
+                .hints
+                .iter()
+                .map(|hint| &source[hint.callee_start_byte..hint.callee_end_byte])
+                .collect::<Vec<_>>(),
+            ["arithmetic.add", "tool.call", "client.lookup"]
+        );
+
+        let runtime = Runtime::default();
+        assert_eq!(
+            runtime.imported_module_call_hint_report(source).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn imported_module_call_hints_fail_closed_when_the_lexical_index_is_truncated() {
+        let mut source = String::from("use mod.target\n");
+        for _ in 0..MAX_LEXICAL_SYMBOL_OCCURRENCES {
+            source.push_str("target.call()\n");
+        }
+
+        let report = imported_module_call_hint_report(&source)
+            .expect("generated source remains within canonical bounds");
+
+        assert!(report.hints.is_empty());
+        assert!(report.truncated);
+    }
+
+    #[test]
+    fn imported_module_call_hints_fail_closed_when_the_import_index_is_truncated() {
+        let mut source = String::new();
+        for index in 0..=MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("module_0.call()\n");
+
+        let report = imported_module_call_hint_report(&source)
+            .expect("generated source remains within canonical bounds");
+
+        assert!(report.hints.is_empty());
+        assert!(report.truncated);
+    }
+
+    #[test]
+    fn bounds_imported_module_call_hints_with_a_truncation_signal() {
+        let mut source = String::from("use mod.target\n");
+        for _ in 0..=MAX_IMPORTED_MODULE_CALL_HINTS {
+            source.push_str("target.call()\n");
+        }
+
+        let report = imported_module_call_hint_report(&source)
+            .expect("generated source remains within canonical bounds");
+
+        assert_eq!(report.hints.len(), MAX_IMPORTED_MODULE_CALL_HINTS);
+        assert!(report.truncated);
+        assert!(report
+            .hints
+            .iter()
+            .all(|hint| hint.module_path == ["mod", "target"] && hint.method == "call"));
     }
 
     #[test]

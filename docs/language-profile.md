@@ -213,6 +213,17 @@ evaluates source or creates a capability host. It is therefore a review
 presentation, not static authorization: the host must still issue a capability
 lease and runtime reservation validates every actual call.
 
+Core also provides `imported_module_call_hint_report` for an exact
+scope-resolved `binding.method(...)` spelling whose receiver is a visible
+`use mod.<path>` binding. This is still source metadata: it does not load the
+module or know whether an imported path is installed. A `CapabilityRuntime`
+can match those hints against its own bounded setup-defined direct capability
+module catalog through `capability_module_call_hint_report`; only an exact
+flat registered mapping becomes an advisory target-tool hint. The
+capability-resolved report fails closed with an empty mapping and
+`truncated: true` if its bounded lexical or import metadata is incomplete.
+Neither report creates a policy, lease, or authority.
+
 For an ordered LLM workflow, `WorkflowPlan::review` returns one data-only
 `WorkflowStepReview` per trusted step. Each item contains the step ID,
 canonical syntax report, and direct tool-call hints only when that step is

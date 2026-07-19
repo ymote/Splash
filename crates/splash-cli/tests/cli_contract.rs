@@ -111,10 +111,82 @@ fn direct_module_catalog_is_explicit_and_the_demo_source_runs() {
     assert_eq!(catalog[0]["methods"][0]["tool"], "math.add");
 
     let source = example_path("direct_module_workflow.splash");
+    let source_only_review = run_splash(vec!["tool-calls".to_owned(), source.clone()]);
+    assert!(
+        source_only_review.status.success(),
+        "stderr: {}",
+        stderr(&source_only_review)
+    );
+    assert_eq!(
+        json_stdout(&source_only_review)["direct_module_calls"],
+        serde_json::json!([])
+    );
+
+    let configured_review = run_splash(vec![
+        "tool-calls".to_owned(),
+        "--allow-json-add".to_owned(),
+        source.clone(),
+    ]);
+    assert!(
+        configured_review.status.success(),
+        "stderr: {}",
+        stderr(&configured_review)
+    );
+    let configured_review = json_stdout(&configured_review);
+    assert_eq!(configured_review["tool_calls"], serde_json::json!([]));
+    assert_eq!(
+        configured_review["direct_module_calls"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["module"],
+        "arithmetic"
+    );
+    assert_eq!(configured_review["direct_module_calls"][0]["method"], "add");
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["tool"],
+        "math.add"
+    );
+
     let execution = run_splash(vec![
         "run".to_owned(),
         "--allow-json-add".to_owned(),
         source,
     ]);
     assert!(execution.status.success(), "stderr: {}", stderr(&execution));
+
+    let draft = example_path("direct_module_workflow_draft.json");
+    let workflow_review = run_splash(vec![
+        "workflow-review".to_owned(),
+        "--allow-json-add".to_owned(),
+        draft.clone(),
+    ]);
+    assert!(
+        workflow_review.status.success(),
+        "stderr: {}",
+        stderr(&workflow_review)
+    );
+    let workflow_review = json_stdout(&workflow_review);
+    assert_eq!(
+        workflow_review["steps"][0]["direct_module_calls"][0]["tool"],
+        "math.add"
+    );
+
+    let workflow_execution = run_splash(vec![
+        "workflow-run".to_owned(),
+        "--allow-json-add".to_owned(),
+        "--grant".to_owned(),
+        "calculate:math.add:1".to_owned(),
+        draft,
+    ]);
+    assert!(
+        workflow_execution.status.success(),
+        "stderr: {}",
+        stderr(&workflow_execution)
+    );
+    let workflow_execution = json_stdout(&workflow_execution);
+    assert_eq!(workflow_execution["status"], "completed");
+    assert_eq!(workflow_execution["audit"][0]["tool"], "math.add");
 }

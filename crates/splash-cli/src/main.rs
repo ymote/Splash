@@ -6,8 +6,9 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use splash_capabilities::{
-    json, CapabilityLeaseGrant, CapabilityModule, CapabilityRuntime, JsonToolContract,
-    JsonToolRequest, JsonValue, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy, ToolRequest,
+    json, CapabilityLeaseGrant, CapabilityModule, CapabilityModuleCallHint,
+    CapabilityModuleCallHintReport, CapabilityRuntime, JsonToolContract, JsonToolRequest,
+    JsonValue, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy, ToolRequest,
 };
 use splash_core::{
     check_syntax_named, format_source_named, tool_call_hint_report_named,
@@ -21,7 +22,7 @@ use splash_workflow::{
     mobile::{MobileWorkflowBuilder, MobileWorkflowRuntime},
     workflow_draft_json_schema, WorkflowData, WorkflowDraft, WorkflowDraftError, WorkflowError,
     WorkflowEvent, WorkflowPlan, WorkflowStepCapabilityPolicy, MAX_WORKFLOW_DATA_BYTES,
-    MAX_WORKFLOW_DRAFT_BYTES, MAX_WORKFLOW_STEP_ID_BYTES,
+    MAX_WORKFLOW_DRAFT_BYTES, MAX_WORKFLOW_REVIEW_TOOL_CALL_HINTS, MAX_WORKFLOW_STEP_ID_BYTES,
 };
 
 const MAX_WORKFLOW_CLI_GRANTS: usize = 4_096;
@@ -101,10 +102,10 @@ fn run_options(options: CliOptions) -> Result<(), String> {
         return run_outline(file, source);
     }
     if let CliCommand::ToolCalls { file, source } = &options.command {
-        return run_tool_calls(file, source);
+        return run_tool_calls(file, source, options.allow_json_add);
     }
     if let CliCommand::WorkflowReview { file, source } = &options.command {
-        return run_workflow_review(file, source);
+        return run_workflow_review(file, source, options.allow_json_add);
     }
     if matches!(&options.command, CliCommand::WorkflowSchema) {
         return run_workflow_schema();
@@ -261,8 +262,8 @@ fn profile_output() -> JsonValue {
             "format": "splash format [--check] <file>",
             "check": "splash check <file>",
             "outline": "splash outline <file>",
-            "tool_calls": "splash tool-calls <file>",
-            "workflow_review": "splash workflow-review <draft.json>",
+            "tool_calls": "splash tool-calls [--allow-json-add] <file>",
+            "workflow_review": "splash workflow-review [--allow-json-add] <draft.json>",
             "workflow_schema": "splash workflow-schema",
         },
         "tool_api": {
@@ -647,16 +648,18 @@ fn run_outline(file: &str, source: &str) -> Result<(), String> {
         .ok_or_else(|| "syntax check failed".to_owned())
 }
 
-fn run_tool_calls(file: &str, source: &str) -> Result<(), String> {
-    let (output, valid) = tool_calls_output(file, source)?;
+fn run_tool_calls(file: &str, source: &str, allow_json_add: bool) -> Result<(), String> {
+    let runtime = demo_direct_module_review_runtime(allow_json_add)?;
+    let (output, valid) = tool_calls_output_with_modules(file, source, runtime.as_ref())?;
     println!("{output}");
     valid
         .then_some(())
         .ok_or_else(|| "syntax check failed".to_owned())
 }
 
-fn run_workflow_review(_file: &str, source: &str) -> Result<(), String> {
-    let (output, valid) = workflow_review_output(source)?;
+fn run_workflow_review(_file: &str, source: &str, allow_json_add: bool) -> Result<(), String> {
+    let runtime = demo_direct_module_review_runtime(allow_json_add)?;
+    let (output, valid) = workflow_review_output_with_modules(source, runtime.as_ref())?;
     println!("{output}");
     valid
         .then_some(())
@@ -704,7 +707,16 @@ fn outline_output(file: &str, source: &str) -> Result<(JsonValue, bool), String>
     ))
 }
 
+#[cfg(test)]
 fn tool_calls_output(file: &str, source: &str) -> Result<(JsonValue, bool), String> {
+    tool_calls_output_with_modules(file, source, None)
+}
+
+fn tool_calls_output_with_modules(
+    file: &str,
+    source: &str,
+    runtime: Option<&CapabilityRuntime>,
+) -> Result<(JsonValue, bool), String> {
     let report = check_syntax_named(file, source, ExecutionLimits::default())
         .map_err(|error| error.to_string())?;
     let (tool_calls, tool_calls_truncated) = if report.valid {
@@ -721,6 +733,11 @@ fn tool_calls_output(file: &str, source: &str) -> Result<(JsonValue, bool), Stri
     } else {
         (Vec::new(), false)
     };
+    let direct_module_calls = if report.valid {
+        capability_module_call_hint_report(runtime, file, source)?
+    } else {
+        CapabilityModuleCallHintReport::default()
+    };
     let valid = report.valid;
     Ok((
         json!({
@@ -729,34 +746,72 @@ fn tool_calls_output(file: &str, source: &str) -> Result<(JsonValue, bool), Stri
             "diagnostics": syntax_diagnostics_json(&report),
             "tool_calls": tool_calls,
             "tool_calls_truncated": tool_calls_truncated,
+            "direct_module_calls": direct_module_calls.hints.iter().map(capability_module_call_hint_json).collect::<Vec<_>>(),
+            "direct_module_calls_truncated": direct_module_calls.truncated,
         }),
         valid,
     ))
 }
 
+#[cfg(test)]
 fn workflow_review_output(source: &str) -> Result<(JsonValue, bool), String> {
+    workflow_review_output_with_modules(source, None)
+}
+
+fn workflow_review_output_with_modules(
+    source: &str,
+    runtime: Option<&CapabilityRuntime>,
+) -> Result<(JsonValue, bool), String> {
     match WorkflowDraft::from_json(source) {
-        Ok(draft) => workflow_review_json(&draft),
+        Ok(draft) => workflow_review_json_with_modules(&draft, runtime),
         Err(error) => Ok((workflow_draft_rejection_output(&error), false)),
     }
 }
 
 fn workflow_review_json(draft: &WorkflowDraft) -> Result<(JsonValue, bool), String> {
+    workflow_review_json_with_modules(draft, None)
+}
+
+fn workflow_review_json_with_modules(
+    draft: &WorkflowDraft,
+    runtime: Option<&CapabilityRuntime>,
+) -> Result<(JsonValue, bool), String> {
     let review = draft.review().map_err(|error| error.to_string())?;
     let valid = review.iter().all(|step| step.syntax.valid);
+    let mut retained_direct_module_calls = 0_usize;
     let steps = review
         .iter()
-        .map(|step| {
-            json!({
+        .zip(draft.steps())
+        .map(|(step, workflow_step)| {
+            let mut direct_module_calls = if step.syntax.valid {
+                capability_module_call_hint_report(
+                    runtime,
+                    &format!("workflow-step-{}.splash", step.step_id),
+                    &workflow_step.source,
+                )?
+            } else {
+                CapabilityModuleCallHintReport::default()
+            };
+            let remaining =
+                MAX_WORKFLOW_REVIEW_TOOL_CALL_HINTS.saturating_sub(retained_direct_module_calls);
+            if direct_module_calls.hints.len() > remaining {
+                direct_module_calls.hints.truncate(remaining);
+                direct_module_calls.truncated = true;
+            }
+            retained_direct_module_calls = retained_direct_module_calls
+                .saturating_add(direct_module_calls.hints.len());
+            Ok(json!({
                 "id": step.step_id,
                 "valid": step.syntax.valid,
                 "diagnostics_truncated": step.syntax.diagnostics_truncated,
                 "diagnostics": syntax_diagnostics_json(&step.syntax),
                 "tool_calls": step.tool_calls.iter().map(tool_call_hint_json).collect::<Vec<_>>(),
                 "tool_calls_truncated": step.tool_calls_truncated,
-            })
+                "direct_module_calls": direct_module_calls.hints.iter().map(capability_module_call_hint_json).collect::<Vec<_>>(),
+                "direct_module_calls_truncated": direct_module_calls.truncated,
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     Ok((
         json!({
             "valid": valid,
@@ -765,6 +820,33 @@ fn workflow_review_json(draft: &WorkflowDraft) -> Result<(JsonValue, bool), Stri
         }),
         valid,
     ))
+}
+
+fn demo_direct_module_review_runtime(
+    allow_json_add: bool,
+) -> Result<Option<CapabilityRuntime>, String> {
+    if !allow_json_add {
+        return Ok(None);
+    }
+
+    let mut runtime = CapabilityRuntime::default();
+    register_demo_tools(&mut runtime, false, true)?;
+    Ok(Some(runtime))
+}
+
+fn capability_module_call_hint_report(
+    runtime: Option<&CapabilityRuntime>,
+    file: &str,
+    source: &str,
+) -> Result<CapabilityModuleCallHintReport, String> {
+    runtime.map_or_else(
+        || Ok(CapabilityModuleCallHintReport::default()),
+        |runtime| {
+            runtime
+                .capability_module_call_hint_report_named(file, source)
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 /// Returns a finite, source-free structural rejection for an untrusted draft.
@@ -848,6 +930,20 @@ fn tool_call_hint_json(hint: &ToolCallHint) -> JsonValue {
             "end_byte": hint.callee_end_byte,
         },
         "name": name,
+    })
+}
+
+fn capability_module_call_hint_json(hint: &CapabilityModuleCallHint) -> JsonValue {
+    json!({
+        "module": hint.module,
+        "method": hint.method,
+        "tool": hint.tool,
+        "callee": {
+            "line": hint.line,
+            "column": hint.column,
+            "start_byte": hint.callee_start_byte,
+            "end_byte": hint.callee_end_byte,
+        },
     })
 }
 
@@ -1106,7 +1202,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
             allow_json_add,
         }),
         _ => Err(
-            "usage: splash profile | splash workflow-schema | splash check <file> | splash outline <file> | splash tool-calls <file> | splash workflow-review <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add] | splash module-catalog [--allow-json-add]".to_owned(),
+            "usage: splash profile | splash workflow-schema | splash check <file> | splash outline <file> | splash tool-calls [--allow-json-add] <file> | splash workflow-review [--allow-json-add] <draft.json> | splash workflow-run [--allow-echo] [--allow-json-add] [--input input.json] [--grant step-id:tool-name:max-calls] <draft.json> | splash format [--check] <file> | splash eval [--allow-echo] [--allow-json-add] '<source>' | splash run [--allow-echo] [--allow-json-add] <file> | splash catalog [--allow-echo] [--allow-json-add] | splash module-catalog [--allow-json-add]".to_owned(),
         ),
     }
 }
@@ -1114,6 +1210,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splash_workflow::WorkflowStep;
 
     #[test]
     fn parses_an_eval_invocation() {
@@ -1625,6 +1722,34 @@ mod tests {
         assert_eq!(tool_calls[1]["kind"], json!("start"));
         assert_eq!(tool_calls[1]["name"], json!({"kind": "dynamic"}));
         assert_eq!(output["tool_calls_truncated"], json!(false));
+        assert_eq!(output["direct_module_calls"], json!([]));
+        assert_eq!(output["direct_module_calls_truncated"], json!(false));
+    }
+
+    #[test]
+    fn tool_call_outline_resolves_a_configured_direct_module_to_its_target_tool() {
+        let mut runtime = CapabilityRuntime::default();
+        register_demo_tools(&mut runtime, false, true).unwrap();
+        let source = "use mod.arithmetic\n\
+                      arithmetic.add({left: 20, right: 22})";
+
+        let (output, valid) =
+            tool_calls_output_with_modules("generated.splash", source, Some(&runtime)).unwrap();
+
+        assert!(valid);
+        assert_eq!(output["tool_calls"], json!([]));
+        assert_eq!(output["direct_module_calls_truncated"], json!(false));
+        assert_eq!(
+            output["direct_module_calls"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            output["direct_module_calls"][0]["module"],
+            json!("arithmetic")
+        );
+        assert_eq!(output["direct_module_calls"][0]["method"], json!("add"));
+        assert_eq!(output["direct_module_calls"][0]["tool"], json!("math.add"));
+        assert!(runtime.audit().is_empty());
     }
 
     #[test]
@@ -1693,6 +1818,83 @@ mod tests {
             steps[1]["tool_calls"][0]["name"],
             json!({"kind": "dynamic"})
         );
+        assert_eq!(steps[0]["direct_module_calls"], json!([]));
+        assert_eq!(steps[0]["direct_module_calls_truncated"], json!(false));
+    }
+
+    #[test]
+    fn workflow_review_resolves_configured_direct_modules_without_granting_them() {
+        let mut runtime = CapabilityRuntime::default();
+        register_demo_tools(&mut runtime, false, true).unwrap();
+        let (output, valid) = workflow_review_output_with_modules(
+            r#"{
+                "format_version": 1,
+                "steps": [{
+                    "id": "calculate",
+                    "source": "use mod.arithmetic\nlet result = arithmetic.add({left: 20, right: 22})\nresult.total"
+                }]
+            }"#,
+            Some(&runtime),
+        )
+        .unwrap();
+
+        assert!(valid);
+        assert_eq!(output["steps"][0]["tool_calls"], json!([]));
+        assert_eq!(
+            output["steps"][0]["direct_module_calls"][0]["module"],
+            json!("arithmetic")
+        );
+        assert_eq!(
+            output["steps"][0]["direct_module_calls"][0]["method"],
+            json!("add")
+        );
+        assert_eq!(
+            output["steps"][0]["direct_module_calls"][0]["tool"],
+            json!("math.add")
+        );
+        assert_eq!(
+            output["steps"][0]["direct_module_calls_truncated"],
+            json!(false)
+        );
+        assert!(runtime.audit().is_empty());
+    }
+
+    #[test]
+    fn workflow_review_bounds_resolved_direct_module_hints_across_steps() {
+        let mut runtime = CapabilityRuntime::default();
+        register_demo_tools(&mut runtime, false, true).unwrap();
+        let mut source = String::from("use mod.arithmetic\n");
+        for _ in 0..splash_core::MAX_IMPORTED_MODULE_CALL_HINTS {
+            source.push_str("arithmetic.add({left: 1, right: 2})\n");
+        }
+        let draft = WorkflowDraft::new(
+            (0..5)
+                .map(|index| WorkflowStep::new(format!("step-{index}"), source.clone()))
+                .collect(),
+        )
+        .unwrap();
+
+        let (output, valid) = workflow_review_json_with_modules(&draft, Some(&runtime)).unwrap();
+
+        assert!(valid);
+        let steps = output["steps"].as_array().unwrap();
+        for step in &steps[..4] {
+            assert_eq!(
+                step["direct_module_calls"].as_array().map(Vec::len),
+                Some(splash_core::MAX_IMPORTED_MODULE_CALL_HINTS)
+            );
+            assert_eq!(step["direct_module_calls_truncated"], json!(false));
+        }
+        assert_eq!(steps[4]["direct_module_calls"], json!([]));
+        assert_eq!(steps[4]["direct_module_calls_truncated"], json!(true));
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step["direct_module_calls"].as_array().unwrap().len())
+                .sum::<usize>(),
+            MAX_WORKFLOW_REVIEW_TOOL_CALL_HINTS
+        );
+        assert!(runtime.audit().is_empty());
     }
 
     #[test]

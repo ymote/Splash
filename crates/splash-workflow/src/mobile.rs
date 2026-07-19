@@ -17,10 +17,10 @@ use std::num::NonZeroUsize;
 use serde::{de::DeserializeOwned, Serialize};
 use splash_capabilities::{
     fixed_file_catalog::FixedFileCatalog, AuditEventBatch, AuditEventCursorError, AuditLog,
-    CapabilityCatalogLimits, CapabilityModule, CapabilityModuleDescriptor, CapabilityModuleLimits,
-    CapabilityModuleRegistrationError, CapabilityRuntime, JsonToolContract, JsonValue,
-    ModuleInterfaceDescriptor, ToolDescriptor, ToolError, ToolMetadata, ToolPolicy,
-    ToolRegistrationError, ToolRequest,
+    CapabilityCatalogLimits, CapabilityModule, CapabilityModuleCallHintReport,
+    CapabilityModuleDescriptor, CapabilityModuleLimits, CapabilityModuleRegistrationError,
+    CapabilityRuntime, JsonToolContract, JsonValue, ModuleInterfaceDescriptor, ToolDescriptor,
+    ToolError, ToolMetadata, ToolPolicy, ToolRegistrationError, ToolRequest,
 };
 use splash_core::{ExecutionLimits, RuntimeError};
 
@@ -392,6 +392,33 @@ impl MobileWorkflowRuntime {
     /// or embedded workflow runtime was sealed.
     pub fn capability_module_catalog(&self) -> Vec<CapabilityModuleDescriptor> {
         self.engine.runtime().capability_module_catalog()
+    }
+
+    /// Resolves exact visible direct capability-module calls against the
+    /// sealed workflow catalog for an LLM or operator review surface.
+    ///
+    /// This is advisory metadata only. It cannot approve a plan, issue a
+    /// lease, change the static catalog, or grant the returned target tool.
+    pub fn capability_module_call_hint_report(
+        &self,
+        source: &str,
+    ) -> Result<CapabilityModuleCallHintReport, RuntimeError> {
+        self.engine
+            .runtime()
+            .capability_module_call_hint_report(source)
+    }
+
+    /// Resolves exact visible direct capability-module calls in named source
+    /// against the sealed workflow catalog without changing workflow or
+    /// capability authority.
+    pub fn capability_module_call_hint_report_named(
+        &self,
+        file: &str,
+        source: &str,
+    ) -> Result<CapabilityModuleCallHintReport, RuntimeError> {
+        self.engine
+            .runtime()
+            .capability_module_call_hint_report_named(file, source)
     }
 
     /// Returns the advisory LSP `moduleCatalog` projection for the sealed
@@ -960,6 +987,18 @@ mod tests {
                 },
             ]
         );
+        let review = runtime
+            .capability_module_call_hint_report(
+                "use mod.arithmetic\n\
+                 arithmetic.add({left: 20, right: 22})",
+            )
+            .expect("sealed workflow direct module review succeeds");
+        assert!(!review.truncated);
+        assert_eq!(review.hints.len(), 1);
+        assert_eq!(review.hints[0].module, "arithmetic");
+        assert_eq!(review.hints[0].method, "add");
+        assert_eq!(review.hints[0].tool, "math.add");
+        assert!(runtime.audit().is_empty());
 
         let plan = runtime
             .plan(vec![WorkflowStep::new(

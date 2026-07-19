@@ -164,6 +164,21 @@ gives an editor authority. The sealed
 path before `build`; the workflow facade retains only its immutable mapping,
 metadata projections, and named step-policy approval surface.
 
+For an LLM or operator review surface that must connect source syntax to a
+reviewed target capability, call
+`CapabilityRuntime::capability_module_call_hint_report_named`. It recognizes
+only a direct `binding.method(...)` whose receiver is scope-resolved to an
+exact visible `use mod.<name>` import and whose flat module and method match
+this runtime's configured direct-module catalog. Each advisory result reports
+the underlying tool name, so a policy UI can present `arithmetic.add` as
+`math.add`. It never evaluates source, seals the catalog, issues a lease, or
+proves reachability. An incomplete source-level lexical/import index reports
+`truncated` and publishes no partial scope-resolved mapping. The development
+CLI exposes the same optional projection as `direct_module_calls` from
+`splash tool-calls --allow-json-add` and
+`splash workflow-review --allow-json-add`; it is only the reviewed demo host
+catalog.
+
 For an approval flow, a host can issue a `CapabilityLease` from a selected
 subset of this catalog and call `eval_with_capability_lease`, or pass that lease
 to `WorkflowEngine::approve_with_capability_lease`. A lease is local to one

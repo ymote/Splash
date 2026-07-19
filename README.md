@@ -307,10 +307,17 @@ demo capability:
 ```sh
 cargo run -p splash-cli -- run --allow-json-add examples/direct_module_workflow.splash
 cargo run -p splash-cli -- module-catalog --allow-json-add
+cargo run -p splash-cli -- tool-calls --allow-json-add examples/direct_module_workflow.splash
+cargo run -p splash-cli -- workflow-review --allow-json-add examples/direct_module_workflow_draft.json
+cargo run -p splash-cli -- workflow-run --allow-json-add --grant calculate:math.add:1 examples/direct_module_workflow_draft.json
 ```
 
 The catalog maps `arithmetic.add` to `math.add`; workflow policies and leases
 continue to grant the underlying `math.add` capability, never the facade name.
+When the reviewed module catalog is configured, `tool-calls` and
+`workflow-review` add advisory `direct_module_calls` entries that expose this
+mapping for LLM and operator review. Those entries do not grant a tool or
+replace the explicit `calculate:math.add:1` workflow policy above.
 
 ```sh
 cargo run -p splash-cli -- run --allow-echo examples/tool_workflow.splash
@@ -406,7 +413,10 @@ argument is directly written as a string. It never evaluates source or creates
 a capability host. It is a review aid only: aliases, shadowing, control flow,
 and computed names remain unresolved, so the host must still issue a lease and
 the runtime must authorize every actual call. The output retains at most 1,024
-direct sites and sets `tool_calls_truncated` when later sites were omitted.
+direct sites and sets `tool_calls_truncated` when later sites were omitted. A
+host can additionally expose its reviewed direct-module mapping; the
+development demonstration does so only when `--allow-json-add` is present and
+emits a separate advisory `direct_module_calls` list.
 
 Review an LLM-generated multi-step draft before it becomes a host-owned plan:
 
@@ -419,6 +429,9 @@ includes per-step syntax status and direct tool-call hints, never grants or
 approvals. Each step reports `tool_calls_truncated` when its direct-call review
 was capped; a workflow retains at most 4,096 hints across all steps. See
 [workflow drafts](docs/workflow-drafts.md) for its bounds and host lifecycle.
+With an explicitly configured host module catalog, a separate advisory
+`direct_module_calls` list can map a direct facade call to its underlying tool;
+it has the same 4,096 workflow-wide cap and never selects a grant.
 
 Run the bounded local demonstration catalog only with explicit host-selected
 per-step grants:

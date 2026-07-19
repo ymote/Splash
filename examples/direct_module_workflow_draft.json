@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "steps": [
+    {
+      "id": "calculate",
+      "source": "use mod.arithmetic\nuse mod.std.assert\nlet result = arithmetic.add({left: 20, right: 22})\nassert(result.total == 42)"
+    }
+  ]
+}
