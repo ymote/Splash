@@ -186,10 +186,12 @@ field/type/required view with optional plain-text property descriptions.
 Scalar, array, missing-properties, noncanonical-key, and partial shapes omit
 that view. The LSP presents both views in direct-leaf hover and signature
 documentation, and can complete an undeclared top-level key in the first direct
-literal-record argument from `inputFields`. It never inserts `await()`,
-completes nested keys, infers result-binding members from `outputFields`,
-evaluates a schema, or gives an editor authority. Neither API is installed into
-Splash source. The sealed
+literal-record argument from `inputFields`. It can additionally complete and
+hover top-level `result.field` names from `outputFields` only for an exact
+original synchronous `let result = imported.method(input)` binding or its exact
+deferred `.await()` form. It never inserts `await()`, completes nested keys,
+follows aliases or arbitrary result chains, evaluates a schema, or gives an
+editor authority. Neither API is installed into Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,

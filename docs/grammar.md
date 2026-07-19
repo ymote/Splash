@@ -383,11 +383,17 @@ and compact `inputFields` and `outputFields`. Each field has a canonical
 identifier, one fixed JSON type, a required bit, and optional plain-text
 description. The LSP shows both bounded field lists in leaf hover and signature
 help, and can complete an undeclared top-level key in the first direct
-literal-record argument from `inputFields`. It does not infer result-binding
-members from `outputFields`, complete nested record keys, evaluate JSON Schema,
-read a runtime, validate a contract, or grant a capability. Record fields
-without the exact one-JSON-value call shape, and any malformed or over-limit
-field projection, fail closed with the rest of the advisory module metadata.
+literal-record argument from `inputFields`. For an exact source binding
+`let result = imported.method(input)` on a synchronous leaf, or the exact
+`let result = imported.method(input).await()` form on a deferred leaf, it also
+completes and hovers top-level `result.field` names from `outputFields`. That
+bounded recognizer rejects aliases, mutations or escapes, parenthesized or
+computed initializers, extra arguments, other postfix chains, nested result
+chains, shadowed imports, and source beyond the safe diagnostic prefix. It
+does not complete nested record keys, evaluate JSON Schema, read a runtime,
+validate a contract, or grant a capability. Record fields without the exact
+one-JSON-value call shape, and any malformed or over-limit field projection,
+fail closed with the rest of the advisory module metadata.
 
 For host-managed dataflow authoring, an editor may separately provide the
 bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP

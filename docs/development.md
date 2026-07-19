@@ -271,9 +271,14 @@ module, or grants authority. When a shaped leaf also supplies `inputFields` or
 field names, fixed JSON types, required bits, and optional descriptions. It can
 additionally complete an undeclared top-level key only in that leaf's first
 direct literal record argument from `inputFields`, after the same visible-import
-and exact-leaf checks. It does not complete nested keys, infer result-binding
-members from `outputFields`, inspect a runtime value, evaluate JSON Schema, or
-validate a contract.
+and exact-leaf checks. For an exact original binding
+`let result = imported.method(input)` on a synchronous leaf, or the exact
+deferred `.await()` form, it also completes and hovers top-level
+`result.field` names from `outputFields`. It rejects aliases, mutations and
+escapes, nested result chains, parenthesized/computed initializers, extra
+arguments, mismatched call mode, and source beyond the safe diagnostic prefix.
+It does not inspect a runtime value, evaluate JSON Schema, or validate a
+contract.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through

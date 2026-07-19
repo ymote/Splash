@@ -89,6 +89,11 @@ const MAX_SIGNATURE_HELP_DELIMITER_DEPTH: usize = DEFAULT_MAX_SYNTAX_NESTING;
 /// unhelpful, so the source-only scanner stops rather than tracking unbounded
 /// comma state for one editor request.
 const MAX_SIGNATURE_HELP_ARGUMENTS: usize = 64;
+/// A direct module-result initializer is deliberately recognized from a small
+/// source window rather than by general expression parsing or type inference.
+/// This keeps one completion or hover request bounded even when a document is
+/// otherwise near its source limit.
+const MAX_LSP_DIRECT_MODULE_OUTPUT_INITIALIZER_BYTES: usize = 64 * 1024;
 /// Maximum projected workflow outputs retained in the advisory dataflow
 /// catalog. This stays far below the workflow-plan hard cap so editor metadata
 /// remains inexpensive on mobile and embedded hosts.
@@ -165,8 +170,8 @@ struct ModuleCatalogCompletion {
     description: String,
     call_mode: Option<ModuleCatalogCallMode>,
     call_shape: Option<ModuleCatalogCallShape>,
-    input_fields: Option<Vec<ModuleCatalogInputFieldCompletion>>,
-    output_fields: Option<Vec<ModuleCatalogInputFieldCompletion>>,
+    input_fields: Option<Vec<ModuleCatalogRecordFieldCompletion>>,
+    output_fields: Option<Vec<ModuleCatalogRecordFieldCompletion>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,7 +221,7 @@ impl ModuleCatalogCallShape {
 /// exact direct-module method. It is intentionally narrower than JSON Schema:
 /// the LSP only uses it for plain-text hover and signature documentation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModuleCatalogInputFieldType {
+enum ModuleCatalogRecordFieldType {
     Any,
     Null,
     Boolean,
@@ -227,7 +232,7 @@ enum ModuleCatalogInputFieldType {
     Object,
 }
 
-impl ModuleCatalogInputFieldType {
+impl ModuleCatalogRecordFieldType {
     fn from_catalog_value(value: &str) -> Option<Self> {
         match value {
             "any" => Some(Self::Any),
@@ -257,9 +262,9 @@ impl ModuleCatalogInputFieldType {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ModuleCatalogInputFieldCompletion {
+struct ModuleCatalogRecordFieldCompletion {
     name: String,
-    field_type: ModuleCatalogInputFieldType,
+    field_type: ModuleCatalogRecordFieldType,
     required: bool,
     description: String,
 }
@@ -690,6 +695,22 @@ impl SplashLanguageServer {
                 if !self.module_catalog.modules.is_empty() {
                     let (_, lexical) = self.lexical_completions(uri)?;
                     let imports = self.module_imports(uri)?;
+                    if let Some(field) = module_catalog_output_field_for_member(
+                        source,
+                        lexical,
+                        imports,
+                        &self.module_catalog,
+                        site,
+                    ) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                // Host-supplied descriptions stay plain text.
+                                kind: MarkupKind::PlainText,
+                                value: module_catalog_output_field_text(field),
+                            }),
+                            range: Some(span_range(source, site.member)),
+                        }));
+                    }
                     if let Some(hover) = module_catalog_member_hover(
                         source,
                         report,
@@ -857,6 +878,16 @@ impl SplashLanguageServer {
                     member_site,
                     lexical_incomplete,
                 ));
+            }
+            if let Some(completion) = module_catalog_output_field_completion(
+                source,
+                report,
+                imports,
+                &self.module_catalog,
+                member_site,
+                is_incomplete,
+            ) {
+                return Ok(completion);
             }
             return Ok(module_catalog_member_completion(
                 source,
@@ -1241,22 +1272,22 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 call_mode: Some(ModuleCatalogCallMode::Deferred),
                 call_shape: Some(ModuleCatalogCallShape::SingleJson),
                 input_fields: Some(vec![
-                    ModuleCatalogInputFieldCompletion {
+                    ModuleCatalogRecordFieldCompletion {
                         name: "left".to_owned(),
-                        field_type: ModuleCatalogInputFieldType::Integer,
+                        field_type: ModuleCatalogRecordFieldType::Integer,
                         required: true,
                         description: "Fuzz-only left operand.".to_owned(),
                     },
-                    ModuleCatalogInputFieldCompletion {
+                    ModuleCatalogRecordFieldCompletion {
                         name: "right".to_owned(),
-                        field_type: ModuleCatalogInputFieldType::Integer,
+                        field_type: ModuleCatalogRecordFieldType::Integer,
                         required: true,
                         description: "Fuzz-only right operand.".to_owned(),
                     },
                 ]),
-                output_fields: Some(vec![ModuleCatalogInputFieldCompletion {
+                output_fields: Some(vec![ModuleCatalogRecordFieldCompletion {
                     name: "total".to_owned(),
-                    field_type: ModuleCatalogInputFieldType::Integer,
+                    field_type: ModuleCatalogRecordFieldType::Integer,
                     required: true,
                     description: "Fuzz-only total result.".to_owned(),
                 }]),
@@ -1743,7 +1774,7 @@ fn parse_module_catalog_record_fields(
     value: &serde_json::Value,
     retained_bytes: &mut usize,
     retained_fields: &mut usize,
-) -> Option<Vec<ModuleCatalogInputFieldCompletion>> {
+) -> Option<Vec<ModuleCatalogRecordFieldCompletion>> {
     let entries = value.as_array()?;
     if entries.len() > MAX_LSP_MODULE_RECORD_FIELDS {
         return None;
@@ -1754,7 +1785,7 @@ fn parse_module_catalog_record_fields(
         let field = entry.as_object()?;
         let name = field.get("name")?.as_str()?;
         let field_type =
-            ModuleCatalogInputFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
+            ModuleCatalogRecordFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
         let required = field.get("required")?.as_bool()?;
         let description = match field.get("description") {
             Some(value) => value.as_str()?,
@@ -1765,7 +1796,7 @@ fn parse_module_catalog_record_fields(
             || description.len() > MAX_LSP_MODULE_RECORD_FIELD_DESCRIPTION_BYTES
             || fields
                 .iter()
-                .any(|existing: &ModuleCatalogInputFieldCompletion| existing.name == name)
+                .any(|existing: &ModuleCatalogRecordFieldCompletion| existing.name == name)
         {
             return None;
         }
@@ -1782,7 +1813,7 @@ fn parse_module_catalog_record_fields(
         if *retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES {
             return None;
         }
-        fields.push(ModuleCatalogInputFieldCompletion {
+        fields.push(ModuleCatalogRecordFieldCompletion {
             name: name.to_owned(),
             field_type,
             required,
@@ -2537,6 +2568,16 @@ struct DirectModuleInputRecordCompletionSite {
     declared_fields: HashSet<String>,
 }
 
+/// A completed, exact direct-module initializer assigned to one local `let`
+/// binding. The source scanner never follows aliases or arbitrary expressions;
+/// it records only the one visible imported member call and whether the exact
+/// deferred suffix was present.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectModuleOutputBinding {
+    call: MemberCompletionSite,
+    awaited: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectRecordDelimiterKind {
     Round,
@@ -2644,6 +2685,358 @@ fn direct_module_member_completion_site(
             end_byte: member_end,
         },
     })
+}
+
+/// Recognizes only `let result = imported.method(input)` and the exact
+/// deferred form `let result = imported.method(input).await()`. This is a
+/// bounded syntactic projection for advisory editor metadata, not expression
+/// parsing, evaluation, or result-type inference.
+fn direct_module_output_binding(
+    source: &str,
+    symbol: &LexicalSymbol,
+    valid_prefix_end_byte: usize,
+) -> Option<DirectModuleOutputBinding> {
+    if symbol.kind != LexicalSymbolKind::Let
+        || symbol.definition.end_byte > valid_prefix_end_byte
+        || valid_prefix_end_byte > source.len()
+    {
+        return None;
+    }
+
+    let initializer_limit_byte = symbol
+        .definition
+        .end_byte
+        .checked_add(MAX_LSP_DIRECT_MODULE_OUTPUT_INITIALIZER_BYTES)?
+        .min(valid_prefix_end_byte);
+    let assignment =
+        skip_splash_trivia_before(source, symbol.definition.end_byte, initializer_limit_byte)?;
+    let after_assignment = assignment.checked_add(1)?;
+    if source.as_bytes().get(assignment) != Some(&b'=')
+        || (after_assignment < initializer_limit_byte
+            && source.as_bytes().get(after_assignment) == Some(&b'='))
+    {
+        return None;
+    }
+    let initializer_start =
+        skip_splash_trivia_before(source, after_assignment, initializer_limit_byte)?;
+    let (call, call_end_byte) =
+        direct_module_output_call_at(source, initializer_start, initializer_limit_byte)?;
+
+    let await_end_byte = call_end_byte.checked_add(b".await()".len())?;
+    let (awaited, initializer_end_byte) = if await_end_byte <= initializer_limit_byte
+        && source.get(call_end_byte..await_end_byte) == Some(".await()")
+    {
+        (true, await_end_byte)
+    } else {
+        (false, call_end_byte)
+    };
+    direct_module_output_statement_boundary(source, initializer_end_byte, initializer_limit_byte)
+        .then_some(DirectModuleOutputBinding { call, awaited })
+}
+
+/// Parses the exact direct callee spelling and a completed one-argument call.
+/// The input itself remains opaque: strings, comments, and balanced delimiters
+/// are retained solely to find the call boundary safely.
+fn direct_module_output_call_at(
+    source: &str,
+    start_byte: usize,
+    valid_prefix_end_byte: usize,
+) -> Option<(MemberCompletionSite, usize)> {
+    if start_byte >= valid_prefix_end_byte || valid_prefix_end_byte > source.len() {
+        return None;
+    }
+    let maximum_end_byte = start_byte
+        .checked_add(MAX_LSP_DIRECT_MODULE_OUTPUT_INITIALIZER_BYTES)?
+        .min(valid_prefix_end_byte);
+    let bytes = source.as_bytes();
+    let receiver_end_byte =
+        direct_module_output_identifier_end(source, start_byte, maximum_end_byte)?;
+    if receiver_end_byte >= maximum_end_byte || bytes.get(receiver_end_byte) != Some(&b'.') {
+        return None;
+    }
+    let member_start_byte = receiver_end_byte.checked_add(1)?;
+    let member_end_byte =
+        direct_module_output_identifier_end(source, member_start_byte, maximum_end_byte)?;
+    if member_end_byte >= maximum_end_byte || bytes.get(member_end_byte) != Some(&b'(') {
+        return None;
+    }
+    let call_end_byte =
+        direct_module_output_single_argument_call_end(source, member_end_byte, maximum_end_byte)?;
+
+    Some((
+        MemberCompletionSite {
+            receiver: SourceSpan {
+                start_byte,
+                end_byte: receiver_end_byte,
+            },
+            receiver_chain: SourceSpan {
+                start_byte,
+                end_byte: receiver_end_byte,
+            },
+            member: SourceSpan {
+                start_byte: member_start_byte,
+                end_byte: member_end_byte,
+            },
+        },
+        call_end_byte,
+    ))
+}
+
+fn direct_module_output_identifier_end(
+    source: &str,
+    start_byte: usize,
+    maximum_end_byte: usize,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if start_byte >= maximum_end_byte
+        || !source.is_char_boundary(start_byte)
+        || !is_identifier_start_byte(*bytes.get(start_byte)?)
+    {
+        return None;
+    }
+    let mut end_byte = start_byte + 1;
+    while end_byte < maximum_end_byte
+        && bytes
+            .get(end_byte)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+    {
+        end_byte += 1;
+    }
+    let name = source.get(start_byte..end_byte)?;
+    is_canonical_identifier(name).then_some(end_byte)
+}
+
+/// Finds the closing parenthesis for one non-empty, single-argument direct
+/// call. A top-level comma, mismatched delimiter, unterminated string/comment,
+/// or nesting beyond the language limit refuses the result binding entirely.
+fn direct_module_output_single_argument_call_end(
+    source: &str,
+    opening_byte: usize,
+    maximum_end_byte: usize,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(opening_byte) != Some(&b'(') || opening_byte >= maximum_end_byte {
+        return None;
+    }
+
+    let mut delimiters = vec![SignatureHelpDelimiterKind::Round];
+    let mut argument_started = false;
+    let mut index = opening_byte + 1;
+    while index < maximum_end_byte {
+        match bytes[index] {
+            b'"' => {
+                argument_started = true;
+                index = direct_module_output_string_end(source, index, maximum_end_byte)?;
+            }
+            b'/' if index + 1 < maximum_end_byte && bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < maximum_end_byte && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            b'/' if index + 1 < maximum_end_byte && bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut terminated = false;
+                while index < maximum_end_byte {
+                    if index + 1 < maximum_end_byte
+                        && bytes[index] == b'*'
+                        && bytes.get(index + 1) == Some(&b'/')
+                    {
+                        index += 2;
+                        terminated = true;
+                        break;
+                    }
+                    index = advance_utf8_character(source, index);
+                }
+                if !terminated {
+                    return None;
+                }
+            }
+            b'(' => {
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                argument_started = true;
+                delimiters.push(SignatureHelpDelimiterKind::Round);
+                index += 1;
+            }
+            b'[' => {
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                argument_started = true;
+                delimiters.push(SignatureHelpDelimiterKind::Square);
+                index += 1;
+            }
+            b'{' => {
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                argument_started = true;
+                delimiters.push(SignatureHelpDelimiterKind::Curly);
+                index += 1;
+            }
+            b')' => {
+                let delimiter = delimiters.pop()?;
+                if delimiter != SignatureHelpDelimiterKind::Round {
+                    return None;
+                }
+                index += 1;
+                if delimiters.is_empty() {
+                    return argument_started.then_some(index);
+                }
+            }
+            b']' => {
+                let delimiter = delimiters.pop()?;
+                if delimiter != SignatureHelpDelimiterKind::Square {
+                    return None;
+                }
+                index += 1;
+            }
+            b'}' => {
+                let delimiter = delimiters.pop()?;
+                if delimiter != SignatureHelpDelimiterKind::Curly {
+                    return None;
+                }
+                index += 1;
+            }
+            b',' if delimiters.len() == 1 => return None,
+            b';' if delimiters.len() == 1 => return None,
+            byte if byte.is_ascii_whitespace() => index += 1,
+            _ => {
+                argument_started = true;
+                index = advance_utf8_character(source, index);
+            }
+        }
+    }
+    None
+}
+
+fn direct_module_output_string_end(
+    source: &str,
+    opening_byte: usize,
+    maximum_end_byte: usize,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.get(opening_byte) != Some(&b'"') {
+        return None;
+    }
+    let mut index = opening_byte + 1;
+    while index < maximum_end_byte {
+        match bytes[index] {
+            b'"' => return Some(index + 1),
+            b'\\' => {
+                index = advance_utf8_character(source, index);
+                if index < maximum_end_byte {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            b'\n' | b'\r' => return None,
+            _ => index = advance_utf8_character(source, index),
+        }
+    }
+    None
+}
+
+/// Requires that the direct call is the whole initializer. Horizontal trivia
+/// and comments are allowed, but another postfix/operator/expression is not.
+/// A newline in either ordinary or comment trivia is a canonical statement
+/// boundary; a `}` is accepted for a completed enclosing block.
+fn direct_module_output_statement_boundary(
+    source: &str,
+    mut index: usize,
+    valid_prefix_end_byte: usize,
+) -> bool {
+    if index > valid_prefix_end_byte || valid_prefix_end_byte > source.len() {
+        return false;
+    }
+
+    let bytes = source.as_bytes();
+    while index < valid_prefix_end_byte {
+        match bytes[index] {
+            b';' | b'}' | b'\n' => return true,
+            b'\r' => {
+                return index + 1 < valid_prefix_end_byte && bytes.get(index + 1) == Some(&b'\n')
+            }
+            byte if byte.is_ascii_whitespace() => index += 1,
+            b'/' if index + 1 < valid_prefix_end_byte && bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < valid_prefix_end_byte && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            b'/' if index + 1 < valid_prefix_end_byte && bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut contains_line_break = false;
+                let mut terminated = false;
+                while index < valid_prefix_end_byte {
+                    if index + 1 < valid_prefix_end_byte
+                        && bytes[index] == b'*'
+                        && bytes.get(index + 1) == Some(&b'/')
+                    {
+                        index += 2;
+                        terminated = true;
+                        break;
+                    }
+                    contains_line_break |= matches!(bytes[index], b'\n' | b'\r');
+                    index = advance_utf8_character(source, index);
+                }
+                if contains_line_break {
+                    return true;
+                }
+                if !terminated {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Bounded variant of the LSP's trivia skipper. It never scans beyond the
+/// lexical report's valid source prefix while recognizing a result initializer.
+fn skip_splash_trivia_before(source: &str, mut index: usize, end_byte: usize) -> Option<usize> {
+    if index > end_byte || end_byte > source.len() {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    loop {
+        while index < end_byte
+            && bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+        if index == end_byte || bytes.get(index) != Some(&b'/') {
+            return Some(index);
+        }
+        match bytes.get(index + 1) {
+            Some(b'/') if index + 1 < end_byte => {
+                index += 2;
+                while index < end_byte && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+            }
+            Some(b'*') if index + 1 < end_byte => {
+                index += 2;
+                while index < end_byte
+                    && !(index + 1 < end_byte
+                        && bytes[index] == b'*'
+                        && bytes.get(index + 1) == Some(&b'/'))
+                {
+                    index = advance_utf8_character(source, index);
+                }
+                if index == end_byte {
+                    return None;
+                }
+                index += 2;
+            }
+            _ => return Some(index),
+        }
+    }
 }
 
 /// Finds the enclosing direct member call at a cursor without parsing or
@@ -3522,7 +3915,7 @@ fn module_catalog_input_field_completion(
     }
 }
 
-fn module_catalog_input_field_text(field: &ModuleCatalogInputFieldCompletion) -> String {
+fn module_catalog_input_field_text(field: &ModuleCatalogRecordFieldCompletion) -> String {
     let mut value = format!(
         "Advisory direct-module input field `{}`.\nType: {}\nRequired: {}",
         field.name,
@@ -3535,6 +3928,82 @@ fn module_catalog_input_field_text(field: &ModuleCatalogInputFieldCompletion) ->
     }
     value.push_str(
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
+    );
+    value
+}
+
+/// Completes host-projected output fields only on the original local binding
+/// from one exact direct-module initializer. This remains narrower than record
+/// shape support: aliases, nested member chains, mutations, and escapes all
+/// refuse the advisory output view.
+fn module_catalog_output_field_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &ModuleCompletionCatalog,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> Option<CompletionList> {
+    let output_binding = direct_module_output_binding_for_member(source, lexical, site)?;
+    let is_incomplete = is_incomplete || imports.truncated || catalog.unavailable;
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if imports.truncated || catalog.unavailable {
+        return Some(empty());
+    }
+    let Some(fields) =
+        module_catalog_output_fields_for_binding(source, lexical, imports, catalog, output_binding)
+    else {
+        return Some(empty());
+    };
+    let edit_range = span_range(source, site.member);
+    let mut items = fields
+        .iter()
+        .map(|field| CompletionItem {
+            label: field.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(
+                if field.required {
+                    "advisory direct-module output field; required"
+                } else {
+                    "advisory direct-module output field; optional"
+                }
+                .to_owned(),
+            ),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: module_catalog_output_field_text(field),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                field.name.clone(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+
+    Some(CompletionList {
+        is_incomplete,
+        items,
+    })
+}
+
+fn module_catalog_output_field_text(field: &ModuleCatalogRecordFieldCompletion) -> String {
+    let mut value = format!(
+        "Advisory direct-module output field `{}`.\nType: {}\nRequired: {}",
+        field.name,
+        field.field_type.label(),
+        if field.required { "yes" } else { "no" }
+    );
+    if !field.description.is_empty() {
+        value.push_str("\n\n");
+        value.push_str(&field.description);
+    }
+    value.push_str(
+        "\n\nAdvisory metadata only; it does not inspect a runtime result or grant a capability.",
     );
     value
 }
@@ -3884,6 +4353,101 @@ fn module_catalog_direct_member<'catalog>(
         .find(|module| module.path.as_slice() == path.as_slice())
 }
 
+/// Finds the compact output-field projection for one exact original local
+/// result binding. It relies on the same visible-import lookup as direct
+/// module completion, but recognizes neither aliases nor general expressions.
+fn module_catalog_output_fields_for_member<'catalog>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &'catalog ModuleCompletionCatalog,
+    site: MemberCompletionSite,
+) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
+    let output_binding = direct_module_output_binding_for_member(source, lexical, site)?;
+    module_catalog_output_fields_for_binding(source, lexical, imports, catalog, output_binding)
+}
+
+fn direct_module_output_binding_for_member(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    site: MemberCompletionSite,
+) -> Option<DirectModuleOutputBinding> {
+    if lexical.symbols_truncated
+        || !site.has_direct_receiver()
+        || site.member.end_byte > lexical.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let receiver_name = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
+    let binding = visible_symbol_at(lexical, receiver_name, site.receiver.start_byte)?;
+    if binding.kind != LexicalSymbolKind::Let
+        || !direct_module_output_binding_is_stable_at(source, binding, site.receiver.start_byte)
+    {
+        return None;
+    }
+    direct_module_output_binding(source, binding, lexical.valid_prefix_end_byte)
+}
+
+fn module_catalog_output_fields_for_binding<'catalog>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &'catalog ModuleCompletionCatalog,
+    output_binding: DirectModuleOutputBinding,
+) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
+    if imports.truncated || catalog.unavailable {
+        return None;
+    }
+    let module =
+        module_catalog_direct_member(source, lexical, imports, catalog, output_binding.call)?;
+    if module.call_shape != Some(ModuleCatalogCallShape::SingleJson)
+        || !matches!(
+            (module.call_mode, output_binding.awaited),
+            (Some(ModuleCatalogCallMode::Synchronous), false)
+                | (Some(ModuleCatalogCallMode::Deferred), true)
+        )
+    {
+        return None;
+    }
+    module.output_fields.as_deref()
+}
+
+fn module_catalog_output_field_for_member<'catalog>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &'catalog ModuleCompletionCatalog,
+    site: MemberCompletionSite,
+) -> Option<&'catalog ModuleCatalogRecordFieldCompletion> {
+    let member_name = source.get(site.member.start_byte..site.member.end_byte)?;
+    module_catalog_output_fields_for_member(source, lexical, imports, catalog, site)?
+        .iter()
+        .find(|field| field.name == member_name)
+}
+
+/// A direct result binding remains usable only while every earlier reference is
+/// a non-mutating direct member read. This purposely rejects aliases and all
+/// other possible value escapes instead of trying to infer their behavior.
+fn direct_module_output_binding_is_stable_at(
+    source: &str,
+    symbol: &LexicalSymbol,
+    site_start_byte: usize,
+) -> bool {
+    symbol
+        .references
+        .iter()
+        .copied()
+        .filter(|reference| reference.start_byte < site_start_byte)
+        .all(|reference| direct_module_output_reference_is_stable_read(source, reference))
+}
+
+fn direct_module_output_reference_is_stable_read(source: &str, reference: SourceSpan) -> bool {
+    let Some(next) = skip_splash_trivia(source, reference.end_byte) else {
+        return false;
+    };
+    source.as_bytes().get(next) == Some(&b'.') && !reference_may_mutate_binding(source, reference)
+}
+
 /// Returns plain-text advisory hover metadata for an exact catalog leaf. This
 /// path is deliberately separate from module resolution and runtime authority.
 fn module_catalog_member_hover(
@@ -4051,7 +4615,7 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
 fn append_module_catalog_record_fields(
     value: &mut String,
     direction: &str,
-    fields: &[ModuleCatalogInputFieldCompletion],
+    fields: &[ModuleCatalogRecordFieldCompletion],
 ) {
     value.push_str("\n\nAdvisory ");
     value.push_str(direction);
@@ -4452,9 +5016,7 @@ fn static_record_alias_group_is_stable(
     else {
         return false;
     };
-    if root.definition != root_binding
-        || !static_record_binding_is_stable_at(source, root, site_start_byte)
-    {
+    if root.definition != root_binding || !binding_is_stable_at(source, root, site_start_byte) {
         return false;
     }
 
@@ -4472,7 +5034,7 @@ fn static_record_alias_group_is_stable(
         };
         match aliases.root_for(alias_symbol) {
             StaticRecordRoot::Found(alias_root) if alias_root == root_binding => {
-                if !static_record_binding_is_stable_at(source, alias_symbol, site_start_byte) {
+                if !binding_is_stable_at(source, alias_symbol, site_start_byte) {
                     return false;
                 }
             }
@@ -4484,23 +5046,19 @@ fn static_record_alias_group_is_stable(
     true
 }
 
-fn static_record_binding_is_stable_at(
-    source: &str,
-    symbol: &LexicalSymbol,
-    site_start_byte: usize,
-) -> bool {
+fn binding_is_stable_at(source: &str, symbol: &LexicalSymbol, site_start_byte: usize) -> bool {
     symbol
         .references
         .iter()
         .copied()
         .filter(|reference| reference.start_byte < site_start_byte)
-        .all(|reference| !reference_may_mutate_static_record(source, reference))
+        .all(|reference| !reference_may_mutate_binding(source, reference))
 }
 
 /// Detects writes to a binding or one of its direct member paths. Indexing,
 /// calls, and delimiter-terminated values fail closed because this lightweight
 /// advisory feature does not model their possible mutation or escape behavior.
-fn reference_may_mutate_static_record(source: &str, reference: SourceSpan) -> bool {
+fn reference_may_mutate_binding(source: &str, reference: SourceSpan) -> bool {
     let bytes = source.as_bytes();
     let Some(mut index) = skip_splash_trivia(source, reference.end_byte) else {
         return true;
@@ -8129,6 +8687,289 @@ mod tests {
     }
 
     #[test]
+    fn completes_and_hovers_advisory_direct_module_output_fields_without_authority() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [
+                    {
+                        "name": "total",
+                        "type": "integer",
+                        "required": true,
+                        "description": "Reviewed sum."
+                    }
+                ]
+            },
+            {
+                "path": "mod.arithmetic.remote_add",
+                "callMode": "deferred",
+                "callShape": "single_json",
+                "outputFields": [
+                    {
+                        "name": "total",
+                        "type": "integer",
+                        "required": true
+                    }
+                ]
+            }
+        ]));
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "result.to"
+        );
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        server.open_document(document(1, source));
+
+        let field_start = source.rfind("to").expect("partial output field exists");
+        let completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, field_start + "to".len()),
+            )
+            .expect("direct output field completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+        let item = completion
+            .items
+            .first()
+            .expect("one projected output field remains");
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("advisory direct-module output field; required")
+        );
+        assert!(matches!(
+            &item.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit { range, new_text }))
+                if *range == Range::new(
+                    position_at_byte(source, field_start),
+                    position_at_byte(source, field_start + "to".len()),
+                ) && new_text == "total"
+        ));
+        let Some(Documentation::MarkupContent(MarkupContent { value, .. })) =
+            item.documentation.as_ref()
+        else {
+            panic!("direct output field documentation should be plain text");
+        };
+        assert!(value.contains("Advisory direct-module output field `total`."));
+        assert!(value.contains("Type: integer"));
+        assert!(value.contains("Required: yes"));
+        assert!(value.contains("Reviewed sum."));
+        assert!(value.contains("does not inspect a runtime result"));
+
+        let empty_member_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "result."
+        );
+        let mut empty_member_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        empty_member_server.open_document(document(1, empty_member_source));
+        let empty_member_completion = empty_member_server
+            .completion(
+                &test_uri(),
+                position_at_byte(empty_member_source, empty_member_source.len()),
+            )
+            .expect("empty output member completion succeeds");
+        assert_eq!(
+            empty_member_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+        assert!(matches!(
+            &empty_member_completion.items[0].text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                if *range == Range::new(
+                    position_at_byte(empty_member_source, empty_member_source.len()),
+                    position_at_byte(empty_member_source, empty_member_source.len()),
+                )
+        ));
+
+        let mut unavailable_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            unavailable_module_completion_catalog(),
+        );
+        unavailable_server.open_document(document(1, source));
+        let unavailable_completion = unavailable_server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, field_start + "to".len()),
+            )
+            .expect("unavailable output catalog completion succeeds");
+        assert!(unavailable_completion.is_incomplete);
+        assert!(unavailable_completion.items.is_empty());
+
+        let hover_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "result.total"
+        );
+        let mut hover_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        hover_server.open_document(document(1, hover_source));
+        let total_start = hover_source.rfind("total").expect("output field exists");
+        let hover = hover_server
+            .hover(&test_uri(), position_at_byte(hover_source, total_start + 1))
+            .expect("direct output field hover succeeds")
+            .expect("known output field has hover metadata");
+        assert_eq!(
+            hover.range,
+            Some(Range::new(
+                position_at_byte(hover_source, total_start),
+                position_at_byte(hover_source, total_start + "total".len()),
+            ))
+        );
+        assert_eq!(
+            hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory direct-module output field `total`.\nType: integer\nRequired: yes\n\nReviewed sum.\n\nAdvisory metadata only; it does not inspect a runtime result or grant a capability.".to_owned(),
+            })
+        );
+
+        let deferred_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.remote_add({left: 20, right: 22}).await()\n",
+            "result.to"
+        );
+        let mut deferred_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        deferred_server.open_document(document(1, deferred_source));
+        let deferred_cursor = deferred_source.rfind("to").expect("output field exists") + 2;
+        assert_eq!(
+            deferred_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(deferred_source, deferred_cursor),
+                )
+                .expect("deferred output completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
+        let assert_no_output_completion = |source: &str| {
+            let mut server = SplashLanguageServer::with_completion_catalogs(
+                ToolCompletionCatalog::default(),
+                catalog.clone(),
+            );
+            server.open_document(document(1, source));
+            let field_start = source.rfind("to").expect("test source has output member");
+            assert!(server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(source, field_start + "to".len()),
+                )
+                .expect("refused output completion request succeeds")
+                .items
+                .is_empty());
+        };
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.remote_add({left: 20})\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20}).await()\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = (arithmetic.add({left: 20}))\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20}).parse_json()\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20}, {right: 22})\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "let alias = result\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "result.extra = 1\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "result.total.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let arithmetic = {add: || nil}\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "result.to"
+        ));
+        let oversized_trivia_source = format!(
+            "use mod.arithmetic\nlet result = {}arithmetic.add({{left: 20}})\nresult.to",
+            " ".repeat(MAX_LSP_DIRECT_MODULE_OUTPUT_INITIALIZER_BYTES + 1),
+        );
+        assert_no_output_completion(&oversized_trivia_source);
+
+        let no_output_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "result.to"
+        );
+        let no_output_catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.add",
+                "callMode": "synchronous",
+                "callShape": "single_json"
+            }
+        ]));
+        let mut no_output_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            no_output_catalog,
+        );
+        no_output_server.open_document(document(1, no_output_source));
+        let no_output_cursor = no_output_source.rfind("to").expect("output member exists") + 2;
+        assert!(no_output_server
+            .completion(
+                &test_uri(),
+                position_at_byte(no_output_source, no_output_cursor),
+            )
+            .expect("missing output projection completion succeeds")
+            .items
+            .is_empty());
+    }
+
+    #[test]
     fn module_catalog_projection_is_bounded_and_fails_closed_when_malformed() {
         let params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -8231,15 +9072,15 @@ mod tests {
         assert_eq!(
             shaped_with_fields.modules[0].input_fields,
             Some(vec![
-                ModuleCatalogInputFieldCompletion {
+                ModuleCatalogRecordFieldCompletion {
                     name: "left".to_owned(),
-                    field_type: ModuleCatalogInputFieldType::Integer,
+                    field_type: ModuleCatalogRecordFieldType::Integer,
                     required: true,
                     description: "Left addend.".to_owned(),
                 },
-                ModuleCatalogInputFieldCompletion {
+                ModuleCatalogRecordFieldCompletion {
                     name: "right".to_owned(),
-                    field_type: ModuleCatalogInputFieldType::Integer,
+                    field_type: ModuleCatalogRecordFieldType::Integer,
                     required: false,
                     description: String::new(),
                 },
@@ -8247,9 +9088,9 @@ mod tests {
         );
         assert_eq!(
             shaped_with_fields.modules[0].output_fields,
-            Some(vec![ModuleCatalogInputFieldCompletion {
+            Some(vec![ModuleCatalogRecordFieldCompletion {
                 name: "total".to_owned(),
-                field_type: ModuleCatalogInputFieldType::Integer,
+                field_type: ModuleCatalogRecordFieldType::Integer,
                 required: true,
                 description: "Reviewed sum.".to_owned(),
             }])

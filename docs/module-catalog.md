@@ -158,6 +158,19 @@ record prefix, or unknown/unshaped leaf. It does not evaluate JSON Schema,
 infer a value or nested shape, read a runtime, validate a contract, or grant a
 capability.
 
+For an exact source binding on that same shaped leaf, the LSP can also use
+`outputFields` for a top-level original result member: a synchronous leaf must
+appear exactly as `let result = weather.current(input)`, while a deferred leaf
+must appear exactly as `let result = weather.current(input).await()`. At
+`result.field`, it completes projected field names and hovers known fields with
+plain-text metadata. The recognizer accepts exactly one completed balanced
+argument and one direct imported member call. It rejects zero or multiple
+arguments, parenthesized or computed initializers, other postfix chains,
+aliases, prior bare uses, mutations, possible escapes, nested result paths,
+shadowed imports, truncated metadata, and source beyond the first diagnostic.
+This is not result-type inference or runtime inspection; an output suggestion
+does not validate a result, load a module, or grant a capability.
+
 The server also advertises `textDocument/signatureHelp`. An exact visible leaf
 with both `callMode` and `callShape: "single_json"` has a one-argument `input`
 signature and labels its result as either a JSON value or a promise of one.
@@ -169,9 +182,10 @@ metadata, shadowed receivers, and unknown or unshaped paths. Signature help
 uses the same plain-text advisory description and compact input/output field
 lists as hover; it does not resolve a module, inspect a runtime, validate an
 adapter contract, or authorize a call. The separate input-key completion is
-limited to the one top-level literal-record position described above. Output
-fields do not infer result-binding fields or arbitrary member chains. Neither
-feature performs JSON Schema evaluation, runtime value inspection, or contract
+limited to the one top-level literal-record position described above. The
+separate output-field feature is limited to the exact original result binding
+described above and never follows arbitrary member chains. Neither feature
+performs JSON Schema evaluation, runtime value inspection, or contract
 validation.
 
 `mod.tool` remains a fixed language surface: a visible `use mod.tool` binding
