@@ -986,10 +986,12 @@ mod tests {
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic".to_owned(),
                     description: "Reviewed arithmetic adapters.".to_owned(),
+                    call_mode: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integer fields.".to_owned(),
+                    call_mode: Some(splash_capabilities::CapabilityModuleMethodMode::Deferred),
                 },
             ]
         );

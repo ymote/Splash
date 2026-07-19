@@ -162,10 +162,12 @@
   and capability lease, returning decoded bounded JSON immediately or from
   `await()`. A bounded scope-resolved advisory review projection can map an
   exact visible direct facade call back to its underlying target tool and mode
-  without issuing authority. The reviewed module-to-tool mapping and method
-  mode are part of the catalog fingerprint recorded by each lease, and the
-  interface seals before lease issuance or evaluation. It does not add module
-  loading, dynamic Rust crate access, or ambient operating-system authority.
+  without issuing authority. Its advisory LSP interface projection carries the
+  same mode as an exact-leaf `callMode` label without inserting source or
+  authorizing a call. The reviewed module-to-tool mapping and method mode are
+  part of the catalog fingerprint recorded by each lease, and the interface
+  seals before lease issuance or evaluation. It does not add module loading,
+  dynamic Rust crate access, or ambient operating-system authority.
 - Fenced rollback-protected storage extension and an authenticated worker
   journal-store bridge with scope, revision, and lease enforcement.
 - Feature-gated anchored SQLite payload backend with bounded recovery of

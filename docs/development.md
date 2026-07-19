@@ -210,7 +210,8 @@ projection through `initializationOptions.splash.moduleCatalog` or a later
       },
       {
         "path": "mod.app.weather.current",
-        "description": "Returns current forecast data."
+        "description": "Returns current forecast data.",
+        "callMode": "deferred"
       }
     ]
   }
@@ -231,13 +232,16 @@ catalogs so the server cannot retain stale metadata.
 
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
-4 KiB description. The LSP retains at most 256 descriptors and 512 KiB of
-path/description bytes. Paths below the fixed `mod.tool` namespace are rejected.
-A duplicate path, malformed descriptor, or over-limit projection is discarded
-as a whole and marks matching completion
+4 KiB description and optional exact-leaf `callMode` of `synchronous` or
+`deferred`; a mode-bearing path must be at least
+`mod.<module>.<method>`. The LSP retains at most 256 descriptors and 512 KiB of
+path/description/call-mode bytes. Paths below the fixed `mod.tool` namespace
+are rejected. A malformed recognized call mode, duplicate path, malformed
+descriptor, or over-limit projection is discarded as a whole and marks matching completion
 `isIncomplete`; no partial interface is presented. See [Editor module interface
-projection](module-catalog.md) for the complete contract. This completion does
-not make a host binding available or authorize a capability.
+projection](module-catalog.md) for the complete contract. A deferred member is
+labeled as returning a promise, but the LSP never inserts `await()` or makes a
+host binding available or authorizes a capability.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through

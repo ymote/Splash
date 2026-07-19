@@ -606,19 +606,26 @@ mod tests {
             pumped.resumed[0].diagnostics
         );
         assert_eq!(runtime.capability_module_catalog().len(), 1);
+        let interface_catalog = runtime.module_interface_catalog();
         assert_eq!(
-            runtime.module_interface_catalog(),
+            interface_catalog,
             vec![
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic".to_owned(),
                     description: "Reviewed arithmetic adapters.".to_owned(),
+                    call_mode: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integer fields.".to_owned(),
+                    call_mode: Some(crate::CapabilityModuleMethodMode::Deferred),
                 },
             ]
         );
+        let lsp_projection =
+            serde_json::to_value(&interface_catalog).expect("interface catalog serializes");
+        assert!(lsp_projection[0].get("callMode").is_none());
+        assert_eq!(lsp_projection[1]["callMode"], json!("deferred"));
     }
 
     #[cfg(feature = "http-endpoint-catalog")]

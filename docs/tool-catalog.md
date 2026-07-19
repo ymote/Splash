@@ -171,9 +171,11 @@ underlying capability and invocation behavior.
 
 `CapabilityRuntime::capability_module_catalog()` returns the reviewed mapping
 for a host prompt or operator UI. `module_interface_catalog()` returns the
-bounded flat `{path, description}` entries accepted by the advisory LSP
-`moduleCatalog` projection. Neither API is installed into Splash source or
-gives an editor authority. The sealed
+bounded flat `{path, description, callMode?}` entries accepted by the advisory
+LSP `moduleCatalog` projection. Direct method entries carry their host-selected
+`synchronous` or `deferred` mode so the editor can label a deferred call as
+returning a promise; the projection never inserts `await()` or gives an editor
+authority. Neither API is installed into Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,

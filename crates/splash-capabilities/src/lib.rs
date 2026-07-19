@@ -648,6 +648,8 @@ pub struct CapabilityModuleMethodDescriptor {
 pub struct ModuleInterfaceDescriptor {
     pub path: String,
     pub description: String,
+    #[serde(rename = "callMode", skip_serializing_if = "Option::is_none")]
+    pub call_mode: Option<CapabilityModuleMethodMode>,
 }
 
 /// One host-resolved advisory direct capability-module call site.
@@ -5289,6 +5291,7 @@ fn module_interface_catalog(
         entries.push(ModuleInterfaceDescriptor {
             path: prefix.clone(),
             description: module.description.clone(),
+            call_mode: None,
         });
         entries.extend(
             module
@@ -5297,6 +5300,7 @@ fn module_interface_catalog(
                 .map(|method| ModuleInterfaceDescriptor {
                     path: format!("{prefix}.{}", method.name),
                     description: method.description.clone(),
+                    call_mode: Some(method.mode),
                 }),
         );
     }
@@ -5883,13 +5887,18 @@ mod tests {
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic".to_owned(),
                     description: "Reviewed arithmetic adapters.".to_owned(),
+                    call_mode: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integers.".to_owned(),
+                    call_mode: Some(CapabilityModuleMethodMode::Synchronous),
                 },
             ]
         );
+        let lsp_projection = serde_json::to_value(runtime.module_interface_catalog()).unwrap();
+        assert!(lsp_projection[0].get("callMode").is_none());
+        assert_eq!(lsp_projection[1]["callMode"], json!("synchronous"));
 
         let lease = runtime
             .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])

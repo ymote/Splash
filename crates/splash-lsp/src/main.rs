@@ -147,6 +147,30 @@ struct ToolCompletionCatalog {
 struct ModuleCatalogCompletion {
     path: Vec<String>,
     description: String,
+    call_mode: Option<ModuleCatalogCallMode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModuleCatalogCallMode {
+    Synchronous,
+    Deferred,
+}
+
+impl ModuleCatalogCallMode {
+    fn from_catalog_value(value: &str) -> Option<Self> {
+        match value {
+            "synchronous" => Some(Self::Synchronous),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+
+    const fn as_catalog_value(self) -> &'static str {
+        match self {
+            Self::Synchronous => "synchronous",
+            Self::Deferred => "deferred",
+        }
+    }
 }
 
 /// A bounded, advisory projection of a host's known `mod.*` interface.
@@ -1361,7 +1385,8 @@ fn is_valid_catalog_tool_name(name: &str) -> bool {
 
 /// Reads a tiny static `mod.*` interface projection without treating it as a
 /// module registry. Each path must be canonical source spelling rooted at
-/// `mod`; unknown descriptor fields remain intentionally ignored.
+/// `mod`; unknown descriptor fields remain intentionally ignored. An optional
+/// `callMode` is advisory metadata for an exact callable path only.
 fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCompletionCatalog> {
     let entries = value.as_array()?;
     if entries.len() > MAX_LSP_MODULE_CATALOG_ENTRIES {
@@ -1377,6 +1402,15 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             Some(value) => value.as_str()?,
             None => "",
         };
+        let call_mode = match object.get("callMode") {
+            Some(value) => Some(ModuleCatalogCallMode::from_catalog_value(value.as_str()?)?),
+            None => None,
+        };
+        // Direct capability methods live below an import target (`mod.<module>.<method>`).
+        // Do not present promise semantics for a bare import target.
+        if call_mode.is_some() && path.len() < 3 {
+            return None;
+        }
         if description.len() > MAX_LSP_MODULE_DESCRIPTION_BYTES {
             return None;
         }
@@ -1384,7 +1418,10 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             .iter()
             .try_fold(0_usize, |total, segment| total.checked_add(segment.len()))?
             .checked_add(path.len().saturating_sub(1))?;
-        let entry_bytes = path_bytes.checked_add(description.len())?.checked_add(1)?;
+        let entry_bytes = path_bytes
+            .checked_add(description.len())?
+            .checked_add(call_mode.map_or(0, |mode| mode.as_catalog_value().len()))?
+            .checked_add(1)?;
         retained_bytes = retained_bytes.checked_add(entry_bytes)?;
         if retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES
             || modules
@@ -1396,7 +1433,16 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
         modules.push(ModuleCatalogCompletion {
             path,
             description: description.to_owned(),
+            call_mode,
         });
+    }
+    if modules.iter().any(|module| {
+        module.call_mode.is_some()
+            && modules.iter().any(|other| {
+                other.path.len() > module.path.len() && other.path.starts_with(&module.path)
+            })
+    }) {
+        return None;
     }
     modules.sort_by(|left, right| left.path.cmp(&right.path));
 
@@ -2815,13 +2861,8 @@ fn module_catalog_path_completion(
         .map(|child| CompletionItem {
             label: child.name.clone(),
             kind: Some(CompletionItemKind::MODULE),
-            detail: Some("advisory module path; host module binding required".to_owned()),
-            documentation: child.description.map(|description| {
-                Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::PlainText,
-                    value: description,
-                })
-            }),
+            detail: Some(module_catalog_path_detail(child.call_mode).to_owned()),
+            documentation: module_catalog_documentation(child.description, child.call_mode),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                 edit_range, child.name,
             ))),
@@ -2882,15 +2923,8 @@ fn module_catalog_member_completion(
         .map(|child| CompletionItem {
             label: child.name.clone(),
             kind: Some(CompletionItemKind::FIELD),
-            detail: Some(
-                "advisory imported-module member; host module binding required".to_owned(),
-            ),
-            documentation: child.description.map(|description| {
-                Documentation::MarkupContent(MarkupContent {
-                    kind: MarkupKind::PlainText,
-                    value: description,
-                })
-            }),
+            detail: Some(module_catalog_member_detail(child.call_mode).to_owned()),
+            documentation: module_catalog_documentation(child.description, child.call_mode),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
                 edit_range, child.name,
             ))),
@@ -2908,6 +2942,7 @@ fn module_catalog_member_completion(
 struct ModuleCatalogChild {
     name: String,
     description: Option<String>,
+    call_mode: Option<ModuleCatalogCallMode>,
 }
 
 /// Returns only immediate descriptors below one static path. Intermediate
@@ -2923,18 +2958,73 @@ fn module_catalog_children(
             continue;
         }
         let name = module.path[parent.len()].clone();
-        let description = (module.path.len() == parent.len() + 1 && !module.description.is_empty())
-            .then(|| module.description.clone());
+        let is_direct_child = module.path.len() == parent.len() + 1;
+        let description =
+            (is_direct_child && !module.description.is_empty()).then(|| module.description.clone());
+        let call_mode = is_direct_child.then_some(module.call_mode).flatten();
         if let Some(existing) = children.iter_mut().find(|child| child.name == name) {
             if existing.description.is_none() && description.is_some() {
                 existing.description = description;
             }
+            if existing.call_mode.is_none() && call_mode.is_some() {
+                existing.call_mode = call_mode;
+            }
         } else {
-            children.push(ModuleCatalogChild { name, description });
+            children.push(ModuleCatalogChild {
+                name,
+                description,
+                call_mode,
+            });
         }
     }
     children.sort_by(|left, right| left.name.cmp(&right.name));
     children
+}
+
+fn module_catalog_path_detail(call_mode: Option<ModuleCatalogCallMode>) -> &'static str {
+    match call_mode {
+        Some(ModuleCatalogCallMode::Synchronous) => {
+            "advisory synchronous module path; host module binding required"
+        }
+        Some(ModuleCatalogCallMode::Deferred) => {
+            "advisory deferred module path; host module binding required"
+        }
+        None => "advisory module path; host module binding required",
+    }
+}
+
+fn module_catalog_member_detail(call_mode: Option<ModuleCatalogCallMode>) -> &'static str {
+    match call_mode {
+        Some(ModuleCatalogCallMode::Synchronous) => {
+            "advisory synchronous imported-module member; host module binding required"
+        }
+        Some(ModuleCatalogCallMode::Deferred) => {
+            "advisory deferred imported-module member; call returns a promise; host module binding required"
+        }
+        None => "advisory imported-module member; host module binding required",
+    }
+}
+
+fn module_catalog_documentation(
+    description: Option<String>,
+    call_mode: Option<ModuleCatalogCallMode>,
+) -> Option<Documentation> {
+    let mut value = description.unwrap_or_default();
+    let mode_note = match call_mode {
+        Some(ModuleCatalogCallMode::Synchronous) => "Advisory synchronous method.",
+        Some(ModuleCatalogCallMode::Deferred) => {
+            "Advisory deferred method; call returns a promise and must use await()."
+        }
+        None => "",
+    };
+    if !value.is_empty() && !mode_note.is_empty() {
+        value.push_str("\n\n");
+    }
+    value.push_str(mode_note);
+    (!value.is_empty()).then_some(Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::PlainText,
+        value,
+    }))
 }
 
 fn tool_catalog_name_completion(
@@ -6327,6 +6417,80 @@ mod tests {
     }
 
     #[test]
+    fn presents_advisory_direct_module_call_modes_without_authority() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic",
+                "description": "Reviewed arithmetic facade."
+            },
+            {
+                "path": "mod.arithmetic.add",
+                "description": "Adds two integers.",
+                "callMode": "synchronous"
+            },
+            {
+                "path": "mod.arithmetic.remote_add",
+                "description": "Adds two integers through a reviewed remote adapter.",
+                "callMode": "deferred"
+            }
+        ]));
+        let source = "use mod.arithmetic\narithmetic.";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        server.open_document(document(1, source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, source.len()))
+            .expect("direct module completion succeeds");
+        let synchronous = completion
+            .items
+            .iter()
+            .find(|item| item.label == "add")
+            .expect("synchronous method is present");
+        assert_eq!(
+            synchronous.detail.as_deref(),
+            Some("advisory synchronous imported-module member; host module binding required")
+        );
+        assert_eq!(
+            synchronous.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Adds two integers.\n\nAdvisory synchronous method.".to_owned(),
+            }))
+        );
+
+        let deferred = completion
+            .items
+            .iter()
+            .find(|item| item.label == "remote_add")
+            .expect("deferred method is present");
+        assert_eq!(
+            deferred.detail.as_deref(),
+            Some(
+                "advisory deferred imported-module member; call returns a promise; host module binding required"
+            )
+        );
+        assert_eq!(
+            deferred.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Adds two integers through a reviewed remote adapter.\n\nAdvisory deferred method; call returns a promise and must use await().".to_owned(),
+            }))
+        );
+        assert!(matches!(
+            deferred.text_edit.as_ref(),
+            Some(CompletionTextEdit::Edit(TextEdit { new_text, .. })) if new_text == "remote_add"
+        ));
+        assert!(completion.items.iter().all(|item| {
+            item.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("host module binding required"))
+        }));
+    }
+
+    #[test]
     fn module_catalog_projection_is_bounded_and_fails_closed_when_malformed() {
         let params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -6363,6 +6527,24 @@ mod tests {
         let invalid = module_completion_catalog_from_initialize_options(&invalid_params);
         assert!(invalid.unavailable);
         assert!(invalid.modules.is_empty());
+
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "callMode": "unknown"}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "callMode": 42}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std", "callMode": "deferred"}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std", "callMode": "deferred"},
+            {"path": "mod.std.log", "description": "log"}
+        ]))
+        .is_none());
         let source = "use mod.";
         let mut server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
