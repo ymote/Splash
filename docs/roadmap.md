@@ -27,8 +27,11 @@
   initialization-time or configuration-refresh advisory module interface
   projection can complete direct `use mod.*` path segments and bounded catalog
   paths below a direct visible imported-module binding, and plainly hover an
-  exact visible catalog leaf, without module loading, resolution, runtime
-  export inspection, or authority inference.
+  exact visible catalog leaf. Exact one-JSON-value leaves can present bounded
+  schema-derived input and output record fields in hover/signature help, with
+  input-key completion only in the first direct literal record argument,
+  without module loading, resolution, runtime export inspection, or authority
+  inference.
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context
@@ -336,9 +339,10 @@
 
 - Additional semantic editor features beyond lexical completion, fixed
   `mod.tool`, bounded direct literal/direct-alias record fields,
-  catalog-backed chained lookup from a visible imported-module binding, and
-  direct advisory workflow-data fields. General module resolution and broader
-  type-aware field semantics remain open.
+  catalog-backed chained lookup and static input/output contract presentation
+  from a visible imported-module binding, and direct advisory workflow-data
+  fields. Direct-module result-binding field completion, general module
+  resolution, and broader type-aware field semantics remain open.
 - Sustained parser/VM differential fuzzing, LSP document lifecycle fuzzing,
   expanded resource-exhaustion coverage, and corpus triage.
 - Independent security review of effectful adapters.

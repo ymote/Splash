@@ -150,16 +150,34 @@ pub const MAX_CAPABILITY_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// This matches the executable schema property's hard limit. It is metadata
 /// only and never relaxes the runtime JSON contract.
 pub const MAX_CAPABILITY_MODULE_INPUT_FIELDS: usize = 128;
+/// Maximum number of schema-derived literal-record fields published for one
+/// direct capability method's advisory output projection.
+///
+/// Output metadata uses the same compact, fixed field representation as input
+/// metadata and never relaxes the executable JSON output contract.
+pub const MAX_CAPABILITY_MODULE_OUTPUT_FIELDS: usize = MAX_CAPABILITY_MODULE_INPUT_FIELDS;
 /// Fixed aggregate ceiling for schema-derived input fields across the direct
 /// module interface. This matches the LSP's bounded catalog parser so a
 /// runtime-produced projection can be passed through unchanged.
 pub const MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS: usize = 1_024;
+/// Fixed aggregate ceiling for schema-derived output fields across the direct
+/// module interface. Keeping this separate from the input budget preserves the
+/// existing input projection surface while bounding both directions.
+pub const MAX_CAPABILITY_MODULE_INTERFACE_OUTPUT_FIELDS: usize = 1_024;
 /// Maximum UTF-8 byte length of one schema-derived direct-module input field
 /// name published to an editor.
 pub const MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of one schema-derived direct-module output field
+/// name published to an editor.
+pub const MAX_CAPABILITY_MODULE_OUTPUT_FIELD_NAME_BYTES: usize =
+    MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES;
 /// Maximum UTF-8 byte length of one schema-derived direct-module input field
 /// description published to an editor.
 pub const MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 byte length of one schema-derived direct-module output field
+/// description published to an editor.
+pub const MAX_CAPABILITY_MODULE_OUTPUT_FIELD_DESCRIPTION_BYTES: usize =
+    MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES;
 /// Maximum UTF-8 byte length of a registered capability name.
 pub const MAX_TOOL_NAME_BYTES: usize = 128;
 /// Default number of recent capability audit events retained in memory.
@@ -650,7 +668,7 @@ pub enum CapabilityModuleCallShape {
     SingleJson,
 }
 
-/// A compact, schema-derived literal-record field for a direct capability
+/// A compact, schema-derived literal-record field type for a direct capability
 /// method's advisory editor projection.
 ///
 /// Only an explicit root object schema with entirely canonical property names
@@ -658,7 +676,7 @@ pub enum CapabilityModuleCallShape {
 /// boundary; this descriptor is not installed into Splash source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CapabilityModuleInputFieldType {
+pub enum CapabilityModuleRecordFieldType {
     Any,
     Null,
     Boolean,
@@ -669,7 +687,12 @@ pub enum CapabilityModuleInputFieldType {
     Object,
 }
 
-impl CapabilityModuleInputFieldType {
+/// Backward-compatible name for a direct-method input record field type.
+pub use CapabilityModuleRecordFieldType as CapabilityModuleInputFieldType;
+/// Semantic name for a direct-method output record field type.
+pub use CapabilityModuleRecordFieldType as CapabilityModuleOutputFieldType;
+
+impl CapabilityModuleRecordFieldType {
     fn from_schema_type(value: &str) -> Option<Self> {
         match value {
             "any" => Some(Self::Any),
@@ -685,17 +708,22 @@ impl CapabilityModuleInputFieldType {
     }
 }
 
-/// One schema-derived direct-module input field retained for host and editor
-/// review.
+/// One schema-derived direct-module input or output field retained for host and
+/// editor review.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct CapabilityModuleInputFieldDescriptor {
+pub struct CapabilityModuleRecordFieldDescriptor {
     pub name: String,
     #[serde(rename = "type")]
-    pub field_type: CapabilityModuleInputFieldType,
+    pub field_type: CapabilityModuleRecordFieldType,
     pub required: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
 }
+
+/// Backward-compatible name for a direct-method input record field.
+pub use CapabilityModuleRecordFieldDescriptor as CapabilityModuleInputFieldDescriptor;
+/// Semantic name for a direct-method output record field.
+pub use CapabilityModuleRecordFieldDescriptor as CapabilityModuleOutputFieldDescriptor;
 
 /// Stable host-facing description of one setup-defined direct capability
 /// module.
@@ -719,6 +747,11 @@ pub struct CapabilityModuleMethodDescriptor {
     /// an array, scalar, missing-properties, or noncanonical-key input shape.
     #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
     pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
+    /// Compact record-field metadata derived only from an explicit executable
+    /// object output contract. `None` deliberately makes no statement about
+    /// an array, scalar, missing-properties, or noncanonical-key output shape.
+    #[serde(rename = "outputFields", skip_serializing_if = "Option::is_none")]
+    pub output_fields: Option<Vec<CapabilityModuleOutputFieldDescriptor>>,
 }
 
 /// One entry in the advisory `splash-lsp` `moduleCatalog` wire shape.
@@ -740,6 +773,11 @@ pub struct ModuleInterfaceDescriptor {
     /// partial field inference.
     #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
     pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
+    /// Compact advisory literal-record fields for one exact direct method's
+    /// result. This is absent unless a reviewed output contract can be
+    /// represented without partial field inference.
+    #[serde(rename = "outputFields", skip_serializing_if = "Option::is_none")]
+    pub output_fields: Option<Vec<CapabilityModuleOutputFieldDescriptor>>,
 }
 
 /// One host-resolved advisory direct capability-module call site.
@@ -819,6 +857,9 @@ pub enum CapabilityModuleRegistrationError {
         maximum: usize,
     },
     InterfaceInputFieldLimitExceeded {
+        maximum: usize,
+    },
+    InterfaceOutputFieldLimitExceeded {
         maximum: usize,
     },
     CatalogEncoding,
@@ -905,6 +946,10 @@ impl Display for CapabilityModuleRegistrationError {
             Self::InterfaceInputFieldLimitExceeded { maximum } => write!(
                 formatter,
                 "direct capability module interface exceeds {maximum} schema-derived input fields"
+            ),
+            Self::InterfaceOutputFieldLimitExceeded { maximum } => write!(
+                formatter,
+                "direct capability module interface exceeds {maximum} schema-derived output fields"
             ),
             Self::CatalogEncoding => {
                 formatter.write_str("direct capability module catalog could not be encoded")
@@ -4595,6 +4640,9 @@ impl CapabilityRuntime {
                     mode: *mode,
                     call_shape: CapabilityModuleCallShape::SingleJson,
                     input_fields: direct_module_input_fields(tool.metadata.input_schema.as_ref()),
+                    output_fields: direct_module_output_fields(
+                        tool.metadata.output_schema.as_ref(),
+                    ),
                 })
                 .collect(),
         };
@@ -4610,6 +4658,19 @@ impl CapabilityRuntime {
             return Err(
                 CapabilityModuleRegistrationError::InterfaceInputFieldLimitExceeded {
                     maximum: MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS,
+                },
+            );
+        }
+        let output_field_count = candidate_catalog
+            .values()
+            .flat_map(|module| module.methods.iter())
+            .filter_map(|method| method.output_fields.as_ref())
+            .map(Vec::len)
+            .sum::<usize>();
+        if output_field_count > MAX_CAPABILITY_MODULE_INTERFACE_OUTPUT_FIELDS {
+            return Err(
+                CapabilityModuleRegistrationError::InterfaceOutputFieldLimitExceeded {
+                    maximum: MAX_CAPABILITY_MODULE_INTERFACE_OUTPUT_FIELDS,
                 },
             );
         }
@@ -5407,6 +5468,7 @@ fn module_interface_catalog(
             call_mode: None,
             call_shape: None,
             input_fields: None,
+            output_fields: None,
         });
         entries.extend(
             module
@@ -5418,6 +5480,7 @@ fn module_interface_catalog(
                     call_mode: Some(method.mode),
                     call_shape: Some(method.call_shape),
                     input_fields: method.input_fields.clone(),
+                    output_fields: method.output_fields.clone(),
                 }),
         );
     }
@@ -5425,18 +5488,43 @@ fn module_interface_catalog(
 }
 
 /// Projects only a complete, literal-record-shaped slice of an executable
-/// input schema. Returning `None` is deliberate: an editor must not infer a
+/// input or output schema. Returning `None` is deliberate: an editor must not infer a
 /// partial shape for scalar, array, missing-properties, noncanonical-key, or
 /// otherwise unsupported object contracts.
 fn direct_module_input_fields(
-    input_schema: Option<&JsonValue>,
+    schema: Option<&JsonValue>,
 ) -> Option<Vec<CapabilityModuleInputFieldDescriptor>> {
-    let schema = input_schema?.as_object()?;
+    direct_module_record_fields(
+        schema,
+        MAX_CAPABILITY_MODULE_INPUT_FIELDS,
+        MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES,
+        MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES,
+    )
+}
+
+fn direct_module_output_fields(
+    schema: Option<&JsonValue>,
+) -> Option<Vec<CapabilityModuleOutputFieldDescriptor>> {
+    direct_module_record_fields(
+        schema,
+        MAX_CAPABILITY_MODULE_OUTPUT_FIELDS,
+        MAX_CAPABILITY_MODULE_OUTPUT_FIELD_NAME_BYTES,
+        MAX_CAPABILITY_MODULE_OUTPUT_FIELD_DESCRIPTION_BYTES,
+    )
+}
+
+fn direct_module_record_fields(
+    schema: Option<&JsonValue>,
+    maximum_fields: usize,
+    maximum_name_bytes: usize,
+    maximum_description_bytes: usize,
+) -> Option<Vec<CapabilityModuleRecordFieldDescriptor>> {
+    let schema = schema?.as_object()?;
     if schema.get("type")?.as_str()? != "object" {
         return None;
     }
     let properties = schema.get("properties")?.as_object()?;
-    if properties.len() > MAX_CAPABILITY_MODULE_INPUT_FIELDS {
+    if properties.len() > maximum_fields {
         return None;
     }
 
@@ -5445,7 +5533,7 @@ fn direct_module_input_fields(
         for entry in entries.as_array()? {
             let name = entry.as_str()?;
             if !properties.contains_key(name)
-                || name.len() > MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES
+                || name.len() > maximum_name_bytes
                 || !is_canonical_identifier(name)
                 || !required.insert(name.to_owned())
             {
@@ -5456,27 +5544,25 @@ fn direct_module_input_fields(
 
     let mut fields = Vec::with_capacity(properties.len());
     for (name, field_schema) in properties {
-        if name.len() > MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES
-            || !is_canonical_identifier(name)
-        {
+        if name.len() > maximum_name_bytes || !is_canonical_identifier(name) {
             return None;
         }
         let field_schema = field_schema.as_object()?;
         let field_type = match field_schema.get("type") {
-            Some(value) => CapabilityModuleInputFieldType::from_schema_type(value.as_str()?)?,
-            None => CapabilityModuleInputFieldType::Any,
+            Some(value) => CapabilityModuleRecordFieldType::from_schema_type(value.as_str()?)?,
+            None => CapabilityModuleRecordFieldType::Any,
         };
         let description = match field_schema.get("description") {
             Some(value) => {
                 let description = value.as_str()?;
-                if description.len() > MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES {
+                if description.len() > maximum_description_bytes {
                     return None;
                 }
                 description.to_owned()
             }
             None => String::new(),
         };
-        fields.push(CapabilityModuleInputFieldDescriptor {
+        fields.push(CapabilityModuleRecordFieldDescriptor {
             name: name.clone(),
             field_type,
             required: required.contains(name.as_str()),
@@ -6073,6 +6159,12 @@ mod tests {
                             description: String::new(),
                         },
                     ]),
+                    output_fields: Some(vec![CapabilityModuleOutputFieldDescriptor {
+                        name: "total".to_owned(),
+                        field_type: CapabilityModuleOutputFieldType::Integer,
+                        required: true,
+                        description: String::new(),
+                    }]),
                 }],
             }]
         );
@@ -6085,6 +6177,7 @@ mod tests {
                     call_mode: None,
                     call_shape: None,
                     input_fields: None,
+                    output_fields: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
@@ -6105,6 +6198,12 @@ mod tests {
                             description: String::new(),
                         },
                     ]),
+                    output_fields: Some(vec![CapabilityModuleOutputFieldDescriptor {
+                        name: "total".to_owned(),
+                        field_type: CapabilityModuleOutputFieldType::Integer,
+                        required: true,
+                        description: String::new(),
+                    }]),
                 },
             ]
         );
@@ -6117,6 +6216,12 @@ mod tests {
             json!([
                 {"name": "left", "type": "integer", "required": true},
                 {"name": "right", "type": "integer", "required": true}
+            ])
+        );
+        assert_eq!(
+            lsp_projection[1]["outputFields"],
+            json!([
+                {"name": "total", "type": "integer", "required": true}
             ])
         );
 
@@ -6191,6 +6296,10 @@ mod tests {
                 },
             ])
         );
+        assert_eq!(
+            direct_module_output_fields(Some(&compatible)),
+            direct_module_input_fields(Some(&compatible))
+        );
         assert!(direct_module_input_fields(Some(&json!({"type": "array"}))).is_none());
         assert!(direct_module_input_fields(Some(&json!({"type": "object"}))).is_none());
         assert!(direct_module_input_fields(Some(&json!({
@@ -6202,6 +6311,11 @@ mod tests {
             "type": "object",
             "properties": {"count": {"type": "integer"}},
             "required": ["missing"]
+        })))
+        .is_none());
+        assert!(direct_module_output_fields(Some(&json!({
+            "type": "object",
+            "properties": {"not-valid": {"type": "integer"}}
         })))
         .is_none());
     }
@@ -6251,6 +6365,57 @@ mod tests {
                     runtime.register_capability_module(module).unwrap_err(),
                     CapabilityModuleRegistrationError::InterfaceInputFieldLimitExceeded {
                         maximum: MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_module_output_field_projection_stays_within_the_lsp_aggregate_bound() {
+        let module_count =
+            MAX_CAPABILITY_MODULE_INTERFACE_OUTPUT_FIELDS / MAX_CAPABILITY_MODULE_OUTPUT_FIELDS;
+        let mut runtime = CapabilityRuntime::default();
+
+        for module_index in 0..=module_count {
+            let mut properties = serde_json::Map::new();
+            for field_index in 0..MAX_CAPABILITY_MODULE_OUTPUT_FIELDS {
+                properties.insert(format!("field_{field_index}"), json!({"type": "integer"}));
+            }
+            let contract = JsonToolContract::new(
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                json!({
+                    "type": "object",
+                    "properties": properties,
+                    "additionalProperties": false
+                }),
+            )
+            .expect("generated object contract is valid");
+            let tool = format!("math.output_fields_{module_index}");
+            runtime
+                .register_validated_json_tool(
+                    ToolPolicy::json(tool.clone()),
+                    ToolMetadata::default(),
+                    contract,
+                    |_| Ok(json!({})),
+                )
+                .expect("reviewed generated tool registers");
+
+            let module = CapabilityModule::new(format!("output_fields_{module_index}"), "Fields.")
+                .with_method("inspect", tool);
+            if module_index < module_count {
+                runtime
+                    .register_capability_module(module)
+                    .expect("projection remains within the aggregate field bound");
+            } else {
+                assert_eq!(
+                    runtime.register_capability_module(module).unwrap_err(),
+                    CapabilityModuleRegistrationError::InterfaceOutputFieldLimitExceeded {
+                        maximum: MAX_CAPABILITY_MODULE_INTERFACE_OUTPUT_FIELDS,
                     }
                 );
             }

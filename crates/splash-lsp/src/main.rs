@@ -76,11 +76,12 @@ const MAX_LSP_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_LSP_MODULE_PATH_BYTES: usize = 256;
 const MAX_LSP_MODULE_PATH_SEGMENTS: usize = 16;
 const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
-/// Maximum schema-derived input fields retained across an advisory module
-/// projection. This is presentation metadata only, never a schema loader.
-const MAX_LSP_MODULE_INPUT_FIELDS: usize = 1_024;
-const MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES: usize = 128;
-const MAX_LSP_MODULE_INPUT_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum schema-derived record fields retained in each direction across an
+/// advisory module projection. This is presentation metadata only, never a
+/// schema loader.
+const MAX_LSP_MODULE_RECORD_FIELDS: usize = 1_024;
+const MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES: usize = 128;
+const MAX_LSP_MODULE_RECORD_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// Signature help scans only the current bounded source document and keeps its
 /// delimiter stack no larger than the canonical grammar nesting budget.
 const MAX_SIGNATURE_HELP_DELIMITER_DEPTH: usize = DEFAULT_MAX_SYNTAX_NESTING;
@@ -165,6 +166,7 @@ struct ModuleCatalogCompletion {
     call_mode: Option<ModuleCatalogCallMode>,
     call_shape: Option<ModuleCatalogCallShape>,
     input_fields: Option<Vec<ModuleCatalogInputFieldCompletion>>,
+    output_fields: Option<Vec<ModuleCatalogInputFieldCompletion>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1226,6 +1228,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 call_mode: None,
                 call_shape: None,
                 input_fields: None,
+                output_fields: None,
             },
             ModuleCatalogCompletion {
                 path: vec![
@@ -1251,6 +1254,12 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                         description: "Fuzz-only right operand.".to_owned(),
                     },
                 ]),
+                output_fields: Some(vec![ModuleCatalogInputFieldCompletion {
+                    name: "total".to_owned(),
+                    field_type: ModuleCatalogInputFieldType::Integer,
+                    required: true,
+                    description: "Fuzz-only total result.".to_owned(),
+                }]),
             },
             ModuleCatalogCompletion {
                 path: vec![
@@ -1263,6 +1272,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 call_mode: Some(ModuleCatalogCallMode::Synchronous),
                 call_shape: Some(ModuleCatalogCallShape::SingleJson),
                 input_fields: Some(Vec::new()),
+                output_fields: None,
             },
         ],
         unavailable: false,
@@ -1631,6 +1641,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
 
     let mut retained_bytes = 0_usize;
     let mut retained_input_fields = 0_usize;
+    let mut retained_output_fields = 0_usize;
     let mut modules = Vec::with_capacity(entries.len());
     for entry in entries {
         let object = entry.as_object()?;
@@ -1658,16 +1669,26 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             return None;
         }
         let input_fields = match object.get("inputFields") {
-            Some(value) => Some(parse_module_catalog_input_fields(
+            Some(value) => Some(parse_module_catalog_record_fields(
                 value,
                 &mut retained_bytes,
                 &mut retained_input_fields,
             )?),
             None => None,
         };
-        // Input fields are meaningful only for a fully explicit one-JSON-value
+        let output_fields = match object.get("outputFields") {
+            Some(value) => Some(parse_module_catalog_record_fields(
+                value,
+                &mut retained_bytes,
+                &mut retained_output_fields,
+            )?),
+            None => None,
+        };
+        // Record fields are meaningful only for a fully explicit one-JSON-value
         // direct method shape. Never infer record structure from a mode alone.
-        if input_fields.is_some() && call_shape != Some(ModuleCatalogCallShape::SingleJson) {
+        if (input_fields.is_some() || output_fields.is_some())
+            && call_shape != Some(ModuleCatalogCallShape::SingleJson)
+        {
             return None;
         }
         if description.len() > MAX_LSP_MODULE_DESCRIPTION_BYTES {
@@ -1696,6 +1717,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             call_mode,
             call_shape,
             input_fields,
+            output_fields,
         });
     }
     if modules.iter().any(|module| {
@@ -1717,13 +1739,13 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
 /// Retains a tiny source-compatible record-field projection. This accepts no
 /// schema syntax, nested shapes, defaults, or arbitrary property keys, so an
 /// editor can never treat configuration as a general JSON Schema evaluator.
-fn parse_module_catalog_input_fields(
+fn parse_module_catalog_record_fields(
     value: &serde_json::Value,
     retained_bytes: &mut usize,
     retained_fields: &mut usize,
 ) -> Option<Vec<ModuleCatalogInputFieldCompletion>> {
     let entries = value.as_array()?;
-    if entries.len() > MAX_LSP_MODULE_INPUT_FIELDS {
+    if entries.len() > MAX_LSP_MODULE_RECORD_FIELDS {
         return None;
     }
 
@@ -1738,9 +1760,9 @@ fn parse_module_catalog_input_fields(
             Some(value) => value.as_str()?,
             None => "",
         };
-        if name.len() > MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES
+        if name.len() > MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES
             || !is_canonical_identifier(name)
-            || description.len() > MAX_LSP_MODULE_INPUT_FIELD_DESCRIPTION_BYTES
+            || description.len() > MAX_LSP_MODULE_RECORD_FIELD_DESCRIPTION_BYTES
             || fields
                 .iter()
                 .any(|existing: &ModuleCatalogInputFieldCompletion| existing.name == name)
@@ -1748,7 +1770,7 @@ fn parse_module_catalog_input_fields(
             return None;
         }
         *retained_fields = retained_fields.checked_add(1)?;
-        if *retained_fields > MAX_LSP_MODULE_INPUT_FIELDS {
+        if *retained_fields > MAX_LSP_MODULE_RECORD_FIELDS {
             return None;
         }
         let entry_bytes = name
@@ -2844,7 +2866,7 @@ fn direct_record_input_field_site(
                 index += 1;
             }
             let name = source.get(start_byte..index)?;
-            if name.len() > MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES || !is_canonical_identifier(name)
+            if name.len() > MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES || !is_canonical_identifier(name)
             {
                 return None;
             }
@@ -2928,7 +2950,7 @@ fn direct_record_input_field_site(
             b':' => match state {
                 DirectRecordFieldState::AfterField { start_byte } => {
                     let name = source.get(start_byte..index)?;
-                    if declared_fields.len() == MAX_LSP_MODULE_INPUT_FIELDS
+                    if declared_fields.len() == MAX_LSP_MODULE_RECORD_FIELDS
                         || !declared_fields.insert(name.to_owned())
                     {
                         return None;
@@ -3019,7 +3041,7 @@ fn direct_record_input_field_span_at(source: &str, byte_offset: usize) -> Option
         });
     }
     let name = source.get(start_byte..end_byte)?;
-    (name.len() <= MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES && is_canonical_identifier(name))
+    (name.len() <= MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES && is_canonical_identifier(name))
         .then_some(SourceSpan {
             start_byte,
             end_byte,
@@ -4012,31 +4034,47 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
         value.push_str(&details);
     }
     if let Some(fields) = &module.input_fields {
-        value.push_str("\n\nAdvisory input record fields:");
-        if fields.is_empty() {
-            value.push_str(" no source-compatible fields are projected.");
-        } else {
-            for field in fields {
-                value.push_str("\n- ");
-                value.push_str(&field.name);
-                value.push_str(": ");
-                value.push_str(field.field_type.label());
-                value.push_str(if field.required {
-                    " (required)"
-                } else {
-                    " (optional)"
-                });
-                if !field.description.is_empty() {
-                    value.push_str("; ");
-                    value.push_str(&field.description);
-                }
-            }
-        }
+        append_module_catalog_record_fields(&mut value, "input", fields);
+    }
+    if let Some(fields) = &module.output_fields {
+        append_module_catalog_record_fields(&mut value, "output", fields);
     }
     value.push_str(
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
     );
     value
+}
+
+/// Adds compact, host-supplied record metadata to a plain-text module hover.
+/// The parser already bounded and validated every field, and this formatting
+/// remains presentation-only rather than a schema interpreter.
+fn append_module_catalog_record_fields(
+    value: &mut String,
+    direction: &str,
+    fields: &[ModuleCatalogInputFieldCompletion],
+) {
+    value.push_str("\n\nAdvisory ");
+    value.push_str(direction);
+    value.push_str(" record fields:");
+    if fields.is_empty() {
+        value.push_str(" no source-compatible fields are projected.");
+        return;
+    }
+    for field in fields {
+        value.push_str("\n- ");
+        value.push_str(&field.name);
+        value.push_str(": ");
+        value.push_str(field.field_type.label());
+        value.push_str(if field.required {
+            " (required)"
+        } else {
+            " (optional)"
+        });
+        if !field.description.is_empty() {
+            value.push_str("; ");
+            value.push_str(&field.description);
+        }
+    }
 }
 
 fn builtin_tool_signature_help(method: &str, active_argument: usize) -> Option<SignatureHelp> {
@@ -7840,7 +7878,7 @@ mod tests {
     }
 
     #[test]
-    fn presents_advisory_direct_module_input_fields_in_hover_and_signature_help() {
+    fn presents_advisory_direct_module_record_fields_in_hover_and_signature_help() {
         let source = concat!(
             "use mod.arithmetic\n",
             "let result = arithmetic.add({left: 20, right: 22})"
@@ -7865,6 +7903,14 @@ mod tests {
                             "type": "integer",
                             "required": false
                         }
+                    ],
+                    "outputFields": [
+                        {
+                            "name": "total",
+                            "type": "integer",
+                            "required": true,
+                            "description": "Sum of both addends."
+                        }
                     ]
                 }
             ])),
@@ -7882,6 +7928,8 @@ mod tests {
         assert!(value.contains("Advisory input record fields:"));
         assert!(value.contains("- left: integer (required); First addend."));
         assert!(value.contains("- right: integer (optional)"));
+        assert!(value.contains("Advisory output record fields:"));
+        assert!(value.contains("- total: integer (required); Sum of both addends."));
         assert!(value.contains("capability authorization remain host-owned"));
 
         let field_cursor = source.find("right:").expect("second field exists") + 1;
@@ -7900,6 +7948,7 @@ mod tests {
         };
         assert!(value.contains("- left: integer (required); First addend."));
         assert!(value.contains("- right: integer (optional)"));
+        assert!(value.contains("- total: integer (required); Sum of both addends."));
     }
 
     #[test]
@@ -8167,6 +8216,14 @@ mod tests {
                         "description": "Left addend."
                     },
                     {"name": "right", "type": "integer", "required": false}
+                ],
+                "outputFields": [
+                    {
+                        "name": "total",
+                        "type": "integer",
+                        "required": true,
+                        "description": "Reviewed sum."
+                    }
                 ]
             }
         ]))
@@ -8188,11 +8245,28 @@ mod tests {
                 },
             ])
         );
+        assert_eq!(
+            shaped_with_fields.modules[0].output_fields,
+            Some(vec![ModuleCatalogInputFieldCompletion {
+                name: "total".to_owned(),
+                field_type: ModuleCatalogInputFieldType::Integer,
+                required: true,
+                description: "Reviewed sum.".to_owned(),
+            }])
+        );
         assert!(parse_module_completion_catalog(&serde_json::json!([
             {
                 "path": "mod.math.add",
                 "callMode": "synchronous",
                 "inputFields": []
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "outputFields": []
             }
         ]))
         .is_none());
@@ -8223,7 +8297,16 @@ mod tests {
             }
         ]))
         .is_none());
-        let input_fields = |start: usize, count: usize| {
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": [{"name": "total", "type": "unknown", "required": true}]
+            }
+        ]))
+        .is_none());
+        let record_fields = |start: usize, count: usize| {
             serde_json::Value::Array(
                 (start..start + count)
                     .map(|index| {
@@ -8241,15 +8324,33 @@ mod tests {
                 "path": "mod.math.left",
                 "callMode": "synchronous",
                 "callShape": "single_json",
-                "inputFields": input_fields(0, MAX_LSP_MODULE_INPUT_FIELDS / 2)
+                "inputFields": record_fields(0, MAX_LSP_MODULE_RECORD_FIELDS / 2)
             },
             {
                 "path": "mod.math.right",
                 "callMode": "synchronous",
                 "callShape": "single_json",
-                "inputFields": input_fields(
-                    MAX_LSP_MODULE_INPUT_FIELDS / 2,
-                    MAX_LSP_MODULE_INPUT_FIELDS / 2 + 1
+                "inputFields": record_fields(
+                    MAX_LSP_MODULE_RECORD_FIELDS / 2,
+                    MAX_LSP_MODULE_RECORD_FIELDS / 2 + 1
+                )
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.output_left",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": record_fields(0, MAX_LSP_MODULE_RECORD_FIELDS / 2)
+            },
+            {
+                "path": "mod.math.output_right",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "outputFields": record_fields(
+                    MAX_LSP_MODULE_RECORD_FIELDS / 2,
+                    MAX_LSP_MODULE_RECORD_FIELDS / 2 + 1
                 )
             }
         ]))

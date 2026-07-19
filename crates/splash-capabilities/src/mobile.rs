@@ -616,6 +616,7 @@ mod tests {
                     call_mode: None,
                     call_shape: None,
                     input_fields: None,
+                    output_fields: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
@@ -636,6 +637,12 @@ mod tests {
                             description: String::new(),
                         },
                     ]),
+                    output_fields: Some(vec![crate::CapabilityModuleOutputFieldDescriptor {
+                        name: "total".to_owned(),
+                        field_type: crate::CapabilityModuleOutputFieldType::Integer,
+                        required: true,
+                        description: String::new(),
+                    }]),
                 },
             ]
         );

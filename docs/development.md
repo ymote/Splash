@@ -215,6 +215,9 @@ projection through `initializationOptions.splash.moduleCatalog` or a later
         "callShape": "single_json",
         "inputFields": [
           {"name": "location", "type": "string", "required": true}
+        ],
+        "outputFields": [
+          {"name": "temperature", "type": "number", "required": true}
         ]
       }
     ]
@@ -238,17 +241,18 @@ Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
 4 KiB description and optional exact-leaf `callMode` of `synchronous` or
 `deferred`, plus an optional exact-leaf `callShape` of `single_json` and its
-optional compact `inputFields` record view. A mode-bearing path must be at
-least `mod.<module>.<method>`; a shape requires a mode and input fields require
-that shape. Each field has a canonical identifier up to 128 bytes, one fixed
-JSON type, an explicit Boolean `required` bit, and an optional 4 KiB
-description. The LSP retains at most 256 descriptors, 1,024 aggregate input
-fields, and 512 KiB of path/description/call-mode/call-shape/input-field bytes.
-Paths below the fixed `mod.tool` namespace are rejected. A malformed recognized
-call mode, shape, or field projection, a shape without a mode, input fields
-without a shape, duplicate path, malformed descriptor, or over-limit projection
-is discarded as a whole and marks matching completion `isIncomplete`; no
-partial interface is presented. See [Editor module interface
+optional compact `inputFields` and `outputFields` record views. A mode-bearing
+path must be at least `mod.<module>.<method>`; a shape requires a mode and
+record fields require that shape. Each field has a canonical identifier up to
+128 bytes, one fixed JSON type, an explicit Boolean `required` bit, and an
+optional 4 KiB description. The LSP retains at most 256 descriptors, 1,024
+aggregate input fields, 1,024 aggregate output fields, and 512 KiB of
+path/description/call-mode/call-shape/field bytes. Paths below the fixed
+`mod.tool` namespace are rejected. A malformed recognized call mode, shape, or
+field projection, a shape without a mode, record fields without a shape,
+duplicate path, malformed descriptor, or over-limit projection is discarded as
+a whole and marks matching completion `isIncomplete`; no partial interface is
+presented. See [Editor module interface
 projection](module-catalog.md) for the complete contract. A deferred member is
 labeled as returning a promise, but the LSP never inserts `await()` or makes a
 host binding available or authorizes a capability.
@@ -262,12 +266,13 @@ metadata still completes and hovers, but has no assumed arity. The cursor
 scanner accepts an in-progress string argument, but rejects a cursor inside a
 comment, mismatched delimiters, deep nesting, shadowed receivers, truncated
 scope/import metadata, and unknown paths. It never reads a runtime, resolves a
-module, or grants authority. When a shaped leaf also supplies `inputFields`,
-its plain-text hover and signature documentation list bounded field names,
-fixed JSON types, required bits, and optional descriptions. It can additionally
-complete an undeclared top-level key only in that leaf's first direct literal
-record argument, after the same visible-import and exact-leaf checks. It does
-not complete nested keys, inspect a runtime value, evaluate JSON Schema, or
+module, or grants authority. When a shaped leaf also supplies `inputFields` or
+`outputFields`, its plain-text hover and signature documentation list bounded
+field names, fixed JSON types, required bits, and optional descriptions. It can
+additionally complete an undeclared top-level key only in that leaf's first
+direct literal record argument from `inputFields`, after the same visible-import
+and exact-leaf checks. It does not complete nested keys, infer result-binding
+members from `outputFields`, inspect a runtime value, evaluate JSON Schema, or
 validate a contract.
 
 For an approved dataflow authoring session, an editor integration may also
