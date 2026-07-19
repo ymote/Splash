@@ -155,6 +155,122 @@ enum ToolCallFormat {
     Json,
 }
 
+/// One fixed function in Splash's core scalar-math module.
+///
+/// This table is intentionally compiled into the LSP instead of being derived
+/// from an advisory module catalog. The documented core surface is stable,
+/// source-only editor metadata and carries no host authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StandardMathFunction {
+    name: &'static str,
+    parameters: &'static [&'static str],
+    description: &'static str,
+}
+
+/// One fixed scalar constant in Splash's core math module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StandardMathConstant {
+    name: &'static str,
+    description: &'static str,
+}
+
+const STANDARD_MATH_FUNCTIONS: &[StandardMathFunction] = &[
+    StandardMathFunction {
+        name: "abs",
+        parameters: &["value"],
+        description: "Returns the absolute value of a scalar number.",
+    },
+    StandardMathFunction {
+        name: "ceil",
+        parameters: &["value"],
+        description: "Rounds a scalar number upward.",
+    },
+    StandardMathFunction {
+        name: "floor",
+        parameters: &["value"],
+        description: "Rounds a scalar number downward.",
+    },
+    StandardMathFunction {
+        name: "round",
+        parameters: &["value"],
+        description: "Rounds a scalar number to the nearest integer-valued number.",
+    },
+    StandardMathFunction {
+        name: "sqrt",
+        parameters: &["value"],
+        description: "Returns a scalar square root.",
+    },
+    StandardMathFunction {
+        name: "sin",
+        parameters: &["value"],
+        description: "Returns a scalar sine.",
+    },
+    StandardMathFunction {
+        name: "cos",
+        parameters: &["value"],
+        description: "Returns a scalar cosine.",
+    },
+    StandardMathFunction {
+        name: "tan",
+        parameters: &["value"],
+        description: "Returns a scalar tangent.",
+    },
+    StandardMathFunction {
+        name: "exp",
+        parameters: &["value"],
+        description: "Returns the scalar natural exponential.",
+    },
+    StandardMathFunction {
+        name: "ln",
+        parameters: &["value"],
+        description: "Returns the scalar natural logarithm.",
+    },
+    StandardMathFunction {
+        name: "log10",
+        parameters: &["value"],
+        description: "Returns the scalar base-10 logarithm.",
+    },
+    StandardMathFunction {
+        name: "pow",
+        parameters: &["base", "exponent"],
+        description: "Raises a scalar base to a scalar exponent.",
+    },
+    StandardMathFunction {
+        name: "min",
+        parameters: &["left", "right"],
+        description: "Returns the smaller scalar value.",
+    },
+    StandardMathFunction {
+        name: "max",
+        parameters: &["left", "right"],
+        description: "Returns the larger scalar value.",
+    },
+    StandardMathFunction {
+        name: "atan2",
+        parameters: &["y", "x"],
+        description: "Returns the scalar two-argument arctangent.",
+    },
+    StandardMathFunction {
+        name: "clamp",
+        parameters: &["value", "minimum", "maximum"],
+        description: "Clamps a value to inclusive scalar bounds; minimum must not exceed maximum.",
+    },
+];
+
+const STANDARD_MATH_CONSTANTS: &[StandardMathConstant] = &[
+    StandardMathConstant {
+        name: "pi",
+        description: "The scalar ratio of a circle's circumference to its diameter.",
+    },
+    StandardMathConstant {
+        name: "e",
+        description: "The scalar base of natural logarithms.",
+    },
+];
+
+const STANDARD_MATH_AUTHORITY_NOTE: &str =
+    "Effect-free Splash core helper; it does not access the host or grant authority.";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ToolCatalogCompletion {
     name: String,
@@ -741,9 +857,19 @@ impl SplashLanguageServer {
                         range: Some(span_range(source, site.member)),
                     }));
                 }
+                let (_, lexical) = self.lexical_completions(uri)?;
+                let imports = self.module_imports(uri)?;
+                if site.has_direct_receiver()
+                    && is_visible_builtin_standard_math_receiver(
+                        source,
+                        lexical,
+                        imports,
+                        site.receiver,
+                    )
+                {
+                    return Ok(standard_math_member_hover(source, site));
+                }
                 if !self.module_catalog.modules.is_empty() {
-                    let (_, lexical) = self.lexical_completions(uri)?;
-                    let imports = self.module_imports(uri)?;
                     if let Some(field) = module_catalog_output_field_for_member(
                         source,
                         lexical,
@@ -913,6 +1039,22 @@ impl SplashLanguageServer {
                     is_incomplete,
                 ));
             }
+            if member_site.has_direct_receiver()
+                && is_visible_builtin_standard_math_receiver(
+                    source,
+                    report,
+                    imports,
+                    member_site.receiver,
+                )
+            {
+                return Ok(standard_math_module_member_completion(
+                    source,
+                    report,
+                    imports,
+                    member_site,
+                    is_incomplete,
+                ));
+            }
             let shapes = self.static_record_shapes(uri)?;
             if let Some(fields) = visible_static_record_fields(
                 source,
@@ -1046,6 +1188,16 @@ impl SplashLanguageServer {
             && is_visible_builtin_tool_receiver(source, lexical, imports, context.callee.receiver)
         {
             return Ok(builtin_tool_signature_help(method, context.active_argument));
+        }
+        if context.callee.has_direct_receiver()
+            && is_visible_builtin_standard_math_receiver(
+                source,
+                lexical,
+                imports,
+                context.callee.receiver,
+            )
+        {
+            return Ok(standard_math_signature_help(source, context));
         }
         if self.module_catalog.unavailable {
             return Ok(None);
@@ -1305,15 +1457,19 @@ const MAX_FUZZ_LSP_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
 /// Fixed source used to exercise arbitrary advisory catalog configuration.
 ///
-/// Its names cover direct tool, direct-module input/result, and workflow-data
-/// metadata without giving the fuzzer a capability host or runtime authority.
+/// Its names cover direct tool, fixed core math, direct-module input/result,
+/// and workflow-data metadata without giving the fuzzer a capability host or
+/// runtime authority.
 #[cfg(fuzzing)]
 const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "use mod.tool\n",
     "use mod.fuzz.inspect\n",
+    "use mod.std.math\n",
     "let result = inspect.remote_add({left: 20, filters: {category: \"news\"}, right: 22}).await()\n",
     "let alias = result\n",
     "alias.summary.total\n",
+    "let bounded = math.clamp(math.sqrt(81), 0, 8)\n",
+    "math.pi\n",
     "tool.call(\"\", \"\")\n",
     "workflow.input.request\n",
     "workflow.outputs.prepare.total"
@@ -1460,6 +1616,7 @@ pub fn fuzz_exercise_document(source: &str) {
         FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
     );
     fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
@@ -1497,12 +1654,14 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
         FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
     ));
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 
     // The same untrusted value crosses the independent refresh boundary after
     // initialization, so malformed and over-limit replacements cannot leave
     // stale catalog state available to semantic requests.
     server.refresh_advisory_configuration(settings);
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
@@ -1555,6 +1714,34 @@ fn fuzz_exercise_advisory_input_field_requests(
         let _ = server.hover(uri, position);
         let _ = server.signature_help(uri, position);
     }
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_fixed_standard_math_requests(
+    server: &SplashLanguageServer,
+    uri: &Uri,
+    source: &str,
+) {
+    let Some(completion_start) = source.find("math.clamp") else {
+        return;
+    };
+    let completion_byte = completion_start + "math.clamp".len();
+    let _ = server.completion(uri, position_at_byte(source, completion_byte));
+
+    let Some(sqrt_start) = source.find("sqrt") else {
+        return;
+    };
+    let _ = server.hover(uri, position_at_byte(source, sqrt_start + 1));
+
+    let Some(pi_start) = source.rfind("pi") else {
+        return;
+    };
+    let _ = server.hover(uri, position_at_byte(source, pi_start + 1));
+
+    let Some(minimum_start) = source.find("0, 8") else {
+        return;
+    };
+    let _ = server.signature_help(uri, position_at_byte(source, minimum_start + 1));
 }
 
 #[cfg(fuzzing)]
@@ -4201,6 +4388,120 @@ fn tool_module_member_completion(
     }
 }
 
+/// Completes only the fixed, documented core math module. This does not use
+/// module-catalog metadata, so a completion is neither a module lookup nor an
+/// indication that a host capability exists.
+fn standard_math_module_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if !site.has_direct_receiver()
+        || site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+        || !is_visible_builtin_standard_math_receiver(source, lexical, imports, site.receiver)
+    {
+        return empty();
+    }
+
+    let edit_range = span_range(source, site.member);
+    let mut items =
+        Vec::with_capacity(STANDARD_MATH_FUNCTIONS.len() + STANDARD_MATH_CONSTANTS.len());
+    for function in STANDARD_MATH_FUNCTIONS {
+        items.push(CompletionItem {
+            label: function.name.to_owned(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("mod.std.math function; effect-free scalar helper".to_owned()),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: standard_math_function_documentation(function, "math"),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                function.name.to_owned(),
+            ))),
+            ..CompletionItem::default()
+        });
+    }
+    for constant in STANDARD_MATH_CONSTANTS {
+        items.push(CompletionItem {
+            label: constant.name.to_owned(),
+            kind: Some(CompletionItemKind::CONSTANT),
+            detail: Some("mod.std.math constant; effect-free scalar value".to_owned()),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: standard_math_constant_documentation(constant, "math"),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                constant.name.to_owned(),
+            ))),
+            ..CompletionItem::default()
+        });
+    }
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
+fn standard_math_member_hover(source: &str, site: MemberCompletionSite) -> Option<Hover> {
+    if !site.has_direct_receiver() {
+        return None;
+    }
+    let member = source.get(site.member.start_byte..site.member.end_byte)?;
+    let value = if let Some(function) = standard_math_function(member) {
+        standard_math_function_documentation(function, "math")
+    } else if let Some(constant) = standard_math_constant(member) {
+        standard_math_constant_documentation(constant, "math")
+    } else {
+        return None;
+    };
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value,
+        }),
+        range: Some(span_range(source, site.member)),
+    })
+}
+
+fn standard_math_function(name: &str) -> Option<&'static StandardMathFunction> {
+    STANDARD_MATH_FUNCTIONS
+        .iter()
+        .find(|function| function.name == name)
+}
+
+fn standard_math_constant(name: &str) -> Option<&'static StandardMathConstant> {
+    STANDARD_MATH_CONSTANTS
+        .iter()
+        .find(|constant| constant.name == name)
+}
+
+fn standard_math_function_documentation(function: &StandardMathFunction, receiver: &str) -> String {
+    format!(
+        "{receiver}.{}({}) -> number\n\n{}\n\n{STANDARD_MATH_AUTHORITY_NOTE}",
+        function.name,
+        function.parameters.join(", "),
+        function.description,
+    )
+}
+
+fn standard_math_constant_documentation(constant: &StandardMathConstant, receiver: &str) -> String {
+    format!(
+        "{receiver}.{} -> number\n\n{}\n\n{STANDARD_MATH_AUTHORITY_NOTE}",
+        constant.name, constant.description,
+    )
+}
+
 fn static_record_member_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -5418,6 +5719,21 @@ fn builtin_tool_signature_help(method: &str, active_argument: usize) -> Option<S
     ))
 }
 
+fn standard_math_signature_help(
+    source: &str,
+    context: SignatureHelpCallContext,
+) -> Option<SignatureHelp> {
+    let member = source.get(context.callee.member.start_byte..context.callee.member.end_byte)?;
+    let function = standard_math_function(member)?;
+    let callee = source.get(context.callee.receiver.start_byte..context.callee.member.end_byte)?;
+    Some(signature_help_with_parameters(
+        format!("{callee}({}) -> number", function.parameters.join(", ")),
+        standard_math_function_documentation(function, callee),
+        function.parameters,
+        context.active_argument,
+    ))
+}
+
 fn module_catalog_signature_help(
     source: &str,
     module: &ModuleCatalogCompletion,
@@ -5525,6 +5841,16 @@ fn is_visible_builtin_tool_receiver(
 ) -> bool {
     visible_module_import_for_receiver(source, lexical, imports, receiver)
         .is_some_and(is_builtin_tool_module_import)
+}
+
+fn is_visible_builtin_standard_math_receiver(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    receiver: SourceSpan,
+) -> bool {
+    visible_module_import_for_receiver(source, lexical, imports, receiver)
+        .is_some_and(is_builtin_standard_math_module_import)
 }
 
 fn visible_module_import_for_receiver<'imports>(
@@ -6306,6 +6632,14 @@ fn static_record_field_for_member<'field>(
 
 fn is_builtin_tool_module_import(import: &ModuleImport) -> bool {
     import.path.iter().map(String::as_str).eq(["mod", "tool"])
+}
+
+fn is_builtin_standard_math_module_import(import: &ModuleImport) -> bool {
+    import
+        .path
+        .iter()
+        .map(String::as_str)
+        .eq(["mod", "std", "math"])
 }
 
 fn require_complete_lexical_report(report: &LexicalSymbolReport) -> Result<(), String> {
@@ -7210,6 +7544,222 @@ mod tests {
                     if *range == expected_partial_range
             )
         }));
+    }
+
+    #[test]
+    fn completes_fixed_standard_math_members_without_host_metadata() {
+        let source = "use mod.std.math\nlet output = math.";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.std.math.untrusted",
+                    "description": "Must not extend the fixed core module."
+                }
+            ])),
+        );
+        server.open_document(document(1, source));
+        let member_start = source.len();
+        let expected_empty_range = Range::new(
+            position_at_byte(source, member_start),
+            position_at_byte(source, member_start),
+        );
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(source, member_start))
+            .expect("core math completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "abs", "atan2", "ceil", "clamp", "cos", "e", "exp", "floor", "ln", "log10", "max",
+                "min", "pi", "pow", "round", "sin", "sqrt", "tan",
+            ]
+        );
+        assert!(completion.items.iter().all(|item| {
+            matches!(
+                &item.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_empty_range
+            )
+        }));
+
+        let sqrt = completion
+            .items
+            .iter()
+            .find(|item| item.label == "sqrt")
+            .expect("sqrt is a fixed core helper");
+        assert_eq!(sqrt.kind, Some(CompletionItemKind::FUNCTION));
+        assert_eq!(
+            sqrt.detail.as_deref(),
+            Some("mod.std.math function; effect-free scalar helper")
+        );
+        assert_eq!(
+            sqrt.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "math.sqrt(value) -> number\n\nReturns a scalar square root.\n\nEffect-free Splash core helper; it does not access the host or grant authority.".to_owned(),
+            }))
+        );
+
+        let pi = completion
+            .items
+            .iter()
+            .find(|item| item.label == "pi")
+            .expect("pi is a fixed core constant");
+        assert_eq!(pi.kind, Some(CompletionItemKind::CONSTANT));
+        assert_eq!(
+            pi.detail.as_deref(),
+            Some("mod.std.math constant; effect-free scalar value")
+        );
+
+        let partial_source = "use mod.std.math\nlet output = math.cl";
+        let mut partial_server = SplashLanguageServer::default();
+        partial_server.open_document(document(1, partial_source));
+        let partial_start = partial_source.rfind("cl").expect("partial member exists");
+        let partial_end = partial_source.len();
+        let expected_partial_range = Range::new(
+            position_at_byte(partial_source, partial_start),
+            position_at_byte(partial_source, partial_end),
+        );
+        let partial = partial_server
+            .completion(&test_uri(), position_at_byte(partial_source, partial_end))
+            .expect("partial core math completion succeeds");
+        assert_eq!(partial.items.len(), 18);
+        assert!(partial.items.iter().all(|item| {
+            matches!(
+                &item.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_partial_range
+            )
+        }));
+    }
+
+    #[test]
+    fn presents_fixed_standard_math_hover_and_signature_help_without_authority() {
+        let source = concat!(
+            "use mod.std.math\n",
+            "let root = math.sqrt(81)\n",
+            "let bounded = math.clamp(4, 0, 8)\n",
+            "math.pi"
+        );
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let sqrt_start = source.find("sqrt").expect("sqrt member exists");
+        let sqrt_hover = server
+            .hover(&test_uri(), position_at_byte(source, sqrt_start + 1))
+            .expect("core math hover succeeds")
+            .expect("sqrt has fixed hover metadata");
+        assert_eq!(
+            sqrt_hover.range,
+            Some(Range::new(
+                position_at_byte(source, sqrt_start),
+                position_at_byte(source, sqrt_start + "sqrt".len()),
+            ))
+        );
+        assert_eq!(
+            sqrt_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "math.sqrt(value) -> number\n\nReturns a scalar square root.\n\nEffect-free Splash core helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let pi_start = source.rfind("pi").expect("pi member exists");
+        let pi_hover = server
+            .hover(&test_uri(), position_at_byte(source, pi_start + 1))
+            .expect("core math constant hover succeeds")
+            .expect("pi has fixed hover metadata");
+        assert_eq!(
+            pi_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "math.pi -> number\n\nThe scalar ratio of a circle's circumference to its diameter.\n\nEffect-free Splash core helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let clamp_cursor = source.find("0, 8").expect("clamp minimum exists") + 1;
+        let clamp_help = server
+            .signature_help(&test_uri(), position_at_byte(source, clamp_cursor))
+            .expect("core math signature help succeeds")
+            .expect("clamp has a fixed signature");
+        assert_eq!(clamp_help.signatures.len(), 1);
+        assert_eq!(
+            clamp_help.signatures[0].label,
+            "math.clamp(value, minimum, maximum) -> number"
+        );
+        assert_eq!(clamp_help.active_signature, Some(0));
+        assert_eq!(clamp_help.active_parameter, Some(1));
+        assert_eq!(
+            clamp_help.signatures[0].parameters,
+            Some(vec![
+                ParameterInformation {
+                    label: ParameterLabel::Simple("value".to_owned()),
+                    documentation: None,
+                },
+                ParameterInformation {
+                    label: ParameterLabel::Simple("minimum".to_owned()),
+                    documentation: None,
+                },
+                ParameterInformation {
+                    label: ParameterLabel::Simple("maximum".to_owned()),
+                    documentation: None,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn refuses_standard_math_projection_outside_exact_visible_imports() {
+        for source in [
+            "use mod.custom.math\nmath.",
+            "use mod.std.math\nlet math = 1\nmath.",
+            "use mod.std.math\nlet alias = math\nalias.",
+            "use mod.std.math\nmath.sqrt.",
+            "use mod.std.math\nlet note = \"math.\"",
+            "use mod.std.math\n// math.",
+        ] {
+            let mut server = SplashLanguageServer::default();
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("completion request succeeds");
+            assert!(
+                completion.items.is_empty(),
+                "unexpected fixed math completion for {source:?}"
+            );
+        }
+
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.std.math.untrusted",
+                "description": "Must not extend the fixed core module.",
+                "callMode": "synchronous",
+                "callShape": "single_json"
+            }
+        ]));
+        let source = "use mod.std.math\nmath.untrusted({})";
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        server.open_document(document(1, source));
+        let untrusted_start = source.find("untrusted").expect("member exists");
+        assert!(server
+            .hover(
+                &test_uri(),
+                position_at_byte(source, untrusted_start + "untrusted".len()),
+            )
+            .expect("fixed math hover request succeeds")
+            .is_none());
+        let argument = source.find("{}").expect("call argument exists") + 1;
+        assert!(server
+            .signature_help(&test_uri(), position_at_byte(source, argument))
+            .expect("fixed math signature request succeeds")
+            .is_none());
     }
 
     #[test]
@@ -12318,6 +12868,24 @@ mod tests {
 
         assert!(completion.is_incomplete);
         assert_eq!(completion.items.len(), 4);
+    }
+
+    #[test]
+    fn marks_standard_math_completion_incomplete_when_imports_are_truncated() {
+        let mut source = String::from("use mod.std.math\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("let output = math.");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, source.len()))
+            .expect("truncated core math completion succeeds");
+
+        assert!(completion.is_incomplete);
+        assert_eq!(completion.items.len(), 18);
     }
 
     #[test]

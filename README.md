@@ -534,8 +534,11 @@ reads a document URI, evaluates source, loads or resolves arbitrary imported
 modules, creates a capability host, or loads a Rust adapter. For an exact,
 lexically visible `use mod.tool` binding, it additionally suggests only the
 fixed `call`, `call_json`, `start`, and `start_json` methods at a direct
-`tool.` member site. Those suggestions use no tool-catalog or adapter lookup
-and do not imply a capability grant. An integration may additionally supply a
+`tool.` member site. For an exact visible `use mod.std.math` binding, it also
+completes the documented fixed scalar functions and `pi`/`e` constants at a
+direct `math.` member site, with plain-text hover and function signature help.
+Both fixed surfaces use no tool-catalog or adapter lookup, do not follow local
+aliases, and do not imply a capability grant. An integration may additionally supply a
 advisory tool-catalog projection through
 `initializationOptions.splash.toolCatalog` or a later
 `workspace/didChangeConfiguration` update; it accepts the `name`, `format`,

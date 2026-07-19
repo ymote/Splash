@@ -142,6 +142,16 @@ candidates from a symbol-truncated report: an omitted inner definition may
 shadow a retained outer binding. The LSP therefore returns an incomplete empty
 candidate set in that case.
 
+The LSP separately recognizes an exact visible direct `use mod.std.math`
+binding. At a direct `math.` member site it completes only the documented
+frozen scalar functions and `pi`/`e` constants, and it offers plain-text hover
+plus fixed function signatures. This is a compiled-in core-language table: it
+does not inspect module-catalog metadata, resolve a module, follow a local
+alias, or expose a host capability. A shadowed `math` binding, a chained
+receiver, an unknown core-math member, or source outside the valid prefix gets
+no fixed-core result; a matching advisory catalog path cannot extend the core
+surface.
+
 For bounded static record metadata, Rust hosts can call
 `splash_core::static_record_shape_report` or its named, limit-aware variant.
 It retains exact direct `let binding = { ... }` shapes plus exact

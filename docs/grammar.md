@@ -402,6 +402,15 @@ or callable. An omitted key retains prior metadata, JSON `null` explicitly
 clears it, and malformed, duplicate, or over-limit input is discarded as a
 whole rather than presented partially.
 
+An exact visible direct `use mod.std.math` binding has a separate fixed core
+projection. At a direct `math.` member site it offers only the documented
+scalar functions and `pi`/`e` constants, with plain-text member hover and
+function signature help. Its descriptors are compiled into the LSP, not read
+from an advisory module catalog; the server does not resolve a module, follow a
+local alias, or derive a host capability. A shadowed binding, chained receiver,
+unknown member, or invalid source prefix has no fixed-math result, and advisory
+metadata cannot add members to this core module.
+
 For an exact visible imported capability-module leaf, the optional advisory
 `moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,
 and compact `inputFields` and `outputFields`. Each field has a canonical

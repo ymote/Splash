@@ -19,6 +19,8 @@
 "tool.start("
 "math.clamp("
 "math.pow("
+"math.sqrt("
+"math.pi"
 ".await()"
 "splash"
 "toolCatalog"
