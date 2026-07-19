@@ -614,11 +614,13 @@ mod tests {
                     path: "mod.arithmetic".to_owned(),
                     description: "Reviewed arithmetic adapters.".to_owned(),
                     call_mode: None,
+                    call_shape: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integer fields.".to_owned(),
                     call_mode: Some(crate::CapabilityModuleMethodMode::Deferred),
+                    call_shape: Some(crate::CapabilityModuleCallShape::SingleJson),
                 },
             ]
         );
@@ -626,6 +628,7 @@ mod tests {
             serde_json::to_value(&interface_catalog).expect("interface catalog serializes");
         assert!(lsp_projection[0].get("callMode").is_none());
         assert_eq!(lsp_projection[1]["callMode"], json!("deferred"));
+        assert_eq!(lsp_projection[1]["callShape"], json!("single_json"));
     }
 
     #[cfg(feature = "http-endpoint-catalog")]

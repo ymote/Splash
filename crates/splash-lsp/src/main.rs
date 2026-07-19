@@ -24,6 +24,7 @@ use lsp_types::{
     request::{
         Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
         HoverRequest, PrepareRenameRequest, References, Rename, Request as LspRequest,
+        SignatureHelpRequest,
     },
     CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionParams,
     CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
@@ -32,10 +33,12 @@ use lsp_types::{
     DocumentHighlightKind, DocumentHighlightParams, DocumentSymbol, DocumentSymbolParams,
     DocumentSymbolResponse, Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, InitializeParams, Location, MarkupContent, MarkupKind, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Position, PositionEncodingKind, PrepareRenameResponse,
-    PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
-    ServerCapabilities, SymbolKind, TextDocumentEdit, TextDocumentItem, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    OptionalVersionedTextDocumentIdentifier, ParameterInformation, ParameterLabel, Position,
+    PositionEncodingKind, PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceParams,
+    RenameOptions, RenameParams, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SignatureInformation, SymbolKind, TextDocumentEdit, TextDocumentItem,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    WorkspaceEdit,
 };
 use splash_core::{
     check_syntax_named, format_source_named, is_canonical_identifier,
@@ -44,7 +47,7 @@ use splash_core::{
     LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
     ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordShape, StaticRecordShapeReport,
     SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind, DEFAULT_MAX_SOURCE_BYTES,
-    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
+    DEFAULT_MAX_SYNTAX_NESTING, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -73,6 +76,13 @@ const MAX_LSP_MODULE_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_LSP_MODULE_PATH_BYTES: usize = 256;
 const MAX_LSP_MODULE_PATH_SEGMENTS: usize = 16;
 const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Signature help scans only the current bounded source document and keeps its
+/// delimiter stack no larger than the canonical grammar nesting budget.
+const MAX_SIGNATURE_HELP_DELIMITER_DEPTH: usize = DEFAULT_MAX_SYNTAX_NESTING;
+/// More arguments than this make the small fixed capability call signatures
+/// unhelpful, so the source-only scanner stops rather than tracking unbounded
+/// comma state for one editor request.
+const MAX_SIGNATURE_HELP_ARGUMENTS: usize = 64;
 /// Maximum projected workflow outputs retained in the advisory dataflow
 /// catalog. This stays far below the workflow-plan hard cap so editor metadata
 /// remains inexpensive on mobile and embedded hosts.
@@ -148,6 +158,7 @@ struct ModuleCatalogCompletion {
     path: Vec<String>,
     description: String,
     call_mode: Option<ModuleCatalogCallMode>,
+    call_shape: Option<ModuleCatalogCallShape>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,6 +180,26 @@ impl ModuleCatalogCallMode {
         match self {
             Self::Synchronous => "synchronous",
             Self::Deferred => "deferred",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModuleCatalogCallShape {
+    SingleJson,
+}
+
+impl ModuleCatalogCallShape {
+    fn from_catalog_value(value: &str) -> Option<Self> {
+        match value {
+            "single_json" => Some(Self::SingleJson),
+            _ => None,
+        }
+    }
+
+    const fn as_catalog_value(self) -> &'static str {
+        match self {
+            Self::SingleJson => "single_json",
         }
     }
 }
@@ -824,6 +855,69 @@ impl SplashLanguageServer {
         })
     }
 
+    /// Returns only fixed language signatures or exact visible advisory module
+    /// leaves. This is source-only editor metadata, never a module lookup or
+    /// capability decision.
+    fn signature_help(
+        &self,
+        uri: &Uri,
+        position: Position,
+    ) -> Result<Option<SignatureHelp>, String> {
+        let (source, lexical) = self.lexical_completions(uri)?;
+        if lexical.symbols_truncated {
+            return Ok(None);
+        }
+        let Some(byte_offset) = byte_at_position(source, position) else {
+            return Ok(None);
+        };
+        let Some(context) = signature_help_call_context(source, byte_offset) else {
+            return Ok(None);
+        };
+        let imports = self.module_imports(uri)?;
+        if imports.truncated
+            || context.callee.member.end_byte > lexical.valid_prefix_end_byte
+            || context.callee.member.end_byte > imports.valid_prefix_end_byte
+        {
+            return Ok(None);
+        }
+
+        let method = source
+            .get(context.callee.member.start_byte..context.callee.member.end_byte)
+            .ok_or_else(|| "the signature-help callee has an invalid source span".to_owned())?;
+        if context.callee.has_direct_receiver()
+            && is_visible_builtin_tool_receiver(source, lexical, imports, context.callee.receiver)
+        {
+            return Ok(builtin_tool_signature_help(method, context.active_argument));
+        }
+        if self.module_catalog.unavailable {
+            return Ok(None);
+        }
+        let Some(mut path) =
+            module_catalog_member_parent_path(source, lexical, imports, context.callee)
+        else {
+            return Ok(None);
+        };
+        path.push(method.to_owned());
+        let Some(module) = self
+            .module_catalog
+            .modules
+            .iter()
+            .find(|module| module.path.as_slice() == path.as_slice())
+        else {
+            return Ok(None);
+        };
+        let Some(call_mode) = module.call_mode else {
+            return Ok(None);
+        };
+        if module.call_shape != Some(ModuleCatalogCallShape::SingleJson) {
+            return Ok(None);
+        }
+
+        Ok(module_catalog_signature_help(
+            source, module, call_mode, context,
+        ))
+    }
+
     fn prepare_rename(
         &self,
         uri: &Uri,
@@ -1065,6 +1159,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 path: vec!["mod".to_owned(), "fuzz".to_owned()],
                 description: "Fuzz-only advisory module.".to_owned(),
                 call_mode: None,
+                call_shape: None,
             },
             ModuleCatalogCompletion {
                 path: vec![
@@ -1075,6 +1170,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 ],
                 description: "Fuzz-only deferred adapter.".to_owned(),
                 call_mode: Some(ModuleCatalogCallMode::Deferred),
+                call_shape: Some(ModuleCatalogCallShape::SingleJson),
             },
             ModuleCatalogCompletion {
                 path: vec![
@@ -1085,6 +1181,7 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                 ],
                 description: "Fuzz-only synchronous adapter.".to_owned(),
                 call_mode: Some(ModuleCatalogCallMode::Synchronous),
+                call_shape: Some(ModuleCatalogCallShape::SingleJson),
             },
         ],
         unavailable: false,
@@ -1145,6 +1242,7 @@ fn fuzz_exercise_semantic_requests(server: &SplashLanguageServer, uri: &Uri, sou
         let position = position_at_byte(source, byte_offset);
         let _ = server.completion(uri, position);
         let _ = server.hover(uri, position);
+        let _ = server.signature_help(uri, position);
         let _ = server.definition(uri, position);
         let _ = server.references(uri, position, true);
         let _ = server.document_highlights(uri, position);
@@ -1157,6 +1255,7 @@ fn fuzz_exercise_semantic_requests(server: &SplashLanguageServer, uri: &Uri, sou
     let invalid_position = Position::new(u32::MAX, u32::MAX);
     let _ = server.completion(uri, invalid_position);
     let _ = server.hover(uri, invalid_position);
+    let _ = server.signature_help(uri, invalid_position);
     let _ = server.definition(uri, invalid_position);
     let _ = server.references(uri, invalid_position, true);
     let _ = server.document_highlights(uri, invalid_position);
@@ -1440,8 +1539,9 @@ fn is_valid_catalog_tool_name(name: &str) -> bool {
 
 /// Reads a tiny static `mod.*` interface projection without treating it as a
 /// module registry. Each path must be canonical source spelling rooted at
-/// `mod`; unknown descriptor fields remain intentionally ignored. An optional
-/// `callMode` is advisory metadata for an exact callable path only.
+/// `mod`; unknown descriptor fields remain intentionally ignored. Optional
+/// `callMode` and `callShape` values are advisory metadata for an exact
+/// callable path only.
 fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCompletionCatalog> {
     let entries = value.as_array()?;
     if entries.len() > MAX_LSP_MODULE_CATALOG_ENTRIES {
@@ -1461,9 +1561,18 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             Some(value) => Some(ModuleCatalogCallMode::from_catalog_value(value.as_str()?)?),
             None => None,
         };
+        let call_shape = match object.get("callShape") {
+            Some(value) => Some(ModuleCatalogCallShape::from_catalog_value(value.as_str()?)?),
+            None => None,
+        };
         // Direct capability methods live below an import target (`mod.<module>.<method>`).
         // Do not present promise semantics for a bare import target.
         if call_mode.is_some() && path.len() < 3 {
+            return None;
+        }
+        // A shape says more than presentation mode, so do not accept it on a
+        // path that does not identify a callable method.
+        if call_shape.is_some() && call_mode.is_none() {
             return None;
         }
         if description.len() > MAX_LSP_MODULE_DESCRIPTION_BYTES {
@@ -1476,6 +1585,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
         let entry_bytes = path_bytes
             .checked_add(description.len())?
             .checked_add(call_mode.map_or(0, |mode| mode.as_catalog_value().len()))?
+            .checked_add(call_shape.map_or(0, |shape| shape.as_catalog_value().len()))?
             .checked_add(1)?;
         retained_bytes = retained_bytes.checked_add(entry_bytes)?;
         if retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES
@@ -1489,6 +1599,7 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
             path,
             description: description.to_owned(),
             call_mode,
+            call_shape,
         });
     }
     if modules.iter().any(|module| {
@@ -1796,6 +1907,11 @@ fn server_capabilities(versioned_document_edits: bool) -> ServerCapabilities {
             trigger_characters: Some(vec![".".to_owned()]),
             ..CompletionOptions::default()
         }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_owned()]),
+            retrigger_characters: Some(vec![",".to_owned()]),
+            ..SignatureHelpOptions::default()
+        }),
         rename_provider: versioned_document_edits.then(|| {
             OneOf::Right(RenameOptions {
                 prepare_provider: Some(true),
@@ -1876,6 +1992,25 @@ fn handle_request(
                 id,
                 ErrorCode::InvalidParams as i32,
                 format!("invalid textDocument/hover parameters: {error}"),
+            ),
+        }
+    } else if request.method == SignatureHelpRequest::METHOD {
+        let id = request.id.clone();
+        match serde_json::from_value::<SignatureHelpParams>(request.params) {
+            Ok(params) => {
+                let text_document_position = params.text_document_position_params;
+                match server.signature_help(
+                    &text_document_position.text_document.uri,
+                    text_document_position.position,
+                ) {
+                    Ok(signature_help) => Response::new_ok(id, signature_help),
+                    Err(message) => Response::new_err(id, ErrorCode::RequestFailed as i32, message),
+                }
+            }
+            Err(error) => Response::new_err(
+                id,
+                ErrorCode::InvalidParams as i32,
+                format!("invalid textDocument/signatureHelp parameters: {error}"),
             ),
         }
     } else if request.method == References::METHOD {
@@ -2209,6 +2344,26 @@ impl MemberCompletionSite {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SignatureHelpCallContext {
+    callee: MemberCompletionSite,
+    active_argument: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignatureHelpDelimiterKind {
+    Round,
+    Square,
+    Curly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SignatureHelpDelimiter {
+    kind: SignatureHelpDelimiterKind,
+    opening_byte: usize,
+    argument_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ImportPathCompletionSite {
     prefix: Vec<String>,
@@ -2288,6 +2443,166 @@ fn direct_module_member_completion_site(
             end_byte: member_end,
         },
     })
+}
+
+/// Finds the enclosing direct member call at a cursor without parsing or
+/// evaluating source. An in-progress string argument is allowed so signature
+/// help remains useful while a user types; a cursor inside a comment fails
+/// closed.
+fn signature_help_call_context(
+    source: &str,
+    byte_offset: usize,
+) -> Option<SignatureHelpCallContext> {
+    let delimiters = signature_help_delimiters_before(source, byte_offset)?;
+    let opening = delimiters
+        .iter()
+        .rev()
+        .find(|delimiter| delimiter.kind == SignatureHelpDelimiterKind::Round)?;
+    let callee_end = skip_ascii_whitespace_backward(source, opening.opening_byte);
+    let callee = direct_module_member_completion_site(source, callee_end)?;
+    (callee.member.end_byte == callee_end).then_some(SignatureHelpCallContext {
+        callee,
+        active_argument: opening.argument_count,
+    })
+}
+
+/// Scans one bounded source prefix while preserving only delimiter state and
+/// top-level call commas. It intentionally recognizes just comments and
+/// strings needed to keep punctuation inside them from becoming source syntax.
+fn signature_help_delimiters_before(
+    source: &str,
+    byte_offset: usize,
+) -> Option<Vec<SignatureHelpDelimiter>> {
+    if byte_offset > source.len() || !source.is_char_boundary(byte_offset) {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut index = 0_usize;
+    while index < byte_offset {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                let mut terminated = false;
+                while index < byte_offset {
+                    match bytes[index] {
+                        b'"' => {
+                            index += 1;
+                            terminated = true;
+                            break;
+                        }
+                        b'\\' => {
+                            index = advance_utf8_character(source, index);
+                            if index < byte_offset {
+                                index = advance_utf8_character(source, index);
+                            }
+                        }
+                        b'\n' | b'\r' => return None,
+                        _ => index = advance_utf8_character(source, index),
+                    }
+                }
+                if !terminated {
+                    // The cursor is inside a string argument. Delimiters before
+                    // it remain valid, while punctuation in the string is not.
+                    break;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < byte_offset && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+                if index == byte_offset {
+                    return None;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut terminated = false;
+                while index < byte_offset {
+                    if bytes[index] == b'*'
+                        && bytes.get(index + 1) == Some(&b'/')
+                        && index + 1 < byte_offset
+                    {
+                        index += 2;
+                        terminated = true;
+                        break;
+                    }
+                    index = advance_utf8_character(source, index);
+                }
+                if !terminated {
+                    return None;
+                }
+            }
+            b'(' => {
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                delimiters.push(SignatureHelpDelimiter {
+                    kind: SignatureHelpDelimiterKind::Round,
+                    opening_byte: index,
+                    argument_count: 0,
+                });
+                index += 1;
+            }
+            b'[' => {
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                delimiters.push(SignatureHelpDelimiter {
+                    kind: SignatureHelpDelimiterKind::Square,
+                    opening_byte: index,
+                    argument_count: 0,
+                });
+                index += 1;
+            }
+            b'{' => {
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                delimiters.push(SignatureHelpDelimiter {
+                    kind: SignatureHelpDelimiterKind::Curly,
+                    opening_byte: index,
+                    argument_count: 0,
+                });
+                index += 1;
+            }
+            b')' => {
+                let delimiter = delimiters.pop()?;
+                if delimiter.kind != SignatureHelpDelimiterKind::Round {
+                    return None;
+                }
+                index += 1;
+            }
+            b']' => {
+                let delimiter = delimiters.pop()?;
+                if delimiter.kind != SignatureHelpDelimiterKind::Square {
+                    return None;
+                }
+                index += 1;
+            }
+            b'}' => {
+                let delimiter = delimiters.pop()?;
+                if delimiter.kind != SignatureHelpDelimiterKind::Curly {
+                    return None;
+                }
+                index += 1;
+            }
+            b',' => {
+                let delimiter = delimiters.last_mut()?;
+                if delimiter.kind == SignatureHelpDelimiterKind::Round {
+                    delimiter.argument_count = delimiter.argument_count.checked_add(1)?;
+                    if delimiter.argument_count >= MAX_SIGNATURE_HELP_ARGUMENTS {
+                        return None;
+                    }
+                }
+                index += 1;
+            }
+            _ => index = advance_utf8_character(source, index),
+        }
+    }
+    Some(delimiters)
 }
 
 /// Recognizes one direct, statement-position `use mod.<path>` segment.
@@ -3160,6 +3475,88 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
     );
     value
+}
+
+fn builtin_tool_signature_help(method: &str, active_argument: usize) -> Option<SignatureHelp> {
+    let (label, documentation, value_parameter) = match method {
+        "call" => (
+            "tool.call(name, input) -> string",
+            "Calls a reviewed text capability synchronously. The host validates the requested name and active capability lease at runtime; signature help does not grant a capability.",
+            "input",
+        ),
+        "start" => (
+            "tool.start(name, input) -> promise<string>",
+            "Starts a reviewed text capability. Await the returned promise before using its string result. The host validates the requested name and active capability lease at runtime; signature help does not grant a capability.",
+            "input",
+        ),
+        "call_json" => (
+            "tool.call_json(name, value) -> string",
+            "Calls a reviewed JSON capability synchronously. Value must cross the bounded JSON bridge, and the returned string can be decoded with parse_json(). The host validates the requested name and active capability lease at runtime; signature help does not grant a capability.",
+            "value",
+        ),
+        "start_json" => (
+            "tool.start_json(name, value) -> promise<string>",
+            "Starts a reviewed JSON capability. Value must cross the bounded JSON bridge; await the promise, then decode its string result with parse_json(). The host validates the requested name and active capability lease at runtime; signature help does not grant a capability.",
+            "value",
+        ),
+        _ => return None,
+    };
+    Some(signature_help_with_parameters(
+        label,
+        documentation,
+        &["name", value_parameter],
+        active_argument,
+    ))
+}
+
+fn module_catalog_signature_help(
+    source: &str,
+    module: &ModuleCatalogCompletion,
+    call_mode: ModuleCatalogCallMode,
+    context: SignatureHelpCallContext,
+) -> Option<SignatureHelp> {
+    let callee = source.get(context.callee.receiver.start_byte..context.callee.member.end_byte)?;
+    let label = match call_mode {
+        ModuleCatalogCallMode::Synchronous => format!("{callee}(input) -> JSON value"),
+        ModuleCatalogCallMode::Deferred => format!("{callee}(input) -> promise<JSON value>"),
+    };
+    Some(signature_help_with_parameters(
+        label,
+        module_catalog_member_hover_text(module),
+        &["input"],
+        context.active_argument,
+    ))
+}
+
+fn signature_help_with_parameters(
+    label: impl Into<String>,
+    documentation: impl Into<String>,
+    parameter_names: &[&str],
+    active_argument: usize,
+) -> SignatureHelp {
+    let active_parameter =
+        (active_argument < parameter_names.len()).then(|| to_u32(active_argument));
+    SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: label.into(),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: documentation.into(),
+            })),
+            parameters: Some(
+                parameter_names
+                    .iter()
+                    .map(|name| ParameterInformation {
+                        label: ParameterLabel::Simple((*name).to_owned()),
+                        documentation: None,
+                    })
+                    .collect(),
+            ),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter,
+    }
 }
 
 fn tool_catalog_name_completion(
@@ -6687,7 +7084,10 @@ mod tests {
         let mut shadowed_server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
             module_catalog(serde_json::json!([
-                {"path": "mod.arithmetic.remote_add", "callMode": "deferred"}
+                {
+                    "path": "mod.arithmetic.remote_add",
+                    "callMode": "deferred"
+                }
             ])),
         );
         shadowed_server.open_document(document(1, shadowed_source));
@@ -6704,7 +7104,10 @@ mod tests {
         let mut invalid_server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
             module_catalog(serde_json::json!([
-                {"path": "mod.arithmetic.remote_add", "callMode": "deferred"}
+                {
+                    "path": "mod.arithmetic.remote_add",
+                    "callMode": "deferred"
+                }
             ])),
         );
         invalid_server.open_document(document(1, invalid_source));
@@ -6715,6 +7118,162 @@ mod tests {
                 position_at_byte(invalid_source, invalid_member + 1)
             )
             .expect("invalid-source hover request succeeds")
+            .is_none());
+    }
+
+    #[test]
+    fn presents_bounded_capability_signature_help_without_authority() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.remote_add",
+                "description": "Adds two integers through a reviewed remote adapter.",
+                "callMode": "deferred",
+                "callShape": "single_json"
+            }
+        ]));
+        let source = concat!(
+            "use mod.tool\n",
+            "use mod.arithmetic\n",
+            "let text = tool.call(\"text.echo\", \"hello\")\n",
+            "let result = arithmetic.remote_add({left: 20, right: 22})"
+        );
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        server.open_document(document(1, source));
+
+        let text_cursor = source.find("hello").expect("text argument exists") + 1;
+        let text_help = server
+            .signature_help(&test_uri(), position_at_byte(source, text_cursor))
+            .expect("text signature help succeeds")
+            .expect("visible mod.tool call has a fixed signature");
+        assert_eq!(text_help.signatures.len(), 1);
+        assert_eq!(
+            text_help.signatures[0].label,
+            "tool.call(name, input) -> string"
+        );
+        assert_eq!(text_help.active_signature, Some(0));
+        assert_eq!(text_help.active_parameter, Some(1));
+        assert_eq!(
+            text_help.signatures[0]
+                .parameters
+                .as_ref()
+                .expect("tool signature has parameters")[1]
+                .label,
+            ParameterLabel::Simple("input".to_owned())
+        );
+
+        let record_cursor = source.find("right:").expect("record field exists") + 1;
+        let module_help = server
+            .signature_help(&test_uri(), position_at_byte(source, record_cursor))
+            .expect("module signature help succeeds")
+            .expect("visible advisory module leaf has a signature");
+        assert_eq!(module_help.signatures.len(), 1);
+        assert_eq!(
+            module_help.signatures[0].label,
+            "arithmetic.remote_add(input) -> promise<JSON value>"
+        );
+        // The comma inside the record is not a second direct-module argument.
+        assert_eq!(module_help.active_parameter, Some(0));
+        assert_eq!(
+            module_help.signatures[0].documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Advisory imported-module member `mod.arithmetic.remote_add`.\n\nAdds two integers through a reviewed remote adapter.\n\nAdvisory deferred method; call returns a promise and must use await().\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.".to_owned(),
+            }))
+        );
+
+        let mode_only_source = "use mod.arithmetic\narithmetic.remote_add({})";
+        let mut mode_only_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {"path": "mod.arithmetic.remote_add", "callMode": "deferred"}
+            ])),
+        );
+        mode_only_server.open_document(document(1, mode_only_source));
+        assert!(mode_only_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(mode_only_source, mode_only_source.len() - 1),
+            )
+            .expect("mode-only signature request succeeds")
+            .is_none());
+
+        let incomplete_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.remote_add(",
+            "\"",
+        );
+        let mut incomplete_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.arithmetic.remote_add",
+                    "callMode": "deferred",
+                    "callShape": "single_json"
+                }
+            ])),
+        );
+        incomplete_server.open_document(document(1, incomplete_source));
+        assert_eq!(
+            incomplete_server
+                .signature_help(
+                    &test_uri(),
+                    position_at_byte(incomplete_source, incomplete_source.len()),
+                )
+                .expect("incomplete signature request succeeds")
+                .expect("in-progress direct call keeps its advisory signature")
+                .signatures[0]
+                .label,
+            "arithmetic.remote_add(input) -> promise<JSON value>"
+        );
+
+        let comment_source =
+            "use mod.arithmetic\nlet result = arithmetic.remote_add(/* editing */ {})";
+        let mut comment_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.arithmetic.remote_add",
+                    "callMode": "deferred",
+                    "callShape": "single_json"
+                }
+            ])),
+        );
+        comment_server.open_document(document(1, comment_source));
+        let comment_cursor = comment_source.find("editing").expect("comment exists") + 1;
+        assert!(comment_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(comment_source, comment_cursor)
+            )
+            .expect("comment signature request succeeds")
+            .is_none());
+
+        let shadowed_source = concat!(
+            "use mod.arithmetic\n",
+            "let arithmetic = {remote_add: || nil}\n",
+            "arithmetic.remote_add({})"
+        );
+        let mut shadowed_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            module_catalog(serde_json::json!([
+                {
+                    "path": "mod.arithmetic.remote_add",
+                    "callMode": "deferred",
+                    "callShape": "single_json"
+                }
+            ])),
+        );
+        shadowed_server.open_document(document(1, shadowed_source));
+        let shadowed_cursor = shadowed_source.rfind("{}").expect("call argument exists") + 1;
+        assert!(shadowed_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(shadowed_source, shadowed_cursor),
+            )
+            .expect("shadowed signature request succeeds")
             .is_none());
     }
 
@@ -6764,6 +7323,35 @@ mod tests {
             {"path": "mod.std.log", "callMode": 42}
         ]))
         .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "callMode": "deferred", "callShape": "unknown"}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "callMode": "deferred", "callShape": 42}
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "callShape": "single_json"}
+        ]))
+        .is_none());
+        let mode_only = parse_module_completion_catalog(&serde_json::json!([
+            {"path": "mod.std.log", "callMode": "deferred"}
+        ]))
+        .expect("mode-only catalog entry remains valid");
+        assert_eq!(mode_only.modules[0].call_shape, None);
+        let shaped = parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.std.log",
+                "callMode": "deferred",
+                "callShape": "single_json"
+            }
+        ]))
+        .expect("recognized call shape is retained");
+        assert_eq!(
+            shaped.modules[0].call_shape,
+            Some(ModuleCatalogCallShape::SingleJson)
+        );
         assert!(parse_module_completion_catalog(&serde_json::json!([
             {"path": "mod.std", "callMode": "deferred"}
         ]))
@@ -7626,6 +8214,14 @@ mod tests {
         assert_eq!(capabilities["referencesProvider"], true);
         assert_eq!(capabilities["hoverProvider"], true);
         assert_eq!(capabilities["documentHighlightProvider"], true);
+        assert_eq!(
+            capabilities["signatureHelpProvider"]["triggerCharacters"],
+            serde_json::json!(["("])
+        );
+        assert_eq!(
+            capabilities["signatureHelpProvider"]["retriggerCharacters"],
+            serde_json::json!([","])
+        );
         assert_eq!(capabilities["completionProvider"]["resolveProvider"], false);
         assert_eq!(
             capabilities["completionProvider"]["triggerCharacters"],
@@ -7987,6 +8583,38 @@ mod tests {
             .receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("diagnostics arrive after tool source change");
+        client_connection
+            .sender
+            .send(
+                Request::new(
+                    10.into(),
+                    SignatureHelpRequest::METHOD.to_owned(),
+                    serde_json::json!({
+                        "textDocument": {"uri": test_uri()},
+                        "position": {"line": 1, "character": 27}
+                    }),
+                )
+                .into(),
+            )
+            .expect("signature help request send succeeds");
+        let signature_help_response = client_connection
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("signature help response arrives");
+        let Message::Response(response) = signature_help_response else {
+            panic!("expected signature help response");
+        };
+        let signature_help = match response.response_kind {
+            lsp_server::ResponseKind::Ok { result } => result,
+            lsp_server::ResponseKind::Err { error } => {
+                panic!("signature help request failed: {}", error.message)
+            }
+        };
+        assert_eq!(
+            signature_help["signatures"][0]["label"],
+            "tool.call(name, input) -> string"
+        );
+        assert_eq!(signature_help["activeParameter"], 0);
         client_connection
             .sender
             .send(

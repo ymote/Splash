@@ -211,7 +211,8 @@ projection through `initializationOptions.splash.moduleCatalog` or a later
       {
         "path": "mod.app.weather.current",
         "description": "Returns current forecast data.",
-        "callMode": "deferred"
+        "callMode": "deferred",
+        "callShape": "single_json"
       }
     ]
   }
@@ -233,15 +234,28 @@ catalogs so the server cannot retain stale metadata.
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
 4 KiB description and optional exact-leaf `callMode` of `synchronous` or
-`deferred`; a mode-bearing path must be at least
-`mod.<module>.<method>`. The LSP retains at most 256 descriptors and 512 KiB of
-path/description/call-mode bytes. Paths below the fixed `mod.tool` namespace
-are rejected. A malformed recognized call mode, duplicate path, malformed
-descriptor, or over-limit projection is discarded as a whole and marks matching completion
-`isIncomplete`; no partial interface is presented. See [Editor module interface
+`deferred`, plus an optional exact-leaf `callShape` of `single_json`. A
+mode-bearing path must be at least `mod.<module>.<method>`; a shape requires a
+mode. The LSP retains at most 256 descriptors and 512 KiB of
+path/description/call-mode/call-shape bytes. Paths below the fixed `mod.tool`
+namespace are rejected. A malformed recognized call mode or shape, a shape
+without a mode, duplicate path, malformed descriptor, or over-limit projection
+is discarded as a whole and marks matching completion `isIncomplete`; no
+partial interface is presented. See [Editor module interface
 projection](module-catalog.md) for the complete contract. A deferred member is
 labeled as returning a promise, but the LSP never inserts `await()` or makes a
 host binding available or authorizes a capability.
+
+The LSP also serves bounded `textDocument/signatureHelp` for a direct visible
+`mod.tool` call and an exact visible advisory module leaf with both `callMode`
+and `callShape: "single_json"`. Fixed `mod.tool` signatures describe their text
+or JSON bridge; only that explicit shape gives a direct module one
+JSON-compatible `input` and synchronous or deferred result label. Mode-only
+metadata still completes and hovers, but has no assumed arity. The cursor
+scanner accepts an in-progress string argument, but rejects a cursor inside a
+comment, mismatched delimiters, deep nesting, shadowed receivers, truncated
+scope/import metadata, and unknown paths. It never reads a runtime, resolves a
+module, or grants authority.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through

@@ -622,6 +622,18 @@ pub enum CapabilityModuleMethodMode {
     Deferred,
 }
 
+/// The script-visible argument shape of one direct capability module method.
+///
+/// Direct methods currently have exactly one JSON-compatible value argument.
+/// This explicit descriptor lets advisory editor metadata describe that fact
+/// without inferring a contract from a method name or target tool. It is part
+/// of the reviewed catalog and capability-lease fingerprint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityModuleCallShape {
+    SingleJson,
+}
+
 /// Stable host-facing description of one setup-defined direct capability
 /// module.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -638,6 +650,7 @@ pub struct CapabilityModuleMethodDescriptor {
     pub tool: String,
     pub description: String,
     pub mode: CapabilityModuleMethodMode,
+    pub call_shape: CapabilityModuleCallShape,
 }
 
 /// One entry in the advisory `splash-lsp` `moduleCatalog` wire shape.
@@ -650,6 +663,10 @@ pub struct ModuleInterfaceDescriptor {
     pub description: String,
     #[serde(rename = "callMode", skip_serializing_if = "Option::is_none")]
     pub call_mode: Option<CapabilityModuleMethodMode>,
+    /// Explicit advisory call arity and value representation for a direct
+    /// method. A mode alone never claims an editor-callable signature.
+    #[serde(rename = "callShape", skip_serializing_if = "Option::is_none")]
+    pub call_shape: Option<CapabilityModuleCallShape>,
 }
 
 /// One host-resolved advisory direct capability-module call site.
@@ -850,8 +867,9 @@ pub struct ToolDescriptor {
 ///
 /// This is process-local policy identity, not a credential. It includes every
 /// published tool descriptor field, including executable-contract status, plus
-/// every direct module name, method, target tool, and description. It is used
-/// to invalidate an approval when the reviewed runtime interface changes.
+/// every direct module name, method, target tool, description, mode, and call
+/// shape. It is used to invalidate an approval when the reviewed runtime
+/// interface changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityCatalogFingerprint(String);
 
@@ -4495,6 +4513,7 @@ impl CapabilityRuntime {
                     tool: tool.name.clone(),
                     description: tool.metadata.description.clone(),
                     mode: *mode,
+                    call_shape: CapabilityModuleCallShape::SingleJson,
                 })
                 .collect(),
         };
@@ -5292,6 +5311,7 @@ fn module_interface_catalog(
             path: prefix.clone(),
             description: module.description.clone(),
             call_mode: None,
+            call_shape: None,
         });
         entries.extend(
             module
@@ -5301,6 +5321,7 @@ fn module_interface_catalog(
                     path: format!("{prefix}.{}", method.name),
                     description: method.description.clone(),
                     call_mode: Some(method.mode),
+                    call_shape: Some(method.call_shape),
                 }),
         );
     }
@@ -5878,6 +5899,7 @@ mod tests {
                     tool: "math.add".to_owned(),
                     description: "Adds two reviewed integers.".to_owned(),
                     mode: CapabilityModuleMethodMode::Synchronous,
+                    call_shape: CapabilityModuleCallShape::SingleJson,
                 }],
             }]
         );
@@ -5888,17 +5910,20 @@ mod tests {
                     path: "mod.arithmetic".to_owned(),
                     description: "Reviewed arithmetic adapters.".to_owned(),
                     call_mode: None,
+                    call_shape: None,
                 },
                 ModuleInterfaceDescriptor {
                     path: "mod.arithmetic.add".to_owned(),
                     description: "Adds two reviewed integers.".to_owned(),
                     call_mode: Some(CapabilityModuleMethodMode::Synchronous),
+                    call_shape: Some(CapabilityModuleCallShape::SingleJson),
                 },
             ]
         );
         let lsp_projection = serde_json::to_value(runtime.module_interface_catalog()).unwrap();
         assert!(lsp_projection[0].get("callMode").is_none());
         assert_eq!(lsp_projection[1]["callMode"], json!("synchronous"));
+        assert_eq!(lsp_projection[1]["callShape"], json!("single_json"));
 
         let lease = runtime
             .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])

@@ -165,17 +165,19 @@ input and output byte limits must fit the runtime JSON bridge: the smaller of
 bounded by the smaller of `max_syntax_nesting` and 64. The module catalog seals
 when a lease is issued or source is first evaluated, so a new syntax alias
 cannot appear under an existing approval. The stable module name, description,
-method name, mode, and target tool are also included in the capability catalog
-fingerprint recorded by that lease, binding a reviewed direct call to its exact
-underlying capability and invocation behavior.
+method name, mode, target tool, and call shape are also included in the
+capability catalog fingerprint recorded by that lease, binding a reviewed direct
+call to its exact underlying capability and invocation behavior.
 
 `CapabilityRuntime::capability_module_catalog()` returns the reviewed mapping
 for a host prompt or operator UI. `module_interface_catalog()` returns the
-bounded flat `{path, description, callMode?}` entries accepted by the advisory
-LSP `moduleCatalog` projection. Direct method entries carry their host-selected
-`synchronous` or `deferred` mode so the editor can label a deferred call as
-returning a promise; the projection never inserts `await()` or gives an editor
-authority. Neither API is installed into Splash source. The sealed
+bounded flat `{path, description, callMode?, callShape?}` entries accepted by
+the advisory LSP `moduleCatalog` projection. Direct method entries carry their
+host-selected `synchronous` or `deferred` mode and `single_json` call shape, so
+the editor can label a deferred call as returning a promise and offer a bounded
+one-value signature without guessing its argument contract; the projection
+never inserts `await()` or gives an editor authority. Neither API is installed
+into Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,

@@ -36,8 +36,9 @@ and keeps UI support optional rather than making UI the language boundary.
   full-document formatting edits, top-level declaration symbols, and
   same-document lexical definitions, references, binding-kind hover, and symbol
   highlights, lexical completion including the fixed `mod.tool` API and optional
-  advisory tool and module metadata, and version-bound guarded rename without
-  reading files or evaluating code.
+  advisory tool and module metadata, bounded fixed/advisory capability signature
+  help, and version-bound guarded rename without reading files or evaluating
+  code.
 - Default runtime and capability-host evaluation that rejects noncanonical
   Makepad compatibility syntax before a tool can run.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
@@ -546,16 +547,19 @@ through `initializationOptions.splash.moduleCatalog` or a later
 `workspace/didChangeConfiguration` update. It completes the current segment in
 a direct statement-position `use mod.*` path and bounded catalog paths after a
 direct, visible imported module binding, and gives an exact catalog leaf a
-plain-text advisory hover. It does not load a source file, resolve a module,
-inspect a runtime export, or override the fixed `mod.tool` API. Tool and module
-catalog keys refresh independently: an omitted key keeps its prior value, JSON
-`null` explicitly clears it, and a malformed or over-limit key value makes only
-that catalog unavailable. A malformed `settings` value or non-object
-`settings.splash` clears all advisory catalogs. Neither projection authorizes
-source. See [editor module-interface projection](docs/module-catalog.md)
-for its exact format and bounds. A truncated lexical index can still serve
-retained, sound definitions and hover, but exhaustive reference, highlight, and
-rename requests fail instead of returning a partial set.
+plain-text advisory hover. An exact leaf that explicitly declares both a mode
+and `single_json` call shape also receives a bounded one-value signature; the
+server never infers a signature from a mode alone. It does not load a source
+file, resolve a module, inspect a runtime export, or override the fixed
+`mod.tool` API. Tool and module catalog keys refresh independently: an omitted
+key keeps its prior value, JSON `null` explicitly clears it, and a malformed or
+over-limit key value makes only that catalog unavailable. A malformed `settings`
+value or non-object `settings.splash` clears all advisory catalogs. Neither
+projection authorizes source. See [editor module-interface
+projection](docs/module-catalog.md) for its exact format and bounds. A
+truncated lexical index can still serve retained, sound definitions and hover,
+but exhaustive reference, highlight, and rename requests fail instead of
+returning a partial set.
 
 For a host-managed dataflow authoring session, an editor can also supply a
 separate `initializationOptions.splash.workflowDataCatalog` projection. It
