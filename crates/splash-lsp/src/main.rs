@@ -4490,7 +4490,7 @@ fn direct_module_output_alias_root<'symbol>(
         }
         let target_start_byte = match aliases.alias_targets.get(&binding_start_byte).copied() {
             Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
-            Some(StaticRecordAliasTarget::DirectChild { .. })
+            Some(StaticRecordAliasTarget::DirectPath { .. })
             | Some(StaticRecordAliasTarget::NotStatic)
             | None => return Some(current),
             Some(StaticRecordAliasTarget::Uncertain) => return None,
@@ -4534,7 +4534,7 @@ fn direct_module_output_alias_group(
             let binding_start_byte = alias.binding.start_byte;
             let target_start_byte = match aliases.alias_targets.get(&binding_start_byte).copied() {
                 Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
-                Some(StaticRecordAliasTarget::DirectChild {
+                Some(StaticRecordAliasTarget::DirectPath {
                     target_start_byte, ..
                 }) => {
                     if depths.contains_key(&target_start_byte) {
@@ -5057,17 +5057,55 @@ fn visible_symbol_in<'symbol>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaticRecordAliasTarget {
     Let(usize),
-    DirectChild {
+    DirectPath {
         target_start_byte: usize,
-        child: SourceSpan,
+        children: [Option<SourceSpan>; MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH],
+        child_count: usize,
     },
     NotStatic,
     Uncertain,
 }
 
+fn static_record_alias_child_path(
+    source: &str,
+    target: SourceSpan,
+    direct_child: Option<SourceSpan>,
+    direct_grandchild: Option<SourceSpan>,
+) -> Option<(
+    [Option<SourceSpan>; MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH],
+    usize,
+)> {
+    let children = [direct_child, direct_grandchild];
+    let child_count = match (direct_child, direct_grandchild) {
+        (None, None) => 0,
+        (Some(_), None) => 1,
+        (Some(_), Some(_)) => 2,
+        (None, Some(_)) => return None,
+    };
+    if child_count > MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
+        return None;
+    }
+
+    let mut previous_end_byte = target.end_byte;
+    for child in children[..child_count].iter().copied() {
+        let child = child?;
+        if child.start_byte < previous_end_byte
+            || !source
+                .get(child.start_byte..child.end_byte)
+                .is_some_and(is_canonical_identifier)
+        {
+            return None;
+        }
+        previous_end_byte = child.end_byte;
+    }
+
+    Some((children, child_count))
+}
+
 /// One root literal-record view reached through an exact local alias chain.
-/// A view can retain a bounded direct child path selected one edge at a time by
-/// `let alias = root.child`; it never follows a computed member expression.
+/// A view can retain a bounded direct child path selected by an exact alias
+/// initializer such as `let alias = root.child.grandchild`; it never follows a
+/// computed member expression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StaticRecordView {
     root_binding: SourceSpan,
@@ -5109,20 +5147,21 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
             let target = match source.get(alias.target.start_byte..alias.target.end_byte) {
                 Some(name) => match visible_symbol_in(symbols, name, alias.target.start_byte) {
                     Some(symbol) if symbol.kind == LexicalSymbolKind::Let => {
-                        match alias.direct_child {
-                            None => StaticRecordAliasTarget::Let(symbol.definition.start_byte),
-                            Some(child)
-                                if child.start_byte >= alias.target.end_byte
-                                    && source
-                                        .get(child.start_byte..child.end_byte)
-                                        .is_some_and(is_canonical_identifier) =>
-                            {
-                                StaticRecordAliasTarget::DirectChild {
-                                    target_start_byte: symbol.definition.start_byte,
-                                    child,
-                                }
+                        match static_record_alias_child_path(
+                            source,
+                            alias.target,
+                            alias.direct_child,
+                            alias.direct_grandchild,
+                        ) {
+                            Some((_, 0)) => {
+                                StaticRecordAliasTarget::Let(symbol.definition.start_byte)
                             }
-                            Some(_) => StaticRecordAliasTarget::Uncertain,
+                            Some((children, child_count)) => StaticRecordAliasTarget::DirectPath {
+                                target_start_byte: symbol.definition.start_byte,
+                                children,
+                                child_count,
+                            },
+                            None => StaticRecordAliasTarget::Uncertain,
                         }
                     }
                     _ => StaticRecordAliasTarget::NotStatic,
@@ -5168,11 +5207,15 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
 
             let target_start_byte = match self.alias_targets.get(&binding_start_byte).copied() {
                 Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
-                Some(StaticRecordAliasTarget::DirectChild {
+                Some(StaticRecordAliasTarget::DirectPath {
                     target_start_byte,
-                    child,
+                    children,
+                    child_count,
                 }) => {
-                    if direct_child_count >= MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
+                    if child_count > MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH
+                        || direct_child_count.saturating_add(child_count)
+                            > MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH
+                    {
                         // A deeper child selector is unsupported, but it still
                         // escapes the retained view. Keep following the bounded
                         // root chain so callers can fail closed only for that
@@ -5180,11 +5223,11 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
                         escaped = true;
                     } else {
                         // Alias traversal proceeds from the use site toward
-                        // the root. Insert each selected child at the front so
-                        // the retained path remains root-to-leaf.
-                        direct_children.copy_within(0..direct_child_count, 1);
-                        direct_children[0] = Some(child);
-                        direct_child_count += 1;
+                        // the root. Insert each selected child path at the
+                        // front so the retained path remains root-to-leaf.
+                        direct_children.copy_within(0..direct_child_count, child_count);
+                        direct_children[..child_count].copy_from_slice(&children[..child_count]);
+                        direct_child_count += child_count;
                     }
                     target_start_byte
                 }
@@ -5247,10 +5290,10 @@ fn visible_static_record_view<'shape>(
 }
 
 /// Returns static fields for the root literal or a bounded direct nested path.
-/// Exact `let alias = root.child` bindings can collectively carry a bounded
-/// child path through an alias chain; a following direct member path may use
-/// the remaining literal-depth budget. Computed paths and deeper alias chains
-/// beyond that budget have no static metadata.
+/// Exact aliases can carry one or two direct selectors through an alias chain;
+/// a following direct member path may use the remaining literal-depth budget.
+/// Computed paths and deeper alias chains beyond that budget have no static
+/// metadata.
 fn visible_static_record_fields<'shape>(
     source: &str,
     symbols: &[LexicalSymbol],
@@ -6756,6 +6799,60 @@ mod tests {
                 position_at_byte(
                     nested_child_alias_chain_source,
                     nested_child_alias_chain_source.find("city:").unwrap() + "city".len(),
+                ),
+            )
+        );
+
+        let compact_nested_alias_source = concat!(
+            "let profile = {user: {address: {city: \"Paris\", zip: \"75000\"}}}\n",
+            "let address = profile.user.address\n",
+            "address.city"
+        );
+        let mut compact_nested_alias_server = SplashLanguageServer::default();
+        compact_nested_alias_server.open_document(document(1, compact_nested_alias_source));
+        let compact_nested_alias_member = compact_nested_alias_source
+            .rfind("city")
+            .expect("compact nested alias field exists");
+        assert_eq!(
+            compact_nested_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(
+                        compact_nested_alias_source,
+                        compact_nested_alias_source.len(),
+                    ),
+                )
+                .expect("compact nested alias completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["city", "zip"]
+        );
+        assert!(compact_nested_alias_server
+            .hover(
+                &test_uri(),
+                position_at_byte(compact_nested_alias_source, compact_nested_alias_member + 1,),
+            )
+            .expect("compact nested alias hover succeeds")
+            .is_some());
+        assert_eq!(
+            compact_nested_alias_server
+                .definition(
+                    &test_uri(),
+                    position_at_byte(compact_nested_alias_source, compact_nested_alias_member + 1,),
+                )
+                .expect("compact nested alias definition succeeds")
+                .expect("known compact nested alias field has a definition")
+                .range,
+            Range::new(
+                position_at_byte(
+                    compact_nested_alias_source,
+                    compact_nested_alias_source.find("city:").unwrap(),
+                ),
+                position_at_byte(
+                    compact_nested_alias_source,
+                    compact_nested_alias_source.find("city:").unwrap() + "city".len(),
                 ),
             )
         );
@@ -9647,6 +9744,12 @@ mod tests {
             "use mod.arithmetic\n",
             "let result = arithmetic.add({left: 20})\n",
             "let selected = result.total\n",
+            "result.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "let selected = result.total.extra\n",
             "result.to"
         ));
         assert_no_output_completion(concat!(

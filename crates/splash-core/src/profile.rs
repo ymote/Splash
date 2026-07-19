@@ -172,11 +172,11 @@ pub(super) fn collect_module_imports(
     CanonicalParser::new(tokens, max_nesting).collect_module_imports(valid_prefix_end_byte)
 }
 
-/// Collects exact direct literal-record initializers plus direct root or child
-/// alias edges after the public caller has bounded and syntax-checked the
-/// source. The parser still runs for an incomplete editor snapshot, but the
-/// collector keeps only complete metadata ending before the supplied safe-prefix
-/// boundary.
+/// Collects exact direct literal-record initializers plus direct root, child,
+/// or grandchild alias edges after the public caller has bounded and
+/// syntax-checked the source. The parser still runs for an incomplete editor
+/// snapshot, but the collector keeps only complete metadata ending before the
+/// supplied safe-prefix boundary.
 pub(super) fn collect_static_record_shapes(
     source: &str,
     max_tokens: usize,
@@ -376,6 +376,7 @@ struct ParsedDirectRecord {
 struct DirectRecordAlias {
     target: SourceSpan,
     direct_child: Option<SourceSpan>,
+    direct_grandchild: Option<SourceSpan>,
     end_byte: usize,
 }
 
@@ -424,6 +425,7 @@ impl StaticRecordShapeCollector {
             binding,
             target: alias.target,
             direct_child: alias.direct_child,
+            direct_grandchild: alias.direct_grandchild,
         });
     }
 
@@ -1755,9 +1757,14 @@ fn direct_record_alias_from_tokens(
         end_byte: target.end_byte,
     };
     let mut direct_child = None;
+    let mut direct_grandchild = None;
     let mut end_index = target_index;
-    let next_index = target_index.checked_add(1)?;
-    if matches!(&tokens.get(next_index)?.kind, TokenKind::Operator(operator) if operator == ".") {
+    for depth in 0..MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH {
+        let next_index = end_index.checked_add(1)?;
+        if !matches!(&tokens.get(next_index)?.kind, TokenKind::Operator(operator) if operator == ".")
+        {
+            break;
+        }
         let child_index = next_index.checked_add(1)?;
         let child = tokens.get(child_index)?;
         let TokenKind::Identifier(name) = &child.kind else {
@@ -1766,10 +1773,15 @@ fn direct_record_alias_from_tokens(
         if is_reserved_identifier(name) {
             return None;
         }
-        direct_child = Some(SourceSpan {
+        let child = SourceSpan {
             start_byte: child.start_byte,
             end_byte: child.end_byte,
-        });
+        };
+        match depth {
+            0 => direct_child = Some(child),
+            1 => direct_grandchild = Some(child),
+            _ => return None,
+        }
         end_index = child_index;
     }
     let boundary_index = end_index.checked_add(1)?;
@@ -1783,6 +1795,7 @@ fn direct_record_alias_from_tokens(
     Some(DirectRecordAlias {
         target,
         direct_child,
+        direct_grandchild,
         end_byte: tokens.get(end_index)?.end_byte,
     })
 }

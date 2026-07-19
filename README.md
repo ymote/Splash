@@ -21,7 +21,7 @@ and keeps UI support optional rather than making UI the language boundary.
   literals, and an optional refreshable module-interface projection for direct
   import paths and bounded chained imported-module members, plus bounded
   direct-literal record-field completion, hover, and definition through exact
-  direct child literals and root-alias chains without runtime type inference.
+  direct child literals and bounded alias paths without runtime type inference.
 - An effect-free per-step workflow review that pairs syntax status with direct
   tool-call hints before a host issues ordered capability leases.
 - A bounded, data-only workflow-draft JSON format and CLI review path for LLM
@@ -530,15 +530,17 @@ as a whole and marks that completion result incomplete. The lexical service
 also recognizes an exact visible direct `let binding = { ... }` initializer.
 At `binding.field`, a direct two-level literal path such as
 `binding.child.grandchild.field`, or through an exact
-`let alias = binding` / `let alias = binding.child` chain of at most 16 hops
-with at most two alias child selections in total, it offers the literal field
-names and supports hover and definition to the field key. Alias targets resolve at their
-source position, so lexical shadowing remains intact. This metadata has
+`let alias = binding`, `let alias = binding.child`, or
+`let alias = binding.child.grandchild` chain of at most 16 hops with at most
+two alias child selections in total, whether carried by one edge or spread
+across a chain, it offers the literal field names and supports hover and
+definition to the field key. Alias targets resolve at their source position, so
+lexical shadowing remains intact. This metadata has
 1,024-shape, 4,096-field, and 1,024-direct-alias bounds. An omitted alias edge
 makes retained record completion empty and incomplete and disables static field
 hover and definition. The LSP suppresses a shape after an earlier direct write
 or potentially mutating member, index, call, or escape path through the root or
-any retained root or child alias that resolves to it. It does not infer
+any retained root, child, or grandchild alias that resolves to it. It does not infer
 parenthesized or computed aliases, parenthesized or computed child values,
 alias or member paths beyond that two-level budget, assignments, control flow,
 function returns, imported values, or runtime data.

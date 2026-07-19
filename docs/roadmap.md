@@ -45,8 +45,10 @@
 - Bounded direct literal-record field metadata for exact visible
   `let binding = { ... }` initializers, two exact direct nested literal levels,
   and lexical exact `let alias = binding` or
-  `let alias = binding.child` chains of at most 16 hops with at most two child
-  selections in total, with same-document completion, hover, and definition.
+  `let alias = binding.child` or `let alias = binding.child.grandchild` chains
+  of at most 16 hops with at most two child selections in total, whether in one
+  edge or spread across the chain, with same-document completion, hover, and
+  definition.
   It is
   advisory and does not infer parenthesized or computed aliases, parenthesized
   or computed child values, alias or member paths beyond that two-level budget,
@@ -54,7 +56,7 @@
   types. Duplicate fields at any retained literal level discard that level's
   nested shape. An earlier direct
   write or potentially mutating member, index, call, or escape path through the
-  root or any retained root or child alias suppresses it. Independent
+  root or any retained root, child, or grandchild alias suppresses it. Independent
   1,024-root-shape and 4,096-aggregate-field caps mark retained completion
   incomplete; the 1,024-alias cap fails closed for omitted alias edges.
 - Version-bound same-document rename with canonical identifier validation,

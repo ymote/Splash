@@ -341,13 +341,15 @@ binding. In invalid source, a site is eligible only when it ends at or before
 the first syntax diagnostic.
 
 Separately, the server recognizes an exact visible direct initializer of the
-form `let binding = { ... }` plus exact `let alias = binding` and
-`let alias = binding.child` source edges. At a direct `binding.field` member
-site, or a direct `binding.child.grandchild.field` site where both child values
-are whole literals, including a lexical alias chain of at most 16 hops with at
-most two direct alias child selections in total, it offers the retained field
-names, hovers a known field, and defines it at the literal key. Alias targets resolve
-at their source position, preserving lexical shadowing. This is bounded source
+form `let binding = { ... }` plus exact `let alias = binding`,
+`let alias = binding.child`, or `let alias = binding.child.grandchild` source
+edges. At a direct `binding.field` member site, or a direct
+`binding.child.grandchild.field` site where both child values are whole
+literals, including a lexical alias chain of at most 16 hops with at most two
+direct alias child selections in total, whether in one edge or spread across
+the chain, it offers the retained field names, hovers a known field, and
+defines it at the literal key. Alias targets resolve at their source position,
+preserving lexical shadowing. This is bounded source
 metadata, not general type inference: it does not follow parenthesized or
 computed aliases, parenthesized or computed child values, alias or member paths
 beyond that two-level budget, assignments, control flow, function returns,
@@ -359,7 +361,7 @@ incomplete and never exposes a partial field list for a binding. A truncated
 alias report returns no static field items, marks completion incomplete, and
 disables static field hover and definition. The LSP stops using a shape after an
 earlier direct write or a potentially mutating member, index, call, or escape
-path through the root or any retained root or child alias that resolves to it.
+path through the root or any retained root, child, or grandchild alias that resolves to it.
 Static field hover and definition also fail closed when the lexical index is
 truncated, because an omitted earlier reference could be a mutation.
 

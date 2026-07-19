@@ -127,8 +127,8 @@ pub const MAX_STATIC_RECORD_SHAPES: usize = 1_024;
 /// `root.child.grandchild` paths. It does not authorize broader type inference
 /// or arbitrary runtime member resolution.
 pub const MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH: usize = 2;
-/// Maximum retained direct root or child aliases of a static record binding per
-/// source snapshot.
+/// Maximum retained direct root, child, or grandchild aliases of a static
+/// record binding per source snapshot.
 ///
 /// This is independent of the direct-shape and aggregate-field bounds. It
 /// prevents source-only alias metadata from growing with generated documents.
@@ -559,26 +559,30 @@ pub struct StaticRecordShape {
     pub direct_field_shapes: Vec<StaticRecordNestedShape>,
 }
 
-/// One exact direct `let alias = target` or `let alias = target.child` source
-/// alias edge.
+/// One exact direct `let alias = target`, `let alias = target.child`, or
+/// `let alias = target.child.grandchild` source alias edge.
 ///
 /// `binding` and `target` identify canonical identifiers in one complete
-/// initializer. When present, `direct_child` identifies the one direct member
-/// selected from `target`; it never represents a computed or deeper path. This
-/// is source-only metadata: it does not resolve the target, prove that it is a
-/// record, infer a value type, or authorize any runtime behavior.
+/// initializer. When present, `direct_child` identifies the first direct member
+/// selected from `target`; `direct_grandchild` is present only with that first
+/// selector and identifies its exact second direct member. They never represent
+/// a computed or deeper path. This is source-only metadata: it does not resolve
+/// the target, prove that it is a record, infer a value type, or authorize any
+/// runtime behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StaticRecordAlias {
     pub binding: SourceSpan,
     pub target: SourceSpan,
     pub direct_child: Option<SourceSpan>,
+    pub direct_grandchild: Option<SourceSpan>,
 }
 
 /// Bounded static literal-record metadata for one source snapshot.
 ///
 /// The report is intentionally not general type inference. It retains completed
 /// direct record literals, their bounded exact nested child literals, and exact
-/// direct root or child alias edges ending at or before `valid_prefix_end_byte`,
+/// direct root, child, or grandchild alias edges ending at or before
+/// `valid_prefix_end_byte`,
 /// allowing editor features to remain useful before a trailing syntax diagnostic
 /// without assigning meaning to later recovery tokens. `truncated` means one or
 /// more complete shapes were omitted at the fixed shape or aggregate-field
@@ -4053,6 +4057,7 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                       let alias = settings\n\
                       let nested_alias = settings.nested\n\
                       let deeper_alias = settings.nested.enabled\n\
+                      let too_deep_alias = settings.nested.enabled.value\n\
                       let selected = {value: 1}.value\n\
                       let parenthesized = (settings)\n\
                       settings.";
@@ -4097,7 +4102,7 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                 .collect::<Vec<_>>(),
             ["enabled"]
         );
-        assert_eq!(report.aliases.len(), 2);
+        assert_eq!(report.aliases.len(), 3);
         let alias = report.aliases[0];
         assert_eq!(
             &source[alias.binding.start_byte..alias.binding.end_byte],
@@ -4108,6 +4113,7 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
             "settings"
         );
         assert_eq!(alias.direct_child, None);
+        assert_eq!(alias.direct_grandchild, None);
 
         let nested_alias = report.aliases[1];
         assert_eq!(
@@ -4124,6 +4130,32 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                 .map(|span| &source[span.start_byte..span.end_byte]),
             Some("nested")
         );
+        assert_eq!(nested_alias.direct_grandchild, None);
+
+        let deeper_alias = report.aliases[2];
+        assert_eq!(
+            &source[deeper_alias.binding.start_byte..deeper_alias.binding.end_byte],
+            "deeper_alias"
+        );
+        assert_eq!(
+            &source[deeper_alias.target.start_byte..deeper_alias.target.end_byte],
+            "settings"
+        );
+        assert_eq!(
+            deeper_alias
+                .direct_child
+                .map(|span| &source[span.start_byte..span.end_byte]),
+            Some("nested")
+        );
+        assert_eq!(
+            deeper_alias
+                .direct_grandchild
+                .map(|span| &source[span.start_byte..span.end_byte]),
+            Some("enabled")
+        );
+        assert!(report.aliases.iter().all(|alias| {
+            &source[alias.binding.start_byte..alias.binding.end_byte] != "too_deep_alias"
+        }));
 
         let runtime = Runtime::default();
         assert_eq!(runtime.static_record_shape_report(source).unwrap(), report);

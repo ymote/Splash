@@ -3,3 +3,5 @@ let selected = profile.user
 let alias = selected
 let address = alias.address
 address.city
+let compact_address = profile.user.address
+compact_address.city

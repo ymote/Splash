@@ -357,40 +357,60 @@ fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShap
 
     let mut previous_alias_binding_start = 0_usize;
     for alias in &report.aliases {
-        let direct_child_is_ordered = alias.direct_child.is_none_or(|child| {
-            alias.target.end_byte <= child.start_byte
-                && child.start_byte < child.end_byte
-                && child.end_byte <= report.valid_prefix_end_byte
-        });
         assert!(
             previous_alias_binding_start <= alias.binding.start_byte
                 && alias.binding.start_byte < alias.binding.end_byte
                 && alias.binding.end_byte <= alias.target.start_byte
                 && alias.target.start_byte < alias.target.end_byte
-                && alias.target.end_byte <= report.valid_prefix_end_byte
-                && direct_child_is_ordered,
+                && alias.target.end_byte <= report.valid_prefix_end_byte,
             "static record alias span is unordered or exceeds the safe prefix: {alias:?}"
         );
-        let direct_child_is_utf8 = alias.direct_child.is_none_or(|child| {
-            source.is_char_boundary(child.start_byte) && source.is_char_boundary(child.end_byte)
-        });
         assert!(
             source.is_char_boundary(alias.binding.start_byte)
                 && source.is_char_boundary(alias.binding.end_byte)
                 && source.is_char_boundary(alias.target.start_byte)
-                && source.is_char_boundary(alias.target.end_byte)
-                && direct_child_is_utf8,
+                && source.is_char_boundary(alias.target.end_byte),
             "static record alias span is not a UTF-8 boundary: {alias:?}"
         );
-        let direct_child_is_identifier = alias
-            .direct_child
-            .is_none_or(|child| is_canonical_identifier(&source[child.start_byte..child.end_byte]));
         assert!(
             is_canonical_identifier(&source[alias.binding.start_byte..alias.binding.end_byte])
-                && is_canonical_identifier(&source[alias.target.start_byte..alias.target.end_byte])
-                && direct_child_is_identifier,
+                && is_canonical_identifier(&source[alias.target.start_byte..alias.target.end_byte]),
             "static record alias is not a canonical identifier: {alias:?}"
         );
+
+        let direct_children = [alias.direct_child, alias.direct_grandchild];
+        let direct_child_count = match (alias.direct_child, alias.direct_grandchild) {
+            (None, None) => 0,
+            (Some(_), None) => 1,
+            (Some(_), Some(_)) => 2,
+            (None, Some(_)) => panic!(
+                "static record alias retained a grandchild selector without its first child: {alias:?}"
+            ),
+        };
+        assert!(
+            direct_child_count <= MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH,
+            "static record alias exceeded the direct selector depth: {alias:?}"
+        );
+        let mut previous_alias_part_end = alias.target.end_byte;
+        for direct_child in direct_children[..direct_child_count].iter().copied() {
+            let direct_child = direct_child.expect("retained selector count requires a span");
+            assert!(
+                previous_alias_part_end <= direct_child.start_byte
+                    && direct_child.start_byte < direct_child.end_byte
+                    && direct_child.end_byte <= report.valid_prefix_end_byte,
+                "static record alias selector span is unordered or exceeds the safe prefix: {alias:?}"
+            );
+            assert!(
+                source.is_char_boundary(direct_child.start_byte)
+                    && source.is_char_boundary(direct_child.end_byte),
+                "static record alias selector span is not a UTF-8 boundary: {alias:?}"
+            );
+            assert!(
+                is_canonical_identifier(&source[direct_child.start_byte..direct_child.end_byte]),
+                "static record alias selector is not a canonical identifier: {alias:?}"
+            );
+            previous_alias_part_end = direct_child.end_byte;
+        }
         previous_alias_binding_start = alias.binding.start_byte;
     }
     if report.aliases_truncated {

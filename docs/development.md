@@ -122,12 +122,13 @@ truncated. When symbols are truncated the server returns no candidates, because
 an omitted inner definition could shadow a retained outer binding.
 
 For an exact visible `let binding = { ... }` initializer, the server separately
-retains a bounded static record shape and exact `let alias = binding` or
-`let alias = binding.child` edges. At a direct `binding.field` site or a direct
-`binding.child.grandchild.field` site whose two child values are exact literals,
-including a lexical alias chain of at most 16 hops with at most two alias child
-selections in total, it can complete the literal's field names, hover a known
-field, and navigate to that field key. Each alias target resolves at its original source
+retains a bounded static record shape and exact `let alias = binding`,
+`let alias = binding.child`, or `let alias = binding.child.grandchild` edges.
+At a direct `binding.field` site or a direct `binding.child.grandchild.field`
+site whose two child values are exact literals, including a lexical alias chain
+of at most 16 hops with at most two alias child selections in total, whether in
+one edge or spread across the chain, it can complete the literal's field names,
+hover a known field, and navigate to that field key. Each alias target resolves at its original source
 position, preserving lexical shadowing. This is source-only advisory metadata,
 not runtime type inference: it does not follow parenthesized or computed
 aliases, parenthesized or computed child values, alias or member paths beyond
@@ -136,7 +137,7 @@ values, or runtime data.
 Duplicate fields at any retained literal level discard that level's nested
 shape. The LSP stops using a shape after an earlier direct write or a potentially
 mutating member, index, call, or escape path through the root or any retained
-root or child alias resolving to that root. The report retains at most 1,024
+root, child, or grandchild alias resolving to that root. The report retains at most 1,024
 root shapes, 4,096 aggregate retained literal fields, and 1,024 direct alias
 edges. A truncated shape report marks a retained member completion
 `isIncomplete`; a truncated alias report returns no static field items, marks

@@ -9,3 +9,5 @@ let selected = profile.nested
 let selected_alias = selected
 let flags = selected_alias.flags
 flags.ignored
+let compact_flags = profile.nested.flags
+compact_flags.ignored

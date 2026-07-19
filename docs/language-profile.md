@@ -145,19 +145,21 @@ candidate set in that case.
 For bounded static record metadata, Rust hosts can call
 `splash_core::static_record_shape_report` or its named, limit-aware variant.
 It retains exact direct `let binding = { ... }` shapes plus exact
-`let alias = binding` and `let alias = binding.child` source edges before
+`let alias = binding`, `let alias = binding.child`, and
+`let alias = binding.child.grandchild` source edges before
 `valid_prefix_end_byte`. It also retains two exact child levels when a root
 field and its direct child are written as whole record literals; it never
 evaluates source, resolves an import, or creates a capability host. The LSP can
 use a lexical direct-alias chain of at most 16 hops, with at most two direct
-alias child selections in total, for same-document root and nested-field
+alias child selections in total, whether in one edge or spread across the
+chain, for same-document root and nested-field
 completion, hover, and definition. Target resolution is source-position-aware, so a
 shadowed name follows the binding visible at the alias initializer. The report
 caps root shapes at 1,024, aggregate retained literal fields at 4,096, and alias
 edges at 1,024. Duplicate fields at any retained literal level discard that
 level's nested shape. Static fields are unavailable after a direct write or
 potentially mutating member, index, call, or escape path through the root or any
-retained root or child alias that resolves to it. Shape truncation marks retained
+retained root, child, or grandchild alias that resolves to it. Shape truncation marks retained
 completion incomplete; alias truncation returns no static fields, marks
 completion incomplete, and disables static field hover and definition. This is
 not general type inference: parenthesized or computed aliases, parenthesized or
