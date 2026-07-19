@@ -411,6 +411,14 @@ local alias, or derive a host capability. A shadowed binding, chained receiver,
 unknown member, or invalid source prefix has no fixed-math result, and advisory
 metadata cannot add members to this core module.
 
+The same compiled-in projection completes `std` at a statement-position `use
+mod.` path and `assert`/`math` below `use mod.std.`. The frozen `mod.std`
+namespace has no catalog descendants: advisory metadata cannot add `log`,
+`inspect`, or children below `mod.std.assert` or `mod.std.math`. If an advisory
+catalog is unavailable, the fixed `std` root candidate remains visible but is
+incomplete because non-core `mod.*` siblings could be absent; the closed
+`mod.std` list remains complete.
+
 For an exact visible imported capability-module leaf, the optional advisory
 `moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,
 and compact `inputFields` and `outputFields`. Each field has a canonical

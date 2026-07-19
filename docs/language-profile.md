@@ -152,6 +152,14 @@ receiver, an unknown core-math member, or source outside the valid prefix gets
 no fixed-core result; a matching advisory catalog path cannot extend the core
 surface.
 
+The same static projection completes `std` at a statement-position `use mod.`
+path and `assert`/`math` below `use mod.std.`. The frozen `mod.std` namespace
+has no advisory catalog children, so metadata cannot add `log`, `inspect`, or
+any descendants below `mod.std.assert` or `mod.std.math`. When an advisory
+catalog is unavailable, the fixed `std` root candidate remains visible but is
+incomplete because non-core `mod.*` siblings could be omitted; the closed
+`mod.std` list remains complete.
+
 For bounded static record metadata, Rust hosts can call
 `splash_core::static_record_shape_report` or its named, limit-aware variant.
 It retains exact direct `let binding = { ... }` shapes plus exact

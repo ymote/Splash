@@ -24,9 +24,10 @@
 - Bounded scope-aware lexical completion at expression identifiers, including
   exact-token edits, conservative invalid-prefix support, independent site
   truncation, and fixed direct-import-only `mod.tool` methods plus documented
-  `mod.std.math` function/constant completion, hover, and signature help. Both
-  fixed surfaces are compiled-in source-only metadata, not host capability
-  discovery. A bounded, initialization-time or configuration-refresh
+  `mod.std` import-path completion and `mod.std.math` function/constant
+  completion, hover, and signature help. The frozen core `mod.std` namespace
+  cannot be extended by advisory metadata. Both fixed surfaces are compiled-in source-only
+  metadata, not host capability discovery. A bounded, initialization-time or configuration-refresh
   advisory catalog projection can complete literal names in direct tool calls
   without a runtime/catalog lookup or authority inference; it performs no
   arbitrary module, type, or field inference. A separate bounded,

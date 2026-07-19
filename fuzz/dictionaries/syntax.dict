@@ -10,6 +10,8 @@
 "loop "
 "use mod.tool"
 "use mod.arithmetic"
+"use mod."
+"use mod.std."
 "let math = arithmetic"
 "use mod.std.assert"
 "use mod.std.math"

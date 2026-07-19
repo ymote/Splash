@@ -6392,6 +6392,17 @@ compute(outer, 2)
         assert!(report.completed(), "{:?}", report.diagnostics);
         assert_eq!(report.value.as_number(), Some(12.0));
 
+        let mut namespace_runtime = Runtime::default();
+        let namespace_report = namespace_runtime
+            .eval("use mod.std\nstd.assert(std.math.sqrt(81) == 9)\nstd.math.sqrt(81)")
+            .unwrap();
+        assert!(
+            namespace_report.completed(),
+            "{:?}",
+            namespace_report.diagnostics
+        );
+        assert_eq!(namespace_report.value.as_number(), Some(9.0));
+
         let mutation = runtime.eval("use mod.std.math\nmath.sqrt = || 0").unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());

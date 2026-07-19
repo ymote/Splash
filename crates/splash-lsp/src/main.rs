@@ -271,6 +271,40 @@ const STANDARD_MATH_CONSTANTS: &[StandardMathConstant] = &[
 const STANDARD_MATH_AUTHORITY_NOTE: &str =
     "Effect-free Splash core helper; it does not access the host or grant authority.";
 
+/// One fixed path child in Splash's documented core import tree.
+///
+/// This is intentionally separate from the host-owned advisory module catalog.
+/// It lets an editor discover the core language without treating that discovery
+/// as module resolution, adapter availability, or a capability grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixedCoreModulePathChild {
+    name: &'static str,
+    detail: &'static str,
+    documentation: &'static str,
+}
+
+const FIXED_ROOT_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[FixedCoreModulePathChild {
+    name: "std",
+    detail: "Splash core namespace; fixed and effect-free",
+    documentation:
+        "Fixed Splash core namespace. Its presence does not resolve a host module or grant authority.",
+}];
+
+const FIXED_STANDARD_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[
+    FixedCoreModulePathChild {
+        name: "assert",
+        detail: "Splash core module; effect-free assertion helper",
+        documentation:
+            "Fixed Splash core assertion helper. It does not resolve a host module or grant authority.",
+    },
+    FixedCoreModulePathChild {
+        name: "math",
+        detail: "Splash core module; effect-free scalar helpers",
+        documentation:
+            "Fixed Splash core scalar helpers. They do not resolve a host module or grant authority.",
+    },
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ToolCatalogCompletion {
     name: String,
@@ -869,6 +903,10 @@ impl SplashLanguageServer {
                 {
                     return Ok(standard_math_member_hover(source, site));
                 }
+                if let Some(hover) = fixed_core_module_member_hover(source, lexical, imports, site)
+                {
+                    return Ok(hover);
+                }
                 if !self.module_catalog.modules.is_empty() {
                     if let Some(field) = module_catalog_output_field_for_member(
                         source,
@@ -1054,6 +1092,15 @@ impl SplashLanguageServer {
                     member_site,
                     is_incomplete,
                 ));
+            }
+            if let Some(completion) = fixed_core_module_member_completion(
+                source,
+                report,
+                imports,
+                member_site,
+                is_incomplete,
+            ) {
+                return Ok(completion);
             }
             let shapes = self.static_record_shapes(uri)?;
             if let Some(fields) = visible_static_record_fields(
@@ -1475,6 +1522,10 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "workflow.outputs.prepare.total"
 );
 
+#[cfg(fuzzing)]
+const FUZZ_FIXED_CORE_IMPORT_PATH_SOURCES: &[&str] =
+    &["use mod.", "use mod.std.", "use mod.std.math."];
+
 /// Fixed no-authority metadata used to exercise advisory module completion and
 /// hover through the production document lifecycle.
 #[cfg(fuzzing)]
@@ -1617,6 +1668,7 @@ pub fn fuzz_exercise_document(source: &str) {
     );
     fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 4);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
@@ -1662,6 +1714,7 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
     server.refresh_advisory_configuration(settings);
     fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 2);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
@@ -1742,6 +1795,24 @@ fn fuzz_exercise_fixed_standard_math_requests(
         return;
     };
     let _ = server.signature_help(uri, position_at_byte(source, minimum_start + 1));
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_fixed_core_import_path_requests(
+    server: &mut SplashLanguageServer,
+    uri: &Uri,
+    first_version: i32,
+) {
+    for (index, source) in FUZZ_FIXED_CORE_IMPORT_PATH_SOURCES.iter().enumerate() {
+        let Ok(version_offset) = i32::try_from(index) else {
+            return;
+        };
+        let Some(version) = first_version.checked_add(version_offset) else {
+            return;
+        };
+        let _ = server.replace_document(uri.clone(), version, (*source).to_owned());
+        let _ = server.completion(uri, position_at_byte(source, source.len()));
+    }
 }
 
 #[cfg(fuzzing)]
@@ -4453,6 +4524,35 @@ fn standard_math_module_member_completion(
     }
 }
 
+/// Completes only the direct, frozen `mod.std` tree. This is placed before
+/// advisory output-field recognition so retained fixed imports remain useful
+/// when a later oversized import list marks that advisory metadata incomplete.
+fn fixed_core_module_member_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+    is_incomplete: bool,
+) -> Option<CompletionList> {
+    let path = fixed_core_direct_import_path_for_member(source, lexical, imports, site)?;
+    if !fixed_core_module_path_blocks_advisory_children(&path) {
+        return None;
+    }
+    let edit_range = span_range(source, site.member);
+    let mut items = fixed_core_module_path_children(&path)
+        .unwrap_or_default()
+        .iter()
+        .map(|child| {
+            fixed_core_module_completion_item(child, CompletionItemKind::FIELD, edit_range)
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.label.cmp(&right.label));
+    Some(CompletionList {
+        is_incomplete,
+        items,
+    })
+}
+
 fn standard_math_member_hover(source: &str, site: MemberCompletionSite) -> Option<Hover> {
     if !site.has_direct_receiver() {
         return None;
@@ -4999,6 +5099,99 @@ fn workflow_data_field_hover_text(field: &WorkflowDataFieldCompletion, context: 
     text
 }
 
+/// Returns compiled-in children for a prefix of the documented core import
+/// tree. An empty child list marks a fixed leaf, which deliberately prevents
+/// advisory catalog metadata from inventing descendants below that leaf.
+fn fixed_core_module_path_children(
+    prefix: &[String],
+) -> Option<&'static [FixedCoreModulePathChild]> {
+    if module_path_matches(prefix, &["mod"]) {
+        Some(FIXED_ROOT_MODULE_PATH_CHILDREN)
+    } else if module_path_matches(prefix, &["mod", "std"]) {
+        Some(FIXED_STANDARD_MODULE_PATH_CHILDREN)
+    } else if module_path_starts_with(prefix, &["mod", "std", "assert"])
+        || module_path_starts_with(prefix, &["mod", "std", "math"])
+    {
+        Some(&[])
+    } else {
+        None
+    }
+}
+
+fn fixed_core_module_path_child(
+    parent: &[String],
+    name: &str,
+) -> Option<&'static FixedCoreModulePathChild> {
+    fixed_core_module_path_children(parent)?
+        .iter()
+        .find(|child| child.name == name)
+}
+
+fn fixed_core_module_path_blocks_advisory_children(path: &[String]) -> bool {
+    module_path_starts_with(path, &["mod", "std"])
+}
+
+fn fixed_core_module_completion_item(
+    child: &FixedCoreModulePathChild,
+    kind: CompletionItemKind,
+    edit_range: Range,
+) -> CompletionItem {
+    CompletionItem {
+        label: child.name.to_owned(),
+        kind: Some(kind),
+        detail: Some(child.detail.to_owned()),
+        documentation: Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: child.documentation.to_owned(),
+        })),
+        text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+            edit_range,
+            child.name.to_owned(),
+        ))),
+        ..CompletionItem::default()
+    }
+}
+
+/// Returns `Some(None)` for an unknown member below a fixed core leaf so a
+/// similarly named advisory descriptor cannot extend that leaf in hover.
+fn fixed_core_module_member_hover(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+) -> Option<Option<Hover>> {
+    let path = fixed_core_direct_import_path_for_member(source, lexical, imports, site)?;
+    let member = source.get(site.member.start_byte..site.member.end_byte)?;
+    if let Some(child) = fixed_core_module_path_child(&path, member) {
+        return Some(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: child.documentation.to_owned(),
+            }),
+            range: Some(span_range(source, site.member)),
+        }));
+    }
+    fixed_core_module_path_blocks_advisory_children(&path).then_some(None)
+}
+
+fn module_path_matches(path: &[String], expected: &[&str]) -> bool {
+    path.len() == expected.len()
+        && path
+            .iter()
+            .map(String::as_str)
+            .zip(expected.iter().copied())
+            .all(|(actual, expected)| actual == expected)
+}
+
+fn module_path_starts_with(path: &[String], expected: &[&str]) -> bool {
+    path.len() >= expected.len()
+        && path
+            .iter()
+            .map(String::as_str)
+            .zip(expected.iter().copied())
+            .all(|(actual, expected)| actual == expected)
+}
+
 fn module_catalog_path_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -5006,7 +5199,10 @@ fn module_catalog_path_completion(
     site: ImportPathCompletionSite,
     is_incomplete: bool,
 ) -> CompletionList {
-    let is_incomplete = is_incomplete || catalog.unavailable;
+    let fixed_children = fixed_core_module_path_children(&site.prefix);
+    let fixed_core_path = fixed_core_module_path_blocks_advisory_children(&site.prefix);
+    let fixed_children = fixed_children.unwrap_or_default();
+    let is_incomplete = is_incomplete || (!fixed_core_path && catalog.unavailable);
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
@@ -5016,22 +5212,33 @@ fn module_catalog_path_completion(
     }
 
     let edit_range = span_range(source, site.segment);
-    let items = module_catalog_children(catalog, &site.prefix)
-        .into_iter()
-        .map(|child| CompletionItem {
-            label: child.name.clone(),
-            kind: Some(CompletionItemKind::MODULE),
-            detail: Some(module_catalog_path_detail(child.call_mode).to_owned()),
-            documentation: module_catalog_documentation(
-                child.description.as_deref(),
-                child.call_mode,
-            ),
-            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
-                edit_range, child.name,
-            ))),
-            ..CompletionItem::default()
+    let mut items = fixed_children
+        .iter()
+        .map(|child| {
+            fixed_core_module_completion_item(child, CompletionItemKind::MODULE, edit_range)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if !fixed_core_path {
+        items.extend(
+            module_catalog_children(catalog, &site.prefix)
+                .into_iter()
+                .filter(|child| !fixed_children.iter().any(|fixed| fixed.name == child.name))
+                .map(|child| CompletionItem {
+                    label: child.name.clone(),
+                    kind: Some(CompletionItemKind::MODULE),
+                    detail: Some(module_catalog_path_detail(child.call_mode).to_owned()),
+                    documentation: module_catalog_documentation(
+                        child.description.as_deref(),
+                        child.call_mode,
+                    ),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                        edit_range, child.name,
+                    ))),
+                    ..CompletionItem::default()
+                }),
+        );
+    }
+    items.sort_by(|left, right| left.label.cmp(&right.label));
 
     CompletionList {
         is_incomplete,
@@ -5059,30 +5266,48 @@ fn module_catalog_member_completion(
         is_incomplete,
         items: Vec::new(),
     };
-    let Some(resolved_path) =
-        module_catalog_member_parent_path(source, lexical, imports, shapes, site)
-    else {
+    let fixed_path = fixed_core_direct_import_path_for_member(source, lexical, imports, site);
+    let fixed_children = fixed_path
+        .as_deref()
+        .and_then(fixed_core_module_path_children);
+    let fixed_core_path = fixed_path
+        .as_deref()
+        .is_some_and(fixed_core_module_path_blocks_advisory_children);
+    let resolved_path = module_catalog_member_parent_path(source, lexical, imports, shapes, site)
+        .or_else(|| fixed_core_path.then(|| fixed_path.clone()).flatten());
+    let Some(resolved_path) = resolved_path else {
         return empty();
     };
-
-    let is_incomplete = is_incomplete || catalog.unavailable;
+    let fixed_children = fixed_children.unwrap_or_default();
+    let is_incomplete = is_incomplete || (!fixed_core_path && catalog.unavailable);
     let edit_range = span_range(source, site.member);
-    let items = module_catalog_children(catalog, &resolved_path)
-        .into_iter()
-        .map(|child| CompletionItem {
-            label: child.name.clone(),
-            kind: Some(CompletionItemKind::FIELD),
-            detail: Some(module_catalog_member_detail(child.call_mode).to_owned()),
-            documentation: module_catalog_documentation(
-                child.description.as_deref(),
-                child.call_mode,
-            ),
-            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
-                edit_range, child.name,
-            ))),
-            ..CompletionItem::default()
+    let mut items = fixed_children
+        .iter()
+        .map(|child| {
+            fixed_core_module_completion_item(child, CompletionItemKind::FIELD, edit_range)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if !fixed_core_path {
+        items.extend(
+            module_catalog_children(catalog, &resolved_path)
+                .into_iter()
+                .filter(|child| !fixed_children.iter().any(|fixed| fixed.name == child.name))
+                .map(|child| CompletionItem {
+                    label: child.name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(module_catalog_member_detail(child.call_mode).to_owned()),
+                    documentation: module_catalog_documentation(
+                        child.description.as_deref(),
+                        child.call_mode,
+                    ),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                        edit_range, child.name,
+                    ))),
+                    ..CompletionItem::default()
+                }),
+        );
+    }
+    items.sort_by(|left, right| left.label.cmp(&right.label));
 
     CompletionList {
         is_incomplete,
@@ -5129,6 +5354,37 @@ fn module_catalog_member_parent_path(
     Some(resolved_path)
 }
 
+/// Resolves the direct source import path for a fixed core member projection.
+/// Unlike advisory catalog completion, fixed core metadata does not follow
+/// aliases: an alias could be reassigned or intentionally model another value.
+fn fixed_core_direct_import_path_for_member(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    site: MemberCompletionSite,
+) -> Option<Vec<String>> {
+    if site.member.end_byte > lexical.valid_prefix_end_byte
+        || site.member.end_byte > imports.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let import = visible_module_import_for_receiver(source, lexical, imports, site.receiver)?;
+    let mut path = import.path.clone();
+    if site.has_direct_receiver() {
+        return Some(path);
+    }
+    let suffix = source
+        .get(site.receiver.end_byte..site.receiver_chain.end_byte)?
+        .strip_prefix('.')?;
+    for segment in suffix.split('.') {
+        if !is_canonical_identifier(segment) || path.len() == MAX_LSP_MODULE_PATH_SEGMENTS {
+            return None;
+        }
+        path.push(segment.to_owned());
+    }
+    Some(path)
+}
+
 /// Finds an exact advisory leaf only through the same visible import-or-alias
 /// path used by member completion and signature help. It never resolves a
 /// module or consults a capability runtime.
@@ -5146,6 +5402,13 @@ fn module_catalog_direct_member<'catalog>(
     let method = source.get(site.member.start_byte..site.member.end_byte)?;
     if !is_canonical_identifier(method) {
         return None;
+    }
+    if let Some(path) = fixed_core_direct_import_path_for_member(source, lexical, imports, site) {
+        if fixed_core_module_path_blocks_advisory_children(&path)
+            || fixed_core_module_path_child(&path, method).is_some()
+        {
+            return None;
+        }
     }
     let mut path = module_catalog_member_parent_path(source, lexical, imports, shapes, site)?;
     path.push(method.to_owned());
@@ -5439,16 +5702,19 @@ fn module_catalog_member_hover(
     catalog: &ModuleCompletionCatalog,
     site: MemberCompletionSite,
 ) -> Option<Hover> {
-    if catalog.unavailable {
-        return None;
-    }
     let receiver_name = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
     visible_symbol_in(&symbols.symbols, receiver_name, site.receiver.start_byte)?;
-    let mut path = module_catalog_member_parent_path(source, lexical, imports, shapes, site)?;
     let member = source.get(site.member.start_byte..site.member.end_byte)?;
     if !is_canonical_identifier(member) {
         return None;
     }
+    if let Some(hover) = fixed_core_module_member_hover(source, lexical, imports, site) {
+        return hover;
+    }
+    if catalog.unavailable {
+        return None;
+    }
+    let mut path = module_catalog_member_parent_path(source, lexical, imports, shapes, site)?;
     path.push(member.to_owned());
     let module = catalog
         .modules
@@ -9929,29 +10195,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["math", "std"]
         );
+        let expected_import_range = Range::new(
+            position_at_byte(import_source, import_start),
+            position_at_byte(import_source, import_source.len()),
+        );
         assert!(import_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::MODULE)
-                && item.detail.as_deref()
-                    == Some("advisory module path; host module binding required")
                 && matches!(
                     &item.text_edit,
-                    Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
-                        if *range == Range::new(
-                            position_at_byte(import_source, import_start),
-                            position_at_byte(import_source, import_source.len()),
-                        )
+                    Some(CompletionTextEdit::Edit(TextEdit { range, .. })) if *range == expected_import_range
                 )
         }));
+        let math_import = import_completion
+            .items
+            .iter()
+            .find(|item| item.label == "math")
+            .expect("advisory module descriptor is present");
+        assert_eq!(
+            math_import.detail.as_deref(),
+            Some("advisory module path; host module binding required")
+        );
         let std_import = import_completion
             .items
             .iter()
             .find(|item| item.label == "std")
-            .expect("explicit module descriptor is present");
+            .expect("fixed core namespace is present");
+        assert_eq!(
+            std_import.detail.as_deref(),
+            Some("Splash core namespace; fixed and effect-free")
+        );
         assert_eq!(
             std_import.documentation,
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::PlainText,
-                value: "Standard helpers.".to_owned(),
+                value: "Fixed Splash core namespace. Its presence does not resolve a host module or grant authority.".to_owned(),
             }))
         );
 
@@ -9973,7 +10250,16 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "log"]
+            ["assert", "math"]
+        );
+        let nested_assert = nested_import_completion
+            .items
+            .iter()
+            .find(|item| item.label == "assert")
+            .expect("fixed assertion module is present");
+        assert_eq!(
+            nested_assert.detail.as_deref(),
+            Some("Splash core module; effect-free assertion helper")
         );
 
         let member_source = "use mod.std\nstd.";
@@ -9995,12 +10281,10 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["assert", "log"]
+            ["assert", "math"]
         );
         assert!(member_completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FIELD)
-                && item.detail.as_deref()
-                    == Some("advisory imported-module member; host module binding required")
                 && matches!(
                     &item.text_edit,
                     Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
@@ -10014,23 +10298,26 @@ mod tests {
             .items
             .iter()
             .find(|item| item.label == "assert")
-            .expect("explicit member descriptor is present");
+            .expect("fixed assertion member is present");
+        assert_eq!(
+            assert_member.detail.as_deref(),
+            Some("Splash core module; effect-free assertion helper")
+        );
         assert_eq!(
             assert_member.documentation,
             Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::PlainText,
-                value: "Stops when a condition is false.".to_owned(),
+                value: "Fixed Splash core assertion helper. It does not resolve a host module or grant authority.".to_owned(),
             }))
         );
-
-        let chained_member_source = "use mod.std\nstd.inspect.";
+        let chained_member_source = "use mod.service\nservice.inspect.";
         let chained_catalog = module_catalog(serde_json::json!([
             {
-                "path": "mod.std.inspect.config",
+                "path": "mod.service.inspect.config",
                 "description": "Reads static inspector configuration."
             },
             {
-                "path": "mod.std.inspect.status",
+                "path": "mod.service.inspect.status",
                 "description": "Returns inspector status."
             }
         ]));
@@ -10070,7 +10357,7 @@ mod tests {
         let mut tool_server = SplashLanguageServer::with_completion_catalogs(
             ToolCompletionCatalog::default(),
             module_catalog(serde_json::json!([
-                {"path": "mod.std.log", "description": "Does not affect mod.tool."}
+                {"path": "mod.service.log", "description": "Does not affect mod.tool."}
             ])),
         );
         tool_server.open_document(document(1, tool_source));
@@ -10088,6 +10375,225 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["call", "call_json", "start", "start_json"]
         );
+    }
+
+    #[test]
+    fn completes_fixed_core_import_paths_without_host_metadata_and_masks_fixed_leaves() {
+        let root_source = "use mod.";
+        let mut root_server = SplashLanguageServer::default();
+        root_server.open_document(document(1, root_source));
+        let root_completion = root_server
+            .completion(
+                &test_uri(),
+                position_at_byte(root_source, root_source.len()),
+            )
+            .expect("fixed root import completion succeeds");
+        assert!(!root_completion.is_incomplete);
+        assert_eq!(root_completion.items.len(), 1);
+        let std = &root_completion.items[0];
+        assert_eq!(std.label, "std");
+        assert_eq!(std.kind, Some(CompletionItemKind::MODULE));
+        assert_eq!(
+            std.detail.as_deref(),
+            Some("Splash core namespace; fixed and effect-free")
+        );
+        assert_eq!(
+            std.documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Fixed Splash core namespace. Its presence does not resolve a host module or grant authority.".to_owned(),
+            }))
+        );
+
+        let standard_source = "use mod.std.";
+        let mut standard_server = SplashLanguageServer::default();
+        standard_server.open_document(document(1, standard_source));
+        let standard_completion = standard_server
+            .completion(
+                &test_uri(),
+                position_at_byte(standard_source, standard_source.len()),
+            )
+            .expect("fixed standard import completion succeeds");
+        assert!(!standard_completion.is_incomplete);
+        assert_eq!(
+            standard_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["assert", "math"]
+        );
+        assert!(standard_completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::MODULE)
+                && item
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("Splash core"))
+        }));
+
+        let direct_standard_source = "use mod.std\nstd.";
+        let mut direct_standard_server = SplashLanguageServer::default();
+        direct_standard_server.open_document(document(1, direct_standard_source));
+        let direct_standard_completion = direct_standard_server
+            .completion(
+                &test_uri(),
+                position_at_byte(direct_standard_source, direct_standard_source.len()),
+            )
+            .expect("direct fixed standard member completion succeeds");
+        assert_eq!(
+            direct_standard_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["assert", "math"]
+        );
+        assert!(direct_standard_completion.items.iter().all(|item| {
+            item.kind == Some(CompletionItemKind::FIELD)
+                && item
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.starts_with("Splash core"))
+        }));
+
+        let direct_standard_hover_source = "use mod.std\nstd.math";
+        let mut direct_standard_hover_server = SplashLanguageServer::default();
+        direct_standard_hover_server.open_document(document(1, direct_standard_hover_source));
+        let math_start = direct_standard_hover_source
+            .rfind("math")
+            .expect("core math member exists");
+        let math_hover = direct_standard_hover_server
+            .hover(
+                &test_uri(),
+                position_at_byte(direct_standard_hover_source, math_start + 1),
+            )
+            .expect("direct fixed standard hover succeeds")
+            .expect("core math member has static hover");
+        assert_eq!(
+            math_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "Fixed Splash core scalar helpers. They do not resolve a host module or grant authority.".to_owned(),
+            })
+        );
+
+        let extension_catalog = module_catalog(serde_json::json!([
+            {"path": "mod.std.math.untrusted", "description": "Must stay hidden."},
+            {"path": "mod.std.assert.untrusted", "description": "Must stay hidden."},
+            {
+                "path": "mod.std.log",
+                "description": "Must stay hidden.",
+                "callMode": "synchronous",
+                "callShape": "single_json"
+            },
+            {"path": "mod.extra.value", "description": "Unrelated advisory module."}
+        ]));
+        for source in [
+            "use mod.std.math.",
+            "use mod.std.assert.",
+            "use mod.std\nstd.math.",
+            "use mod.std\nstd.assert.",
+            "use mod.std\nstd.log.",
+        ] {
+            let mut server = SplashLanguageServer::with_completion_catalogs(
+                ToolCompletionCatalog::default(),
+                extension_catalog.clone(),
+            );
+            server.open_document(document(1, source));
+            let completion = server
+                .completion(&test_uri(), position_at_byte(source, source.len()))
+                .expect("fixed leaf import completion succeeds");
+            assert!(!completion.is_incomplete);
+            assert!(
+                completion.items.is_empty(),
+                "advisory metadata extended a fixed core leaf for {source:?}"
+            );
+        }
+
+        let hostile_member_source = "use mod.std\nstd.log({})";
+        let mut hostile_member_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            extension_catalog,
+        );
+        hostile_member_server.open_document(document(1, hostile_member_source));
+        let log_start = hostile_member_source
+            .rfind("log")
+            .expect("hostile member exists");
+        assert!(hostile_member_server
+            .hover(
+                &test_uri(),
+                position_at_byte(hostile_member_source, log_start + 1),
+            )
+            .expect("fixed leaf hover succeeds")
+            .is_none());
+        let argument = hostile_member_source.find("{}").expect("call input exists") + 1;
+        assert!(hostile_member_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(hostile_member_source, argument)
+            )
+            .expect("fixed leaf signature help succeeds")
+            .is_none());
+
+        let alias_source = "use mod.std\nlet alias = std\nalias.";
+        let mut alias_server = SplashLanguageServer::default();
+        alias_server.open_document(document(1, alias_source));
+        assert!(alias_server
+            .completion(
+                &test_uri(),
+                position_at_byte(alias_source, alias_source.len())
+            )
+            .expect("core alias completion request succeeds")
+            .items
+            .is_empty());
+
+        let unavailable = ModuleCompletionCatalog {
+            modules: Vec::new(),
+            unavailable: true,
+        };
+        let mut unavailable_root = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            unavailable.clone(),
+        );
+        unavailable_root.open_document(document(1, root_source));
+        let root_completion = unavailable_root
+            .completion(
+                &test_uri(),
+                position_at_byte(root_source, root_source.len()),
+            )
+            .expect("unavailable root catalog completion succeeds");
+        assert!(root_completion.is_incomplete);
+        assert_eq!(root_completion.items.len(), 1);
+        assert_eq!(root_completion.items[0].label, "std");
+
+        let mut unavailable_standard = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            unavailable.clone(),
+        );
+        unavailable_standard.open_document(document(1, standard_source));
+        let standard_completion = unavailable_standard
+            .completion(
+                &test_uri(),
+                position_at_byte(standard_source, standard_source.len()),
+            )
+            .expect("unavailable standard catalog completion succeeds");
+        assert!(!standard_completion.is_incomplete);
+        assert_eq!(standard_completion.items.len(), 2);
+
+        let leaf_source = "use mod.std.math.";
+        let mut unavailable_leaf = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            unavailable,
+        );
+        unavailable_leaf.open_document(document(1, leaf_source));
+        let leaf_completion = unavailable_leaf
+            .completion(
+                &test_uri(),
+                position_at_byte(leaf_source, leaf_source.len()),
+            )
+            .expect("unavailable fixed leaf completion succeeds");
+        assert!(!leaf_completion.is_incomplete);
+        assert!(leaf_completion.items.is_empty());
     }
 
     #[test]
@@ -12540,7 +13046,12 @@ mod tests {
             .completion(&test_uri(), position_at_byte(source, source.len()))
             .expect("malformed module-catalog completion request succeeds");
         assert!(completion.is_incomplete);
-        assert!(completion.items.is_empty());
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(completion.items[0].label, "std");
+        assert_eq!(
+            completion.items[0].detail.as_deref(),
+            Some("Splash core namespace; fixed and effect-free")
+        );
 
         let independent_params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -12886,6 +13397,31 @@ mod tests {
 
         assert!(completion.is_incomplete);
         assert_eq!(completion.items.len(), 18);
+    }
+
+    #[test]
+    fn marks_fixed_standard_namespace_completion_incomplete_when_imports_are_truncated() {
+        let mut source = String::from("use mod.std\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("std.");
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, &source));
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, source.len()))
+            .expect("truncated fixed standard completion succeeds");
+
+        assert!(completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["assert", "math"]
+        );
     }
 
     #[test]

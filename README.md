@@ -538,7 +538,10 @@ fixed `call`, `call_json`, `start`, and `start_json` methods at a direct
 completes the documented fixed scalar functions and `pi`/`e` constants at a
 direct `math.` member site, with plain-text hover and function signature help.
 Both fixed surfaces use no tool-catalog or adapter lookup, do not follow local
-aliases, and do not imply a capability grant. An integration may additionally supply a
+aliases, and do not imply a capability grant. At a statement-position `use
+mod.` path, the same static projection completes `std`; below `use mod.std.`
+it completes `assert` and `math`. The frozen `mod.std` subtree cannot be
+extended by advisory catalog metadata. An integration may additionally supply a
 advisory tool-catalog projection through
 `initializationOptions.splash.toolCatalog` or a later
 `workspace/didChangeConfiguration` update; it accepts the `name`, `format`,
