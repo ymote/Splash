@@ -528,16 +528,18 @@ to 128 entries, 512 KiB of retained names and descriptions, 128-byte names,
 and 4 KiB descriptions; malformed, duplicate, or oversized input is discarded
 as a whole and marks that completion result incomplete. The lexical service
 also recognizes an exact visible direct `let binding = { ... }` initializer.
-At `binding.field`, or through a direct `let alias = binding` chain of at most
-16 hops, it offers the literal field names and supports hover and definition to
-the field key. Alias targets resolve at their source position, so lexical
-shadowing remains intact. This metadata has 1,024-shape, 4,096-field, and
-1,024-direct-alias bounds. An omitted alias edge makes retained record
-completion empty and incomplete and disables static field hover and definition.
-The LSP suppresses a shape after an earlier direct write or potentially
-mutating member, index, call, or escape path through the root or any retained
-direct alias that resolves to it. It does not infer parenthesized or computed aliases,
-assignments, control flow, function returns, imported values, or runtime data.
+At `binding.field`, `binding.child.field` for a direct child literal, or through
+an exact `let alias = binding` / `let alias = binding.child` chain of at most
+16 hops with at most one child selection, it offers the literal field names and
+supports hover and definition to the field key. Alias targets resolve at their
+source position, so lexical shadowing remains intact. This metadata has
+1,024-shape, 4,096-field, and 1,024-direct-alias bounds. An omitted alias edge
+makes retained record completion empty and incomplete and disables static field
+hover and definition. The LSP suppresses a shape after an earlier direct write
+or potentially mutating member, index, call, or escape path through the root or
+any retained root or child alias that resolves to it. It does not infer
+parenthesized or computed aliases, deeper child aliases or paths, assignments,
+control flow, function returns, imported values, or runtime data.
 It otherwise remains conservative: it does not infer forward references,
 general types, arbitrary record fields, builtins, arbitrary catalog data, or
 runtime-derived imported-module exports.

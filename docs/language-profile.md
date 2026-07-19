@@ -145,23 +145,24 @@ candidate set in that case.
 For bounded static record metadata, Rust hosts can call
 `splash_core::static_record_shape_report` or its named, limit-aware variant.
 It retains exact direct `let binding = { ... }` shapes plus exact
-`let alias = binding` source edges before `valid_prefix_end_byte`. It also
-retains one exact child level when a root field is written as `child: { ... }`;
-it never evaluates source, resolves an import, or creates a capability host. The
-LSP can use a lexical direct-alias chain of at most 16 hops for same-document
-root and direct-child field completion, hover, and definition. Target resolution
-is source-position-aware, so a shadowed name follows the binding visible at the
+`let alias = binding` and `let alias = binding.child` source edges before
+`valid_prefix_end_byte`. It also retains one exact child level when a root field
+is written as `child: { ... }`; it never evaluates source, resolves an import,
+or creates a capability host. The LSP can use a lexical direct-alias chain of at
+most 16 hops, with at most one direct child selection, for same-document root
+and direct-child field completion, hover, and definition. Target resolution is
+source-position-aware, so a shadowed name follows the binding visible at the
 alias initializer. The report caps root shapes at 1,024, aggregate root-and-child
-fields at 4,096, and alias edges at 1,024. Duplicate parent fields discard
-every child shape, and duplicate child fields discard that child shape. Static
-fields are unavailable after a direct write or potentially mutating member,
-index, call, or escape path through the root or any retained direct alias that
+fields at 4,096, and alias edges at 1,024. Duplicate parent fields discard every
+child shape, and duplicate child fields discard that child shape. Static fields
+are unavailable after a direct write or potentially mutating member, index,
+call, or escape path through the root or any retained root or child alias that
 resolves to it. Shape truncation marks retained completion incomplete; alias
 truncation returns no static fields, marks completion incomplete, and disables
 static field hover and definition. This is not general type inference:
-parenthesized or computed aliases, parenthesized or computed child values, child
-aliases, deeper paths, assignments, control flow, returns, imports, and runtime
-values remain outside the claim and never grant authority.
+parenthesized or computed aliases, parenthesized or computed child values,
+deeper child aliases or paths, assignments, control flow, returns, imports, and
+runtime values remain outside the claim and never grant authority.
 
 An editor may separately supply `initializationOptions.splash.moduleCatalog`
 or a later `settings.splash.moduleCatalog` update: a bounded list of canonical

@@ -396,24 +396,38 @@ fn assert_static_record_shape_invariants(source: &str, report: &StaticRecordShap
 
     let mut previous_alias_binding_start = 0_usize;
     for alias in &report.aliases {
+        let direct_child_is_ordered = alias.direct_child.is_none_or(|child| {
+            alias.target.end_byte <= child.start_byte
+                && child.start_byte < child.end_byte
+                && child.end_byte <= report.valid_prefix_end_byte
+        });
         assert!(
             previous_alias_binding_start <= alias.binding.start_byte
                 && alias.binding.start_byte < alias.binding.end_byte
                 && alias.binding.end_byte <= alias.target.start_byte
                 && alias.target.start_byte < alias.target.end_byte
-                && alias.target.end_byte <= report.valid_prefix_end_byte,
+                && alias.target.end_byte <= report.valid_prefix_end_byte
+                && direct_child_is_ordered,
             "static record alias span is unordered or exceeds the safe prefix: {alias:?}"
         );
+        let direct_child_is_utf8 = alias.direct_child.is_none_or(|child| {
+            source.is_char_boundary(child.start_byte) && source.is_char_boundary(child.end_byte)
+        });
         assert!(
             source.is_char_boundary(alias.binding.start_byte)
                 && source.is_char_boundary(alias.binding.end_byte)
                 && source.is_char_boundary(alias.target.start_byte)
-                && source.is_char_boundary(alias.target.end_byte),
+                && source.is_char_boundary(alias.target.end_byte)
+                && direct_child_is_utf8,
             "static record alias span is not a UTF-8 boundary: {alias:?}"
         );
+        let direct_child_is_identifier = alias
+            .direct_child
+            .is_none_or(|child| is_canonical_identifier(&source[child.start_byte..child.end_byte]));
         assert!(
             is_canonical_identifier(&source[alias.binding.start_byte..alias.binding.end_byte])
-                && is_canonical_identifier(&source[alias.target.start_byte..alias.target.end_byte]),
+                && is_canonical_identifier(&source[alias.target.start_byte..alias.target.end_byte])
+                && direct_child_is_identifier,
             "static record alias is not a canonical identifier: {alias:?}"
         );
         previous_alias_binding_start = alias.binding.start_byte;

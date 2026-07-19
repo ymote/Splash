@@ -122,26 +122,26 @@ truncated. When symbols are truncated the server returns no candidates, because
 an omitted inner definition could shadow a retained outer binding.
 
 For an exact visible `let binding = { ... }` initializer, the server separately
-retains a bounded static record shape and exact `let alias = binding` edges. At
-a direct `binding.field` site or a direct `binding.child.field` site whose
-`child: { ... }` value is an exact literal, including a lexical root-alias chain
-of at most 16 hops, it can complete the literal's field names, hover a known
-field, and navigate to that field key. Each alias target resolves at its
-original source position, preserving lexical shadowing. This is source-only
-advisory metadata, not runtime type inference: it does not follow parenthesized
-or computed aliases, parenthesized or computed child values, child aliases,
-deeper paths, assignments, control flow, function returns, imported values, or
-runtime data. Duplicate parent record fields discard every child shape, and
-duplicate child fields discard that child shape. The LSP stops using a shape
-after an earlier direct write or a potentially mutating member, index, call, or
-escape path through the root or any retained direct alias resolving to that
-root. The report retains at most 1,024 root shapes, 4,096 aggregate
-root-and-child fields, and 1,024 direct alias edges. A truncated shape report
-marks a retained member completion `isIncomplete`; a truncated alias report
-returns no static field items, marks completion incomplete, and disables static
-field hover and definition. Static field hover and definition also fail closed
-when the lexical index is truncated, because an omitted earlier reference could
-be a mutation.
+retains a bounded static record shape and exact `let alias = binding` or
+`let alias = binding.child` edges. At a direct `binding.field` site or a direct
+`binding.child.field` site whose `child: { ... }` value is an exact literal,
+including a lexical alias chain of at most 16 hops with at most one child
+selection, it can complete the literal's field names, hover a known field, and
+navigate to that field key. Each alias target resolves at its original source
+position, preserving lexical shadowing. This is source-only advisory metadata,
+not runtime type inference: it does not follow parenthesized or computed
+aliases, parenthesized or computed child values, deeper child aliases or paths,
+assignments, control flow, function returns, imported values, or runtime data.
+Duplicate parent record fields discard every child shape, and duplicate child
+fields discard that child shape. The LSP stops using a shape after an earlier
+direct write or a potentially mutating member, index, call, or escape path
+through the root or any retained root or child alias resolving to that root. The
+report retains at most 1,024 root shapes, 4,096 aggregate root-and-child fields,
+and 1,024 direct alias edges. A truncated shape report marks a retained member
+completion `isIncomplete`; a truncated alias report returns no static field
+items, marks completion incomplete, and disables static field hover and
+definition. Static field hover and definition also fail closed when the lexical
+index is truncated, because an omitted earlier reference could be a mutation.
 
 The server separately recognizes a complete, lexically visible `use mod.tool`
 binding before the safe syntax boundary. At a direct `tool.` member site it
@@ -352,16 +352,18 @@ same invalid-source coverage validates bounded source-only import reports:
 every retained `mod.<path>` spelling and final binding span is ordered,
 UTF-8-safe, within the safe prefix, and structurally consistent; truncation is
 explicit at the fixed import cap. It also validates direct literal-record root
-and exact child shape spans, unique field names, direct alias binding and target
-spans, safe-prefix boundaries, and the separate shape, aggregate root-and-child
-field, and alias caps.
+and exact child shape spans, unique field names, direct alias binding, target,
+and optional child-selector spans, safe-prefix boundaries, and the separate
+shape, aggregate root-and-child field, and alias caps.
 `lsp_document` feeds bounded UTF-8 source through the production language
 server's document lifecycle. It opens one fixed local URI, requests formatting,
 outlining, completion, hover, definition, references, highlights, and guarded
 rename across at most 33 UTF-8-boundary positions plus an invalid UTF-16
 position, replaces the whole document to invalidate lazy reports, repeats the
 requests, and closes the document. It accepts at most 16 KiB of fuzzer source
-and has reviewed baseline and module-catalog `.splash` seeds. The server uses a
+and has reviewed source `.splash` and advisory-configuration `.json` seeds.
+For a parsed JSON value, it also exercises the bounded initialization and
+configuration-refresh projection around a fixed document. The server uses a
 fixed bounded advisory module catalog, including shaped direct-method input
 field metadata, only to exercise catalog completion, top-level input-key
 completion, hover, and signature help: the target never starts stdio, reads the

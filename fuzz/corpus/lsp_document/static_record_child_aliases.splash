@@ -1,0 +1,4 @@
+let profile = {user: {name: "Ada", active: true}}
+let selected = profile.user
+let alias = selected
+alias.name

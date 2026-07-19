@@ -5,3 +5,6 @@ let profile = {
 }
 let alias = profile
 alias.nested.level
+let selected = profile.nested
+let selected_alias = selected
+selected_alias.level

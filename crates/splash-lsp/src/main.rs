@@ -4489,7 +4489,9 @@ fn direct_module_output_alias_root<'symbol>(
         }
         let target_start_byte = match aliases.alias_targets.get(&binding_start_byte).copied() {
             Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
-            Some(StaticRecordAliasTarget::NotStatic) | None => return Some(current),
+            Some(StaticRecordAliasTarget::DirectChild { .. })
+            | Some(StaticRecordAliasTarget::NotStatic)
+            | None => return Some(current),
             Some(StaticRecordAliasTarget::Uncertain) => return None,
         };
         if depth == MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
@@ -4529,10 +4531,19 @@ fn direct_module_output_alias_group(
             .filter(|alias| alias.binding.start_byte < site_start_byte)
         {
             let binding_start_byte = alias.binding.start_byte;
-            let Some(StaticRecordAliasTarget::Let(target_start_byte)) =
-                aliases.alias_targets.get(&binding_start_byte).copied()
-            else {
-                continue;
+            let target_start_byte = match aliases.alias_targets.get(&binding_start_byte).copied() {
+                Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
+                Some(StaticRecordAliasTarget::DirectChild {
+                    target_start_byte, ..
+                }) => {
+                    if depths.contains_key(&target_start_byte) {
+                        return None;
+                    }
+                    continue;
+                }
+                Some(StaticRecordAliasTarget::NotStatic)
+                | Some(StaticRecordAliasTarget::Uncertain)
+                | None => continue,
             };
             let Some(target_depth) = depths.get(&target_start_byte).copied() else {
                 continue;
@@ -5045,13 +5056,27 @@ fn visible_symbol_in<'symbol>(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StaticRecordAliasTarget {
     Let(usize),
+    DirectChild {
+        target_start_byte: usize,
+        child: SourceSpan,
+    },
     NotStatic,
     Uncertain,
 }
 
+/// One root literal-record view reached through an exact local alias chain.
+/// A view can carry one direct child selected by `let alias = root.child`, but
+/// never a deeper path or a computed member expression.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StaticRecordRoot {
-    Found(SourceSpan),
+struct StaticRecordView {
+    root_binding: SourceSpan,
+    direct_child: Option<SourceSpan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticRecordViewResolution {
+    Found(StaticRecordView),
+    Escaped(SourceSpan),
     NotStatic,
     Uncertain,
 }
@@ -5082,7 +5107,21 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
             let target = match source.get(alias.target.start_byte..alias.target.end_byte) {
                 Some(name) => match visible_symbol_in(symbols, name, alias.target.start_byte) {
                     Some(symbol) if symbol.kind == LexicalSymbolKind::Let => {
-                        StaticRecordAliasTarget::Let(symbol.definition.start_byte)
+                        match alias.direct_child {
+                            None => StaticRecordAliasTarget::Let(symbol.definition.start_byte),
+                            Some(child)
+                                if child.start_byte >= alias.target.end_byte
+                                    && source
+                                        .get(child.start_byte..child.end_byte)
+                                        .is_some_and(is_canonical_identifier) =>
+                            {
+                                StaticRecordAliasTarget::DirectChild {
+                                    target_start_byte: symbol.definition.start_byte,
+                                    child,
+                                }
+                            }
+                            Some(_) => StaticRecordAliasTarget::Uncertain,
+                        }
                     }
                     _ => StaticRecordAliasTarget::NotStatic,
                 },
@@ -5098,50 +5137,75 @@ impl<'symbol> StaticRecordAliasIndex<'symbol> {
         }
     }
 
-    fn root_for(&self, initial: &'symbol LexicalSymbol) -> StaticRecordRoot {
+    fn view_for(&self, initial: &'symbol LexicalSymbol) -> StaticRecordViewResolution {
         if initial.kind != LexicalSymbolKind::Let {
-            return StaticRecordRoot::NotStatic;
+            return StaticRecordViewResolution::NotStatic;
         }
 
         let mut current = initial;
+        let mut direct_child = None;
+        let mut escaped = false;
         let mut visited = Vec::with_capacity(MAX_STATIC_RECORD_ALIAS_DEPTH + 1);
         for depth in 0..=MAX_STATIC_RECORD_ALIAS_DEPTH {
             let binding_start_byte = current.definition.start_byte;
             if self.static_shape_bindings.contains(&binding_start_byte) {
-                return StaticRecordRoot::Found(current.definition);
+                if escaped {
+                    return StaticRecordViewResolution::Escaped(current.definition);
+                }
+                return StaticRecordViewResolution::Found(StaticRecordView {
+                    root_binding: current.definition,
+                    direct_child,
+                });
             }
             if visited.contains(&binding_start_byte) || depth == MAX_STATIC_RECORD_ALIAS_DEPTH {
-                return StaticRecordRoot::Uncertain;
+                return StaticRecordViewResolution::Uncertain;
             }
             visited.push(binding_start_byte);
 
             let target_start_byte = match self.alias_targets.get(&binding_start_byte).copied() {
                 Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
-                Some(StaticRecordAliasTarget::NotStatic) | None => {
-                    return StaticRecordRoot::NotStatic
+                Some(StaticRecordAliasTarget::DirectChild {
+                    target_start_byte,
+                    child,
+                }) => {
+                    if direct_child.is_some() {
+                        // A second child selector would be a deeper alias. It
+                        // is unsupported, but it still escapes the retained
+                        // child view. Keep following the bounded root chain so
+                        // callers can fail closed only for that root.
+                        escaped = true;
+                    } else {
+                        direct_child = Some(child);
+                    }
+                    target_start_byte
                 }
-                Some(StaticRecordAliasTarget::Uncertain) => return StaticRecordRoot::Uncertain,
+                Some(StaticRecordAliasTarget::NotStatic) | None => {
+                    return StaticRecordViewResolution::NotStatic
+                }
+                Some(StaticRecordAliasTarget::Uncertain) => {
+                    return StaticRecordViewResolution::Uncertain
+                }
             };
             let Some(target) = self.symbols_by_definition.get(&target_start_byte).copied() else {
-                return StaticRecordRoot::Uncertain;
+                return StaticRecordViewResolution::Uncertain;
             };
             if target.kind != LexicalSymbolKind::Let {
-                return StaticRecordRoot::Uncertain;
+                return StaticRecordViewResolution::Uncertain;
             }
             current = target;
         }
 
-        StaticRecordRoot::Uncertain
+        StaticRecordViewResolution::Uncertain
     }
 }
 
-fn visible_static_record_shape<'shape>(
+fn visible_static_record_view<'shape>(
     source: &str,
     symbols: &[LexicalSymbol],
     valid_prefix_end_byte: usize,
     shapes: &'shape StaticRecordShapeReport,
     receiver: SourceSpan,
-) -> Option<&'shape StaticRecordShape> {
+) -> Option<(&'shape StaticRecordShape, StaticRecordView)> {
     if receiver.end_byte > valid_prefix_end_byte || receiver.end_byte > shapes.valid_prefix_end_byte
     {
         return None;
@@ -5152,7 +5216,7 @@ fn visible_static_record_shape<'shape>(
         return None;
     }
     let aliases = StaticRecordAliasIndex::new(source, symbols, shapes);
-    let StaticRecordRoot::Found(root_binding) = aliases.root_for(symbol) else {
+    let StaticRecordViewResolution::Found(view) = aliases.view_for(symbol) else {
         return None;
     };
     if !shapes.aliases_truncated
@@ -5160,7 +5224,7 @@ fn visible_static_record_shape<'shape>(
             source,
             shapes,
             &aliases,
-            root_binding,
+            view.root_binding,
             receiver.start_byte,
         )
     {
@@ -5169,12 +5233,14 @@ fn visible_static_record_shape<'shape>(
     shapes
         .shapes
         .iter()
-        .find(|shape| shape.binding == root_binding)
+        .find(|shape| shape.binding == view.root_binding)
+        .map(|shape| (shape, view))
 }
 
 /// Returns static fields for either the root literal or one exact direct child
-/// literal. This is not a general member-path resolver: child aliases,
-/// computed paths, and deeper chains intentionally have no static metadata.
+/// literal. An exact `let alias = root.child` binding can carry that one child
+/// through a bounded alias chain, but computed paths and deeper chains have no
+/// static metadata.
 fn visible_static_record_fields<'shape>(
     source: &str,
     symbols: &[LexicalSymbol],
@@ -5182,21 +5248,25 @@ fn visible_static_record_fields<'shape>(
     shapes: &'shape StaticRecordShapeReport,
     site: MemberCompletionSite,
 ) -> Option<&'shape [StaticRecordField]> {
-    let shape = visible_static_record_shape(
+    let (shape, view) = visible_static_record_view(
         source,
         symbols,
         valid_prefix_end_byte,
         shapes,
         site.receiver,
     )?;
-    match static_record_direct_child_name(source, site)? {
-        None => Some(&shape.fields),
-        Some(child_name) => shape
-            .direct_field_shapes
-            .iter()
-            .find(|child| child.field.name == child_name)
-            .map(|child| child.fields.as_slice()),
-    }
+    let site_child = static_record_direct_child_name(source, site)?;
+    let selected_child = match (view.direct_child, site_child) {
+        (None, None) => return Some(&shape.fields),
+        (None, Some(child_name)) => child_name,
+        (Some(child), None) => source.get(child.start_byte..child.end_byte)?,
+        (Some(_), Some(_)) => return None,
+    };
+    shape
+        .direct_field_shapes
+        .iter()
+        .find(|child| child.field.name == selected_child)
+        .map(|child| child.fields.as_slice())
 }
 
 /// Extracts the one optional direct child identifier between a root binding
@@ -5246,14 +5316,21 @@ fn static_record_alias_group_is_stable(
         else {
             return false;
         };
-        match aliases.root_for(alias_symbol) {
-            StaticRecordRoot::Found(alias_root) if alias_root == root_binding => {
+        match aliases.view_for(alias_symbol) {
+            StaticRecordViewResolution::Found(alias_view)
+                if alias_view.root_binding == root_binding =>
+            {
                 if !binding_is_stable_at(source, alias_symbol, site_start_byte) {
                     return false;
                 }
             }
-            StaticRecordRoot::Found(_) | StaticRecordRoot::NotStatic => {}
-            StaticRecordRoot::Uncertain => return false,
+            StaticRecordViewResolution::Escaped(alias_root) if alias_root == root_binding => {
+                return false;
+            }
+            StaticRecordViewResolution::Found(_)
+            | StaticRecordViewResolution::Escaped(_)
+            | StaticRecordViewResolution::NotStatic => {}
+            StaticRecordViewResolution::Uncertain => return false,
         }
     }
 
@@ -6463,11 +6540,68 @@ mod tests {
             ["name"]
         );
 
+        let child_alias_source = concat!(
+            "let profile = {user: {name: \"Ada\", active: true}}\n",
+            "let selected = profile.user\n",
+            "let alias = selected\n",
+            "alias.name"
+        );
+        let mut child_alias_server = SplashLanguageServer::default();
+        child_alias_server.open_document(document(1, child_alias_source));
+        let child_alias_member = child_alias_source
+            .rfind("name")
+            .expect("child alias field exists");
+        assert_eq!(
+            child_alias_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(child_alias_source, child_alias_source.len()),
+                )
+                .expect("direct child alias completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "name"]
+        );
+        assert_eq!(
+            child_alias_server
+                .definition(
+                    &test_uri(),
+                    position_at_byte(child_alias_source, child_alias_member + 1),
+                )
+                .expect("direct child alias definition succeeds")
+                .expect("known direct child alias field has a definition")
+                .range,
+            Range::new(
+                position_at_byte(
+                    child_alias_source,
+                    child_alias_source.find("name:").unwrap()
+                ),
+                position_at_byte(
+                    child_alias_source,
+                    child_alias_source.find("name:").unwrap() + "name".len(),
+                ),
+            )
+        );
+        assert!(child_alias_server
+            .hover(
+                &test_uri(),
+                position_at_byte(child_alias_source, child_alias_member + 1),
+            )
+            .expect("direct child alias hover succeeds")
+            .is_some());
+
         for unsupported_source in [
             "let profile = {user: ({name: \"Ada\"})}\nprofile.user.",
             "let profile = {user: {name: \"Ada\"}.name}\nprofile.user.",
             "let profile = {user: {name: {deeper: true}}}\nprofile.user.name.",
             "let profile = {user: {name: \"Ada\"}, user: {other: true}}\nprofile.user.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = (profile.user)\nselected.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user.name\nselected.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile[\"user\"]\nselected.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nselected.name.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nlet detail = selected.name\nprofile.user.",
         ] {
             let mut unsupported_server = SplashLanguageServer::default();
             unsupported_server.open_document(document(1, unsupported_source));
@@ -6483,6 +6617,29 @@ mod tests {
                 "static child metadata must fail closed for {unsupported_source:?}"
             );
         }
+
+        let unrelated_source = concat!(
+            "let profile = {user: {name: \"Ada\"}}\n",
+            "let selected = profile.user\n",
+            "let detail = selected.name\n",
+            "let settings = {theme: \"dark\"}\n",
+            "settings."
+        );
+        let mut unrelated_server = SplashLanguageServer::default();
+        unrelated_server.open_document(document(1, unrelated_source));
+        assert_eq!(
+            unrelated_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(unrelated_source, unrelated_source.len()),
+                )
+                .expect("unrelated root completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["theme"]
+        );
 
         let duplicate_child_source =
             "let profile = {user: {name: \"Ada\", name: \"Grace\"}}\nprofile.user.name";
@@ -6553,6 +6710,29 @@ mod tests {
             .unwrap();
         assert_eq!(
             shadowed_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["inner"]
+        );
+
+        let shadowed_child_source = "let profile = {user: {outer: true}}\n\
+                                    fn inspect() {\n\
+                                        let profile = {user: {inner: true}}\n\
+                                        let selected = profile.user\n\
+                                        selected.inner\n\
+                                    }";
+        let mut shadowed_child_server = SplashLanguageServer::default();
+        shadowed_child_server.open_document(document(1, shadowed_child_source));
+        let inner_member = shadowed_child_source.rfind("inner").unwrap();
+        assert_eq!(
+            shadowed_child_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(shadowed_child_source, inner_member + "inner".len()),
+                )
+                .unwrap()
                 .items
                 .iter()
                 .map(|item| item.label.as_str())
@@ -6648,6 +6828,9 @@ mod tests {
             "let profile = {name: \"Ada\"}\nlet alias = profile\nalias.refresh()\nprofile.",
             "let profile = {name: \"Ada\"}\nlet alias = profile\nmutate(alias)\nprofile.",
             "let profile = {user: {name: \"Ada\"}}\nprofile.user.name = \"Grace\"\nprofile.user.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nselected.name = \"Grace\"\nprofile.user.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nmutate(selected)\nprofile.user.",
+            "let profile = {user: {name: \"Ada\"}}\nlet selected = profile.user\nlet alias = selected\nalias[\"name\"]\nprofile.user.",
         ] {
             let mut server = SplashLanguageServer::default();
             server.open_document(document(1, source));
@@ -9287,6 +9470,12 @@ mod tests {
             "use mod.arithmetic\n",
             "let result = arithmetic.add({left: 20})\n",
             "result.total.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "let selected = result.total\n",
+            "result.to"
         ));
         assert_no_output_completion(concat!(
             "use mod.arithmetic\n",

@@ -172,10 +172,11 @@ pub(super) fn collect_module_imports(
     CanonicalParser::new(tokens, max_nesting).collect_module_imports(valid_prefix_end_byte)
 }
 
-/// Collects exact direct literal-record initializers and direct alias edges
-/// after the public caller has bounded and syntax-checked the source. The
-/// parser still runs for an incomplete editor snapshot, but the collector keeps
-/// only complete metadata ending before the supplied safe-prefix boundary.
+/// Collects exact direct literal-record initializers plus direct root or child
+/// alias edges after the public caller has bounded and syntax-checked the
+/// source. The parser still runs for an incomplete editor snapshot, but the
+/// collector keeps only complete metadata ending before the supplied safe-prefix
+/// boundary.
 pub(super) fn collect_static_record_shapes(
     source: &str,
     max_tokens: usize,
@@ -374,6 +375,7 @@ struct ParsedDirectRecord {
 
 struct DirectRecordAlias {
     target: SourceSpan,
+    direct_child: Option<SourceSpan>,
     end_byte: usize,
 }
 
@@ -421,6 +423,7 @@ impl StaticRecordShapeCollector {
         self.aliases.push(StaticRecordAlias {
             binding,
             target: alias.target,
+            direct_child: alias.direct_child,
         });
     }
 
@@ -1732,21 +1735,44 @@ fn direct_record_alias_from_tokens(
     let TokenKind::Identifier(name) = &target.kind else {
         return None;
     };
-    if is_reserved_identifier(name)
-        || !matches!(
-            &tokens.get(target_index + 1)?.kind,
-            TokenKind::Newline | TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::End
-        )
-    {
+    if is_reserved_identifier(name) {
+        return None;
+    }
+
+    let target = SourceSpan {
+        start_byte: target.start_byte,
+        end_byte: target.end_byte,
+    };
+    let mut direct_child = None;
+    let mut end_index = target_index;
+    let next_index = target_index.checked_add(1)?;
+    if matches!(&tokens.get(next_index)?.kind, TokenKind::Operator(operator) if operator == ".") {
+        let child_index = next_index.checked_add(1)?;
+        let child = tokens.get(child_index)?;
+        let TokenKind::Identifier(name) = &child.kind else {
+            return None;
+        };
+        if is_reserved_identifier(name) {
+            return None;
+        }
+        direct_child = Some(SourceSpan {
+            start_byte: child.start_byte,
+            end_byte: child.end_byte,
+        });
+        end_index = child_index;
+    }
+    let boundary_index = end_index.checked_add(1)?;
+    if !matches!(
+        &tokens.get(boundary_index)?.kind,
+        TokenKind::Newline | TokenKind::Semicolon | TokenKind::CloseCurly | TokenKind::End
+    ) {
         return None;
     }
 
     Some(DirectRecordAlias {
-        target: SourceSpan {
-            start_byte: target.start_byte,
-            end_byte: target.end_byte,
-        },
-        end_byte: target.end_byte,
+        target,
+        direct_child,
+        end_byte: tokens.get(end_index)?.end_byte,
     })
 }
 
