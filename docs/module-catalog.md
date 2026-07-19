@@ -18,10 +18,10 @@ not a runtime declaration. `callShape` explicitly says that a direct method
 has one JSON-compatible argument; it must appear with `callMode` and never
 creates a runtime contract. `inputFields` is a compact literal-record view for
 that one argument, while `outputFields` is the compact view for the declared
-JSON result. Both require `callShape: "single_json"`. An `outputFields` entry
-whose `type` is `object` may contain one optional `fields` array describing its
-direct object children; `inputFields` never accepts `fields`, and a child entry
-cannot itself contain `fields`. A path with
+JSON result. Both require `callShape: "single_json"`. An `inputFields` or
+`outputFields` entry whose `type` is `object` may contain one optional `fields`
+array describing its direct object children; a child entry cannot itself
+contain `fields`. A path with
 `callMode` must have at least three segments (`mod.<module>.<method>`) and
 cannot also be a parent of another catalog path.
 
@@ -45,7 +45,15 @@ cannot also be a parent of another catalog path.
             "required": true,
             "description": "Canonical location to query."
           },
-          {"name": "units", "type": "string", "required": false}
+          {"name": "units", "type": "string", "required": false},
+          {
+            "name": "filters",
+            "type": "object",
+            "required": false,
+            "fields": [
+              {"name": "station", "type": "string", "required": false}
+            ]
+          }
         ],
         "outputFields": [
           {
@@ -71,16 +79,17 @@ cannot also be a parent of another catalog path.
 
 Every path must start with `mod`, have at least one following canonical Splash
 identifier, contain at most 16 segments, and fit in 256 bytes. The LSP keeps at
-most 256 descriptors, 1,024 aggregate input fields, 1,024 aggregate output
-fields (including retained output children), and 512 KiB of retained path,
+most 256 descriptors, 1,024 aggregate input fields (including retained input
+children), 1,024 aggregate output fields (including retained output children),
+and 512 KiB of retained path,
 description, call-mode, call-shape, and field bytes. A descriptor description
 and a field description each cap at 4 KiB. Every input or output field requires
 a canonical Splash identifier up to
 128 bytes, one of the fixed
 `any`, `null`, `boolean`, `number`, `integer`, `string`, `array`, or `object`
 types, and an explicit Boolean `required` value. `fields` is valid only on a
-top-level `object` output field and retains at most one child level; duplicates
-at either retained level, `fields` on an input or non-object field, a deeper
+top-level `object` input or output field and retains at most one child level;
+duplicates at either retained level, `fields` on a non-object field, a deeper
 `fields` list, or any other malformed recognized `callMode`, `callShape`,
 `inputFields`, or `outputFields` discards the catalog as a whole;
 completion at a matching site then returns no candidates with `isIncomplete:
@@ -99,9 +108,9 @@ entries; a direct method includes its host-selected `callMode` and
 explicit object with a `properties` map whose declared property and required
 names use canonical Splash identifiers, it also projects `inputFields` or
 `outputFields` with the schema field type, required bit, and optional plain-text
-description. For an output property explicitly typed as `object` with its own
-complete `properties` map, the runtime also projects that one direct child level
-as `fields`; deeper object structure is omitted. Array, scalar,
+description. For an input or output property explicitly typed as `object` with
+its own complete `properties` map, the runtime also projects that one direct
+child level as `fields`; deeper object structure is omitted. Array, scalar,
 missing-properties, noncanonical-key, and otherwise incomplete retained record
 shapes omit the corresponding view rather than exposing a partial one. The
 runtime module is still configured separately during host setup; this returned
@@ -179,16 +188,17 @@ lists, and the advisory authority boundary. Inferred namespaces and unresolved,
 shadowed, or non-direct paths have no catalog hover.
 
 For an exact visible leaf with `callShape: "single_json"` and `inputFields`,
-the server also completes an undeclared top-level key while the cursor is in the
-first direct literal-record argument, such as
-`weather.current({loc})` or `weather_api.current({loc})`. It replaces only
-that key identifier and does not
-insert an object, a value, or `await()`. The recognizer rejects a nested record,
-second argument, string or comment cursor, mismatched/deep delimiters,
+the server also completes an undeclared root key or one direct object-child key
+while the cursor is in the first direct literal-record argument, such as
+`weather.current({loc})`, `weather_api.current({loc})`, or
+`weather.current({filters: {sta}})`. It replaces only that key identifier and
+does not insert an object, a value, or `await()`. The recognizer rejects a path
+below that direct child level, second argument, string or comment cursor,
+mismatched/deep delimiters,
 duplicate prior key, truncated import metadata, shadowed receiver, malformed
 record prefix, or unknown/unshaped leaf. It does not evaluate JSON Schema,
-infer a value or nested shape, read a runtime, validate a contract, or grant a
-capability.
+infer a value or deeper/arbitrary nested shape, read a runtime, validate a
+contract, or grant a capability.
 
 For an exact source binding on that same shaped leaf, the LSP can also use
 `outputFields` for a result member: a synchronous leaf must appear exactly as
@@ -223,7 +233,7 @@ metadata, shadowed receivers, and unknown or unshaped paths. Signature help
 uses the same plain-text advisory description and compact input/output field
 lists as hover; it does not resolve a module, inspect a runtime, validate an
 adapter contract, or authorize a call. The separate input-key completion is
-limited to the one top-level literal-record position described above. The
+limited to root keys and one direct object-child literal-record position. The
 separate output-field feature is limited to the exact result binding and
 bounded local alias chain described above, plus one explicit object-child path;
 it never follows arbitrary member chains. Neither feature performs JSON Schema

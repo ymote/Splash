@@ -174,8 +174,8 @@ or a later `settings.splash.moduleCatalog` update: a bounded list of canonical
 `callShape` of `single_json` that requires a mode, plus optional compact
 `inputFields` and `outputFields` that require that exact shape. Each field has
 a canonical source identifier, one fixed JSON type, an explicit required bit,
-and an optional plain-text description. An object output field may carry one
-direct child `fields` list; input fields and output children cannot. This
+and an optional plain-text description. An object input or output field may
+carry one direct child `fields` list; children cannot. This
 LSP-only projection can complete
 the current segment of a direct statement-position `use mod.*` path, or bounded
 catalog paths below a direct visible imported-module binding or stable exact
@@ -185,18 +185,20 @@ or direct member call; writes, member extraction, parenthesized/computed edges,
 escapes, and truncated alias metadata fail closed. A deferred leaf is only
 labeled as returning a promise; an exact visible catalog leaf also has a
 plain-text advisory hover. For an exact shaped leaf, it can complete an
-undeclared top-level key in the first direct literal record argument from
-`inputFields`, and documents both input and output fields in hover and signature
-help. For an exact root `let result = receiver.method(input)` binding on a
-synchronous leaf, where `receiver` is that import or qualifying alias, or its
+undeclared root key or one direct object-child key in the first direct literal
+record argument from `inputFields`, and documents both input and output fields
+in hover and signature help. For an exact root
+`let result = receiver.method(input)` binding on a synchronous leaf, where
+`receiver` is that import or qualifying alias, or its
 exact deferred `.await()` form, it can complete and hover root `result.field`
 names from `outputFields` and one retained object-child path such as
 `result.summary.total`. It also follows exact local `let alias = result` chains
 of at most 16 hops. Its whole result-alias group, including aliases declared
 after the member site, must stay stable; truncated alias metadata makes output
-completion empty and incomplete. It does not complete nested input keys, result
-paths below that one object-child level, infer values, follow computed or deeper
-aliases, or infer arbitrary result-binding members. The LSP never inserts `await()` or
+completion empty and incomplete. It does not complete input keys below that
+one object-child level, result paths below that one object-child level, infer
+values, follow computed or deeper aliases, or infer arbitrary result-binding
+members. The LSP never inserts `await()` or
 changes source beyond the selected identifier. It is not part of the core
 report and does not load a source file, resolve or validate a module, inspect
 runtime exports, infer arbitrary fields, or make a Rust adapter current or
@@ -221,14 +223,14 @@ editor scans only the bounded client source and advisory metadata. It does not
 load a module, inspect a runtime, validate a tool name, issue a lease, or
 authorize a call. When a shaped leaf has `inputFields` or `outputFields`, hover
 and signature documentation list those bounded field/type/required views, and
-the first direct literal-record argument can complete an undeclared top-level
-key from `inputFields`. The bounded output feature serves the exact result
-binding plus an exact local alias chain of at most 16 hops, requires a matching
+the first direct literal-record argument can complete an undeclared root key or
+one direct object-child key from `inputFields`. The bounded output feature
+serves the exact result binding plus an exact local alias chain of at most 16 hops, requires a matching
 synchronous/deferred call form, and retains at most one explicit object-child
-output path. It rejects computed/deeper aliases, mutation/escape, result paths
-beyond that child, and computed initializers. This is not general nested-key
-completion, JSON Schema evaluation, runtime inspection, or proof that a
-contract remains installed.
+output path. It rejects computed/deeper aliases, mutation/escape, input or
+result paths beyond that child, and computed initializers. This is not general
+arbitrary nested-key completion, JSON Schema evaluation, runtime inspection,
+or proof that a contract remains installed.
 
 For dataflow authoring, an editor may instead supply the separate bounded
 `initializationOptions.splash.workflowDataCatalog` projection. It contains only

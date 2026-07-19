@@ -32,10 +32,10 @@
   escapes, and truncated alias metadata fail closed; fixed `mod.tool` methods
   remain direct-import-only. Exact one-JSON-value leaves can present bounded
   schema-derived input and output record fields in hover/signature help, with
-  input-key completion only in the first direct literal record argument and
-  result-field completion/hover at the root plus one explicit output-object
-  child level, without module loading, resolution, runtime export inspection,
-  or authority inference.
+  input-key completion at the root plus one explicit input-object child level
+  in the first direct literal record argument and result-field completion/hover
+  at the root plus one explicit output-object child level, without module
+  loading, resolution, runtime export inspection, or authority inference.
 - A bounded initialization-time or explicit configuration-refresh advisory
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context
@@ -181,8 +181,9 @@
   call shape without inserting source or authorizing a call. An explicit,
   source-compatible executable object input contract can additionally project
   bounded field/type/required metadata into direct-leaf hover and signature
-  help and first-literal top-level input-key completion; arrays, scalars,
-  missing-properties, noncanonical-key, and partial shapes are omitted. The
+  help plus first-literal root and one direct input-object child key completion;
+  arrays, scalars, missing-properties, noncanonical-key, and partial shapes are
+  omitted. The
   reviewed module-to-tool mapping, method mode, call shape, and any compact
   field projection are part of the catalog fingerprint recorded by each lease,
   and the interface seals before lease issuance or evaluation. It does not add
@@ -351,10 +352,10 @@
   `mod.tool`, bounded direct literal/direct-alias record fields,
   catalog-backed chained lookup and static input/output contract presentation
   from a visible imported-module binding, bounded direct-module root and one
-  object-child result-field completion/hover through stable exact local alias
-  groups, and direct advisory workflow-data fields. General module resolution,
-  computed/deeper result aliases and chains, and broader type-aware field
-  semantics remain open.
+  object-child input-key and result-field completion/hover through stable exact
+  local alias groups, and direct advisory workflow-data fields. General module
+  resolution, computed/deeper result aliases and chains, and broader type-aware
+  field semantics remain open.
 - Sustained parser/VM differential fuzzing, LSP document and advisory
   configuration lifecycle fuzzing, expanded resource-exhaustion coverage, and
   corpus triage.

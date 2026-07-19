@@ -631,12 +631,14 @@ mod tests {
                             field_type: crate::CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                         crate::CapabilityModuleInputFieldDescriptor {
                             name: "right".to_owned(),
                             field_type: crate::CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                     ]),
                     output_fields: Some(vec![crate::CapabilityModuleOutputFieldDescriptor {

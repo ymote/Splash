@@ -396,10 +396,11 @@ For an exact visible imported capability-module leaf, the optional advisory
 `moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,
 and compact `inputFields` and `outputFields`. Each field has a canonical
 identifier, one fixed JSON type, a required bit, and optional plain-text
-description. An object output field may carry one direct child `fields` list;
-input fields and output children cannot. The LSP shows both bounded field lists in leaf hover and signature
-help, and can complete an undeclared top-level key in the first direct
-literal-record argument from `inputFields`. For an exact source binding through
+description. An object input or output field may carry one direct child
+`fields` list; children cannot. The LSP shows both bounded field lists in leaf
+hover and signature help, and can complete an undeclared root key or one direct
+object-child key in the first direct literal-record argument from
+`inputFields`. For an exact source binding through
 a direct visible import or qualifying exact root alias, such as
 `let result = receiver.method(input)` on a synchronous leaf, or the exact
 `let result = receiver.method(input).await()` form on a deferred leaf, it also
@@ -411,9 +412,10 @@ declared after the member site, must remain stable; truncated alias metadata
 makes output completion empty and incomplete. That bounded recognizer rejects
 parenthesized or computed aliases, deeper alias chains, mutations or escapes,
 parenthesized or computed initializers, extra arguments, other postfix chains,
-result paths below that child level, shadowed imports, and source beyond the
-safe diagnostic prefix. It does not complete nested input-record keys, evaluate
-JSON Schema, read a runtime, validate a contract, or grant a capability. Record
+input paths below that direct child level, result paths below that child level,
+shadowed imports, and source beyond the safe diagnostic prefix. It does not
+evaluate JSON Schema, read a runtime, validate a contract, or grant a
+capability. Record
 fields without the exact one-JSON-value call shape, and any malformed or
 over-limit field projection, fail closed with the rest of the advisory module
 metadata.

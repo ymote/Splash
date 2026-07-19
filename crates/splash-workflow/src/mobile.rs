@@ -1004,6 +1004,7 @@ mod tests {
                                 splash_capabilities::CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                         splash_capabilities::CapabilityModuleInputFieldDescriptor {
                             name: "right".to_owned(),
@@ -1011,6 +1012,7 @@ mod tests {
                                 splash_capabilities::CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                     ]),
                     output_fields: Some(vec![

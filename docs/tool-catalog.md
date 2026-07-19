@@ -188,19 +188,20 @@ contract. When an executable input or output schema is an explicit object whose
 entire property set uses canonical Splash identifiers and defines a `properties`
 map, the projection also carries the corresponding bounded
 field/type/required view with optional plain-text property descriptions. An
-output property explicitly typed as an object with a complete direct
-`properties` map retains one nested `fields` level; deeper output structure is
+input or output property explicitly typed as an object with a complete direct
+`properties` map retains one nested `fields` level; deeper structure is
 omitted. Scalar, array, missing-properties, noncanonical-key, and partial
 retained shapes omit that view. The LSP presents both views in direct-leaf hover and signature
-documentation, and can complete an undeclared top-level key in the first direct
-literal-record argument from `inputFields`. It can additionally complete and
-hover root `result.field` names and one explicit object-child path such as
+documentation, and can complete an undeclared root key or one direct
+object-child key in the first direct literal-record argument from `inputFields`.
+It can additionally complete and hover root `result.field` names and one
+explicit object-child path such as
 `result.summary.total` from `outputFields` only for an exact root synchronous
 `let result = imported.method(input)` binding or its exact deferred `.await()`
 form. It also follows exact local `let alias = result` chains of at most 16
-hops. It never inserts `await()`, completes nested input keys or result paths
-below that child level, follows computed/deeper aliases or arbitrary result
-chains, evaluates a schema, or gives an editor authority. Neither API is
+hops. It never inserts `await()`, completes input or result paths below that
+child level, follows computed/deeper aliases or arbitrary result chains,
+evaluates a schema, or gives an editor authority. Neither API is
 installed into Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration

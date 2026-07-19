@@ -258,14 +258,14 @@ identifier, at most 16 path segments and 256 path bytes, plus an optional
 4 KiB description and optional exact-leaf `callMode` of `synchronous` or
 `deferred`, plus an optional exact-leaf `callShape` of `single_json` and its
 optional compact `inputFields` and `outputFields` record views. An object
-`outputFields` entry may carry one direct child `fields` list; input entries and
-output children cannot carry `fields`. A mode-bearing
+input or output entry may carry one direct child `fields` list; children cannot
+carry `fields`. A mode-bearing
 path must be at least `mod.<module>.<method>`; a shape requires a mode and
 record fields require that shape. Each field has a canonical identifier up to
 128 bytes, one fixed JSON type, an explicit Boolean `required` bit, and an
 optional 4 KiB description. The LSP retains at most 256 descriptors, 1,024
-aggregate input fields, 1,024 aggregate output fields including direct object
-children, and 512 KiB of
+aggregate input fields including direct object children, 1,024 aggregate output
+fields including direct object children, and 512 KiB of
 path/description/call-mode/call-shape/field bytes. Paths below the fixed
 `mod.tool` namespace are rejected. A malformed recognized call mode, shape, or
 field projection, a shape without a mode, record fields without a shape,
@@ -289,10 +289,10 @@ scope/import metadata, and unknown paths. It never reads a runtime, resolves a
 module, or grants authority. When a shaped leaf also supplies `inputFields` or
 `outputFields`, its plain-text hover and signature documentation list bounded
 field names, fixed JSON types, required bits, and optional descriptions. It can
-additionally complete an undeclared top-level key only in that leaf's first
-direct literal record argument from `inputFields`, after the same visible-import
-or qualifying-alias and exact-leaf checks. For an exact original binding such
-as `let result = receiver.method(input)`, where `receiver` is that import or
+additionally complete an undeclared root key or one direct object-child key only
+in that leaf's first direct literal record argument from `inputFields`, after
+the same visible-import-or-qualifying-alias and exact-leaf checks. For an exact
+original binding such as `let result = receiver.method(input)`, where `receiver` is that import or
 qualifying alias, or the exact deferred `.await()` form, it also completes and
 hovers root `result.field` names from `outputFields`, plus one explicit object
 child path such as `result.summary.total`. It follows exact local
@@ -300,7 +300,8 @@ child path such as `result.summary.total`. It follows exact local
 including later aliases, must remain stable throughout the source; incomplete
 alias metadata returns no output fields with incomplete completion. It rejects
 computed/deeper aliases, mutations and escapes, direct field-selection aliases,
-result paths below the one object-child level,
+input paths below the one object-child level, result paths below the one
+object-child level,
 parenthesized/computed initializers, extra arguments, mismatched call mode,
 and source beyond the safe diagnostic prefix. It does not inspect a runtime
 value, evaluate JSON Schema, or validate a contract.
@@ -388,10 +389,10 @@ and has reviewed source `.splash` and advisory-configuration `.json` seeds.
 For a parsed JSON value, it also exercises the bounded initialization and
 configuration-refresh projection around a fixed document. The server uses a
 fixed bounded advisory module catalog, including shaped direct-method input
-field metadata, only to exercise catalog completion, top-level input-key
-completion, hover, and signature help: the target never starts stdio, reads the
-URI, resolves modules, evaluates Splash, creates a capability host, or invokes
-an adapter.
+field metadata, only to exercise catalog completion, root/direct-child input-key
+completion, hover, and signature help: the target never starts stdio, reads
+the URI, resolves modules, evaluates Splash, creates a capability host, or
+invokes an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 8 KiB individual-string cap, 1,024 live operand values, 256 active call

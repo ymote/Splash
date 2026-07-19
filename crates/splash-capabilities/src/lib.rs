@@ -145,11 +145,17 @@ pub const MAX_CAPABILITY_MODULE_IDENTIFIER_BYTES: usize = 64;
 /// Maximum UTF-8 byte length of a direct capability module description.
 pub const MAX_CAPABILITY_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
 /// Maximum number of schema-derived literal-record fields published for one
-/// direct capability method's advisory editor projection.
+/// direct capability method's advisory input editor projection.
 ///
-/// This matches the executable schema property's hard limit. It is metadata
-/// only and never relaxes the runtime JSON contract.
+/// This counts every retained field, including one bounded nested input-object
+/// level. It is metadata only and never relaxes the runtime JSON contract.
 pub const MAX_CAPABILITY_MODULE_INPUT_FIELDS: usize = 128;
+/// Maximum nested object-field levels retained below one direct input field.
+///
+/// A value of one permits a direct literal input such as
+/// `{filters: {category: "news"}}`, but not deeper input paths. This is
+/// advisory editor metadata, not general JSON Schema traversal.
+pub const MAX_CAPABILITY_MODULE_INPUT_FIELD_CHILD_DEPTH: usize = 1;
 /// Maximum number of schema-derived literal-record fields published for one
 /// direct capability method's advisory output projection.
 ///
@@ -717,6 +723,11 @@ impl CapabilityModuleRecordFieldType {
 
 /// One schema-derived direct-module input field retained for host and editor
 /// review.
+///
+/// `fields` is present only for an explicit object-valued field whose direct
+/// child record shape can be represented completely within the fixed nesting
+/// and aggregate-field limits. It is advisory metadata only and never changes
+/// executable input validation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CapabilityModuleRecordFieldDescriptor {
     pub name: String,
@@ -725,6 +736,8 @@ pub struct CapabilityModuleRecordFieldDescriptor {
     pub required: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
+    #[serde(rename = "fields", skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<CapabilityModuleRecordFieldDescriptor>>,
 }
 
 /// Backward-compatible name for a direct-method input record field.
@@ -767,8 +780,9 @@ pub struct CapabilityModuleMethodDescriptor {
     pub mode: CapabilityModuleMethodMode,
     pub call_shape: CapabilityModuleCallShape,
     /// Compact record-field metadata derived only from an explicit executable
-    /// object input contract. `None` deliberately makes no statement about
-    /// an array, scalar, missing-properties, or noncanonical-key input shape.
+    /// object input contract. One explicit object-child level may be retained
+    /// for editor metadata. `None` deliberately makes no statement about an
+    /// array, scalar, missing-properties, or noncanonical-key input shape.
     #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
     pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
     /// Compact record-field metadata derived only from an explicit executable
@@ -794,8 +808,8 @@ pub struct ModuleInterfaceDescriptor {
     #[serde(rename = "callShape", skip_serializing_if = "Option::is_none")]
     pub call_shape: Option<CapabilityModuleCallShape>,
     /// Compact advisory literal-record fields for one exact direct method.
-    /// This is absent unless a reviewed contract can be represented without
-    /// partial field inference.
+    /// One explicit object-child level may be present; this is absent unless a
+    /// reviewed contract can be represented without partial field inference.
     #[serde(rename = "inputFields", skip_serializing_if = "Option::is_none")]
     pub input_fields: Option<Vec<CapabilityModuleInputFieldDescriptor>>,
     /// Compact advisory fields for one exact direct method's result. One
@@ -4680,7 +4694,7 @@ impl CapabilityRuntime {
             .values()
             .flat_map(|module| module.methods.iter())
             .filter_map(|method| method.input_fields.as_ref())
-            .map(Vec::len)
+            .map(|fields| capability_module_input_field_count(fields))
             .sum::<usize>();
         if input_field_count > MAX_CAPABILITY_MODULE_INTERFACE_INPUT_FIELDS {
             return Err(
@@ -5522,12 +5536,112 @@ fn module_interface_catalog(
 fn direct_module_input_fields(
     schema: Option<&JsonValue>,
 ) -> Option<Vec<CapabilityModuleInputFieldDescriptor>> {
-    direct_module_record_fields(
-        schema,
+    let mut retained_fields = 0_usize;
+    direct_module_input_record_fields(
+        schema?,
         MAX_CAPABILITY_MODULE_INPUT_FIELDS,
         MAX_CAPABILITY_MODULE_INPUT_FIELD_NAME_BYTES,
         MAX_CAPABILITY_MODULE_INPUT_FIELD_DESCRIPTION_BYTES,
+        MAX_CAPABILITY_MODULE_INPUT_FIELD_CHILD_DEPTH,
+        &mut retained_fields,
     )
+}
+
+/// Projects one explicit input record shape and, at most, one exact object
+/// level below each direct input field. The executable contract stays at the
+/// capability boundary; this is only the compact editor view.
+fn direct_module_input_record_fields(
+    schema: &JsonValue,
+    maximum_fields: usize,
+    maximum_name_bytes: usize,
+    maximum_description_bytes: usize,
+    remaining_child_depth: usize,
+    retained_fields: &mut usize,
+) -> Option<Vec<CapabilityModuleInputFieldDescriptor>> {
+    let schema = schema.as_object()?;
+    if schema.get("type")?.as_str()? != "object" {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.len() > maximum_fields.saturating_sub(*retained_fields) {
+        return None;
+    }
+
+    let mut required = BTreeSet::<String>::new();
+    if let Some(entries) = schema.get("required") {
+        for entry in entries.as_array()? {
+            let name = entry.as_str()?;
+            if !properties.contains_key(name)
+                || name.len() > maximum_name_bytes
+                || !is_canonical_identifier(name)
+                || !required.insert(name.to_owned())
+            {
+                return None;
+            }
+        }
+    }
+
+    let mut fields = Vec::with_capacity(properties.len());
+    for (name, field_schema_value) in properties {
+        if name.len() > maximum_name_bytes || !is_canonical_identifier(name) {
+            return None;
+        }
+        *retained_fields = retained_fields.checked_add(1)?;
+        if *retained_fields > maximum_fields {
+            return None;
+        }
+        let field_schema = field_schema_value.as_object()?;
+        let field_type = match field_schema.get("type") {
+            Some(value) => CapabilityModuleInputFieldType::from_schema_type(value.as_str()?)?,
+            None => CapabilityModuleInputFieldType::Any,
+        };
+        let description = match field_schema.get("description") {
+            Some(value) => {
+                let description = value.as_str()?;
+                if description.len() > maximum_description_bytes {
+                    return None;
+                }
+                description.to_owned()
+            }
+            None => String::new(),
+        };
+        let child_fields = if remaining_child_depth > 0
+            && field_type == CapabilityModuleInputFieldType::Object
+            && field_schema.contains_key("properties")
+        {
+            Some(direct_module_input_record_fields(
+                field_schema_value,
+                maximum_fields,
+                maximum_name_bytes,
+                maximum_description_bytes,
+                remaining_child_depth - 1,
+                retained_fields,
+            )?)
+        } else {
+            None
+        };
+        fields.push(CapabilityModuleInputFieldDescriptor {
+            name: name.clone(),
+            field_type,
+            required: required.contains(name.as_str()),
+            description,
+            fields: child_fields,
+        });
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(fields)
+}
+
+fn capability_module_input_field_count(fields: &[CapabilityModuleInputFieldDescriptor]) -> usize {
+    fields.iter().fold(0_usize, |count, field| {
+        count.saturating_add(1).saturating_add(
+            field
+                .fields
+                .as_deref()
+                .map(capability_module_input_field_count)
+                .unwrap_or(0),
+        )
+    })
 }
 
 fn direct_module_output_fields(
@@ -5639,66 +5753,6 @@ fn capability_module_output_field_count(fields: &[CapabilityModuleOutputFieldDes
                 .unwrap_or(0),
         )
     })
-}
-
-fn direct_module_record_fields(
-    schema: Option<&JsonValue>,
-    maximum_fields: usize,
-    maximum_name_bytes: usize,
-    maximum_description_bytes: usize,
-) -> Option<Vec<CapabilityModuleRecordFieldDescriptor>> {
-    let schema = schema?.as_object()?;
-    if schema.get("type")?.as_str()? != "object" {
-        return None;
-    }
-    let properties = schema.get("properties")?.as_object()?;
-    if properties.len() > maximum_fields {
-        return None;
-    }
-
-    let mut required = BTreeSet::<String>::new();
-    if let Some(entries) = schema.get("required") {
-        for entry in entries.as_array()? {
-            let name = entry.as_str()?;
-            if !properties.contains_key(name)
-                || name.len() > maximum_name_bytes
-                || !is_canonical_identifier(name)
-                || !required.insert(name.to_owned())
-            {
-                return None;
-            }
-        }
-    }
-
-    let mut fields = Vec::with_capacity(properties.len());
-    for (name, field_schema) in properties {
-        if name.len() > maximum_name_bytes || !is_canonical_identifier(name) {
-            return None;
-        }
-        let field_schema = field_schema.as_object()?;
-        let field_type = match field_schema.get("type") {
-            Some(value) => CapabilityModuleRecordFieldType::from_schema_type(value.as_str()?)?,
-            None => CapabilityModuleRecordFieldType::Any,
-        };
-        let description = match field_schema.get("description") {
-            Some(value) => {
-                let description = value.as_str()?;
-                if description.len() > maximum_description_bytes {
-                    return None;
-                }
-                description.to_owned()
-            }
-            None => String::new(),
-        };
-        fields.push(CapabilityModuleRecordFieldDescriptor {
-            name: name.clone(),
-            field_type,
-            required: required.contains(name.as_str()),
-            description,
-        });
-    }
-    fields.sort_by(|left, right| left.name.cmp(&right.name));
-    Some(fields)
 }
 
 fn install_capability_module(
@@ -6285,12 +6339,14 @@ mod tests {
                             field_type: CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                         CapabilityModuleInputFieldDescriptor {
                             name: "right".to_owned(),
                             field_type: CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                     ]),
                     output_fields: Some(vec![CapabilityModuleOutputFieldDescriptor {
@@ -6325,12 +6381,14 @@ mod tests {
                             field_type: CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                         CapabilityModuleInputFieldDescriptor {
                             name: "right".to_owned(),
                             field_type: CapabilityModuleInputFieldType::Integer,
                             required: true,
                             description: String::new(),
+                            fields: None,
                         },
                     ]),
                     output_fields: Some(vec![CapabilityModuleOutputFieldDescriptor {
@@ -6423,12 +6481,14 @@ mod tests {
                     field_type: CapabilityModuleInputFieldType::Integer,
                     required: true,
                     description: "Number of requested items.".to_owned(),
+                    fields: None,
                 },
                 CapabilityModuleInputFieldDescriptor {
                     name: "filter".to_owned(),
                     field_type: CapabilityModuleInputFieldType::String,
                     required: false,
                     description: String::new(),
+                    fields: None,
                 },
             ])
         );
@@ -6469,6 +6529,145 @@ mod tests {
             "properties": {"not-valid": {"type": "integer"}}
         })))
         .is_none());
+    }
+
+    #[test]
+    fn direct_module_input_field_projection_retains_one_complete_object_child_level() {
+        let nested = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "description": "Reviewed filters.",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "description": "Requested category."
+                        },
+                        "limit": {"type": "integer"}
+                    },
+                    "required": ["category"]
+                },
+                "verbose": {"type": "boolean"}
+            },
+            "required": ["filters"]
+        });
+
+        assert_eq!(
+            direct_module_input_fields(Some(&nested)),
+            Some(vec![
+                CapabilityModuleInputFieldDescriptor {
+                    name: "filters".to_owned(),
+                    field_type: CapabilityModuleInputFieldType::Object,
+                    required: true,
+                    description: "Reviewed filters.".to_owned(),
+                    fields: Some(vec![
+                        CapabilityModuleInputFieldDescriptor {
+                            name: "category".to_owned(),
+                            field_type: CapabilityModuleInputFieldType::String,
+                            required: true,
+                            description: "Requested category.".to_owned(),
+                            fields: None,
+                        },
+                        CapabilityModuleInputFieldDescriptor {
+                            name: "limit".to_owned(),
+                            field_type: CapabilityModuleInputFieldType::Integer,
+                            required: false,
+                            description: String::new(),
+                            fields: None,
+                        },
+                    ]),
+                },
+                CapabilityModuleInputFieldDescriptor {
+                    name: "verbose".to_owned(),
+                    field_type: CapabilityModuleInputFieldType::Boolean,
+                    required: false,
+                    description: String::new(),
+                    fields: None,
+                },
+            ])
+        );
+
+        let unsupported_grandchild = json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "properties": {
+                        "range": {
+                            "type": "object",
+                            "properties": {"minimum": {"type": "integer"}}
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            direct_module_input_fields(Some(&unsupported_grandchild)),
+            Some(vec![CapabilityModuleInputFieldDescriptor {
+                name: "filters".to_owned(),
+                field_type: CapabilityModuleInputFieldType::Object,
+                required: false,
+                description: String::new(),
+                fields: Some(vec![CapabilityModuleInputFieldDescriptor {
+                    name: "range".to_owned(),
+                    field_type: CapabilityModuleInputFieldType::Object,
+                    required: false,
+                    description: String::new(),
+                    fields: None,
+                }]),
+            }])
+        );
+
+        assert!(direct_module_input_fields(Some(&json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "properties": {"not-valid": {"type": "integer"}}
+                }
+            }
+        })))
+        .is_none());
+
+        let mut too_many_child_fields = serde_json::Map::new();
+        for index in 0..MAX_CAPABILITY_MODULE_INPUT_FIELDS {
+            too_many_child_fields.insert(format!("field_{index}"), json!({"type": "integer"}));
+        }
+        assert!(direct_module_input_fields(Some(&json!({
+            "type": "object",
+            "properties": {
+                "filters": {
+                    "type": "object",
+                    "properties": too_many_child_fields
+                }
+            }
+        })))
+        .is_none());
+
+        let wire_projection = direct_module_input_fields(Some(&nested))
+            .expect("nested input projection remains serializable");
+        assert_eq!(
+            serde_json::to_value(wire_projection).expect("nested input projection serializes"),
+            json!([
+                {
+                    "name": "filters",
+                    "type": "object",
+                    "required": true,
+                    "description": "Reviewed filters.",
+                    "fields": [
+                        {
+                            "name": "category",
+                            "type": "string",
+                            "required": true,
+                            "description": "Requested category."
+                        },
+                        {"name": "limit", "type": "integer", "required": false}
+                    ]
+                },
+                {"name": "verbose", "type": "boolean", "required": false}
+            ])
+        );
     }
 
     #[test]
@@ -6625,14 +6824,19 @@ mod tests {
         let mut runtime = CapabilityRuntime::default();
 
         for module_index in 0..=module_count {
-            let mut properties = serde_json::Map::new();
-            for field_index in 0..MAX_CAPABILITY_MODULE_INPUT_FIELDS {
-                properties.insert(format!("field_{field_index}"), json!({"type": "integer"}));
+            let mut child_properties = serde_json::Map::new();
+            for field_index in 1..MAX_CAPABILITY_MODULE_INPUT_FIELDS {
+                child_properties.insert(format!("field_{field_index}"), json!({"type": "integer"}));
             }
             let contract = JsonToolContract::new(
                 json!({
                     "type": "object",
-                    "properties": properties,
+                    "properties": {
+                        "filters": {
+                            "type": "object",
+                            "properties": child_properties
+                        }
+                    },
                     "additionalProperties": false
                 }),
                 json!({

@@ -86,6 +86,10 @@ const MAX_LSP_MODULE_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_LSP_MODULE_RECORD_FIELDS: usize = 1_024;
 const MAX_LSP_MODULE_RECORD_FIELD_NAME_BYTES: usize = 128;
 const MAX_LSP_MODULE_RECORD_FIELD_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum nested object-field levels retained below one direct-module input
+/// field. This permits `{filters: {category: "news"}}`, but not deeper input
+/// paths.
+const MAX_LSP_MODULE_INPUT_FIELD_CHILD_DEPTH: usize = 1;
 /// Maximum nested object-field levels retained below one direct-module output
 /// field. This permits `result.summary.total`, but not deeper result paths.
 const MAX_LSP_MODULE_OUTPUT_FIELD_CHILD_DEPTH: usize = 1;
@@ -224,9 +228,10 @@ impl ModuleCatalogCallShape {
     }
 }
 
-/// A compact source-compatible JSON record field supplied by the host for one
+/// A compact source-compatible JSON input field supplied by the host for one
 /// exact direct-module method. It is intentionally narrower than JSON Schema:
-/// the LSP only uses it for plain-text hover and signature documentation.
+/// the LSP only uses it for bounded key completion plus plain-text hover and
+/// signature documentation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModuleCatalogRecordFieldType {
     Any,
@@ -274,6 +279,7 @@ struct ModuleCatalogRecordFieldCompletion {
     field_type: ModuleCatalogRecordFieldType,
     required: bool,
     description: String,
+    fields: Option<Vec<ModuleCatalogRecordFieldCompletion>>,
 }
 
 /// One compact, source-compatible output field supplied by the host for one
@@ -1281,7 +1287,7 @@ const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
 const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "use mod.tool\n",
     "use mod.fuzz.inspect\n",
-    "let result = inspect.remote_add({left: 20, right: 22}).await()\n",
+    "let result = inspect.remote_add({left: 20, filters: {category: \"news\"}, right: 22}).await()\n",
     "let alias = result\n",
     "alias.summary.total\n",
     "tool.call(\"\", \"\")\n",
@@ -1319,12 +1325,36 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
                         field_type: ModuleCatalogRecordFieldType::Integer,
                         required: true,
                         description: "Fuzz-only left operand.".to_owned(),
+                        fields: None,
                     },
                     ModuleCatalogRecordFieldCompletion {
                         name: "right".to_owned(),
                         field_type: ModuleCatalogRecordFieldType::Integer,
                         required: true,
                         description: "Fuzz-only right operand.".to_owned(),
+                        fields: None,
+                    },
+                    ModuleCatalogRecordFieldCompletion {
+                        name: "filters".to_owned(),
+                        field_type: ModuleCatalogRecordFieldType::Object,
+                        required: false,
+                        description: "Fuzz-only nested input filters.".to_owned(),
+                        fields: Some(vec![
+                            ModuleCatalogRecordFieldCompletion {
+                                name: "category".to_owned(),
+                                field_type: ModuleCatalogRecordFieldType::String,
+                                required: true,
+                                description: "Fuzz-only input category.".to_owned(),
+                                fields: None,
+                            },
+                            ModuleCatalogRecordFieldCompletion {
+                                name: "limit".to_owned(),
+                                field_type: ModuleCatalogRecordFieldType::Integer,
+                                required: false,
+                                description: String::new(),
+                                fields: None,
+                            },
+                        ]),
                     },
                 ]),
                 output_fields: Some(vec![ModuleCatalogOutputFieldCompletion {
@@ -1859,13 +1889,27 @@ fn parse_module_completion_catalog(value: &serde_json::Value) -> Option<ModuleCo
     })
 }
 
-/// Retains a tiny source-compatible record-field projection. This accepts no
-/// schema syntax, nested shapes, defaults, or arbitrary property keys, so an
-/// editor can never treat configuration as a general JSON Schema evaluator.
+/// Retains one bounded nested-input record projection. A child `fields` list
+/// is allowed only on an explicit object field and only through the fixed
+/// direct-child depth, keeping this distinct from JSON Schema evaluation.
 fn parse_module_catalog_record_fields(
     value: &serde_json::Value,
     retained_bytes: &mut usize,
     retained_fields: &mut usize,
+) -> Option<Vec<ModuleCatalogRecordFieldCompletion>> {
+    parse_module_catalog_record_fields_at_depth(
+        value,
+        retained_bytes,
+        retained_fields,
+        MAX_LSP_MODULE_INPUT_FIELD_CHILD_DEPTH,
+    )
+}
+
+fn parse_module_catalog_record_fields_at_depth(
+    value: &serde_json::Value,
+    retained_bytes: &mut usize,
+    retained_fields: &mut usize,
+    remaining_child_depth: usize,
 ) -> Option<Vec<ModuleCatalogRecordFieldCompletion>> {
     let entries = value.as_array()?;
     if entries.len() > MAX_LSP_MODULE_RECORD_FIELDS {
@@ -1875,9 +1919,6 @@ fn parse_module_catalog_record_fields(
     let mut fields = Vec::with_capacity(entries.len());
     for entry in entries {
         let field = entry.as_object()?;
-        if field.contains_key("fields") {
-            return None;
-        }
         let name = field.get("name")?.as_str()?;
         let field_type =
             ModuleCatalogRecordFieldType::from_catalog_value(field.get("type")?.as_str()?)?;
@@ -1908,11 +1949,27 @@ fn parse_module_catalog_record_fields(
         if *retained_bytes > MAX_LSP_MODULE_CATALOG_BYTES {
             return None;
         }
+        let child_fields = match field.get("fields") {
+            Some(value)
+                if field_type == ModuleCatalogRecordFieldType::Object
+                    && remaining_child_depth > 0 =>
+            {
+                Some(parse_module_catalog_record_fields_at_depth(
+                    value,
+                    retained_bytes,
+                    retained_fields,
+                    remaining_child_depth - 1,
+                )?)
+            }
+            Some(_) => return None,
+            None => None,
+        };
         fields.push(ModuleCatalogRecordFieldCompletion {
             name: name.to_owned(),
             field_type,
             required,
             description: description.to_owned(),
+            fields: child_fields,
         });
     }
     fields.sort_by(|left, right| left.name.cmp(&right.name));
@@ -2739,14 +2796,15 @@ struct SignatureHelpCallContext {
     active_argument: usize,
 }
 
-/// An exact top-level key position in the first literal-record argument to a
-/// direct module method. The scanner retains only prior key names so it can
-/// avoid proposing duplicate metadata fields without assigning meaning to
-/// values, nested records, or arbitrary expressions.
+/// An exact root or direct child key position in the first literal-record
+/// argument to a direct module method. The scanner retains only prior key
+/// names so it can avoid proposing duplicate metadata fields without assigning
+/// meaning to values or arbitrary expressions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectModuleInputRecordCompletionSite {
     context: SignatureHelpCallContext,
     field: SourceSpan,
+    parent_field: Option<String>,
     declared_fields: HashSet<String>,
 }
 
@@ -2767,11 +2825,18 @@ enum DirectRecordDelimiterKind {
     Curly,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum DirectRecordFieldState {
     Field,
     AfterField { start_byte: usize },
-    Value,
+    Value { field_name: String, started: bool },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectRecordInputScope {
+    parent_field: Option<String>,
+    declared_fields: HashSet<String>,
+    state: DirectRecordFieldState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3382,10 +3447,10 @@ fn signature_help_delimiters_before(
     Some(delimiters)
 }
 
-/// Recognizes only a top-level source key in the first direct literal-record
-/// argument to a member call. The catalog and visible-import checks happen
-/// later; this recognizer deliberately does not resolve a module, evaluate a
-/// value, or interpret JSON Schema.
+/// Recognizes only a root or direct object-child source key in the first direct
+/// literal-record argument to a member call. The catalog and visible-import
+/// checks happen later; this recognizer deliberately does not resolve a
+/// module, evaluate a value, or interpret JSON Schema.
 fn direct_module_input_record_completion_site(
     source: &str,
     byte_offset: usize,
@@ -3399,23 +3464,25 @@ fn direct_module_input_record_completion_site(
     if source.as_bytes().get(record_opening) != Some(&b'{') {
         return None;
     }
-    let (field, declared_fields) =
+    let (field, parent_field, declared_fields) =
         direct_record_input_field_site(source, record_opening, byte_offset)?;
     Some(DirectModuleInputRecordCompletionSite {
         context,
         field,
+        parent_field,
         declared_fields,
     })
 }
 
-/// Scans the source prefix of one direct record without retaining values or
-/// nested structures. A malformed key/value separator, duplicate key, nested
-/// key position, unterminated string/comment, or oversized key fails closed.
+/// Scans the source prefix of one direct record without retaining values. At
+/// most one direct object child can become a completion target; a malformed
+/// key/value separator, duplicate key, deeper nested key position,
+/// unterminated string/comment, or oversized key fails closed.
 fn direct_record_input_field_site(
     source: &str,
     record_opening: usize,
     byte_offset: usize,
-) -> Option<(SourceSpan, HashSet<String>)> {
+) -> Option<(SourceSpan, Option<String>, HashSet<String>)> {
     if record_opening.checked_add(1)? > byte_offset
         || byte_offset > source.len()
         || !source.is_char_boundary(byte_offset)
@@ -3426,13 +3493,20 @@ fn direct_record_input_field_site(
     let bytes = source.as_bytes();
     let mut index = record_opening + 1;
     let mut delimiters = Vec::<DirectRecordDelimiterKind>::new();
-    let mut declared_fields = HashSet::<String>::new();
-    let mut state = DirectRecordFieldState::Field;
+    let mut scopes = vec![DirectRecordInputScope {
+        parent_field: None,
+        declared_fields: HashSet::new(),
+        state: DirectRecordFieldState::Field,
+    }];
 
     while index < byte_offset {
         let byte = bytes[index];
         if is_identifier_start_byte(byte) {
-            if state != DirectRecordFieldState::Field {
+            let scope = scopes.last_mut()?;
+            if scope.state != DirectRecordFieldState::Field {
+                if let DirectRecordFieldState::Value { started, .. } = &mut scope.state {
+                    *started = true;
+                }
                 index = advance_utf8_character(source, index);
                 continue;
             }
@@ -3445,15 +3519,17 @@ fn direct_record_input_field_site(
             {
                 return None;
             }
-            state = DirectRecordFieldState::AfterField { start_byte };
+            scope.state = DirectRecordFieldState::AfterField { start_byte };
             continue;
         }
 
         match byte {
             b' ' | b'\t' => index += 1,
             b'\n' | b'\r' => {
-                if delimiters.is_empty() && state == DirectRecordFieldState::Value {
-                    state = DirectRecordFieldState::Field;
+                if delimiters.is_empty()
+                    && matches!(&scopes.last()?.state, DirectRecordFieldState::Value { .. })
+                {
+                    scopes.last_mut()?.state = DirectRecordFieldState::Field;
                 }
                 index += 1;
                 if byte == b'\r' && index < byte_offset && bytes[index] == b'\n' {
@@ -3490,15 +3566,17 @@ fn direct_record_input_field_site(
                 }
                 if contains_line_break
                     && delimiters.is_empty()
-                    && state == DirectRecordFieldState::Value
+                    && matches!(&scopes.last()?.state, DirectRecordFieldState::Value { .. })
                 {
-                    state = DirectRecordFieldState::Field;
+                    scopes.last_mut()?.state = DirectRecordFieldState::Field;
                 }
             }
             b'"' => {
-                if state != DirectRecordFieldState::Value {
+                let scope = scopes.last_mut()?;
+                let DirectRecordFieldState::Value { started, .. } = &mut scope.state else {
                     return None;
-                }
+                };
+                *started = true;
                 index += 1;
                 let mut terminated = false;
                 while index < byte_offset {
@@ -3522,73 +3600,162 @@ fn direct_record_input_field_site(
                     return None;
                 }
             }
-            b':' => match state {
+            b':' => match scopes.last()?.state.clone() {
                 DirectRecordFieldState::AfterField { start_byte } => {
                     let name = source.get(start_byte..index)?;
-                    if declared_fields.len() == MAX_LSP_MODULE_RECORD_FIELDS
-                        || !declared_fields.insert(name.to_owned())
+                    let scope = scopes.last_mut()?;
+                    if scope.declared_fields.len() == MAX_LSP_MODULE_RECORD_FIELDS
+                        || !scope.declared_fields.insert(name.to_owned())
                     {
                         return None;
                     }
-                    state = DirectRecordFieldState::Value;
+                    scope.state = DirectRecordFieldState::Value {
+                        field_name: name.to_owned(),
+                        started: false,
+                    };
                     index += 1;
                 }
-                DirectRecordFieldState::Value => index += 1,
+                DirectRecordFieldState::Value { .. } => {
+                    if let DirectRecordFieldState::Value { started, .. } =
+                        &mut scopes.last_mut()?.state
+                    {
+                        *started = true;
+                    }
+                    index += 1;
+                }
                 DirectRecordFieldState::Field => return None,
             },
             b',' => {
                 if delimiters.is_empty() {
-                    match state {
+                    match &scopes.last()?.state {
                         DirectRecordFieldState::Field => {}
                         DirectRecordFieldState::AfterField { .. } => return None,
-                        DirectRecordFieldState::Value => state = DirectRecordFieldState::Field,
+                        DirectRecordFieldState::Value { .. } => {
+                            scopes.last_mut()?.state = DirectRecordFieldState::Field;
+                        }
                     }
                 }
                 index += 1;
             }
-            b'(' | b'[' | b'{' => {
-                if state != DirectRecordFieldState::Value
-                    || delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH
-                {
+            b'{' => {
+                let direct_child_parent = match scopes.last()?.state.clone() {
+                    DirectRecordFieldState::Value {
+                        field_name,
+                        started: false,
+                    } if scopes.len().saturating_sub(1)
+                        < MAX_LSP_MODULE_INPUT_FIELD_CHILD_DEPTH =>
+                    {
+                        Some(field_name)
+                    }
+                    _ => None,
+                };
+                if let Some(parent_field) = direct_child_parent {
+                    if let DirectRecordFieldState::Value { started, .. } =
+                        &mut scopes.last_mut()?.state
+                    {
+                        *started = true;
+                    }
+                    scopes.push(DirectRecordInputScope {
+                        parent_field: Some(parent_field),
+                        declared_fields: HashSet::new(),
+                        state: DirectRecordFieldState::Field,
+                    });
+                    index += 1;
+                    continue;
+                }
+                let scope = scopes.last_mut()?;
+                let DirectRecordFieldState::Value { started, .. } = &mut scope.state else {
+                    return None;
+                };
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
                     return None;
                 }
-                let kind = match byte {
-                    b'(' => DirectRecordDelimiterKind::Round,
-                    b'[' => DirectRecordDelimiterKind::Square,
-                    b'{' => DirectRecordDelimiterKind::Curly,
-                    _ => unreachable!("matched opening delimiter"),
-                };
-                delimiters.push(kind);
+                *started = true;
+                delimiters.push(DirectRecordDelimiterKind::Curly);
                 index += 1;
             }
-            b')' | b']' | b'}' => {
+            b'(' | b'[' => {
+                let scope = scopes.last_mut()?;
+                let DirectRecordFieldState::Value { started, .. } = &mut scope.state else {
+                    return None;
+                };
+                if delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH {
+                    return None;
+                }
+                *started = true;
+                delimiters.push(match byte {
+                    b'(' => DirectRecordDelimiterKind::Round,
+                    b'[' => DirectRecordDelimiterKind::Square,
+                    _ => unreachable!("matched opening delimiter"),
+                });
+                index += 1;
+            }
+            b')' | b']' => {
                 let expected = match byte {
                     b')' => DirectRecordDelimiterKind::Round,
                     b']' => DirectRecordDelimiterKind::Square,
-                    b'}' => DirectRecordDelimiterKind::Curly,
                     _ => unreachable!("matched closing delimiter"),
                 };
                 if delimiters.pop()? != expected {
                     return None;
                 }
+                if let DirectRecordFieldState::Value { started, .. } = &mut scopes.last_mut()?.state
+                {
+                    *started = true;
+                }
                 index += 1;
             }
-            _ => {
-                if state != DirectRecordFieldState::Value {
-                    return None;
+            b'}' => match delimiters.last().copied() {
+                Some(DirectRecordDelimiterKind::Curly) => {
+                    delimiters.pop();
+                    if let DirectRecordFieldState::Value { started, .. } =
+                        &mut scopes.last_mut()?.state
+                    {
+                        *started = true;
+                    }
+                    index += 1;
                 }
+                Some(_) => return None,
+                None => {
+                    if scopes.len() == 1
+                        || matches!(
+                            &scopes.last()?.state,
+                            DirectRecordFieldState::AfterField { .. }
+                        )
+                    {
+                        return None;
+                    }
+                    scopes.pop();
+                    index += 1;
+                }
+            },
+            _ => {
+                let scope = scopes.last_mut()?;
+                let DirectRecordFieldState::Value { started, .. } = &mut scope.state else {
+                    return None;
+                };
+                *started = true;
                 index = advance_utf8_character(source, index);
             }
         }
     }
 
     let field = direct_record_input_field_span_at(source, byte_offset)?;
-    match state {
-        DirectRecordFieldState::Field => Some((field, declared_fields)),
-        DirectRecordFieldState::AfterField { start_byte } if field.start_byte == start_byte => {
-            Some((field, declared_fields))
+    let scope = scopes.last()?;
+    match &scope.state {
+        DirectRecordFieldState::Field => Some((
+            field,
+            scope.parent_field.clone(),
+            scope.declared_fields.clone(),
+        )),
+        DirectRecordFieldState::AfterField { start_byte } if field.start_byte == *start_byte => {
+            Some((
+                field,
+                scope.parent_field.clone(),
+                scope.declared_fields.clone(),
+            ))
         }
-        DirectRecordFieldState::AfterField { .. } | DirectRecordFieldState::Value => None,
+        DirectRecordFieldState::AfterField { .. } | DirectRecordFieldState::Value { .. } => None,
     }
 }
 
@@ -4027,10 +4194,10 @@ fn static_record_member_completion(
     }
 }
 
-/// Completes compact host-projected fields only at one exact top-level input
-/// key in a direct visible module call. The source scanner provides no value or
-/// nested-record semantics, and this function only looks up advisory catalog
-/// metadata after the existing visible-import-or-alias checks succeed.
+/// Completes compact host-projected fields only at one exact root or direct
+/// object-child input key in a direct visible module call. The source scanner
+/// provides no value semantics, and this function only looks up advisory
+/// catalog metadata after the existing visible-import-or-alias checks succeed.
 fn module_catalog_input_field_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
@@ -4073,7 +4240,12 @@ fn module_catalog_input_field_completion(
     if module.call_mode.is_none() || module.call_shape != Some(ModuleCatalogCallShape::SingleJson) {
         return empty();
     }
-    let Some(fields) = &module.input_fields else {
+    let Some(root_fields) = &module.input_fields else {
+        return empty();
+    };
+    let Some(fields) =
+        module_catalog_input_fields_at_parent(root_fields, site.parent_field.as_deref())
+    else {
         return empty();
     };
 
@@ -4125,6 +4297,20 @@ fn module_catalog_input_field_text(field: &ModuleCatalogRecordFieldCompletion) -
         "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
     );
     value
+}
+
+fn module_catalog_input_fields_at_parent<'catalog>(
+    fields: &'catalog [ModuleCatalogRecordFieldCompletion],
+    parent_field: Option<&str>,
+) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
+    let Some(parent_field) = parent_field else {
+        return Some(fields);
+    };
+    fields
+        .iter()
+        .find(|field| field.name == parent_field)?
+        .fields
+        .as_deref()
 }
 
 /// Completes host-projected output fields on one exact direct-module result
@@ -5003,7 +5189,7 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
         value.push_str(&details);
     }
     if let Some(fields) = &module.input_fields {
-        append_module_catalog_record_fields(&mut value, "input", fields);
+        append_module_catalog_input_fields(&mut value, fields);
     }
     if let Some(fields) = &module.output_fields {
         append_module_catalog_output_fields(&mut value, fields);
@@ -5017,31 +5203,51 @@ fn module_catalog_member_hover_text(module: &ModuleCatalogCompletion) -> String 
 /// Adds compact, host-supplied record metadata to a plain-text module hover.
 /// The parser already bounded and validated every field, and this formatting
 /// remains presentation-only rather than a schema interpreter.
-fn append_module_catalog_record_fields(
+fn append_module_catalog_input_fields(
     value: &mut String,
-    direction: &str,
     fields: &[ModuleCatalogRecordFieldCompletion],
 ) {
-    value.push_str("\n\nAdvisory ");
-    value.push_str(direction);
-    value.push_str(" record fields:");
+    value.push_str("\n\nAdvisory input record fields:");
     if fields.is_empty() {
         value.push_str(" no source-compatible fields are projected.");
         return;
     }
     for field in fields {
-        value.push_str("\n- ");
-        value.push_str(&field.name);
-        value.push_str(": ");
-        value.push_str(field.field_type.label());
-        value.push_str(if field.required {
-            " (required)"
-        } else {
-            " (optional)"
-        });
-        if !field.description.is_empty() {
-            value.push_str("; ");
-            value.push_str(&field.description);
+        append_module_catalog_input_field(value, field, "", 0);
+    }
+}
+
+fn append_module_catalog_input_field(
+    value: &mut String,
+    field: &ModuleCatalogRecordFieldCompletion,
+    parent_path: &str,
+    depth: usize,
+) {
+    value.push('\n');
+    for _ in 0..depth {
+        value.push_str("  ");
+    }
+    value.push_str("- ");
+    let path = if parent_path.is_empty() {
+        field.name.clone()
+    } else {
+        format!("{parent_path}.{}", field.name)
+    };
+    value.push_str(&path);
+    value.push_str(": ");
+    value.push_str(field.field_type.label());
+    value.push_str(if field.required {
+        " (required)"
+    } else {
+        " (optional)"
+    });
+    if !field.description.is_empty() {
+        value.push_str("; ");
+        value.push_str(&field.description);
+    }
+    if let Some(fields) = &field.fields {
+        for field in fields {
+            append_module_catalog_input_field(value, field, &path, depth + 1);
         }
     }
 }
@@ -10032,6 +10238,20 @@ mod tests {
                             "name": "right",
                             "type": "integer",
                             "required": false
+                        },
+                        {
+                            "name": "filters",
+                            "type": "object",
+                            "required": false,
+                            "description": "Reviewed filters.",
+                            "fields": [
+                                {
+                                    "name": "category",
+                                    "type": "string",
+                                    "required": true,
+                                    "description": "Requested category."
+                                }
+                            ]
                         }
                     ],
                     "outputFields": [
@@ -10058,6 +10278,8 @@ mod tests {
         assert!(value.contains("Advisory input record fields:"));
         assert!(value.contains("- left: integer (required); First addend."));
         assert!(value.contains("- right: integer (optional)"));
+        assert!(value.contains("- filters: object (optional); Reviewed filters."));
+        assert!(value.contains("- filters.category: string (required); Requested category."));
         assert!(value.contains("Advisory output record fields:"));
         assert!(value.contains("- total: integer (required); Sum of both addends."));
         assert!(value.contains("capability authorization remain host-owned"));
@@ -10078,6 +10300,7 @@ mod tests {
         };
         assert!(value.contains("- left: integer (required); First addend."));
         assert!(value.contains("- right: integer (optional)"));
+        assert!(value.contains("- filters.category: string (required); Requested category."));
         assert!(value.contains("- total: integer (required); Sum of both addends."));
     }
 
@@ -10234,7 +10457,10 @@ mod tests {
             "let result = arithmetic.add({left: {ri: 22}})"
         );
         let nested_cursor = nested_source.find("ri:").expect("nested field exists") + "ri".len();
-        assert!(direct_module_input_record_completion_site(nested_source, nested_cursor).is_none());
+        let nested_site = direct_module_input_record_completion_site(nested_source, nested_cursor)
+            .expect("direct child record completion site is recognized");
+        assert_eq!(nested_site.parent_field.as_deref(), Some("left"));
+        assert!(nested_site.declared_fields.is_empty());
 
         let shadowed_source = concat!(
             "use mod.arithmetic\n",
@@ -10254,6 +10480,212 @@ mod tests {
                 position_at_byte(shadowed_source, shadowed_cursor),
             )
             .expect("shadowed record completion request succeeds")
+            .items
+            .is_empty());
+    }
+
+    #[test]
+    fn completes_one_nested_advisory_direct_module_input_field_level() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.inspect",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {
+                        "name": "filters",
+                        "type": "object",
+                        "required": true,
+                        "description": "Reviewed filters.",
+                        "fields": [
+                            {
+                                "name": "category",
+                                "type": "string",
+                                "required": true,
+                                "description": "Requested category."
+                            },
+                            {
+                                "name": "limit",
+                                "type": "integer",
+                                "required": false
+                            },
+                            {
+                                "name": "range",
+                                "type": "object",
+                                "required": false
+                            }
+                        ]
+                    },
+                    {
+                        "name": "verbose",
+                        "type": "boolean",
+                        "required": false
+                    }
+                ]
+            }
+        ]));
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({filters: {ca: \"news\"}})"
+        );
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        server.open_document(document(1, source));
+        let field_start = source.find("ca:").expect("partial child field exists");
+        let completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, field_start + "ca".len()),
+            )
+            .expect("nested input field completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["category", "limit", "range"]
+        );
+        let category = completion
+            .items
+            .iter()
+            .find(|item| item.label == "category")
+            .expect("nested category is completed");
+        assert_eq!(
+            category.detail.as_deref(),
+            Some("advisory direct-module input field; required")
+        );
+        assert!(matches!(
+            &category.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit { range, new_text }))
+                if *range == Range::new(
+                    position_at_byte(source, field_start),
+                    position_at_byte(source, field_start + "ca".len()),
+                ) && new_text == "category"
+        ));
+        let Some(Documentation::MarkupContent(MarkupContent { value, .. })) =
+            category.documentation.as_ref()
+        else {
+            panic!("nested input field documentation should be plain text");
+        };
+        assert!(value.contains("Requested category."));
+        assert!(value.contains("capability authorization remain host-owned"));
+
+        let empty_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({filters: {}})"
+        );
+        let mut empty_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        empty_server.open_document(document(1, empty_source));
+        let empty_cursor = empty_source.find("{}").expect("empty child record exists") + 1;
+        assert_eq!(
+            empty_server
+                .completion(&test_uri(), position_at_byte(empty_source, empty_cursor))
+                .expect("empty child record completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["category", "limit", "range"]
+        );
+
+        let sibling_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({filters: {}, ve: true})"
+        );
+        let mut sibling_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        sibling_server.open_document(document(1, sibling_source));
+        let sibling_cursor = sibling_source.find("ve:").expect("root sibling exists") + "ve".len();
+        assert_eq!(
+            sibling_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(sibling_source, sibling_cursor)
+                )
+                .expect("root field after child record completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["verbose"]
+        );
+
+        let alias_source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "let result = math.inspect({filters: {}})"
+        );
+        let mut alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        alias_server.open_document(document(1, alias_source));
+        let alias_cursor = alias_source.find("{}").expect("empty child record exists") + 1;
+        assert_eq!(
+            alias_server
+                .completion(&test_uri(), position_at_byte(alias_source, alias_cursor))
+                .expect("aliased child record completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["category", "limit", "range"]
+        );
+
+        let duplicate_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({filters: {category: \"news\", category: \"sports\", li: 2}})"
+        );
+        let mut duplicate_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        duplicate_server.open_document(document(1, duplicate_source));
+        let duplicate_cursor = duplicate_source
+            .rfind("li:")
+            .expect("partial child field exists")
+            + "li".len();
+        assert!(duplicate_server
+            .completion(
+                &test_uri(),
+                position_at_byte(duplicate_source, duplicate_cursor),
+            )
+            .expect("duplicate child record completion request succeeds")
+            .items
+            .is_empty());
+
+        let deeper_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({filters: {range: {mi: 1}}})"
+        );
+        let deeper_cursor = deeper_source.find("mi:").expect("deeper field exists") + "mi".len();
+        assert!(direct_module_input_record_completion_site(deeper_source, deeper_cursor).is_none());
+
+        let scalar_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.inspect({verbose: {va: true}})"
+        );
+        let mut scalar_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        scalar_server.open_document(document(1, scalar_source));
+        let scalar_cursor = scalar_source
+            .find("va:")
+            .expect("scalar child field exists")
+            + "va".len();
+        assert!(scalar_server
+            .completion(&test_uri(), position_at_byte(scalar_source, scalar_cursor))
+            .expect("scalar input child completion request succeeds")
             .items
             .is_empty());
     }
@@ -11048,12 +11480,14 @@ mod tests {
                     field_type: ModuleCatalogRecordFieldType::Integer,
                     required: true,
                     description: "Left addend.".to_owned(),
+                    fields: None,
                 },
                 ModuleCatalogRecordFieldCompletion {
                     name: "right".to_owned(),
                     field_type: ModuleCatalogRecordFieldType::Integer,
                     required: false,
                     description: String::new(),
+                    fields: None,
                 },
             ])
         );
@@ -11066,6 +11500,60 @@ mod tests {
                 description: "Reviewed sum.".to_owned(),
                 fields: None,
             }])
+        );
+        let nested_input_fields = parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.inspect",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {
+                        "name": "filters",
+                        "type": "object",
+                        "required": true,
+                        "description": "Reviewed filters.",
+                        "fields": [
+                            {"name": "category", "type": "string", "required": true},
+                            {
+                                "name": "limit",
+                                "type": "integer",
+                                "required": false,
+                                "description": "Result limit."
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]))
+        .expect("one nested input field level is retained");
+        assert_eq!(
+            nested_input_fields.modules[0].input_fields,
+            Some(vec![ModuleCatalogRecordFieldCompletion {
+                name: "filters".to_owned(),
+                field_type: ModuleCatalogRecordFieldType::Object,
+                required: true,
+                description: "Reviewed filters.".to_owned(),
+                fields: Some(vec![
+                    ModuleCatalogRecordFieldCompletion {
+                        name: "category".to_owned(),
+                        field_type: ModuleCatalogRecordFieldType::String,
+                        required: true,
+                        description: String::new(),
+                        fields: None,
+                    },
+                    ModuleCatalogRecordFieldCompletion {
+                        name: "limit".to_owned(),
+                        field_type: ModuleCatalogRecordFieldType::Integer,
+                        required: false,
+                        description: "Result limit.".to_owned(),
+                        fields: None,
+                    },
+                ]),
+            }])
+        );
+        assert!(
+            module_catalog_member_hover_text(&nested_input_fields.modules[0])
+                .contains("- filters.category: string (required)")
         );
         let nested_output_fields = parse_module_completion_catalog(&serde_json::json!([
             {
@@ -11153,9 +11641,28 @@ mod tests {
                 "callShape": "single_json",
                 "inputFields": [{
                     "name": "input",
-                    "type": "object",
+                    "type": "integer",
                     "required": true,
                     "fields": []
+                }]
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [{
+                    "name": "input",
+                    "type": "object",
+                    "required": true,
+                    "fields": [{
+                        "name": "detail",
+                        "type": "object",
+                        "required": false,
+                        "fields": []
+                    }]
                 }]
             }
         ]))
@@ -11265,6 +11772,20 @@ mod tests {
                     MAX_LSP_MODULE_RECORD_FIELDS / 2,
                     MAX_LSP_MODULE_RECORD_FIELDS / 2 + 1
                 )
+            }
+        ]))
+        .is_none());
+        assert!(parse_module_completion_catalog(&serde_json::json!([
+            {
+                "path": "mod.math.nested_input",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [{
+                    "name": "filters",
+                    "type": "object",
+                    "required": false,
+                    "fields": record_fields(0, MAX_LSP_MODULE_RECORD_FIELDS)
+                }]
             }
         ]))
         .is_none());

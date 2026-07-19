@@ -24,6 +24,8 @@
 "workflowDataStepContext"
 "inputFields"
 "outputFields"
+"filters"
+"category"
 "currentStepId"
 "completedOutputStepIds"
 "true"
