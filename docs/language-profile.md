@@ -174,19 +174,21 @@ plain-text description. This LSP-only projection can complete the current
 segment of a direct statement-position `use mod.*` path, or bounded catalog
 paths below a direct visible imported-module binding. A deferred leaf is only
 labeled as returning a promise; an exact visible catalog leaf also has a
-plain-text advisory hover. The LSP never inserts `await()` or changes source
-beyond the selected identifier. It is not part of the core report and does not
-load a source file, resolve or validate a module, inspect runtime exports,
-infer arbitrary fields, or make a Rust adapter current or callable. `mod.tool`
-remains a fixed language surface and never receives metadata-defined members.
-The client-supplied projection is advisory, potentially stale, and never
-authority; an omitted key retains the prior projection, JSON `null` explicitly
-clears it, and malformed, duplicate, or over-limit input is discarded as a
-whole and makes matching completion incomplete. Tool and module updates are
-independent of each other and of the atomic workflow-data pair. A malformed
-`settings` value or non-object `settings.splash` clears all advisory catalogs.
-See [Editor module interface projection](module-catalog.md) for the exact wire
-shape and limits.
+plain-text advisory hover. For an exact shaped leaf, it can complete an
+undeclared top-level key in the first direct literal record argument; it does
+not complete nested keys or infer values. The LSP never inserts `await()` or
+changes source beyond the selected identifier. It is not part of the core
+report and does not load a source file, resolve or validate a module, inspect
+runtime exports, infer arbitrary fields, or make a Rust adapter current or
+callable. `mod.tool` remains a fixed language surface and never receives
+metadata-defined members. The client-supplied projection is advisory,
+potentially stale, and never authority; an omitted key retains the prior
+projection, JSON `null` explicitly clears it, and malformed, duplicate, or
+over-limit input is discarded as a whole and makes matching completion
+incomplete. Tool and module updates are independent of each other and of the
+atomic workflow-data pair. A malformed `settings` value or non-object
+`settings.splash` clears all advisory catalogs. See [Editor module interface
+projection](module-catalog.md) for the exact wire shape and limits.
 
 The LSP additionally offers bounded signature help for direct visible
 `tool.call`, `tool.start`, `tool.call_json`, and `tool.start_json` calls, plus
@@ -197,8 +199,9 @@ deferred result as a promise. A mode-only leaf has no assumed signature. The
 editor scans only the bounded client source and advisory metadata. It does not
 load a module, inspect a runtime, validate a tool name, issue a lease, or
 authorize a call. When a shaped leaf has `inputFields`, hover and signature
-documentation list that bounded field/type/required view only. It is not
-record-key completion, JSON Schema evaluation, runtime inspection, or proof
+documentation list that bounded field/type/required view, and the first direct
+literal-record argument can complete an undeclared top-level key from it. It is
+not nested-key completion, JSON Schema evaluation, runtime inspection, or proof
 that a contract remains installed.
 
 For dataflow authoring, an editor may instead supply the separate bounded

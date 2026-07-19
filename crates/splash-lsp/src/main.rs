@@ -866,6 +866,18 @@ impl SplashLanguageServer {
             ));
         }
 
+        if let Some(record_site) = direct_module_input_record_completion_site(source, byte_offset) {
+            let imports = self.module_imports(uri)?;
+            return Ok(module_catalog_input_field_completion(
+                source,
+                report,
+                imports,
+                &self.module_catalog,
+                record_site,
+                lexical_incomplete || imports.truncated,
+            ));
+        }
+
         let Some(site) = report.sites.iter().copied().find(|site| {
             site.start_byte <= byte_offset
                 && byte_offset <= site.end_byte
@@ -950,18 +962,13 @@ impl SplashLanguageServer {
         if self.module_catalog.unavailable {
             return Ok(None);
         }
-        let Some(mut path) =
-            module_catalog_member_parent_path(source, lexical, imports, context.callee)
-        else {
-            return Ok(None);
-        };
-        path.push(method.to_owned());
-        let Some(module) = self
-            .module_catalog
-            .modules
-            .iter()
-            .find(|module| module.path.as_slice() == path.as_slice())
-        else {
+        let Some(module) = module_catalog_direct_member(
+            source,
+            lexical,
+            imports,
+            &self.module_catalog,
+            context.callee,
+        ) else {
             return Ok(None);
         };
         let Some(call_mode) = module.call_mode else {
@@ -2493,7 +2500,33 @@ impl MemberCompletionSite {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SignatureHelpCallContext {
     callee: MemberCompletionSite,
+    opening_byte: usize,
     active_argument: usize,
+}
+
+/// An exact top-level key position in the first literal-record argument to a
+/// direct module method. The scanner retains only prior key names so it can
+/// avoid proposing duplicate metadata fields without assigning meaning to
+/// values, nested records, or arbitrary expressions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectModuleInputRecordCompletionSite {
+    context: SignatureHelpCallContext,
+    field: SourceSpan,
+    declared_fields: HashSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectRecordDelimiterKind {
+    Round,
+    Square,
+    Curly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectRecordFieldState {
+    Field,
+    AfterField { start_byte: usize },
+    Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2608,6 +2641,7 @@ fn signature_help_call_context(
     let callee = direct_module_member_completion_site(source, callee_end)?;
     (callee.member.end_byte == callee_end).then_some(SignatureHelpCallContext {
         callee,
+        opening_byte: opening.opening_byte,
         active_argument: opening.argument_count,
     })
 }
@@ -2749,6 +2783,247 @@ fn signature_help_delimiters_before(
         }
     }
     Some(delimiters)
+}
+
+/// Recognizes only a top-level source key in the first direct literal-record
+/// argument to a member call. The catalog and visible-import checks happen
+/// later; this recognizer deliberately does not resolve a module, evaluate a
+/// value, or interpret JSON Schema.
+fn direct_module_input_record_completion_site(
+    source: &str,
+    byte_offset: usize,
+) -> Option<DirectModuleInputRecordCompletionSite> {
+    let context = signature_help_call_context(source, byte_offset)?;
+    if context.active_argument != 0 {
+        return None;
+    }
+    let record_opening =
+        skip_ascii_whitespace_forward(source, context.opening_byte.checked_add(1)?);
+    if source.as_bytes().get(record_opening) != Some(&b'{') {
+        return None;
+    }
+    let (field, declared_fields) =
+        direct_record_input_field_site(source, record_opening, byte_offset)?;
+    Some(DirectModuleInputRecordCompletionSite {
+        context,
+        field,
+        declared_fields,
+    })
+}
+
+/// Scans the source prefix of one direct record without retaining values or
+/// nested structures. A malformed key/value separator, duplicate key, nested
+/// key position, unterminated string/comment, or oversized key fails closed.
+fn direct_record_input_field_site(
+    source: &str,
+    record_opening: usize,
+    byte_offset: usize,
+) -> Option<(SourceSpan, HashSet<String>)> {
+    if record_opening.checked_add(1)? > byte_offset
+        || byte_offset > source.len()
+        || !source.is_char_boundary(byte_offset)
+    {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+    let mut index = record_opening + 1;
+    let mut delimiters = Vec::<DirectRecordDelimiterKind>::new();
+    let mut declared_fields = HashSet::<String>::new();
+    let mut state = DirectRecordFieldState::Field;
+
+    while index < byte_offset {
+        let byte = bytes[index];
+        if is_identifier_start_byte(byte) {
+            if state != DirectRecordFieldState::Field {
+                index = advance_utf8_character(source, index);
+                continue;
+            }
+            let start_byte = index;
+            while index < byte_offset && is_identifier_byte(bytes[index]) {
+                index += 1;
+            }
+            let name = source.get(start_byte..index)?;
+            if name.len() > MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES || !is_canonical_identifier(name)
+            {
+                return None;
+            }
+            state = DirectRecordFieldState::AfterField { start_byte };
+            continue;
+        }
+
+        match byte {
+            b' ' | b'\t' => index += 1,
+            b'\n' | b'\r' => {
+                if delimiters.is_empty() && state == DirectRecordFieldState::Value {
+                    state = DirectRecordFieldState::Field;
+                }
+                index += 1;
+                if byte == b'\r' && index < byte_offset && bytes[index] == b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < byte_offset && !matches!(bytes[index], b'\n' | b'\r') {
+                    index = advance_utf8_character(source, index);
+                }
+                if index == byte_offset {
+                    return None;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                let mut contains_line_break = false;
+                let mut terminated = false;
+                while index < byte_offset {
+                    if bytes[index] == b'*'
+                        && bytes.get(index + 1) == Some(&b'/')
+                        && index + 1 < byte_offset
+                    {
+                        index += 2;
+                        terminated = true;
+                        break;
+                    }
+                    contains_line_break |= matches!(bytes[index], b'\n' | b'\r');
+                    index = advance_utf8_character(source, index);
+                }
+                if !terminated {
+                    return None;
+                }
+                if contains_line_break
+                    && delimiters.is_empty()
+                    && state == DirectRecordFieldState::Value
+                {
+                    state = DirectRecordFieldState::Field;
+                }
+            }
+            b'"' => {
+                if state != DirectRecordFieldState::Value {
+                    return None;
+                }
+                index += 1;
+                let mut terminated = false;
+                while index < byte_offset {
+                    match bytes[index] {
+                        b'"' => {
+                            index += 1;
+                            terminated = true;
+                            break;
+                        }
+                        b'\\' => {
+                            index = advance_utf8_character(source, index);
+                            if index < byte_offset {
+                                index = advance_utf8_character(source, index);
+                            }
+                        }
+                        b'\n' | b'\r' => return None,
+                        _ => index = advance_utf8_character(source, index),
+                    }
+                }
+                if !terminated {
+                    return None;
+                }
+            }
+            b':' => match state {
+                DirectRecordFieldState::AfterField { start_byte } => {
+                    let name = source.get(start_byte..index)?;
+                    if declared_fields.len() == MAX_LSP_MODULE_INPUT_FIELDS
+                        || !declared_fields.insert(name.to_owned())
+                    {
+                        return None;
+                    }
+                    state = DirectRecordFieldState::Value;
+                    index += 1;
+                }
+                DirectRecordFieldState::Value => index += 1,
+                DirectRecordFieldState::Field => return None,
+            },
+            b',' => {
+                if delimiters.is_empty() {
+                    match state {
+                        DirectRecordFieldState::Field => {}
+                        DirectRecordFieldState::AfterField { .. } => return None,
+                        DirectRecordFieldState::Value => state = DirectRecordFieldState::Field,
+                    }
+                }
+                index += 1;
+            }
+            b'(' | b'[' | b'{' => {
+                if state != DirectRecordFieldState::Value
+                    || delimiters.len() == MAX_SIGNATURE_HELP_DELIMITER_DEPTH
+                {
+                    return None;
+                }
+                let kind = match byte {
+                    b'(' => DirectRecordDelimiterKind::Round,
+                    b'[' => DirectRecordDelimiterKind::Square,
+                    b'{' => DirectRecordDelimiterKind::Curly,
+                    _ => unreachable!("matched opening delimiter"),
+                };
+                delimiters.push(kind);
+                index += 1;
+            }
+            b')' | b']' | b'}' => {
+                let expected = match byte {
+                    b')' => DirectRecordDelimiterKind::Round,
+                    b']' => DirectRecordDelimiterKind::Square,
+                    b'}' => DirectRecordDelimiterKind::Curly,
+                    _ => unreachable!("matched closing delimiter"),
+                };
+                if delimiters.pop()? != expected {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => {
+                if state != DirectRecordFieldState::Value {
+                    return None;
+                }
+                index = advance_utf8_character(source, index);
+            }
+        }
+    }
+
+    let field = direct_record_input_field_span_at(source, byte_offset)?;
+    match state {
+        DirectRecordFieldState::Field => Some((field, declared_fields)),
+        DirectRecordFieldState::AfterField { start_byte } if field.start_byte == start_byte => {
+            Some((field, declared_fields))
+        }
+        DirectRecordFieldState::AfterField { .. } | DirectRecordFieldState::Value => None,
+    }
+}
+
+fn direct_record_input_field_span_at(source: &str, byte_offset: usize) -> Option<SourceSpan> {
+    if byte_offset > source.len() || !source.is_char_boundary(byte_offset) {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut start_byte = byte_offset;
+    while start_byte > 0 && is_identifier_byte(bytes[start_byte - 1]) {
+        start_byte -= 1;
+    }
+    let mut end_byte = byte_offset;
+    while end_byte < bytes.len() && is_identifier_byte(bytes[end_byte]) {
+        end_byte += 1;
+    }
+    if start_byte == end_byte {
+        let next = bytes.get(byte_offset).copied();
+        if next.is_some_and(|byte| !byte.is_ascii_whitespace() && byte != b'}') {
+            return None;
+        }
+        return Some(SourceSpan {
+            start_byte,
+            end_byte,
+        });
+    }
+    let name = source.get(start_byte..end_byte)?;
+    (name.len() <= MAX_LSP_MODULE_INPUT_FIELD_NAME_BYTES && is_canonical_identifier(name))
+        .then_some(SourceSpan {
+            start_byte,
+            end_byte,
+        })
 }
 
 /// Recognizes one direct, statement-position `use mod.<path>` segment.
@@ -3048,6 +3323,13 @@ fn skip_ascii_whitespace_backward(source: &str, mut end_byte: usize) -> usize {
     end_byte
 }
 
+fn skip_ascii_whitespace_forward(source: &str, mut start_byte: usize) -> usize {
+    while start_byte < source.len() && source.as_bytes()[start_byte].is_ascii_whitespace() {
+        start_byte += 1;
+    }
+    start_byte
+}
+
 fn identifier_start_before(source: &str, mut end_byte: usize) -> usize {
     while end_byte > 0 && is_identifier_byte(source.as_bytes()[end_byte - 1]) {
         end_byte -= 1;
@@ -3146,6 +3428,93 @@ fn static_record_member_completion(
         is_incomplete,
         items,
     }
+}
+
+/// Completes compact host-projected fields only at one exact top-level input
+/// key in a direct visible module call. The source scanner provides no value or
+/// nested-record semantics, and this function only looks up advisory catalog
+/// metadata after the existing import visibility checks succeed.
+fn module_catalog_input_field_completion(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &ModuleCompletionCatalog,
+    site: DirectModuleInputRecordCompletionSite,
+    is_incomplete: bool,
+) -> CompletionList {
+    let is_incomplete = is_incomplete || catalog.unavailable;
+    let empty = || CompletionList {
+        is_incomplete,
+        items: Vec::new(),
+    };
+    if imports.truncated
+        || catalog.unavailable
+        || site.context.callee.member.end_byte > lexical.valid_prefix_end_byte
+        || site.field.end_byte > lexical.valid_prefix_end_byte
+        || site.context.callee.member.end_byte > imports.valid_prefix_end_byte
+    {
+        return empty();
+    }
+    let Some(module) =
+        module_catalog_direct_member(source, lexical, imports, catalog, site.context.callee)
+    else {
+        return empty();
+    };
+    if module.call_mode.is_none() || module.call_shape != Some(ModuleCatalogCallShape::SingleJson) {
+        return empty();
+    }
+    let Some(fields) = &module.input_fields else {
+        return empty();
+    };
+
+    let edit_range = span_range(source, site.field);
+    let items = fields
+        .iter()
+        .filter(|field| !site.declared_fields.contains(&field.name))
+        .map(|field| CompletionItem {
+            label: field.name.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(
+                if field.required {
+                    "advisory direct-module input field; required"
+                } else {
+                    "advisory direct-module input field; optional"
+                }
+                .to_owned(),
+            ),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: module_catalog_input_field_text(field),
+            })),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                edit_range,
+                field.name.clone(),
+            ))),
+            ..CompletionItem::default()
+        })
+        .collect();
+
+    CompletionList {
+        is_incomplete,
+        items,
+    }
+}
+
+fn module_catalog_input_field_text(field: &ModuleCatalogInputFieldCompletion) -> String {
+    let mut value = format!(
+        "Advisory direct-module input field `{}`.\nType: {}\nRequired: {}",
+        field.name,
+        field.field_type.label(),
+        if field.required { "yes" } else { "no" }
+    );
+    if !field.description.is_empty() {
+        value.push_str("\n\n");
+        value.push_str(&field.description);
+    }
+    value.push_str(
+        "\n\nAdvisory metadata only; host module binding and any required capability authorization remain host-owned.",
+    );
+    value
 }
 
 /// Identifies a direct, unshadowed advisory workflow-data member path.
@@ -3466,6 +3835,31 @@ fn module_catalog_member_parent_path(
         resolved_path.push(segment.to_owned());
     }
     Some(resolved_path)
+}
+
+/// Finds an exact advisory leaf only through the same visible import path used
+/// by member completion and signature help. It never resolves a module or
+/// consults a capability runtime.
+fn module_catalog_direct_member<'catalog>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &ModuleImportReport,
+    catalog: &'catalog ModuleCompletionCatalog,
+    site: MemberCompletionSite,
+) -> Option<&'catalog ModuleCatalogCompletion> {
+    if catalog.unavailable {
+        return None;
+    }
+    let method = source.get(site.member.start_byte..site.member.end_byte)?;
+    if !is_canonical_identifier(method) {
+        return None;
+    }
+    let mut path = module_catalog_member_parent_path(source, lexical, imports, site)?;
+    path.push(method.to_owned());
+    catalog
+        .modules
+        .iter()
+        .find(|module| module.path.as_slice() == path.as_slice())
 }
 
 /// Returns plain-text advisory hover metadata for an exact catalog leaf. This
@@ -7509,6 +7903,183 @@ mod tests {
     }
 
     #[test]
+    fn completes_advisory_direct_module_input_record_fields_without_authority() {
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, ri: 22})"
+        );
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {
+                        "name": "left",
+                        "type": "integer",
+                        "required": true,
+                        "description": "First addend."
+                    },
+                    {
+                        "name": "right",
+                        "type": "integer",
+                        "required": false,
+                        "description": "Second addend."
+                    }
+                ]
+            }
+        ]));
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        server.open_document(document(1, source));
+
+        let field_start = source.find("ri:").expect("partial record field exists");
+        let completion = server
+            .completion(
+                &test_uri(),
+                position_at_byte(source, field_start + "ri".len()),
+            )
+            .expect("direct input field completion succeeds");
+        assert!(!completion.is_incomplete);
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["right"]
+        );
+        let item = completion
+            .items
+            .first()
+            .expect("one undeclared field remains");
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("advisory direct-module input field; optional")
+        );
+        assert!(matches!(
+            &item.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit { range, new_text }))
+                if *range == Range::new(
+                    position_at_byte(source, field_start),
+                    position_at_byte(source, field_start + "ri".len()),
+                ) && new_text == "right"
+        ));
+        let Some(Documentation::MarkupContent(MarkupContent { value, .. })) =
+            item.documentation.as_ref()
+        else {
+            panic!("direct input field documentation should be plain text");
+        };
+        assert!(value.contains("Type: integer"));
+        assert!(value.contains("Required: no"));
+        assert!(value.contains("Second addend."));
+        assert!(value.contains("capability authorization remain host-owned"));
+
+        let empty_source = concat!("use mod.arithmetic\n", "let result = arithmetic.add({})");
+        let mut empty_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        empty_server.open_document(document(1, empty_source));
+        let empty_cursor = empty_source.find("{}").expect("empty record exists") + 1;
+        let empty_completion = empty_server
+            .completion(&test_uri(), position_at_byte(empty_source, empty_cursor))
+            .expect("empty direct record completion succeeds");
+        assert_eq!(
+            empty_completion
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["left", "right"]
+        );
+        assert!(empty_completion.items.iter().all(|item| {
+            matches!(
+                &item.text_edit,
+                Some(CompletionTextEdit::Edit(TextEdit { range, .. }))
+                    if *range == Range::new(
+                        position_at_byte(empty_source, empty_cursor),
+                        position_at_byte(empty_source, empty_cursor),
+                    )
+            )
+        }));
+
+        let duplicate_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, left: 21, ri: 22})"
+        );
+        let mut duplicate_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        duplicate_server.open_document(document(1, duplicate_source));
+        let duplicate_cursor = duplicate_source
+            .rfind("ri:")
+            .expect("partial duplicate-record field exists")
+            + "ri".len();
+        assert!(duplicate_server
+            .completion(
+                &test_uri(),
+                position_at_byte(duplicate_source, duplicate_cursor),
+            )
+            .expect("duplicate record completion request succeeds")
+            .items
+            .is_empty());
+
+        let malformed_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: , ri: 22})"
+        );
+        let mut malformed_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        malformed_server.open_document(document(1, malformed_source));
+        let malformed_cursor = malformed_source
+            .find("ri:")
+            .expect("field after malformed prefix exists")
+            + "ri".len();
+        assert!(malformed_server
+            .completion(
+                &test_uri(),
+                position_at_byte(malformed_source, malformed_cursor),
+            )
+            .expect("malformed record completion request succeeds")
+            .items
+            .is_empty());
+
+        let nested_source = concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: {ri: 22}})"
+        );
+        let nested_cursor = nested_source.find("ri:").expect("nested field exists") + "ri".len();
+        assert!(direct_module_input_record_completion_site(nested_source, nested_cursor).is_none());
+
+        let shadowed_source = concat!(
+            "use mod.arithmetic\n",
+            "let arithmetic = {add: || nil}\n",
+            "let result = arithmetic.add({ri: 22})"
+        );
+        let mut shadowed_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        shadowed_server.open_document(document(1, shadowed_source));
+        let shadowed_cursor =
+            shadowed_source.find("ri:").expect("shadowed field exists") + "ri".len();
+        assert!(shadowed_server
+            .completion(
+                &test_uri(),
+                position_at_byte(shadowed_source, shadowed_cursor),
+            )
+            .expect("shadowed record completion request succeeds")
+            .items
+            .is_empty());
+    }
+
+    #[test]
     fn module_catalog_projection_is_bounded_and_fails_closed_when_malformed() {
         let params = InitializeParams {
             initialization_options: Some(serde_json::json!({
@@ -8030,6 +8601,38 @@ mod tests {
 
         assert!(completion.is_incomplete);
         assert_eq!(completion.items.len(), 4);
+    }
+
+    #[test]
+    fn refuses_direct_module_input_fields_when_imports_are_truncated() {
+        let mut source = String::from("use mod.arithmetic\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        source.push_str("let result = arithmetic.add({ri: 22})");
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.add",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {"name": "left", "type": "integer", "required": true},
+                    {"name": "right", "type": "integer", "required": true}
+                ]
+            }
+        ]));
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        server.open_document(document(1, &source));
+        let cursor = source.rfind("ri:").expect("input field exists") + "ri".len();
+
+        let completion = server
+            .completion(&test_uri(), position_at_byte(&source, cursor))
+            .expect("truncated direct input completion request succeeds");
+        assert!(completion.is_incomplete);
+        assert!(completion.items.is_empty());
     }
 
     #[test]

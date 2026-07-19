@@ -78,10 +78,9 @@ canonical Splash identifiers, it also projects `inputFields` with the schema
 field type, required bit, and optional plain-text description. Array, scalar,
 missing-properties, noncanonical-key, and otherwise incomplete record shapes
 omit `inputFields` rather than exposing a partial view. The runtime module is
-still configured separately during
-host setup; this returned list is only a bounded snapshot for editor
-completion, hover, and explicit signature metadata, not runtime discovery or
-authority.
+still configured separately during host setup; this returned list is only a
+bounded snapshot for editor completion, hover, and explicit signature metadata,
+not runtime discovery or authority.
 
 A host can replace the complete projection later through
 `workspace/didChangeConfiguration` using the same array under
@@ -138,6 +137,17 @@ note, any compact input-record field list, and the advisory authority boundary.
 Inferred namespaces and unresolved, shadowed, or non-direct paths have no
 catalog hover.
 
+For an exact visible leaf with `callShape: "single_json"` and `inputFields`,
+the server also completes an undeclared top-level key while the cursor is in the
+first direct literal-record argument, such as
+`weather.current({loc})`. It replaces only that key identifier and does not
+insert an object, a value, or `await()`. The recognizer rejects a nested record,
+second argument, string or comment cursor, mismatched/deep delimiters,
+duplicate prior key, truncated import metadata, shadowed receiver, malformed
+record prefix, or unknown/unshaped leaf. It does not evaluate JSON Schema,
+infer a value or nested shape, read a runtime, validate a contract, or grant a
+capability.
+
 The server also advertises `textDocument/signatureHelp`. An exact visible leaf
 with both `callMode` and `callShape: "single_json"` has a one-argument `input`
 signature and labels its result as either a JSON value or a promise of one.
@@ -148,9 +158,10 @@ cursor inside a comment, mismatched/deep delimiters, truncated scope or import
 metadata, shadowed receivers, and unknown or unshaped paths. Signature help
 uses the same plain-text advisory description and compact input-field list as
 hover; it does not resolve a module, inspect a runtime, validate an adapter
-contract, or authorize a call. The field list is not record-key completion,
-JSON Schema evaluation, a runtime value inspection, or a contract validation
-result.
+contract, or authorize a call. The separate input-key completion is limited to
+the one top-level literal-record position described above; neither feature
+performs JSON Schema evaluation, runtime value inspection, or contract
+validation.
 
 `mod.tool` remains a fixed language surface: a visible `use mod.tool` binding
 offers only `call`, `call_json`, `start`, and `start_json`, regardless of this
@@ -163,11 +174,11 @@ first syntax diagnostic.
 This bounded catalog lookup is not general imported-module resolution or type
 inference. The LSP does not read module files, URIs, the environment, a Rust
 registry, a capability runtime, or a live catalog. It does not validate an
-imported path, load a module, inspect exports, infer record fields, or authorize
-a tool. The metadata, including `callMode`, `callShape`, and `inputFields`, is
-client-supplied, potentially stale, and advisory even when an integration
-generated it from trusted host configuration. `inputFields` is static
-presentation metadata, not a JSON Schema payload or contract proof.
+imported path, load a module, inspect exports, infer general record fields, or
+authorize a tool. The metadata, including `callMode`, `callShape`, and
+`inputFields`, is client-supplied, potentially stale, and advisory even when an
+integration generated it from trusted host configuration. `inputFields` is
+static presentation metadata, not a JSON Schema payload or contract proof.
 Configuration refresh only replaces editor metadata; it never validates a live
 runtime.
 

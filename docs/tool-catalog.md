@@ -183,10 +183,11 @@ input schema is an explicit object whose entire property set uses canonical
 Splash identifiers and defines a `properties` map, the projection also carries
 a bounded field/type/required view with optional plain-text property
 descriptions. Scalar, array, missing-properties, noncanonical-key, and partial
-shapes omit that view. The LSP presents it only
-in direct-leaf hover and signature documentation; it never inserts `await()`,
-completes record keys, evaluates a schema, or gives an editor authority. Neither
-API is installed into Splash source. The sealed
+shapes omit that view. The LSP presents it in direct-leaf hover and signature
+documentation, and can complete an undeclared top-level key in the first direct
+literal-record argument. It never inserts `await()`, completes nested keys,
+evaluates a schema, or gives an editor authority. Neither API is installed into
+Splash source. The sealed
 `mobile::MobileRuntimeBuilder` and
 `splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,

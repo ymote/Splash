@@ -381,11 +381,12 @@ For an exact visible imported capability-module leaf, the optional advisory
 `moduleCatalog` may additionally declare `callMode`, `callShape: "single_json"`,
 and compact `inputFields`. Each field has a canonical identifier, one fixed
 JSON type, a required bit, and optional plain-text description. The LSP shows
-that bounded field list only in leaf hover and signature help; it does not
-complete record keys, evaluate JSON Schema, read a runtime, validate a
-contract, or grant a capability. `inputFields` without the exact one-JSON-value
-call shape, and any malformed or over-limit field projection, fails closed with
-the rest of the advisory module metadata.
+that bounded field list in leaf hover and signature help, and can complete an
+undeclared top-level key in the first direct literal-record argument to that
+exact leaf. It does not complete nested record keys, evaluate JSON Schema, read
+a runtime, validate a contract, or grant a capability. `inputFields` without
+the exact one-JSON-value call shape, and any malformed or over-limit field
+projection, fails closed with the rest of the advisory module metadata.
 
 For host-managed dataflow authoring, an editor may separately provide the
 bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP

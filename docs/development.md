@@ -263,10 +263,12 @@ scanner accepts an in-progress string argument, but rejects a cursor inside a
 comment, mismatched delimiters, deep nesting, shadowed receivers, truncated
 scope/import metadata, and unknown paths. It never reads a runtime, resolves a
 module, or grants authority. When a shaped leaf also supplies `inputFields`,
-its plain-text hover and signature documentation list only those bounded
-field names, fixed JSON types, required bits, and optional descriptions. This
-is not record-key completion, JSON Schema evaluation, a runtime value view, or
-contract validation.
+its plain-text hover and signature documentation list bounded field names,
+fixed JSON types, required bits, and optional descriptions. It can additionally
+complete an undeclared top-level key only in that leaf's first direct literal
+record argument, after the same visible-import and exact-leaf checks. It does
+not complete nested keys, inspect a runtime value, evaluate JSON Schema, or
+validate a contract.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through
@@ -349,9 +351,10 @@ position, replaces the whole document to invalidate lazy reports, repeats the
 requests, and closes the document. It accepts at most 16 KiB of fuzzer source
 and has reviewed baseline and module-catalog `.splash` seeds. The server uses a
 fixed bounded advisory module catalog, including shaped direct-method input
-field metadata, only to exercise catalog completion, hover, and signature help:
-the target never starts stdio, reads the URI, resolves modules, evaluates
-Splash, creates a capability host, or invokes an adapter.
+field metadata, only to exercise catalog completion, top-level input-key
+completion, hover, and signature help: the target never starts stdio, reads the
+URI, resolves modules, evaluates Splash, creates a capability host, or invokes
+an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 8 KiB individual-string cap, 1,024 live operand values, 256 active call
