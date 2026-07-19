@@ -182,13 +182,15 @@ exact direct form ending in `.await()`. At
 `result.field`, it completes projected field names and hovers known fields with
 plain-text metadata. It also follows exact local `let alias = result` chains of
 at most 16 hops, so `alias.field` receives the same advisory metadata. The
-recognizer accepts exactly one completed balanced argument and one direct
-imported member call. It rejects zero or multiple arguments, parenthesized or
-computed initializers or aliases, deeper alias chains, other postfix chains,
-prior non-alias bare uses, mutations, possible escapes, nested result paths,
-shadowed imports, truncated metadata, and source beyond the first diagnostic.
-This is not result-type inference or runtime inspection; an output suggestion
-does not validate a result, load a module, or grant a capability.
+complete result-alias group, including aliases declared after the queried
+member, must remain stable; a capped alias report makes output completion empty
+and incomplete. The recognizer accepts exactly one completed balanced argument
+and one direct imported member call. It rejects zero or multiple arguments,
+parenthesized or computed initializers or aliases, deeper alias chains, other
+postfix chains, non-alias bare uses, mutations, possible escapes, nested result
+paths, shadowed imports, truncated metadata, and source beyond the first
+diagnostic. This is not result-type inference or runtime inspection; an output
+suggestion does not validate a result, load a module, or grant a capability.
 
 The server also advertises `textDocument/signatureHelp`. An exact visible leaf
 through the same import-or-qualifying-alias rule, with both `callMode` and

@@ -292,11 +292,13 @@ or qualifying-alias and exact-leaf checks. For an exact original binding such
 as `let result = receiver.method(input)`, where `receiver` is that import or
 qualifying alias, or the exact deferred `.await()` form, it also completes and hovers top-level
 `result.field` names from `outputFields`. It follows exact local
-`let alias = result` chains of at most 16 hops, but rejects computed/deeper
-aliases, mutations and escapes, nested result chains, parenthesized/computed
-initializers, extra arguments, mismatched call mode, and source beyond the
-safe diagnostic prefix. It does not inspect a runtime value, evaluate JSON
-Schema, or validate a contract.
+`let alias = result` chains of at most 16 hops. The whole result-alias group,
+including later aliases, must remain stable throughout the source; incomplete
+alias metadata returns no output fields with incomplete completion. It rejects
+computed/deeper aliases, mutations and escapes, nested result chains,
+parenthesized/computed initializers, extra arguments, mismatched call mode,
+and source beyond the safe diagnostic prefix. It does not inspect a runtime
+value, evaluate JSON Schema, or validate a contract.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through

@@ -189,15 +189,18 @@ help. For an exact root `let result = receiver.method(input)` binding on a
 synchronous leaf, where `receiver` is that import or qualifying alias, or its
 exact deferred `.await()` form, it can complete and
 hover top-level `result.field` names from `outputFields`. It also follows exact
-local `let alias = result` chains of at most 16 hops. It does not complete
-nested keys, infer values, follow computed or deeper aliases, or infer
-arbitrary result-binding members. The LSP never inserts `await()` or changes source
-beyond the selected identifier. It is not part of the core report and does not
-load a source file, resolve or validate a module, inspect runtime exports, infer
-arbitrary fields, or make a Rust adapter current or callable. `mod.tool` remains
-a fixed language surface, accepts only a direct visible import for its fixed
-methods, and never receives metadata-defined members. The
-client-supplied projection is advisory, potentially stale, and never authority;
+local `let alias = result` chains of at most 16 hops. Its whole result-alias
+group, including aliases declared after the member site, must stay stable;
+truncated alias metadata makes output completion empty and incomplete. It does
+not complete nested keys, infer values, follow computed or deeper aliases, or
+infer arbitrary result-binding members. The LSP never inserts `await()` or
+changes source beyond the selected identifier. It is not part of the core
+report and does not load a source file, resolve or validate a module, inspect
+runtime exports, infer arbitrary fields, or make a Rust adapter current or
+callable. `mod.tool` remains a fixed language surface. It accepts only a direct
+visible import for its fixed methods and never receives metadata-defined
+members. The client-supplied projection is advisory, potentially stale, and
+never authority;
 an omitted key retains the prior projection, JSON `null` explicitly clears it,
 and malformed, duplicate, or over-limit input is discarded as a whole and makes
 matching completion incomplete. Tool and module updates are independent of each

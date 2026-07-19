@@ -404,14 +404,17 @@ a direct visible import or qualifying exact root alias, such as
 `let result = receiver.method(input).await()` form on a deferred leaf, it also
 completes and hovers top-level `result.field` names from `outputFields`. It can
 follow exact local `let alias = result` chains of at most 16 hops and serves
-the same top-level fields at `alias.field`. That bounded recognizer rejects
-parenthesized or computed aliases, deeper alias chains, mutations or escapes,
-parenthesized or computed initializers, extra arguments, other postfix chains,
-nested result chains, shadowed imports, and source beyond the safe diagnostic
-prefix. It does not complete nested record keys, evaluate JSON Schema, read a
-runtime, validate a contract, or grant a capability. Record fields without the
-exact one-JSON-value call shape, and any malformed or over-limit field
-projection, fail closed with the rest of the advisory module metadata.
+the same top-level fields at `alias.field`. The whole result-alias group,
+including aliases declared after the member site, must remain stable; truncated
+alias metadata makes output completion empty and incomplete. That bounded
+recognizer rejects parenthesized or computed aliases, deeper alias chains,
+mutations or escapes, parenthesized or computed initializers, extra arguments,
+other postfix chains, nested result chains, shadowed imports, and source beyond
+the safe diagnostic prefix. It does not complete nested record keys, evaluate
+JSON Schema, read a runtime, validate a contract, or grant a capability. Record
+fields without the exact one-JSON-value call shape, and any malformed or
+over-limit field projection, fail closed with the rest of the advisory module
+metadata.
 
 For host-managed dataflow authoring, an editor may separately provide the
 bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP

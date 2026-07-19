@@ -4028,23 +4028,22 @@ fn module_catalog_output_field_completion(
     site: MemberCompletionSite,
     is_incomplete: bool,
 ) -> Option<CompletionList> {
-    let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
-    let is_incomplete = is_incomplete
-        || imports.truncated
-        || catalog.unavailable
-        || module_catalog_alias_metadata_is_truncated_at_receiver(
-            source,
-            lexical,
-            shapes,
-            output_binding.call.receiver,
-        );
+    let aliases_truncated = module_catalog_alias_metadata_is_truncated_at_receiver(
+        source,
+        lexical,
+        shapes,
+        site.receiver,
+    );
+    let is_incomplete =
+        is_incomplete || imports.truncated || catalog.unavailable || aliases_truncated;
     let empty = || CompletionList {
         is_incomplete,
         items: Vec::new(),
     };
-    if imports.truncated || catalog.unavailable {
+    if imports.truncated || catalog.unavailable || aliases_truncated {
         return Some(empty());
     }
+    let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
     let Some(fields) = module_catalog_output_fields_for_binding(
         source,
         lexical,
@@ -4511,24 +4510,15 @@ fn direct_module_output_binding_for_member(
     }
 
     if shapes.aliases_truncated {
-        return direct_module_output_binding(source, initial, lexical.valid_prefix_end_byte)
-            .filter(|_| {
-                direct_module_output_binding_is_stable_at(source, initial, site.receiver.start_byte)
-            });
+        return None;
     }
 
     let aliases = StaticRecordAliasIndex::new(source, &lexical.symbols, shapes);
     let root = direct_module_output_alias_root(&aliases, initial)?;
     let output_binding = direct_module_output_binding(source, root, lexical.valid_prefix_end_byte)?;
-    let group = direct_module_output_alias_group(shapes, &aliases, root, site.receiver.start_byte)?;
-    direct_module_output_alias_group_is_stable(
-        source,
-        shapes,
-        &aliases,
-        &group,
-        site.receiver.start_byte,
-    )
-    .then_some(output_binding)
+    let group = direct_module_output_alias_group(shapes, &aliases, root)?;
+    direct_module_output_alias_group_is_stable(source, shapes, &aliases, &group, site.receiver)
+        .then_some(output_binding)
 }
 
 /// Follows only exact source aliases from the static alias report. The root is
@@ -4567,14 +4557,17 @@ fn direct_module_output_alias_root<'symbol>(
     None
 }
 
-/// Builds every earlier exact alias that reaches the direct result root. It
-/// refuses a chain beyond the fixed alias depth instead of retaining a partial
-/// group, but never lets a later declaration affect metadata at this site.
+/// Builds every exact alias that reaches the direct result root. It refuses a
+/// chain beyond the fixed alias depth instead of retaining a partial group.
+///
+/// Unlike ordinary lexical completion, output metadata describes a value that
+/// can be captured by a function or lambda and consumed after a later source
+/// statement. The complete alias group therefore participates even when an
+/// alias is declared after the member site.
 fn direct_module_output_alias_group(
     shapes: &StaticRecordShapeReport,
     aliases: &StaticRecordAliasIndex<'_>,
     root: &LexicalSymbol,
-    site_start_byte: usize,
 ) -> Option<HashSet<usize>> {
     let root_start_byte = root.definition.start_byte;
     let mut depths = HashMap::with_capacity(shapes.aliases.len() + 1);
@@ -4583,11 +4576,7 @@ fn direct_module_output_alias_group(
     let mut changed = true;
     while changed {
         changed = false;
-        for alias in shapes
-            .aliases
-            .iter()
-            .filter(|alias| alias.binding.start_byte < site_start_byte)
-        {
+        for alias in &shapes.aliases {
             let binding_start_byte = alias.binding.start_byte;
             let target_start_byte = match aliases.alias_targets.get(&binding_start_byte).copied() {
                 Some(StaticRecordAliasTarget::Let(target_start_byte)) => target_start_byte,
@@ -4622,16 +4611,16 @@ fn direct_module_output_alias_group(
     Some(depths.into_keys().collect())
 }
 
-/// Every earlier direct alias of a result participates in one stability group.
-/// An exact `let alias = binding` target read is allowed only for another
-/// member of that same group; all other bare reads remain possible value
-/// escapes.
+/// Every direct alias of a result participates in one whole-document stability
+/// group. An exact `let alias = binding` target read is allowed only for
+/// another member of that same group; all other bare reads remain possible
+/// value escapes.
 fn direct_module_output_alias_group_is_stable(
     source: &str,
     shapes: &StaticRecordShapeReport,
     aliases: &StaticRecordAliasIndex<'_>,
     group: &HashSet<usize>,
-    site_start_byte: usize,
+    requested_receiver: SourceSpan,
 ) -> bool {
     group.iter().all(|binding_start_byte| {
         let Some(symbol) = aliases
@@ -4641,20 +4630,11 @@ fn direct_module_output_alias_group_is_stable(
         else {
             return false;
         };
-        if symbol.definition.start_byte >= site_start_byte {
-            return true;
-        }
-        symbol
-            .references
-            .iter()
-            .copied()
-            .filter(|reference| reference.start_byte < site_start_byte)
-            .all(|reference| {
-                direct_module_output_reference_is_stable_read(source, reference)
-                    || direct_module_output_reference_is_group_alias_target(
-                        shapes, group, reference,
-                    )
-            })
+        symbol.references.iter().copied().all(|reference| {
+            reference == requested_receiver
+                || direct_module_output_reference_is_stable_read(source, reference)
+                || direct_module_output_reference_is_group_alias_target(shapes, group, reference)
+        })
     })
 }
 
@@ -4712,23 +4692,6 @@ fn module_catalog_output_field_for_member<'catalog>(
     module_catalog_output_fields_for_member(source, lexical, imports, catalog, shapes, site)?
         .iter()
         .find(|field| field.name == member_name)
-}
-
-/// Used only when alias metadata is truncated: a direct result binding remains
-/// usable only while every earlier reference is a non-mutating direct member
-/// read. It rejects aliases and all other possible value escapes rather than
-/// trying to infer their behavior from an incomplete alias group.
-fn direct_module_output_binding_is_stable_at(
-    source: &str,
-    symbol: &LexicalSymbol,
-    site_start_byte: usize,
-) -> bool {
-    symbol
-        .references
-        .iter()
-        .copied()
-        .filter(|reference| reference.start_byte < site_start_byte)
-        .all(|reference| direct_module_output_reference_is_stable_read(source, reference))
 }
 
 fn direct_module_output_reference_is_stable_read(source: &str, reference: SourceSpan) -> bool {
@@ -10393,13 +10356,42 @@ mod tests {
             catalog.clone(),
         );
         later_alias_server.open_document(document(1, &later_alias_source));
+        assert!(later_alias_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&later_alias_source, root_cursor),
+            )
+            .expect("over-depth later aliases suppress root output metadata")
+            .items
+            .is_empty());
+
+        let mut bounded_later_alias_source = String::from(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20, right: 22})\n",
+            "result.to\n"
+        ));
+        let bounded_root_cursor = bounded_later_alias_source
+            .rfind("to")
+            .expect("output field exists")
+            + "to".len();
+        let mut previous = "result".to_owned();
+        for index in 0..MAX_DIRECT_MODULE_OUTPUT_ALIAS_DEPTH {
+            let alias = format!("bounded_later_alias_{index}");
+            bounded_later_alias_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        let mut bounded_later_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        bounded_later_alias_server.open_document(document(1, &bounded_later_alias_source));
         assert_eq!(
-            later_alias_server
+            bounded_later_alias_server
                 .completion(
                     &test_uri(),
-                    position_at_byte(&later_alias_source, root_cursor),
+                    position_at_byte(&bounded_later_alias_source, bounded_root_cursor),
                 )
-                .expect("root completion ignores later aliases")
+                .expect("bounded later aliases preserve root output metadata")
                 .items
                 .iter()
                 .map(|item| item.label.as_str())
@@ -10467,6 +10459,15 @@ mod tests {
             "let alias = result\n",
             "send(alias)\n",
             "alias.to"
+        ));
+        assert_no_output_completion(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "fn inspect() {\n",
+            "    result.to\n",
+            "}\n",
+            "result.extra = 1\n",
+            "inspect()"
         ));
         assert_no_output_completion(concat!(
             "use mod.arithmetic\n",
@@ -10552,6 +10553,35 @@ mod tests {
         }
         truncated_alias_source.push_str(&format!("{previous}.to"));
         assert_no_output_completion(&truncated_alias_source);
+
+        let mut truncated_root_source = String::from(concat!(
+            "use mod.arithmetic\n",
+            "let result = arithmetic.add({left: 20})\n",
+            "result.to\n"
+        ));
+        let truncated_root_cursor = truncated_root_source
+            .rfind("to")
+            .expect("output field exists")
+            + "to".len();
+        let mut previous = "result".to_owned();
+        for index in 0..=MAX_STATIC_RECORD_ALIASES {
+            let alias = format!("truncated_root_alias_{index}");
+            truncated_root_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        let mut truncated_root_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        truncated_root_server.open_document(document(1, &truncated_root_source));
+        let truncated_root_completion = truncated_root_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&truncated_root_source, truncated_root_cursor),
+            )
+            .expect("truncated root alias output completion request succeeds");
+        assert!(truncated_root_completion.is_incomplete);
+        assert!(truncated_root_completion.items.is_empty());
 
         let no_output_source = concat!(
             "use mod.arithmetic\n",

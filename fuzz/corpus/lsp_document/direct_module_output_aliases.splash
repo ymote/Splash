@@ -3,3 +3,10 @@ use mod.fuzz.inspect
 let result = inspect.remote_add({left: 20, right: 22}).await()
 let alias = result
 alias.total
+
+fn inspect_later() {
+    result.total
+}
+
+result.extra = 1
+inspect_later()
