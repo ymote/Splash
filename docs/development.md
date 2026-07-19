@@ -322,8 +322,9 @@ outlining, completion, hover, definition, references, highlights, and guarded
 rename across at most 33 UTF-8-boundary positions plus an invalid UTF-16
 position, replaces the whole document to invalidate lazy reports, repeats the
 requests, and closes the document. It accepts at most 16 KiB of fuzzer source
-and has a reviewed baseline `.splash` seed. The server uses its empty advisory
-catalogs only: the target never starts stdio, reads the URI, resolves modules,
+and has reviewed baseline and module-catalog `.splash` seeds. The server uses a
+fixed bounded advisory module catalog only to exercise catalog completion and
+hover: the target never starts stdio, reads the URI, resolves modules,
 evaluates Splash, creates a capability host, or invokes an adapter.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting

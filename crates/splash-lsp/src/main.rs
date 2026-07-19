@@ -1055,6 +1055,42 @@ const MAX_FUZZ_LSP_SOURCE_BYTES: usize = 16 * 1024;
 #[cfg(fuzzing)]
 const MAX_FUZZ_LSP_POSITION_SAMPLES: usize = 32;
 
+/// Fixed no-authority metadata used to exercise advisory module completion and
+/// hover through the production document lifecycle.
+#[cfg(fuzzing)]
+fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
+    ModuleCompletionCatalog {
+        modules: vec![
+            ModuleCatalogCompletion {
+                path: vec!["mod".to_owned(), "fuzz".to_owned()],
+                description: "Fuzz-only advisory module.".to_owned(),
+                call_mode: None,
+            },
+            ModuleCatalogCompletion {
+                path: vec![
+                    "mod".to_owned(),
+                    "fuzz".to_owned(),
+                    "inspect".to_owned(),
+                    "remote_add".to_owned(),
+                ],
+                description: "Fuzz-only deferred adapter.".to_owned(),
+                call_mode: Some(ModuleCatalogCallMode::Deferred),
+            },
+            ModuleCatalogCompletion {
+                path: vec![
+                    "mod".to_owned(),
+                    "fuzz".to_owned(),
+                    "inspect".to_owned(),
+                    "status".to_owned(),
+                ],
+                description: "Fuzz-only synchronous adapter.".to_owned(),
+                call_mode: Some(ModuleCatalogCallMode::Synchronous),
+            },
+        ],
+        unavailable: false,
+    }
+}
+
 /// Exercises the source-only LSP document lifecycle for libFuzzer.
 ///
 /// This hook creates a fixed local URI, opens and replaces one bounded source
@@ -1072,7 +1108,12 @@ pub fn fuzz_exercise_document(source: &str) {
         return;
     };
 
-    let mut server = SplashLanguageServer::default();
+    let mut server = SplashLanguageServer::with_completion_catalogs_and_workflow_data(
+        ToolCompletionCatalog::default(),
+        fuzz_module_completion_catalog(),
+        WorkflowDataCompletionCatalog::default(),
+        WorkflowDataStepContext::default(),
+    );
     let _ = server.open_document(TextDocumentItem::new(
         uri.clone(),
         "splash".to_owned(),
