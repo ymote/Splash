@@ -379,8 +379,9 @@ impl MobileRuntime {
         self.runtime.capability_module_catalog()
     }
 
-    /// Resolves exact visible direct capability-module calls against the
-    /// sealed setup catalog for an LLM or operator review surface.
+    /// Resolves exact visible direct capability-module calls and bounded local
+    /// root aliases against the sealed setup catalog for an LLM or operator
+    /// review surface.
     ///
     /// This is read-only advisory metadata. It does not evaluate source,
     /// expose registration, issue a lease, or grant the returned target tool.
@@ -391,9 +392,10 @@ impl MobileRuntime {
         self.runtime.capability_module_call_hint_report(source)
     }
 
-    /// Resolves exact visible direct capability-module calls in named source
-    /// against the sealed setup catalog. The result remains advisory metadata
-    /// and cannot widen the sealed capability surface.
+    /// Resolves exact visible direct capability-module calls and bounded local
+    /// root aliases in named source against the sealed setup catalog. The
+    /// result remains advisory metadata and cannot widen the sealed capability
+    /// surface.
     pub fn capability_module_call_hint_report_named(
         &self,
         file: &str,

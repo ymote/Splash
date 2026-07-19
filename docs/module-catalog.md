@@ -141,6 +141,12 @@ source beyond the selected identifier segment. A chain has at most 16
 identifier segments, and it must begin at the visible binding from a direct
 `use mod.*` statement.
 
+This is an editor-only direct-import rule. The separate core
+`imported_module_call_hint_report` may preserve a reviewed module path through
+a bounded exact local root alias for a host review surface, but an alias such
+as `let weather_api = weather` does not receive module-catalog completion,
+hover, input-key completion, result-field metadata, or signature help.
+
 Hovering an exact catalog leaf reached through the same visible-import path
 returns its canonical catalog path, any plain-text description or call-mode
 note, any compact input- and output-record field lists, and the advisory

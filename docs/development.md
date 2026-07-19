@@ -240,6 +240,11 @@ independent of each other and of the atomic workflow-data pair. A malformed
 `settings` value or non-object `settings.splash` invalidates all advisory
 catalogs so the server cannot retain stale metadata.
 
+This direct-import editor boundary is intentionally narrower than the separate
+core imported-module review API. That API can preserve a reviewed `mod.*` path
+through a bounded exact local root alias for a pre-approval surface, but local
+aliases do not receive module-catalog completion, hover, or signature metadata.
+
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
 4 KiB description and optional exact-leaf `callMode` of `synchronous` or

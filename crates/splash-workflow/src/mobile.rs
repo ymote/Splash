@@ -396,8 +396,9 @@ impl MobileWorkflowRuntime {
         self.engine.runtime().capability_module_catalog()
     }
 
-    /// Resolves exact visible direct capability-module calls against the
-    /// sealed workflow catalog for an LLM or operator review surface.
+    /// Resolves exact visible direct capability-module calls and bounded local
+    /// root aliases against the sealed workflow catalog for an LLM or operator
+    /// review surface.
     ///
     /// This is advisory metadata only. It cannot approve a plan, issue a
     /// lease, change the static catalog, or grant the returned target tool.
@@ -410,9 +411,9 @@ impl MobileWorkflowRuntime {
             .capability_module_call_hint_report(source)
     }
 
-    /// Resolves exact visible direct capability-module calls in named source
-    /// against the sealed workflow catalog without changing workflow or
-    /// capability authority.
+    /// Resolves exact visible direct capability-module calls and bounded local
+    /// root aliases in named source against the sealed workflow catalog without
+    /// changing workflow or capability authority.
     pub fn capability_module_call_hint_report_named(
         &self,
         file: &str,

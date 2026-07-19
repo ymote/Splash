@@ -365,6 +365,18 @@ path through the root or any retained root, child, or grandchild alias that reso
 Static field hover and definition also fail closed when the lexical index is
 truncated, because an omitted earlier reference could be a mutation.
 
+Separately, the core `imported_module_call_hint_report` review API can preserve
+an imported `mod.*` path through an exact local `let alias = binding` chain of
+at most 16 hops for an exact `alias.method(...)` call. It examines every
+reference in that import-alias group and accepts only another exact group alias
+or a direct member call; writes, member aliases, indexing, calls that pass the
+value onward, and incomplete alias metadata suppress the hint. This whole-group
+rule also rejects a call captured in a function when a later source statement
+could rewrite the receiver before invocation.
+This is a bounded pre-approval presentation aid, not module resolution or
+authorization. The LSP catalog behavior below deliberately remains limited to
+a direct visible import binding.
+
 The server separately recognizes an exact visible `use mod.tool` binding. At a
 direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
 `start_json` methods. An editor integration may also provide a bounded advisory

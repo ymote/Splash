@@ -153,6 +153,10 @@ fn direct_module_catalog_is_explicit_and_the_demo_source_runs() {
         configured_review["direct_module_calls"][0]["mode"],
         "synchronous"
     );
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["callee"]["line"],
+        5
+    );
 
     let execution = run_splash(vec![
         "run".to_owned(),
@@ -180,6 +184,10 @@ fn direct_module_catalog_is_explicit_and_the_demo_source_runs() {
     assert_eq!(
         workflow_review["steps"][0]["direct_module_calls"][0]["mode"],
         "synchronous"
+    );
+    assert_eq!(
+        workflow_review["steps"][0]["direct_module_calls"][0]["callee"]["line"],
+        4
     );
 
     let workflow_execution = run_splash(vec![

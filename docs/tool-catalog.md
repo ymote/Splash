@@ -121,7 +121,8 @@ runtime.register_capability_module(
 ```splash
 use mod.arithmetic
 
-let result = arithmetic.add({left: 20, right: 22})
+let math = arithmetic
+let result = math.add({left: 20, right: 22})
 result.total
 ```
 
@@ -137,6 +138,10 @@ underlying target tool. In both modes the target retains its call limit,
 metadata, audit entry, JSON validation, and active capability-lease check.
 Prompt-only schemas, text tools, duplicate target aliases, existing VM module
 names, dynamic libraries, and script-selected crates remain unavailable.
+After the host has installed the fixed methods, Splash freezes both the direct
+module object and `mod.tool`; a script cannot rewrite a reviewed method through
+the import or any local alias, either during the current evaluation or for a
+later evaluation on the same runtime.
 
 ```splash
 use mod.remote_math
@@ -201,12 +206,18 @@ metadata projections, and named step-policy approval surface.
 For an LLM or operator review surface that must connect source syntax to a
 reviewed target capability, call
 `CapabilityRuntime::capability_module_call_hint_report_named`. It recognizes
-only a direct `binding.method(...)` whose receiver is scope-resolved to an
-exact visible `use mod.<name>` import and whose flat module and method match
-this runtime's configured direct-module catalog. Each advisory result reports
-the underlying tool name, so a policy UI can present `arithmetic.add` as
-`math.add`. It never evaluates source, seals the catalog, issues a lease, or
-proves reachability. An incomplete source-level lexical/import index reports
+an exact `binding.method(...)` whose receiver is scope-resolved to an exact
+visible `use mod.<name>` import or a bounded exact local root-alias chain of at
+most 16 hops, and whose flat module and method match this runtime's configured
+direct-module catalog. Every reference in that import-alias group must be
+another exact group alias or a direct member call; this whole-source check
+rejects function-captured calls when a later statement could rewrite the
+receiver before invocation. Writes, member aliases, indexing, arbitrary
+escapes, computed receivers, or incomplete metadata fail
+closed. Each advisory result keeps the source location separate from the
+underlying tool name, so a policy UI can display both without treating the
+local alias as a grant. It never evaluates source, seals the catalog, issues a lease, or proves
+reachability. An incomplete source-level lexical/import/alias index reports
 `truncated` and publishes no partial scope-resolved mapping. The development
 CLI exposes the same optional projection as `direct_module_calls` from
 `splash tool-calls --allow-json-add` and
@@ -247,9 +258,11 @@ leases with `issue_capability_lease_with_authorizer` and use the lease APIs.
 trusted step and includes each step's canonical syntax status. A workflow
 retains at most 4,096 hints overall and marks a step as truncated when it omits
 direct sites. It is useful for displaying an LLM-generated plan to an operator
-before lease issuance, but it does not infer aliases, flow, or computed names
-and cannot be used as the grant-selection mechanism. The runtime validates the
-actual call against the active step lease when it reserves the tool.
+before lease issuance, but its ordinary `mod.tool` hints do not infer aliases,
+flow, or computed names and cannot be used as the grant-selection mechanism.
+The separate direct-module projection can recognize only the bounded exact
+root-alias form above; the runtime validates every actual call against the
+active step lease when it reserves the tool.
 
 Dispatch is `host_pump` for a local Rust handler and `external` for a
 deferred-only tool. An external tool can only be used with `tool.start` or

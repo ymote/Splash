@@ -576,7 +576,9 @@ impl Default for CapabilityModuleLimits {
 /// returns decoded bounded JSON. A deferred method returns an opaque bounded
 /// promise whose `await()` decodes the target's bounded JSON result. The
 /// binding is syntax only: every call continues through the target tool's
-/// policy, audit trail, output contract, and active capability lease.
+/// policy, audit trail, output contract, and active capability lease. The
+/// runtime freezes the installed VM module after host setup, so Splash source
+/// cannot rewrite a reviewed method through an import or local alias.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityModule {
     pub name: String,
@@ -4416,8 +4418,9 @@ impl CapabilityRuntime {
         self.capability_modules.values().cloned().collect()
     }
 
-    /// Resolves exact visible direct capability-module calls in canonical
-    /// source against this runtime's current setup-defined module catalog.
+    /// Resolves exact visible direct capability-module calls and bounded local
+    /// root aliases in canonical source against this runtime's current
+    /// setup-defined module catalog.
     ///
     /// This is an effect-free review aid. It neither evaluates source nor
     /// seals the catalog, issues a lease, or treats a source hint as authority.
@@ -4429,14 +4432,16 @@ impl CapabilityRuntime {
         self.capability_module_call_hint_report_named("inline.splash", source)
     }
 
-    /// Resolves exact visible direct capability-module calls in named
-    /// canonical source against this runtime's current setup-defined catalog.
+    /// Resolves exact visible direct capability-module calls and bounded local
+    /// root aliases in named canonical source against this runtime's current
+    /// setup-defined catalog.
     ///
     /// Only flat `use mod.<name>` imports that match a registered direct
-    /// capability module, and methods that match its reviewed mapping, appear
-    /// in the output. Unknown modules and methods remain absent rather than
-    /// being inferred. The result is advisory and can become stale if the host
-    /// changes its setup catalog before issuing a later lease.
+    /// capability module, their exact bounded `let alias = binding` chains,
+    /// and methods that match a reviewed mapping appear in the output. Unknown
+    /// modules and methods remain absent rather than being inferred. The result
+    /// is advisory and can become stale if the host changes its setup catalog
+    /// before issuing a later lease.
     pub fn capability_module_call_hint_report_named(
         &self,
         file: &str,
@@ -5690,6 +5695,10 @@ fn install_capability_module(
                 ),
             }
         }
+        // Host capability facades are setup-owned objects. Freezing them keeps
+        // local aliases from rewriting a reviewed method for this or a later
+        // evaluation.
+        vm.bx.heap.freeze(module);
     });
 }
 
@@ -5926,6 +5935,8 @@ fn install_tool_module(runtime: &mut Runtime<CapabilityHost, ()>, max_pending_to
                 }
             },
         );
+        // The fixed `mod.tool` facade is also host-owned after installation.
+        vm.bx.heap.freeze(tool);
     });
 }
 
@@ -6628,6 +6639,106 @@ mod tests {
             )
             .expect("review metadata must not seal the setup catalog");
         assert_eq!(runtime.capability_module_catalog().len(), 2);
+    }
+
+    #[test]
+    fn exact_direct_module_alias_executes_and_reviews_under_the_same_lease() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integers."),
+                add_contract(),
+                |request| {
+                    let left = request.input["left"]
+                        .as_i64()
+                        .ok_or_else(|| ToolError::Failed("missing left input".to_owned()))?;
+                    let right = request.input["right"]
+                        .as_i64()
+                        .ok_or_else(|| ToolError::Failed("missing right input".to_owned()))?;
+                    Ok(json!({"total": left + right}))
+                },
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "use mod.std.assert\n",
+            "let math = arithmetic\n",
+            "let result = math.add({left: 20, right: 22})\n",
+            "assert(result.total == 42)"
+        );
+        let review = runtime
+            .capability_module_call_hint_report(source)
+            .expect("exact direct module alias remains reviewable");
+        assert_eq!(review.hints.len(), 1);
+        assert_eq!(review.hints[0].module, "arithmetic");
+        assert_eq!(review.hints[0].method, "add");
+        assert_eq!(review.hints[0].tool, "math.add");
+
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
+            .unwrap();
+        let evaluation = runtime.eval_with_capability_lease(source, &lease).unwrap();
+        assert!(evaluation.completed(), "{:?}", evaluation.diagnostics);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "math.add");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
+    }
+
+    #[test]
+    fn host_capability_module_objects_cannot_be_rewritten_by_script_aliases() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_validated_json_tool(
+                ToolPolicy::json("math.add"),
+                ToolMetadata::new("Adds two reviewed integers."),
+                add_contract(),
+                |_| Ok(json!({"total": 42})),
+            )
+            .unwrap();
+        runtime
+            .register_capability_module(
+                CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
+                    .with_method("add", "math.add"),
+            )
+            .unwrap();
+
+        let direct_module_mutation = runtime
+            .eval("use mod.arithmetic\nlet math = arithmetic\nmath.add = nil")
+            .unwrap();
+        assert!(
+            !direct_module_mutation.succeeded(),
+            "direct module mutation must fail: {:?}",
+            direct_module_mutation.diagnostics
+        );
+        let tool_module_mutation = runtime.eval("use mod.tool\ntool.call = nil").unwrap();
+        assert!(
+            !tool_module_mutation.succeeded(),
+            "tool facade mutation must fail: {:?}",
+            tool_module_mutation.diagnostics
+        );
+        assert!(runtime.audit().is_empty());
+
+        let lease = runtime
+            .issue_capability_lease([CapabilityLeaseGrant::new("math.add", 1)])
+            .unwrap();
+        let evaluation = runtime
+            .eval_with_capability_lease(
+                "use mod.arithmetic\nlet math = arithmetic\nmath.add({left: 20, right: 22})",
+                &lease,
+            )
+            .unwrap();
+        assert!(evaluation.completed(), "{:?}", evaluation.diagnostics);
+        assert_eq!(runtime.audit().len(), 1);
+        assert_eq!(runtime.audit()[0].tool, "math.add");
+        assert_eq!(runtime.audit()[0].outcome, AuditOutcome::Allowed);
     }
 
     #[test]

@@ -11,10 +11,11 @@ use super::{
     LexicalSymbolKind, LexicalSymbolReport, ModuleImport, ModuleImportReport, SourceSpan,
     StaticRecordAlias, StaticRecordField, StaticRecordNestedShape, StaticRecordShape,
     StaticRecordShapeReport, SyntaxDiagnostic, ToolCallHint, ToolCallHintReport, ToolCallKind,
-    TopLevelDeclaration, TopLevelDeclarationKind, MAX_IMPORTED_MODULE_CALL_HINTS,
-    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
-    MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH,
-    MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    TopLevelDeclaration, TopLevelDeclarationKind, MAX_IMPORTED_MODULE_ALIAS_DEPTH,
+    MAX_IMPORTED_MODULE_CALL_HINTS, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS,
+    MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
+    MAX_TOOL_CALL_HINTS,
 };
 
 pub(super) struct ProfileReport {
@@ -207,11 +208,12 @@ pub(super) fn collect_imported_module_call_hints(
     max_tokens: usize,
     symbols: &LexicalSymbolReport,
     imports: &ModuleImportReport,
+    aliases: &StaticRecordShapeReport,
 ) -> ImportedModuleCallHintReport {
     // An omitted definition can shadow a retained import, and an omitted
     // import can hide a later matching call. Do not publish partial mappings
     // as if they were scope-resolved.
-    if symbols.truncated || imports.truncated {
+    if symbols.truncated || imports.truncated || aliases.aliases_truncated {
         return ImportedModuleCallHintReport {
             hints: Vec::new(),
             truncated: true,
@@ -220,7 +222,13 @@ pub(super) fn collect_imported_module_call_hints(
 
     let lexer = ProfileLexer::new(source, max_tokens);
     let (tokens, _, _) = lexer.tokenize();
-    imported_module_call_hints_from_tokens(source, &tokens, &symbols.symbols, &imports.imports)
+    imported_module_call_hints_from_tokens(
+        source,
+        &tokens,
+        &symbols.symbols,
+        &imports.imports,
+        &aliases.aliases,
+    )
 }
 
 /// Formats source after validating the canonical grammar without evaluating it.
@@ -679,42 +687,27 @@ fn imported_module_call_hints_from_tokens(
     tokens: &[Token],
     symbols: &[LexicalSymbol],
     imports: &[ModuleImport],
+    aliases: &[StaticRecordAlias],
 ) -> ImportedModuleCallHintReport {
     let mut hints = Vec::new();
     let mut truncated = false;
+    let aliases = ImportedModuleAliasIndex::new(source, tokens, symbols, imports, aliases);
 
     for index in 0..tokens.len() {
-        let Some(receiver) = tokens.get(index) else {
+        if !is_direct_imported_module_call_receiver(tokens, index) {
             continue;
-        };
-        let TokenKind::Identifier(_) = &receiver.kind else {
-            continue;
-        };
-        let Some(separator) = tokens.get(index + 1) else {
-            continue;
-        };
-        let Some(method) = tokens.get(index + 2) else {
-            continue;
-        };
-        let Some(opening) = tokens.get(index + 3) else {
-            continue;
-        };
+        }
+        let receiver = &tokens[index];
+        let method = &tokens[index + 2];
         let TokenKind::Identifier(method_name) = &method.kind else {
             continue;
         };
-        if !is_operator(&separator.kind, ".")
-            || !matches!(opening.kind, TokenKind::OpenRound)
-            || (index > 0 && is_operator(&tokens[index - 1].kind, "."))
-        {
-            continue;
-        }
 
         let receiver_span = SourceSpan {
             start_byte: receiver.start_byte,
             end_byte: receiver.end_byte,
         };
-        let Some(import) = visible_import_for_receiver(source, symbols, imports, receiver_span)
-        else {
+        let Some(import) = visible_import_for_receiver(source, &aliases, receiver_span) else {
             continue;
         };
 
@@ -735,28 +728,204 @@ fn imported_module_call_hints_from_tokens(
     ImportedModuleCallHintReport { hints, truncated }
 }
 
+struct ImportedModuleAliasIndex<'imports, 'symbols> {
+    imports_by_binding: HashMap<usize, &'imports ModuleImport>,
+    symbols: &'symbols [LexicalSymbol],
+    symbols_by_binding: HashMap<usize, &'symbols LexicalSymbol>,
+    imported_binding_by_alias: HashMap<usize, usize>,
+    alias_binding_by_target: HashMap<(usize, usize), usize>,
+    direct_module_call_receivers: HashSet<(usize, usize)>,
+}
+
+impl<'imports, 'symbols> ImportedModuleAliasIndex<'imports, 'symbols> {
+    fn new(
+        source: &str,
+        tokens: &[Token],
+        symbols: &'symbols [LexicalSymbol],
+        imports: &'imports [ModuleImport],
+        aliases: &[StaticRecordAlias],
+    ) -> Self {
+        let imports_by_binding = imports
+            .iter()
+            .map(|import| (import.binding.start_byte, import))
+            .collect::<HashMap<_, _>>();
+        let symbols_by_binding = symbols
+            .iter()
+            .map(|symbol| (symbol.definition.start_byte, symbol))
+            .collect::<HashMap<_, _>>();
+        let mut alias_targets = HashMap::with_capacity(aliases.len());
+        let mut alias_binding_by_target = HashMap::with_capacity(aliases.len());
+
+        for alias in aliases
+            .iter()
+            .filter(|alias| alias.direct_child.is_none() && alias.direct_grandchild.is_none())
+        {
+            let Some(target_name) = source.get(alias.target.start_byte..alias.target.end_byte)
+            else {
+                continue;
+            };
+            let Some(target) = visible_symbol_in(symbols, target_name, alias.target.start_byte)
+            else {
+                continue;
+            };
+            alias_targets.insert(alias.binding.start_byte, target.definition.start_byte);
+            alias_binding_by_target.insert(
+                (alias.target.start_byte, alias.target.end_byte),
+                alias.binding.start_byte,
+            );
+        }
+
+        let mut imported_binding_by_alias = HashMap::with_capacity(alias_targets.len());
+        for alias_binding in alias_targets.keys().copied() {
+            if let Some(import_binding) = imported_module_binding_for_alias(
+                alias_binding,
+                &symbols_by_binding,
+                &imports_by_binding,
+                &alias_targets,
+            ) {
+                imported_binding_by_alias.insert(alias_binding, import_binding);
+            }
+        }
+
+        Self {
+            imports_by_binding,
+            symbols,
+            symbols_by_binding,
+            imported_binding_by_alias,
+            alias_binding_by_target,
+            direct_module_call_receivers: tokens
+                .iter()
+                .enumerate()
+                .filter_map(|(index, receiver)| {
+                    is_direct_imported_module_call_receiver(tokens, index)
+                        .then_some((receiver.start_byte, receiver.end_byte))
+                })
+                .collect(),
+        }
+    }
+
+    fn visible_symbol(&self, name: &str, byte_offset: usize) -> Option<&'symbols LexicalSymbol> {
+        visible_symbol_in(self.symbols, name, byte_offset)
+    }
+
+    fn imported_module_for_symbol(&self, symbol: &LexicalSymbol) -> Option<&'imports ModuleImport> {
+        let import_binding = match symbol.kind {
+            LexicalSymbolKind::Import => symbol.definition.start_byte,
+            LexicalSymbolKind::Let => *self
+                .imported_binding_by_alias
+                .get(&symbol.definition.start_byte)?,
+            LexicalSymbolKind::Function
+            | LexicalSymbolKind::Parameter
+            | LexicalSymbolKind::LoopBinding
+            | LexicalSymbolKind::LambdaParameter => return None,
+        };
+        self.imports_by_binding.get(&import_binding).copied()
+    }
+
+    fn alias_group(&self, import_binding: usize) -> HashSet<usize> {
+        let mut group = HashSet::with_capacity(self.imported_binding_by_alias.len() + 1);
+        group.insert(import_binding);
+        group.extend(self.imported_binding_by_alias.iter().filter_map(
+            |(&alias_binding, &resolved_import)| {
+                (resolved_import == import_binding).then_some(alias_binding)
+            },
+        ));
+        group
+    }
+}
+
+fn imported_module_binding_for_alias(
+    initial_binding: usize,
+    symbols_by_binding: &HashMap<usize, &LexicalSymbol>,
+    imports_by_binding: &HashMap<usize, &ModuleImport>,
+    alias_targets: &HashMap<usize, usize>,
+) -> Option<usize> {
+    let mut current_binding = initial_binding;
+    let mut visited = HashSet::with_capacity(MAX_IMPORTED_MODULE_ALIAS_DEPTH + 1);
+
+    for depth in 0..=MAX_IMPORTED_MODULE_ALIAS_DEPTH {
+        if !visited.insert(current_binding) {
+            return None;
+        }
+        if imports_by_binding.contains_key(&current_binding) {
+            return Some(current_binding);
+        }
+        if depth == MAX_IMPORTED_MODULE_ALIAS_DEPTH
+            || symbols_by_binding
+                .get(&current_binding)
+                .is_none_or(|symbol| symbol.kind != LexicalSymbolKind::Let)
+        {
+            return None;
+        }
+        current_binding = *alias_targets.get(&current_binding)?;
+    }
+
+    None
+}
+
+fn visible_symbol_in<'symbol>(
+    symbols: &'symbol [LexicalSymbol],
+    name: &str,
+    byte_offset: usize,
+) -> Option<&'symbol LexicalSymbol> {
+    symbols
+        .iter()
+        .filter(|symbol| {
+            symbol.name == name
+                && symbol.visibility_start_byte <= byte_offset
+                && byte_offset < symbol.visibility_end_byte
+        })
+        .max_by_key(|symbol| (symbol.visibility_start_byte, symbol.definition.start_byte))
+}
+
 fn visible_import_for_receiver<'imports>(
     source: &str,
-    symbols: &[LexicalSymbol],
-    imports: &'imports [ModuleImport],
+    aliases: &ImportedModuleAliasIndex<'imports, '_>,
     receiver: SourceSpan,
 ) -> Option<&'imports ModuleImport> {
     let receiver_name = source.get(receiver.start_byte..receiver.end_byte)?;
-    let symbol = symbols
-        .iter()
-        .filter(|symbol| {
-            symbol.name == receiver_name
-                && symbol.visibility_start_byte <= receiver.start_byte
-                && receiver.start_byte < symbol.visibility_end_byte
+    let initial = aliases.visible_symbol(receiver_name, receiver.start_byte)?;
+    let import = aliases.imported_module_for_symbol(initial)?;
+    let group = aliases.alias_group(import.binding.start_byte);
+    imported_module_alias_group_is_stable(aliases, &group).then_some(import)
+}
+
+fn imported_module_alias_group_is_stable(
+    aliases: &ImportedModuleAliasIndex<'_, '_>,
+    group: &HashSet<usize>,
+) -> bool {
+    // A direct call can be captured by a function and execute after a later
+    // statement, so source order cannot make a mutable alias safe here.
+    group.iter().all(|binding_start_byte| {
+        let Some(symbol) = aliases.symbols_by_binding.get(binding_start_byte).copied() else {
+            return false;
+        };
+        symbol.references.iter().copied().all(|reference| {
+            aliases
+                .alias_binding_by_target
+                .get(&(reference.start_byte, reference.end_byte))
+                .is_some_and(|alias_binding| group.contains(alias_binding))
+                || aliases
+                    .direct_module_call_receivers
+                    .contains(&(reference.start_byte, reference.end_byte))
         })
-        .max_by_key(|symbol| (symbol.visibility_start_byte, symbol.definition.start_byte))?;
-    (symbol.kind == LexicalSymbolKind::Import)
-        .then(|| {
-            imports
-                .iter()
-                .find(|import| import.binding == symbol.definition)
-        })
-        .flatten()
+    })
+}
+
+fn is_direct_imported_module_call_receiver(tokens: &[Token], index: usize) -> bool {
+    matches!(
+        tokens.get(index).map(|token| &token.kind),
+        Some(TokenKind::Identifier(_))
+    ) && matches!(
+        tokens.get(index + 1).map(|token| &token.kind),
+        Some(TokenKind::Operator(operator)) if operator == "."
+    ) && matches!(
+        tokens.get(index + 2).map(|token| &token.kind),
+        Some(TokenKind::Identifier(_))
+    ) && matches!(
+        tokens.get(index + 3).map(|token| &token.kind),
+        Some(TokenKind::OpenRound)
+    ) && !(index > 0 && is_operator(&tokens[index - 1].kind, "."))
 }
 
 fn direct_tool_call_kind(tokens: &[Token], index: usize) -> Option<ToolCallKind> {

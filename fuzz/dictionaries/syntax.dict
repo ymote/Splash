@@ -9,6 +9,8 @@
 "while "
 "loop "
 "use mod.tool"
+"use mod.arithmetic"
+"let math = arithmetic"
 "use mod.std.assert"
 "match "
 ":="

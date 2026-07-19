@@ -294,7 +294,8 @@ capability module and generated source can use decoded data directly:
 use mod.arithmetic
 use mod.std.assert
 
-let response = arithmetic.add({left: 20, right: 22})
+let math = arithmetic
+let response = math.add({left: 20, right: 22})
 assert(response.total == 42)
 ```
 
@@ -313,8 +314,11 @@ cargo run -p splash-cli -- workflow-review --allow-json-add examples/direct_modu
 cargo run -p splash-cli -- workflow-run --allow-json-add --grant calculate:math.add:1 examples/direct_module_workflow_draft.json
 ```
 
-The catalog maps `arithmetic.add` to `math.add`; workflow policies and leases
-continue to grant the underlying `math.add` capability, never the facade name.
+The catalog maps the `arithmetic.add` facade to `math.add`; workflow policies
+and leases continue to grant the underlying `math.add` capability, never the
+facade name. Review can preserve that mapping through a bounded exact local
+root alias such as `let math = arithmetic`; it never treats an alias as a new
+module, target tool, or grant.
 Hosts can also register a `with_deferred_method` facade over a reviewed JSON
 tool; its explicit `mode: "deferred"` returns the existing bounded promise and
 `await()` yields decoded JSON while preserving the same underlying grant.
@@ -420,7 +424,9 @@ the runtime must authorize every actual call. The output retains at most 1,024
 direct sites and sets `tool_calls_truncated` when later sites were omitted. A
 host can additionally expose its reviewed direct-module mapping; the
 development demonstration does so only when `--allow-json-add` is present and
-emits a separate advisory `direct_module_calls` list.
+emits a separate advisory `direct_module_calls` list. That mapping can follow a
+bounded exact local root alias of a visible direct import, but never computed
+receivers, member aliases, or source-derived authority.
 
 Review an LLM-generated multi-step draft before it becomes a host-owned plan:
 
@@ -434,8 +440,9 @@ approvals. Each step reports `tool_calls_truncated` when its direct-call review
 was capped; a workflow retains at most 4,096 hints across all steps. See
 [workflow drafts](docs/workflow-drafts.md) for its bounds and host lifecycle.
 With an explicitly configured host module catalog, a separate advisory
-`direct_module_calls` list can map a direct facade call to its underlying tool;
-it has the same 4,096 workflow-wide cap and never selects a grant.
+`direct_module_calls` list can map a direct facade call, including a bounded
+exact local root alias, to its underlying tool; it has the same 4,096
+workflow-wide cap and never selects a grant.
 
 Run the bounded local demonstration catalog only with explicit host-selected
 per-step grants:
@@ -561,7 +568,9 @@ file, resolve a module, inspect a runtime export, or override the fixed
 key keeps its prior value, JSON `null` explicitly clears it, and a malformed or
 over-limit key value makes only that catalog unavailable. A malformed `settings`
 value or non-object `settings.splash` clears all advisory catalogs. Neither
-projection authorizes source. See [editor module-interface
+projection authorizes source. This direct-import editor boundary is
+intentionally narrower than the separate core review alias recognizer; a local
+module alias does not receive catalog completion or hover. See [editor module-interface
 projection](docs/module-catalog.md) for its exact format and bounds. A
 truncated lexical index can still serve retained, sound definitions and hover,
 but exhaustive reference, highlight, and rename requests fail instead of

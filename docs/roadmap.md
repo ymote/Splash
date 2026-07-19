@@ -169,8 +169,10 @@
   either form routes through the same target-tool policy, audit, JSON boundary,
   and capability lease, returning decoded bounded JSON immediately or from
   `await()`. A bounded scope-resolved advisory review projection can map an
-  exact visible direct facade call back to its underlying target tool and mode
-  without issuing authority. Its advisory LSP interface projection carries the
+  exact visible direct facade call or bounded exact local root alias back to
+  its underlying target tool and mode without issuing authority. Installed
+  direct module objects are frozen after host setup, and review rejects writes
+  or other possible alias escapes. Its advisory LSP interface projection carries the
   same mode as an exact-leaf `callMode` label and an explicit `single_json`
   call shape without inserting source or authorizing a call. An explicit,
   source-compatible executable object input contract can additionally project

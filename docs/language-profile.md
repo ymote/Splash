@@ -251,15 +251,24 @@ presentation, not static authorization: the host must still issue a capability
 lease and runtime reservation validates every actual call.
 
 Core also provides `imported_module_call_hint_report` for an exact
-scope-resolved `binding.method(...)` spelling whose receiver is a visible
-`use mod.<path>` binding. This is still source metadata: it does not load the
-module or know whether an imported path is installed. A `CapabilityRuntime`
-can match those hints against its own bounded setup-defined direct capability
-module catalog through `capability_module_call_hint_report`; only an exact
-flat registered mapping becomes an advisory target-tool hint. The
-capability-resolved report fails closed with an empty mapping and
-`truncated: true` if its bounded lexical or import metadata is incomplete.
-Neither report creates a policy, lease, or authority.
+scope-resolved `binding.method(...)` spelling whose receiver is either a
+visible `use mod.<path>` binding or an exact `let alias = binding` root-alias
+chain of at most 16 hops. The report preserves the original `mod.*` path; an
+alias does not create a module name, target tool, or authority path. To avoid
+presenting a mutable module handle as stable, every reference through the
+relevant alias group must be either another exact group alias or a direct member
+call. This whole-source group check rejects a function-captured call when a
+later statement could rewrite the receiver before invocation. Writes, member
+extraction, indexing, argument/return escapes, computed receivers, shadowed
+bindings, and incomplete alias metadata suppress the hint. This is still source
+metadata: it does not load the module or know
+whether an imported path is installed. A `CapabilityRuntime` can match those
+hints against its own bounded setup-defined direct capability-module catalog
+through `capability_module_call_hint_report`; only an exact flat registered
+mapping becomes an advisory target-tool hint. The capability-resolved report
+fails closed with an empty mapping and `truncated: true` if its bounded
+lexical, import, or alias metadata is incomplete. Neither report creates a
+policy, lease, or authority.
 
 For an ordered LLM workflow, `WorkflowPlan::review` returns one data-only
 `WorkflowStepReview` per trusted step. Each item contains the step ID,

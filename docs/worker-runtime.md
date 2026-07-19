@@ -393,9 +393,9 @@ contract-enforced local JSON adapters as a fixed direct `mod.<name>` method
 before `build()` seals the profile; it retains the adapter's policy and audit
 checks rather than adding ambient application APIs. The sealed
 `MobileRuntime::capability_module_call_hint_report` exposes a bounded,
-read-only mapping from an exact visible direct facade call to its underlying
-tool for an app-owned LLM or operator review surface; it neither evaluates
-source nor grants the target tool.
+read-only mapping from an exact visible direct facade call or bounded exact
+local root alias to its underlying tool for an app-owned LLM or operator review
+surface; it neither evaluates source nor grants the target tool.
 `MobileRuntimeBuilder::with_limits_and_catalog` additionally lets the app set
 an immutable maximum descriptor count and serialized catalog size before any
 adapter is registered. `with_max_audit_events(NonZeroUsize)` sets the bounded
@@ -463,9 +463,9 @@ facade retains the underlying tool's named step-policy grant, JSON contract,
 audit entry, and lease check. Hosts that need a tighter direct-module budget use
 `with_limits_catalog_and_module_limits`; the sealed runtime exposes only the
 immutable mapping, advisory LSP projection, and a read-only
-`capability_module_call_hint_report` for mapping an exact direct facade call to
-its underlying named tool during app-owned review. That report cannot approve
-or grant a workflow capability.
+`capability_module_call_hint_report` for mapping an exact direct facade call or
+bounded exact local root alias to its underlying named tool during app-owned
+review. That report cannot approve or grant a workflow capability.
 
 ```rust
 use splash_capabilities::{CapabilityLeaseGrant, ToolMetadata, ToolPolicy};

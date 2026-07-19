@@ -209,11 +209,13 @@ the draft.
 
 The default command creates no capability runtime. A host that has already
 selected a direct-module catalog may add a separate advisory projection for
-exact direct module calls and their mapped underlying tools. The development
-CLI demonstrates that bounded projection with `--allow-json-add`, which adds
+exact direct module calls, including a bounded exact local root alias of a
+visible import, and their mapped underlying tools. The development CLI
+demonstrates that bounded projection with `--allow-json-add`, which adds
 `direct_module_calls` and `direct_module_calls_truncated` to each valid step.
 It still does not create a grant: the host must select the underlying tool name
-when it later approves the plan.
+when it later approves the plan. Computed receivers, member aliases, writes,
+and other possible alias escapes remain absent from this review projection.
 
 ## CLI Demonstration Execution
 

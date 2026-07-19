@@ -98,6 +98,13 @@ pub const MAX_TOOL_CALL_HINTS: usize = 1_024;
 /// review surfaces. Use [`ImportedModuleCallHintReport::truncated`] to detect
 /// omitted sites or a lexical/import index that could not resolve every site.
 pub const MAX_IMPORTED_MODULE_CALL_HINTS: usize = 1_024;
+/// Maximum exact local root-alias hops followed while resolving one imported
+/// module receiver for advisory review.
+///
+/// This permits ergonomic `let alias = imported_module` chains without
+/// treating computed values, field selections, or arbitrary runtime values as
+/// module bindings.
+pub const MAX_IMPORTED_MODULE_ALIAS_DEPTH: usize = 16;
 /// Maximum complete `use mod.<path>` declarations retained in one
 /// source-only import report.
 ///
@@ -712,7 +719,7 @@ pub struct ToolCallHintReport {
 }
 
 /// A bounded, scope-resolved hint for an exact direct member call on a visible
-/// `use mod.<path>` binding.
+/// `use mod.<path>` binding or its bounded exact local root-alias chain.
 ///
 /// `module_path` is the source import path, including its initial `"mod"`
 /// segment. The callee span covers the direct `binding.method` spelling. This
@@ -731,7 +738,8 @@ pub struct ImportedModuleCallHint {
 /// Bounded direct imported-module member-call review output.
 ///
 /// `truncated` is true when additional matching sites were omitted or when
-/// the bounded lexical/import metadata cannot resolve the complete source.
+/// the bounded lexical/import/alias metadata cannot resolve the complete
+/// source.
 /// Callers must treat that state as incomplete. The report is advisory and is
 /// never an authorization decision.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1284,17 +1292,19 @@ pub fn tool_call_hint_report(source: &str) -> Result<ToolCallHintReport, Runtime
     tool_call_hint_report_named("inline.splash", source, ExecutionLimits::default())
 }
 
-/// Lists bounded exact member calls on visible `use mod.<path>` bindings in
-/// valid canonical Splash without evaluating source, loading a module, or
-/// creating a capability host.
+/// Lists bounded exact member calls on visible `use mod.<path>` bindings and
+/// their bounded exact local root-alias chains in valid canonical Splash
+/// without evaluating source, loading a module, or creating a capability host.
 ///
 /// This is an LLM and operator-review aid, not static authorization. It
-/// resolves only the receiver's visible lexical import binding and does not
-/// infer aliases, computed receivers, module exports, method types, control
-/// flow, reachability, or runtime values. Invalid or VM-incompatible source
-/// produces no hints. `truncated` means the result is incomplete, either
-/// because matching sites exceeded [`MAX_IMPORTED_MODULE_CALL_HINTS`] or the
-/// bounded lexical/import metadata could not resolve every site.
+/// resolves only a visible lexical import binding or an exact
+/// `let alias = binding` chain of at most [`MAX_IMPORTED_MODULE_ALIAS_DEPTH`]
+/// hops. It rejects aliases after writes or other potential escapes and never
+/// infers computed receivers, member aliases, module exports, method types,
+/// control flow, reachability, or runtime values. Invalid or VM-incompatible
+/// source produces no hints. `truncated` means the result is incomplete,
+/// either because matching sites exceeded [`MAX_IMPORTED_MODULE_CALL_HINTS`]
+/// or the bounded lexical/import/alias metadata could not resolve every site.
 pub fn imported_module_call_hint_report(
     source: &str,
 ) -> Result<ImportedModuleCallHintReport, RuntimeError> {
@@ -1706,11 +1716,18 @@ pub fn imported_module_call_hint_report_named(
     );
     let symbols =
         collect_lexical_symbols(source, limits.max_syntax_tokens, limits.max_syntax_nesting);
+    let aliases = collect_static_record_shapes(
+        source,
+        limits.max_syntax_tokens,
+        limits.max_syntax_nesting,
+        source.len(),
+    );
     Ok(collect_imported_module_call_hints(
         source,
         limits.max_syntax_tokens,
         &symbols,
         &imports,
+        &aliases,
     ))
 }
 
@@ -3846,6 +3863,115 @@ let noise = "tool.call(\"also.ignored\", \"x\")"
                 .collect::<Vec<_>>(),
             ["arithmetic.add", "tool.call", "client.lookup"]
         );
+
+        let runtime = Runtime::default();
+        assert_eq!(
+            runtime.imported_module_call_hint_report(source).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn imported_module_call_hints_follow_bounded_stable_root_aliases() {
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "math.add({left: 20, right: 22})\n",
+            "let calculator = math\n",
+            "calculator.add({left: 21, right: 21})\n",
+            "arithmetic.add({left: 19, right: 23})"
+        );
+
+        let report = imported_module_call_hint_report(source)
+            .expect("canonical source resolves stable direct import aliases");
+        assert!(!report.truncated);
+        assert_eq!(report.hints.len(), 3);
+        assert!(report
+            .hints
+            .iter()
+            .all(|hint| hint.module_path == ["mod", "arithmetic"] && hint.method == "add"));
+        assert_eq!(
+            report
+                .hints
+                .iter()
+                .map(|hint| &source[hint.callee_start_byte..hint.callee_end_byte])
+                .collect::<Vec<_>>(),
+            ["math.add", "calculator.add", "arithmetic.add"]
+        );
+
+        for unstable_source in [
+            "use mod.arithmetic\narithmetic = {}\narithmetic.add({})",
+            "use mod.arithmetic\nlet math = arithmetic\nmath = {}\nmath.add({})",
+            "use mod.arithmetic\nlet math = arithmetic\nconsume(math)\nmath.add({})",
+            "use mod.arithmetic\nlet math = arithmetic\nlet sibling = math\nsibling.add = nil\nmath.add({})",
+            "use mod.arithmetic\nlet math = arithmetic\nlet method = math.add\nmath.add({})",
+            "use mod.arithmetic\nlet math = arithmetic\nlet parenthesized = (math)\nmath.add({})",
+            concat!(
+                "use mod.arithmetic\n",
+                "let math = arithmetic\n",
+                "fn run() { math.add({}) }\n",
+                "math = {}\n",
+                "run()"
+            ),
+        ] {
+            let report = imported_module_call_hint_report(unstable_source)
+                .expect("canonical source remains reviewable");
+            assert!(
+                report.hints.is_empty(),
+                "module alias hint must fail closed for {unstable_source:?}"
+            );
+        }
+
+        let preserved_alias_source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "let arithmetic = {}\n",
+            "math.add({left: 20, right: 22})"
+        );
+        let preserved_alias = imported_module_call_hint_report(preserved_alias_source)
+            .expect("a later shadow must not rewrite an earlier exact alias");
+        assert_eq!(preserved_alias.hints.len(), 1);
+        assert_eq!(
+            &preserved_alias_source[preserved_alias.hints[0].callee_start_byte
+                ..preserved_alias.hints[0].callee_end_byte],
+            "math.add"
+        );
+
+        let mut bounded_source = String::from("use mod.arithmetic\n");
+        let mut previous = "arithmetic".to_owned();
+        for index in 0..MAX_IMPORTED_MODULE_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            bounded_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        bounded_source.push_str(&format!("{previous}.add({{}})"));
+        let bounded = imported_module_call_hint_report(&bounded_source)
+            .expect("bounded direct import alias chain is canonical");
+        assert_eq!(bounded.hints.len(), 1);
+        assert_eq!(bounded.hints[0].module_path, ["mod", "arithmetic"]);
+
+        let mut too_deep_source = String::from("use mod.arithmetic\n");
+        let mut previous = "arithmetic".to_owned();
+        for index in 0..=MAX_IMPORTED_MODULE_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            too_deep_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        too_deep_source.push_str(&format!("{previous}.add({{}})"));
+        assert!(imported_module_call_hint_report(&too_deep_source)
+            .expect("too-deep direct import alias chain is canonical")
+            .hints
+            .is_empty());
+
+        let mut truncated_source = String::from("use mod.arithmetic\n");
+        for index in 0..=MAX_STATIC_RECORD_ALIASES {
+            truncated_source.push_str(&format!("let alias_{index} = arithmetic\n"));
+        }
+        truncated_source.push_str("arithmetic.add({})");
+        let truncated = imported_module_call_hint_report(&truncated_source)
+            .expect("alias-truncated source is canonical");
+        assert!(truncated.hints.is_empty());
+        assert!(truncated.truncated);
 
         let runtime = Runtime::default();
         assert_eq!(

@@ -1,5 +1,6 @@
 use mod.arithmetic
 use mod.std.assert
 
-let response = arithmetic.add({left: 20, right: 22})
+let math = arithmetic
+let response = math.add({left: 20, right: 22})
 assert(response.total == 42)

@@ -3,14 +3,16 @@
 use libfuzzer_sys::fuzz_target;
 use splash_core::{
     check_syntax_named, check_vm_compatibility_named, format_source_named, fuzzing,
-    is_canonical_identifier, lexical_completion_report_named, lexical_symbol_report_named,
-    module_import_report_named, static_record_shape_report_named, tool_call_hint_report_named,
-    top_level_declarations_named, ExecutionLimits, LexicalCompletionReport, LexicalSymbol,
+    imported_module_call_hint_report_named, is_canonical_identifier,
+    lexical_completion_report_named, lexical_symbol_report_named, module_import_report_named,
+    static_record_shape_report_named, tool_call_hint_report_named, top_level_declarations_named,
+    ExecutionLimits, ImportedModuleCallHintReport, LexicalCompletionReport, LexicalSymbol,
     ModuleImportReport, RuntimeError, StaticRecordField, StaticRecordNestedShape,
     StaticRecordShapeReport, ToolCallHint, TopLevelDeclaration, TopLevelDeclarationKind,
-    MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_MODULE_IMPORTS,
-    MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS, MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH,
-    MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS, MAX_TOOL_CALL_HINTS,
+    MAX_IMPORTED_MODULE_CALL_HINTS, MAX_LEXICAL_COMPLETION_SITES, MAX_LEXICAL_SYMBOL_OCCURRENCES,
+    MAX_MODULE_IMPORTS, MAX_STATIC_RECORD_ALIASES, MAX_STATIC_RECORD_FIELDS,
+    MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH, MAX_STATIC_RECORD_SHAPES, MAX_SYNTAX_DIAGNOSTICS,
+    MAX_TOOL_CALL_HINTS,
 };
 
 const MAX_FUZZ_SOURCE_BYTES: usize = 16 * 1024;
@@ -44,6 +46,10 @@ fuzz_target!(|data: &[u8]| {
         static_record_shape_report_named("fuzz.splash", source, limits)
             .expect("the fuzz limits are always valid for bounded static record metadata");
     assert_static_record_shape_invariants(source, &static_record_shape_report);
+    let imported_module_call_report =
+        imported_module_call_hint_report_named("fuzz.splash", source, limits)
+            .expect("the fuzz limits are always valid for bounded imported-module review");
+    assert_imported_module_call_hint_invariants(source, &imported_module_call_report);
 
     if profile.valid {
         assert!(
@@ -550,6 +556,58 @@ fn assert_tool_call_hint_invariants(source: &str, hints: &[ToolCallHint]) {
             ),
             _ => panic!("tool-call literal span is only partially present: {hint:?}"),
         }
+
+        previous_start_byte = hint.callee_start_byte;
+    }
+}
+
+fn assert_imported_module_call_hint_invariants(
+    source: &str,
+    report: &ImportedModuleCallHintReport,
+) {
+    assert!(report.hints.len() <= MAX_IMPORTED_MODULE_CALL_HINTS);
+
+    let mut previous_start_byte = 0_usize;
+    for hint in &report.hints {
+        assert!(
+            previous_start_byte <= hint.callee_start_byte
+                && hint.callee_start_byte < hint.callee_end_byte
+                && hint.callee_end_byte <= source.len(),
+            "imported-module hint has unordered or out-of-bounds callee span: {hint:?}"
+        );
+        assert!(
+            source.is_char_boundary(hint.callee_start_byte)
+                && source.is_char_boundary(hint.callee_end_byte),
+            "imported-module callee span is not a UTF-8 boundary: {hint:?}"
+        );
+        assert!(
+            hint.module_path.len() >= 2
+                && hint
+                    .module_path
+                    .first()
+                    .is_some_and(|segment| segment == "mod")
+                && hint
+                    .module_path
+                    .iter()
+                    .all(|segment| is_canonical_identifier(segment)),
+            "imported-module hint has a non-canonical module path: {hint:?}"
+        );
+        assert!(
+            is_canonical_identifier(&hint.method),
+            "imported-module hint has a non-canonical method: {hint:?}"
+        );
+        let callee = normalized_import_path(&source[hint.callee_start_byte..hint.callee_end_byte]);
+        let Some((receiver, method)) = callee.split_once('.') else {
+            panic!("imported-module callee is not a direct member call: {hint:?}");
+        };
+        assert!(
+            is_canonical_identifier(receiver) && method == hint.method,
+            "imported-module callee span does not match its method: {hint:?}"
+        );
+        assert!(
+            hint.line >= 1 && hint.column >= 1,
+            "imported-module hint has a zero-based source location: {hint:?}"
+        );
 
         previous_start_byte = hint.callee_start_byte;
     }
