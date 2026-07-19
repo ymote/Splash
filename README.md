@@ -506,6 +506,12 @@ cargo run -p splash-cli -- workflow-run --allow-json-add \
   examples/dataflow_workflow_draft.json
 ```
 
+The `prepare` step explicitly narrows the host input to the reviewed
+`math.add` envelope. The pure `summarize` step then uses a dynamic text-key
+lookup, a bounded array transformation and loop, text normalization,
+own-field record merging, and a bounded JSON round trip. It receives no tool
+grant; only `prepare` can issue the reviewed effect.
+
 `workflow-run` accepts only the two opt-in local demo adapters and prints a
 structured execution/audit summary. It never derives grants from source hints,
 opens filesystem/network/process authority, or supports external workers. A

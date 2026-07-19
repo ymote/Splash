@@ -1,0 +1,21 @@
+use mod.std.array
+use mod.std.assert
+use mod.std.json
+use mod.std.object
+use mod.std.text
+
+let document = "{\"label\":\" release total \",\"route\":\"primary\",\"tags\":[\"release\",\"math\"]}"
+let request = json.parse(document)
+let route_key = "route"
+let route = request[route_key]
+let normalized_tags = []
+
+for tag in array.reverse(request.tags) {
+    normalized_tags.push(text.upper(tag))
+}
+
+let summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: 42}, {tag_count: array.len(normalized_tags), tags: normalized_tags})
+
+assert(object.keys(summary) == ["label", "route", "total", "tag_count", "tags"])
+assert(normalized_tags == ["MATH", "RELEASE"])
+json.parse(json.stringify(summary))

@@ -670,6 +670,10 @@ or mutate its keys, input digest, worker observation, or restart policy.
 - Import `mod.std.object` before using `object.*`; transforms are bounded
   own-field operations over plain record or JSON-object data, not capabilities.
   Keep transforming inputs and combined `merge` source fields at or below 4,096.
+- For a data-driven plain record or JSON-object field, use text-key indexing
+  such as `record[field_name]`. A missing field evaluates to `nil`; this is
+  local data access and does not expose reflection, host objects, or a
+  capability.
 - Use canonical `try protected catch fallback` for bounded local recovery. The
   fallback cannot inspect the error, and hard string-allocation,
   heap-allocation, operand-stack, call-frame, instruction, or deadline

@@ -92,6 +92,11 @@ let request = workflow.input
 let prepared = workflow.outputs.prepare
 ```
 
+For a data-driven field in that JSON context, use a text key with normal index
+syntax, for example `let route = workflow.input[field_name]`. A missing field
+evaluates to `nil`; the injected value remains data only and cannot expose a
+host object or capability.
+
 The aggregate `{ input, outputs }` context is capped at 64 KiB and 64 JSON
 levels. A result must be JSON-representable and fit within that aggregate cap;
 functions, handles, cycles, non-finite numbers, and non-string object keys are

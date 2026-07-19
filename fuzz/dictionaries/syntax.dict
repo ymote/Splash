@@ -35,6 +35,8 @@
 "object.merge("
 "text.trim("
 "text.replace_all("
+"record["
+"workflow.input["
 "assert("
 ".await()"
 "splash"

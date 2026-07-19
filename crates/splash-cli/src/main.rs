@@ -2111,25 +2111,18 @@ mod tests {
     #[test]
     fn workflow_run_dataflow_uses_an_explicit_bounded_json_input() {
         let (output, completed) = workflow_execution_output_with_input(
-            r#"{
-                "format_version": 1,
-                "steps": [
-                    {
-                        "id": "prepare",
-                        "source": "use mod.tool\nlet raw = tool.call_json(\"math.add\", workflow.input)\nlet result = raw.parse_json()\nresult"
-                    },
-                    {
-                        "id": "summarize",
-                        "source": "let result = {next: workflow.outputs.prepare.total + 1}\nresult"
-                    }
-                ]
-            }"#,
+            include_str!("../../../examples/dataflow_workflow_draft.json"),
             &[CliWorkflowGrant {
                 step_id: "prepare".to_owned(),
                 tool: "math.add".to_owned(),
                 max_calls: 1,
             }],
-            Some(WorkflowData::new(json!({"left": 20, "right": 22})).unwrap()),
+            Some(
+                WorkflowData::from_input_json(include_str!(
+                    "../../../examples/dataflow_input.json"
+                ))
+                .unwrap(),
+            ),
             false,
             true,
         )
@@ -2139,7 +2132,13 @@ mod tests {
         assert_eq!(output["status"], json!("completed"));
         assert_eq!(
             output["dataflow"]["input"],
-            json!({"left": 20, "right": 22})
+            json!({
+                "left": 20,
+                "right": 22,
+                "label": " release total ",
+                "route": "primary",
+                "tags": ["release", "math"]
+            })
         );
         assert_eq!(
             output["dataflow"]["outputs"]["prepare"],
@@ -2147,7 +2146,13 @@ mod tests {
         );
         assert_eq!(
             output["dataflow"]["outputs"]["summarize"],
-            json!({"next": 43})
+            json!({
+                "label": "RELEASE TOTAL",
+                "route": "primary",
+                "total": 42,
+                "tag_count": 2,
+                "tags": ["MATH", "RELEASE"]
+            })
         );
         assert!(output["dataflow"]["fingerprint"].is_string());
     }
