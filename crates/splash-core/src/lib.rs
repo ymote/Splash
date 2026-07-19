@@ -1017,9 +1017,10 @@ impl<H: Any, S: Any> Runtime<H, S> {
     /// evaluating bytecode, resolving imports, or entering any host binding.
     ///
     /// This is advisory editor metadata only. It reports exact direct
-    /// `let binding = { ... }` initializers plus `let alias = target` or
-    /// `let alias = target.child` source edges, but never resolves an alias or
-    /// infers mutation, types, or runtime values.
+    /// `let binding = { ... }` initializers plus `let alias = target`,
+    /// `let alias = target.child`, or `let alias = target.child.grandchild`
+    /// source edges, but never resolves an alias or infers mutation, types, or
+    /// runtime values.
     pub fn static_record_shape_report(
         &self,
         source: &str,
@@ -1246,11 +1247,12 @@ pub fn module_import_report(source: &str) -> Result<ModuleImportReport, RuntimeE
 /// a capability host.
 ///
 /// Only a complete `let name = { ... }` initializer and exact
-/// `let alias = target` or `let alias = target.child` edge are retained. This
-/// is not general type inference and never resolves an alias or follows
-/// parenthesized/computed aliases, assignments, function returns, imported
-/// values, or runtime data. For invalid source, only metadata ending before the
-/// first syntax diagnostic is retained.
+/// `let alias = target`, `let alias = target.child`, or
+/// `let alias = target.child.grandchild` edge are retained. This is not general
+/// type inference and never resolves an alias or follows parenthesized/computed
+/// aliases, assignments, function returns, imported values, or runtime data.
+/// For invalid source, only metadata ending before the first syntax diagnostic
+/// is retained.
 pub fn static_record_shape_report(source: &str) -> Result<StaticRecordShapeReport, RuntimeError> {
     static_record_shape_report_named("inline.splash", source, ExecutionLimits::default())
 }
@@ -1615,10 +1617,10 @@ pub fn module_import_report_named(
 /// binding with a record literal before `valid_prefix_end_byte`. An optional
 /// retained child shape proves only that one direct field's whole value was a
 /// record literal. A retained alias proves only the exact source spelling
-/// `let alias = target` or `let alias = target.child`; it does not resolve the
-/// target. Neither metadata kind infers a field value type, mutation, function
-/// return, or runtime value, and neither can authorize an effect or module
-/// access.
+/// `let alias = target`, `let alias = target.child`, or
+/// `let alias = target.child.grandchild`; it does not resolve the target.
+/// Neither metadata kind infers a field value type, mutation, function return,
+/// or runtime value, and neither can authorize an effect or module access.
 pub fn static_record_shape_report_named(
     file: &str,
     source: &str,
