@@ -122,13 +122,14 @@ non-object `settings.splash` clears all advisory catalogs.
 
 The LSP can complete the current segment in a direct statement-position import
 such as `use mod.` or `use mod.app.`. It also completes immediate static
-children after a direct, visible imported module binding, including a bounded
-chain of catalog paths below that binding:
+children after a direct, visible imported module binding or a stable exact
+local root alias, including a bounded chain of catalog paths below that binding:
 
 ```splash
 use mod.app.weather
-weather.
-weather.current.
+let weather_api = weather
+weather_api.
+weather_api.current.
 ```
 
 Only immediate children at the selected catalog path are exposed. Intermediate
@@ -138,25 +139,31 @@ as plain text. An exact `callMode: "deferred"` leaf is labeled as returning a
 promise and documents that the generated call needs `await()`; a synchronous
 leaf is labeled as synchronous. The LSP never inserts `await()` or changes
 source beyond the selected identifier segment. A chain has at most 16
-identifier segments, and it must begin at the visible binding from a direct
-`use mod.*` statement.
+identifier segments. It must begin at the visible binding from a direct
+`use mod.*` statement or a qualifying exact root alias.
 
-This is an editor-only direct-import rule. The separate core
-`imported_module_call_hint_report` may preserve a reviewed module path through
-a bounded exact local root alias for a host review surface, but an alias such
-as `let weather_api = weather` does not receive module-catalog completion,
-hover, input-key completion, result-field metadata, or signature help.
+This is an editor-only, source-only alias rule. An alias such as
+`let weather_api = weather` is accepted only through exact root `let alias =
+binding` edges, for at most 16 hops, with complete lexical/import/alias
+metadata. Other than the active queried receiver, every reference in the
+resolved import-alias group must remain an exact group alias or direct member
+call; writes, member extraction,
+parenthesized/computed edges, and other escapes make completion, hover,
+input-key completion, result-field metadata, and signature help fail closed.
+It never resolves a module, evaluates source, or creates authority. The fixed
+`mod.tool` API deliberately does not use this alias rule.
 
-Hovering an exact catalog leaf reached through the same visible-import path
-returns its canonical catalog path, any plain-text description or call-mode
-note, any compact input- and output-record field lists, and the advisory
-authority boundary. Inferred namespaces and unresolved, shadowed, or non-direct
-paths have no catalog hover.
+Hovering an exact catalog leaf reached through the same visible import or
+qualifying alias path returns its canonical catalog path, any plain-text
+description or call-mode note, any compact input- and output-record field
+lists, and the advisory authority boundary. Inferred namespaces and unresolved,
+shadowed, or non-direct paths have no catalog hover.
 
 For an exact visible leaf with `callShape: "single_json"` and `inputFields`,
 the server also completes an undeclared top-level key while the cursor is in the
 first direct literal-record argument, such as
-`weather.current({loc})`. It replaces only that key identifier and does not
+`weather.current({loc})` or `weather_api.current({loc})`. It replaces only
+that key identifier and does not
 insert an object, a value, or `await()`. The recognizer rejects a nested record,
 second argument, string or comment cursor, mismatched/deep delimiters,
 duplicate prior key, truncated import metadata, shadowed receiver, malformed
@@ -166,8 +173,9 @@ capability.
 
 For an exact source binding on that same shaped leaf, the LSP can also use
 `outputFields` for a top-level result member: a synchronous leaf must appear
-exactly as `let result = weather.current(input)`, while a deferred leaf must
-appear exactly as `let result = weather.current(input).await()`. At
+exactly as `let result = weather.current(input)` or
+`let result = weather_api.current(input)`, while a deferred leaf uses the same
+exact direct form ending in `.await()`. At
 `result.field`, it completes projected field names and hovers known fields with
 plain-text metadata. It also follows exact local `let alias = result` chains of
 at most 16 hops, so `alias.field` receives the same advisory metadata. The
@@ -180,7 +188,8 @@ This is not result-type inference or runtime inspection; an output suggestion
 does not validate a result, load a module, or grant a capability.
 
 The server also advertises `textDocument/signatureHelp`. An exact visible leaf
-with both `callMode` and `callShape: "single_json"` has a one-argument `input`
+through the same import-or-qualifying-alias rule, with both `callMode` and
+`callShape: "single_json"`, has a one-argument `input`
 signature and labels its result as either a JSON value or a promise of one.
 Mode-only metadata remains useful for completion and hover, but gets no
 invented arity or value contract. The scanner is bounded by the source and
@@ -196,11 +205,11 @@ bounded local alias chain described above and never follows arbitrary member
 chains. Neither feature performs JSON Schema evaluation, runtime value
 inspection, or contract validation.
 
-`mod.tool` remains a fixed language surface: a visible `use mod.tool` binding
-offers only `call`, `call_json`, `start`, and `start_json`, regardless of this
-projection. The projection is also refused for a shadowed binding, a receiver
-that does not begin at a visible import, comments, strings, or source after the
-first syntax diagnostic.
+`mod.tool` remains a fixed language surface: only a direct visible
+`use mod.tool` binding offers `call`, `call_json`, `start`, and `start_json`,
+regardless of this projection. The projection is also refused for a shadowed
+binding, a receiver that does not begin at a visible import or qualifying alias,
+comments, strings, or source after the first syntax diagnostic.
 
 ## Security and authority
 

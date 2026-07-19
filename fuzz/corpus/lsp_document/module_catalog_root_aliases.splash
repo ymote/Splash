@@ -1,0 +1,6 @@
+use mod.fuzz.inspect
+let service = inspect
+let client = service
+let result = client.remote_add({left: 20, right: 22}).await()
+result.total
+client.status({})

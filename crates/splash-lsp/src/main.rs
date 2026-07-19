@@ -47,8 +47,8 @@ use splash_core::{
     LexicalCompletionReport, LexicalSymbol, LexicalSymbolKind, LexicalSymbolReport, ModuleImport,
     ModuleImportReport, SourceSpan, StaticRecordField, StaticRecordNestedShape, StaticRecordShape,
     StaticRecordShapeReport, SyntaxDiagnostic, TopLevelDeclaration, TopLevelDeclarationKind,
-    DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_SYNTAX_NESTING, MAX_LEXICAL_SYMBOL_OCCURRENCES,
-    MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH, MAX_SYNTAX_DIAGNOSTICS,
+    DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_SYNTAX_NESTING, MAX_IMPORTED_MODULE_ALIAS_DEPTH,
+    MAX_LEXICAL_SYMBOL_OCCURRENCES, MAX_STATIC_RECORD_LITERAL_CHILD_DEPTH, MAX_SYNTAX_DIAGNOSTICS,
 };
 
 const MAX_OPEN_DOCUMENTS: usize = 128;
@@ -721,6 +721,7 @@ impl SplashLanguageServer {
                         report,
                         lexical,
                         imports,
+                        shapes,
                         &self.module_catalog,
                         site,
                     ) {
@@ -899,6 +900,7 @@ impl SplashLanguageServer {
                 source,
                 report,
                 imports,
+                shapes,
                 &self.module_catalog,
                 member_site,
                 is_incomplete,
@@ -907,10 +909,12 @@ impl SplashLanguageServer {
 
         if let Some(record_site) = direct_module_input_record_completion_site(source, byte_offset) {
             let imports = self.module_imports(uri)?;
+            let shapes = self.static_record_shapes(uri)?;
             return Ok(module_catalog_input_field_completion(
                 source,
                 report,
                 imports,
+                shapes,
                 &self.module_catalog,
                 record_site,
                 lexical_incomplete || imports.truncated,
@@ -1001,10 +1005,12 @@ impl SplashLanguageServer {
         if self.module_catalog.unavailable {
             return Ok(None);
         }
+        let shapes = self.static_record_shapes(uri)?;
         let Some(module) = module_catalog_direct_member(
             source,
             lexical,
             imports,
+            shapes,
             &self.module_catalog,
             context.callee,
         ) else {
@@ -3912,11 +3918,12 @@ fn static_record_member_completion(
 /// Completes compact host-projected fields only at one exact top-level input
 /// key in a direct visible module call. The source scanner provides no value or
 /// nested-record semantics, and this function only looks up advisory catalog
-/// metadata after the existing import visibility checks succeed.
+/// metadata after the existing visible-import-or-alias checks succeed.
 fn module_catalog_input_field_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
     catalog: &ModuleCompletionCatalog,
     site: DirectModuleInputRecordCompletionSite,
     is_incomplete: bool,
@@ -3934,9 +3941,14 @@ fn module_catalog_input_field_completion(
     {
         return empty();
     }
-    let Some(module) =
-        module_catalog_direct_member(source, lexical, imports, catalog, site.context.callee)
-    else {
+    let Some(module) = module_catalog_direct_member(
+        source,
+        lexical,
+        imports,
+        shapes,
+        catalog,
+        site.context.callee,
+    ) else {
         return empty();
     };
     if module.call_mode.is_none() || module.call_shape != Some(ModuleCatalogCallShape::SingleJson) {
@@ -4018,9 +4030,14 @@ fn module_catalog_output_field_completion(
     if imports.truncated || catalog.unavailable {
         return Some(empty());
     }
-    let Some(fields) =
-        module_catalog_output_fields_for_binding(source, lexical, imports, catalog, output_binding)
-    else {
+    let Some(fields) = module_catalog_output_fields_for_binding(
+        source,
+        lexical,
+        imports,
+        shapes,
+        catalog,
+        output_binding,
+    ) else {
         return Some(empty());
     };
     let edit_range = span_range(source, site.member);
@@ -4324,6 +4341,7 @@ fn module_catalog_member_completion(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
     catalog: &ModuleCompletionCatalog,
     site: MemberCompletionSite,
     is_incomplete: bool,
@@ -4332,7 +4350,8 @@ fn module_catalog_member_completion(
         is_incomplete,
         items: Vec::new(),
     };
-    let Some(resolved_path) = module_catalog_member_parent_path(source, lexical, imports, site)
+    let Some(resolved_path) =
+        module_catalog_member_parent_path(source, lexical, imports, shapes, site)
     else {
         return empty();
     };
@@ -4363,11 +4382,13 @@ fn module_catalog_member_completion(
 }
 
 /// Resolves the catalog parent path for one member only when the receiver is
-/// an exact visible import. It never loads or validates a module.
+/// an exact visible import or a stable exact root alias. It never loads or
+/// validates a module.
 fn module_catalog_member_parent_path(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
     site: MemberCompletionSite,
 ) -> Option<Vec<String>> {
     if site.member.end_byte > lexical.valid_prefix_end_byte
@@ -4375,7 +4396,13 @@ fn module_catalog_member_parent_path(
     {
         return None;
     }
-    let import = visible_module_import_for_receiver(source, lexical, imports, site.receiver)?;
+    let import = visible_module_import_or_alias_for_catalog_receiver(
+        source,
+        lexical,
+        imports,
+        shapes,
+        site.receiver,
+    )?;
     let mut resolved_path = import.path.clone();
     if site.has_direct_receiver() {
         return Some(resolved_path);
@@ -4393,13 +4420,14 @@ fn module_catalog_member_parent_path(
     Some(resolved_path)
 }
 
-/// Finds an exact advisory leaf only through the same visible import path used
-/// by member completion and signature help. It never resolves a module or
-/// consults a capability runtime.
+/// Finds an exact advisory leaf only through the same visible import-or-alias
+/// path used by member completion and signature help. It never resolves a
+/// module or consults a capability runtime.
 fn module_catalog_direct_member<'catalog>(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
     catalog: &'catalog ModuleCompletionCatalog,
     site: MemberCompletionSite,
 ) -> Option<&'catalog ModuleCatalogCompletion> {
@@ -4410,7 +4438,7 @@ fn module_catalog_direct_member<'catalog>(
     if !is_canonical_identifier(method) {
         return None;
     }
-    let mut path = module_catalog_member_parent_path(source, lexical, imports, site)?;
+    let mut path = module_catalog_member_parent_path(source, lexical, imports, shapes, site)?;
     path.push(method.to_owned());
     catalog
         .modules
@@ -4420,7 +4448,7 @@ fn module_catalog_direct_member<'catalog>(
 
 /// Finds the compact output-field projection for one exact direct-module local
 /// result binding or its bounded exact alias group. It relies on the same
-/// visible-import lookup as direct module completion and never resolves
+/// visible-import-or-alias lookup as direct module completion and never resolves
 /// general expressions.
 fn module_catalog_output_fields_for_member<'catalog>(
     source: &str,
@@ -4431,7 +4459,14 @@ fn module_catalog_output_fields_for_member<'catalog>(
     site: MemberCompletionSite,
 ) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
     let output_binding = direct_module_output_binding_for_member(source, lexical, shapes, site)?;
-    module_catalog_output_fields_for_binding(source, lexical, imports, catalog, output_binding)
+    module_catalog_output_fields_for_binding(
+        source,
+        lexical,
+        imports,
+        shapes,
+        catalog,
+        output_binding,
+    )
 }
 
 fn direct_module_output_binding_for_member(
@@ -4616,14 +4651,21 @@ fn module_catalog_output_fields_for_binding<'catalog>(
     source: &str,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
     catalog: &'catalog ModuleCompletionCatalog,
     output_binding: DirectModuleOutputBinding,
 ) -> Option<&'catalog [ModuleCatalogRecordFieldCompletion]> {
     if imports.truncated || catalog.unavailable {
         return None;
     }
-    let module =
-        module_catalog_direct_member(source, lexical, imports, catalog, output_binding.call)?;
+    let module = module_catalog_direct_member(
+        source,
+        lexical,
+        imports,
+        shapes,
+        catalog,
+        output_binding.call,
+    )?;
     if module.call_shape != Some(ModuleCatalogCallShape::SingleJson)
         || !matches!(
             (module.call_mode, output_binding.awaited),
@@ -4681,6 +4723,7 @@ fn module_catalog_member_hover(
     symbols: &LexicalSymbolReport,
     lexical: &LexicalCompletionReport,
     imports: &ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
     catalog: &ModuleCompletionCatalog,
     site: MemberCompletionSite,
 ) -> Option<Hover> {
@@ -4688,12 +4731,8 @@ fn module_catalog_member_hover(
         return None;
     }
     let receiver_name = source.get(site.receiver.start_byte..site.receiver.end_byte)?;
-    if visible_symbol_in(&symbols.symbols, receiver_name, site.receiver.start_byte)
-        .is_none_or(|symbol| symbol.kind != LexicalSymbolKind::Import)
-    {
-        return None;
-    }
-    let mut path = module_catalog_member_parent_path(source, lexical, imports, site)?;
+    visible_symbol_in(&symbols.symbols, receiver_name, site.receiver.start_byte)?;
+    let mut path = module_catalog_member_parent_path(source, lexical, imports, shapes, site)?;
     let member = source.get(site.member.start_byte..site.member.end_byte)?;
     if !is_canonical_identifier(member) {
         return None;
@@ -5029,6 +5068,236 @@ fn visible_module_import_for_receiver<'imports>(
                 .find(|import| import.binding == symbol.definition)
         })
         .flatten()
+}
+
+/// Resolves an exact local root alias only for advisory module-catalog
+/// metadata. It shares the review boundary's fixed hop limit, but remains
+/// source-only and never creates a module binding or authority.
+struct ImportedModuleAliasIndex<'imports, 'symbol> {
+    imports_by_binding: HashMap<usize, &'imports ModuleImport>,
+    symbols_by_definition: HashMap<usize, &'symbol LexicalSymbol>,
+    imported_binding_by_alias: HashMap<usize, usize>,
+    alias_binding_by_target: HashMap<(usize, usize), usize>,
+}
+
+impl<'imports, 'symbol> ImportedModuleAliasIndex<'imports, 'symbol> {
+    fn new(
+        source: &str,
+        symbols: &'symbol [LexicalSymbol],
+        imports: &'imports [ModuleImport],
+        shapes: &StaticRecordShapeReport,
+    ) -> Self {
+        let imports_by_binding = imports
+            .iter()
+            .map(|import| (import.binding.start_byte, import))
+            .collect::<HashMap<_, _>>();
+        let symbols_by_definition = symbols
+            .iter()
+            .map(|symbol| (symbol.definition.start_byte, symbol))
+            .collect::<HashMap<_, _>>();
+        let mut alias_targets = HashMap::with_capacity(shapes.aliases.len());
+        let mut alias_binding_by_target = HashMap::with_capacity(shapes.aliases.len());
+
+        for alias in shapes
+            .aliases
+            .iter()
+            .filter(|alias| alias.direct_child.is_none() && alias.direct_grandchild.is_none())
+        {
+            let Some(target_name) = source.get(alias.target.start_byte..alias.target.end_byte)
+            else {
+                continue;
+            };
+            let Some(target) = visible_symbol_in(symbols, target_name, alias.target.start_byte)
+            else {
+                continue;
+            };
+            alias_targets.insert(alias.binding.start_byte, target.definition.start_byte);
+            alias_binding_by_target.insert(
+                (alias.target.start_byte, alias.target.end_byte),
+                alias.binding.start_byte,
+            );
+        }
+
+        let mut imported_binding_by_alias = HashMap::with_capacity(alias_targets.len());
+        for alias_binding in alias_targets.keys().copied() {
+            if let Some(import_binding) = imported_module_binding_for_alias(
+                alias_binding,
+                &symbols_by_definition,
+                &imports_by_binding,
+                &alias_targets,
+            ) {
+                imported_binding_by_alias.insert(alias_binding, import_binding);
+            }
+        }
+
+        Self {
+            imports_by_binding,
+            symbols_by_definition,
+            imported_binding_by_alias,
+            alias_binding_by_target,
+        }
+    }
+
+    fn imported_module_for_symbol(&self, symbol: &LexicalSymbol) -> Option<&'imports ModuleImport> {
+        let import_binding = match symbol.kind {
+            LexicalSymbolKind::Import => symbol.definition.start_byte,
+            LexicalSymbolKind::Let => *self
+                .imported_binding_by_alias
+                .get(&symbol.definition.start_byte)?,
+            LexicalSymbolKind::Function
+            | LexicalSymbolKind::Parameter
+            | LexicalSymbolKind::LoopBinding
+            | LexicalSymbolKind::LambdaParameter => return None,
+        };
+        self.imports_by_binding.get(&import_binding).copied()
+    }
+
+    fn alias_group(&self, import_binding: usize) -> HashSet<usize> {
+        let mut group = HashSet::with_capacity(self.imported_binding_by_alias.len() + 1);
+        group.insert(import_binding);
+        group.extend(self.imported_binding_by_alias.iter().filter_map(
+            |(&alias_binding, &resolved_import)| {
+                (resolved_import == import_binding).then_some(alias_binding)
+            },
+        ));
+        group
+    }
+}
+
+fn imported_module_binding_for_alias(
+    initial_binding: usize,
+    symbols_by_definition: &HashMap<usize, &LexicalSymbol>,
+    imports_by_binding: &HashMap<usize, &ModuleImport>,
+    alias_targets: &HashMap<usize, usize>,
+) -> Option<usize> {
+    let mut current_binding = initial_binding;
+    let mut visited = HashSet::with_capacity(MAX_IMPORTED_MODULE_ALIAS_DEPTH + 1);
+
+    for depth in 0..=MAX_IMPORTED_MODULE_ALIAS_DEPTH {
+        if !visited.insert(current_binding) {
+            return None;
+        }
+        if imports_by_binding.contains_key(&current_binding) {
+            return Some(current_binding);
+        }
+        if depth == MAX_IMPORTED_MODULE_ALIAS_DEPTH
+            || symbols_by_definition
+                .get(&current_binding)
+                .is_none_or(|symbol| symbol.kind != LexicalSymbolKind::Let)
+        {
+            return None;
+        }
+        current_binding = *alias_targets.get(&current_binding)?;
+    }
+
+    None
+}
+
+fn visible_module_import_or_alias_for_catalog_receiver<'imports>(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    imports: &'imports ModuleImportReport,
+    shapes: &StaticRecordShapeReport,
+    receiver: SourceSpan,
+) -> Option<&'imports ModuleImport> {
+    if receiver.end_byte > lexical.valid_prefix_end_byte
+        || receiver.end_byte > imports.valid_prefix_end_byte
+    {
+        return None;
+    }
+    let receiver_name = source.get(receiver.start_byte..receiver.end_byte)?;
+    let initial = visible_symbol_at(lexical, receiver_name, receiver.start_byte)?;
+    if initial.kind == LexicalSymbolKind::Import {
+        return imports
+            .imports
+            .iter()
+            .find(|import| import.binding == initial.definition);
+    }
+    if initial.kind != LexicalSymbolKind::Let
+        || lexical.symbols_truncated
+        || imports.truncated
+        || shapes.aliases_truncated
+        || receiver.end_byte > shapes.valid_prefix_end_byte
+    {
+        return None;
+    }
+
+    let aliases = ImportedModuleAliasIndex::new(source, &lexical.symbols, &imports.imports, shapes);
+    let import = aliases.imported_module_for_symbol(initial)?;
+    let group = aliases.alias_group(import.binding.start_byte);
+    imported_module_alias_group_is_stable(source, &aliases, &group, receiver).then_some(import)
+}
+
+fn imported_module_alias_group_is_stable(
+    source: &str,
+    aliases: &ImportedModuleAliasIndex<'_, '_>,
+    group: &HashSet<usize>,
+    requested_receiver: SourceSpan,
+) -> bool {
+    group.iter().all(|binding_start_byte| {
+        let Some(symbol) = aliases
+            .symbols_by_definition
+            .get(binding_start_byte)
+            .copied()
+        else {
+            return false;
+        };
+        symbol.references.iter().copied().all(|reference| {
+            reference == requested_receiver
+                || aliases
+                    .alias_binding_by_target
+                    .get(&(reference.start_byte, reference.end_byte))
+                    .is_some_and(|alias_binding| group.contains(alias_binding))
+                || imported_module_alias_reference_is_direct_member_call(source, reference)
+        })
+    })
+}
+
+fn imported_module_alias_reference_is_direct_member_call(
+    source: &str,
+    reference: SourceSpan,
+) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = reference.end_byte;
+    let mut member_count = 0_usize;
+
+    loop {
+        let Some(separator) = skip_splash_trivia(source, index) else {
+            return false;
+        };
+        if bytes.get(separator) != Some(&b'.') {
+            return false;
+        }
+        let Some(member_start) = skip_splash_trivia(source, separator + 1) else {
+            return false;
+        };
+        if !bytes
+            .get(member_start)
+            .is_some_and(|byte| is_identifier_start_byte(*byte))
+        {
+            return false;
+        }
+        member_count += 1;
+        if member_count > MAX_LSP_MODULE_PATH_SEGMENTS {
+            return false;
+        }
+        index = member_start + 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+
+        let Some(next) = skip_splash_trivia(source, index) else {
+            return false;
+        };
+        match bytes.get(next) {
+            Some(b'(') => return true,
+            Some(b'.') => index = next,
+            _ => return false,
+        }
+    }
 }
 
 fn visible_symbol_at<'symbol>(
@@ -9098,6 +9367,357 @@ mod tests {
                 position_at_byte(shadowed_source, shadowed_cursor),
             )
             .expect("shadowed signature request succeeds")
+            .is_none());
+    }
+
+    #[test]
+    fn catalog_metadata_follows_stable_exact_root_module_aliases() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.add",
+                "description": "Adds reviewed integers.",
+                "callMode": "synchronous",
+                "callShape": "single_json",
+                "inputFields": [
+                    {
+                        "name": "left",
+                        "type": "integer",
+                        "required": true
+                    },
+                    {
+                        "name": "right",
+                        "type": "integer",
+                        "required": false
+                    }
+                ],
+                "outputFields": [
+                    {
+                        "name": "total",
+                        "type": "integer",
+                        "required": true
+                    }
+                ]
+            },
+            {
+                "path": "mod.arithmetic.metrics.count",
+                "description": "Returns a reviewed metric count."
+            }
+        ]));
+        let source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "let calculator = math\n",
+            "let result = calculator.add({left: 20, ri: 22})\n",
+            "result.to"
+        );
+        let mut server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        server.open_document(document(1, source));
+
+        let input_start = source.find("ri:").expect("partial input field exists");
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(source, input_start + "ri".len()),
+                )
+                .expect("aliased input-field completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["right"]
+        );
+
+        let method_start = source.find("add").expect("aliased method exists");
+        let hover = server
+            .hover(&test_uri(), position_at_byte(source, method_start + 1))
+            .expect("aliased module hover succeeds")
+            .expect("stable exact alias has advisory hover metadata");
+        let HoverContents::Markup(MarkupContent { value, .. }) = hover.contents else {
+            panic!("aliased module hover should use markup");
+        };
+        assert!(value.contains("`mod.arithmetic.add`"));
+
+        let signature = server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(source, input_start + "ri".len()),
+            )
+            .expect("aliased signature help succeeds")
+            .expect("stable exact alias has an advisory signature");
+        assert_eq!(
+            signature.signatures[0].label,
+            "calculator.add(input) -> JSON value"
+        );
+
+        let output_start = source.rfind("to").expect("partial output field exists");
+        assert_eq!(
+            server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(source, output_start + "to".len()),
+                )
+                .expect("aliased output-field completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["total"]
+        );
+
+        let member_source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "let calculator = math\n",
+            "calculator."
+        );
+        let mut member_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        member_server.open_document(document(1, member_source));
+        assert_eq!(
+            member_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(member_source, member_source.len()),
+                )
+                .expect("aliased member completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "metrics"]
+        );
+
+        let shadowed_import_source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "let arithmetic = {}\n",
+            "math."
+        );
+        let mut shadowed_import_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        shadowed_import_server.open_document(document(1, shadowed_import_source));
+        assert_eq!(
+            shadowed_import_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(shadowed_import_source, shadowed_import_source.len()),
+                )
+                .expect("source-position-aware alias completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "metrics"]
+        );
+
+        let nested_source = concat!(
+            "use mod.arithmetic\n",
+            "let math = arithmetic\n",
+            "let calculator = math\n",
+            "calculator.metrics."
+        );
+        let mut nested_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        nested_server.open_document(document(1, nested_source));
+        assert_eq!(
+            nested_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(nested_source, nested_source.len()),
+                )
+                .expect("aliased nested member completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["count"]
+        );
+
+        let mut bounded_source = String::from("use mod.arithmetic\n");
+        let mut previous = "arithmetic".to_owned();
+        for index in 0..splash_core::MAX_IMPORTED_MODULE_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            bounded_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        bounded_source.push_str(&format!("{previous}."));
+        let mut bounded_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        bounded_server.open_document(document(1, &bounded_source));
+        assert_eq!(
+            bounded_server
+                .completion(
+                    &test_uri(),
+                    position_at_byte(&bounded_source, bounded_source.len()),
+                )
+                .expect("bounded alias completion succeeds")
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["add", "metrics"]
+        );
+    }
+
+    #[test]
+    fn catalog_module_aliases_fail_closed_and_never_alias_mod_tool() {
+        let catalog = module_catalog(serde_json::json!([
+            {
+                "path": "mod.arithmetic.add",
+                "callMode": "synchronous"
+            }
+        ]));
+
+        for source in [
+            concat!(
+                "use mod.arithmetic\n",
+                "let math = arithmetic\n",
+                "math = {}\n",
+                "math."
+            ),
+            concat!(
+                "use mod.arithmetic\n",
+                "let math = arithmetic\n",
+                "let sibling = math\n",
+                "sibling.add = nil\n",
+                "math."
+            ),
+            concat!(
+                "use mod.arithmetic\n",
+                "let math = arithmetic\n",
+                "let method = math.add\n",
+                "math."
+            ),
+            concat!(
+                "use mod.arithmetic\n",
+                "let math = arithmetic\n",
+                "let parenthesized = (math)\n",
+                "math."
+            ),
+            concat!(
+                "use mod.arithmetic\n",
+                "let math = arithmetic.metrics\n",
+                "math."
+            ),
+        ] {
+            let mut server = SplashLanguageServer::with_completion_catalogs(
+                ToolCompletionCatalog::default(),
+                catalog.clone(),
+            );
+            server.open_document(document(1, source));
+            assert!(
+                server
+                    .completion(&test_uri(), position_at_byte(source, source.len()))
+                    .expect("unsafe alias completion request succeeds")
+                    .items
+                    .is_empty(),
+                "catalog metadata must fail closed for {source:?}"
+            );
+        }
+
+        let mut over_depth_source = String::from("use mod.arithmetic\n");
+        let mut previous = "arithmetic".to_owned();
+        for index in 0..=splash_core::MAX_IMPORTED_MODULE_ALIAS_DEPTH {
+            let alias = format!("alias_{index}");
+            over_depth_source.push_str(&format!("let {alias} = {previous}\n"));
+            previous = alias;
+        }
+        over_depth_source.push_str(&format!("{previous}."));
+        let mut over_depth_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        over_depth_server.open_document(document(1, &over_depth_source));
+        assert!(over_depth_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&over_depth_source, over_depth_source.len()),
+            )
+            .expect("over-depth alias completion request succeeds")
+            .items
+            .is_empty());
+
+        let mut truncated_import_source = String::from("use mod.arithmetic\n");
+        for index in 0..=splash_core::MAX_MODULE_IMPORTS {
+            truncated_import_source.push_str(&format!("use mod.module_{index}\n"));
+        }
+        truncated_import_source.push_str("let math = arithmetic\nmath.");
+        let mut truncated_import_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog.clone(),
+        );
+        truncated_import_server.open_document(document(1, &truncated_import_source));
+        let truncated_import_completion = truncated_import_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&truncated_import_source, truncated_import_source.len()),
+            )
+            .expect("truncated import alias completion request succeeds");
+        assert!(truncated_import_completion.is_incomplete);
+        assert!(truncated_import_completion.items.is_empty());
+
+        let mut truncated_alias_source = String::from("use mod.arithmetic\n");
+        for index in 0..=MAX_STATIC_RECORD_ALIASES {
+            truncated_alias_source.push_str(&format!("let alias_{index} = arithmetic\n"));
+        }
+        truncated_alias_source.push_str("alias_0.");
+        let mut truncated_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            catalog,
+        );
+        truncated_alias_server.open_document(document(1, &truncated_alias_source));
+        assert!(truncated_alias_server
+            .completion(
+                &test_uri(),
+                position_at_byte(&truncated_alias_source, truncated_alias_source.len()),
+            )
+            .expect("truncated alias completion request succeeds")
+            .items
+            .is_empty());
+
+        let tool_alias_source = concat!("use mod.tool\n", "let tool_alias = tool\n", "tool_alias.");
+        let mut tool_alias_server = SplashLanguageServer::with_completion_catalogs(
+            ToolCompletionCatalog::default(),
+            ModuleCompletionCatalog::default(),
+        );
+        tool_alias_server.open_document(document(1, tool_alias_source));
+        assert!(tool_alias_server
+            .completion(
+                &test_uri(),
+                position_at_byte(tool_alias_source, tool_alias_source.len()),
+            )
+            .expect("tool alias completion request succeeds")
+            .items
+            .is_empty());
+
+        let tool_alias_signature_source = concat!(
+            "use mod.tool\n",
+            "let tool_alias = tool\n",
+            "tool_alias.call(\"text.echo\", \"hello\")"
+        );
+        let mut tool_alias_signature_server = SplashLanguageServer::default();
+        tool_alias_signature_server.open_document(document(1, tool_alias_signature_source));
+        let tool_alias_argument = tool_alias_signature_source
+            .find("hello")
+            .expect("tool alias argument exists");
+        assert!(tool_alias_signature_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(tool_alias_signature_source, tool_alias_argument + 1),
+            )
+            .expect("tool alias signature request succeeds")
             .is_none());
     }
 

@@ -374,8 +374,9 @@ value onward, and incomplete alias metadata suppress the hint. This whole-group
 rule also rejects a call captured in a function when a later source statement
 could rewrite the receiver before invocation.
 This is a bounded pre-approval presentation aid, not module resolution or
-authorization. The LSP catalog behavior below deliberately remains limited to
-a direct visible import binding.
+authorization. The LSP catalog behavior below can use the same stable exact
+root-alias form for advisory module metadata, but remains source-only and
+keeps fixed `mod.tool` suggestions limited to a direct visible import binding.
 
 The server separately recognizes an exact visible `use mod.tool` binding. At a
 direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
@@ -397,9 +398,10 @@ and compact `inputFields` and `outputFields`. Each field has a canonical
 identifier, one fixed JSON type, a required bit, and optional plain-text
 description. The LSP shows both bounded field lists in leaf hover and signature
 help, and can complete an undeclared top-level key in the first direct
-literal-record argument from `inputFields`. For an exact source binding
-`let result = imported.method(input)` on a synchronous leaf, or the exact
-`let result = imported.method(input).await()` form on a deferred leaf, it also
+literal-record argument from `inputFields`. For an exact source binding through
+a direct visible import or qualifying exact root alias, such as
+`let result = receiver.method(input)` on a synchronous leaf, or the exact
+`let result = receiver.method(input).await()` form on a deferred leaf, it also
 completes and hovers top-level `result.field` names from `outputFields`. It can
 follow exact local `let alias = result` chains of at most 16 hops and serves
 the same top-level fields at `alias.field`. That bounded recognizer rejects

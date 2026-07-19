@@ -559,7 +559,8 @@ An editor may also supply a separate advisory module-interface projection
 through `initializationOptions.splash.moduleCatalog` or a later
 `workspace/didChangeConfiguration` update. It completes the current segment in
 a direct statement-position `use mod.*` path and bounded catalog paths after a
-direct, visible imported module binding, and gives an exact catalog leaf a
+direct, visible imported module binding or a stable exact local root-alias
+chain, and gives an exact catalog leaf a
 plain-text advisory hover. An exact leaf that explicitly declares both a mode
 and `single_json` call shape also receives a bounded one-value signature; the
 server never infers a signature from a mode alone. It does not load a source
@@ -568,10 +569,12 @@ file, resolve a module, inspect a runtime export, or override the fixed
 key keeps its prior value, JSON `null` explicitly clears it, and a malformed or
 over-limit key value makes only that catalog unavailable. A malformed `settings`
 value or non-object `settings.splash` clears all advisory catalogs. Neither
-projection authorizes source. This direct-import editor boundary is
-intentionally narrower than the separate core review alias recognizer; a local
-module alias does not receive catalog completion or hover. See [editor module-interface
-projection](docs/module-catalog.md) for its exact format and bounds. A
+projection authorizes source. Module aliases must be exact `let alias = binding`
+chains of at most 16 hops with complete source metadata and no write, member
+extraction, parenthesized/computed edge, or other value escape in their resolved
+group; otherwise catalog metadata fails closed. This does not extend the fixed
+`mod.tool` API, whose editor support remains direct-import-only. See [editor
+module-interface projection](docs/module-catalog.md) for its exact format and bounds. A
 truncated lexical index can still serve retained, sound definitions and hover,
 but exhaustive reference, highlight, and rename requests fail instead of
 returning a partial set.

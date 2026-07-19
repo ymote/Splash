@@ -176,13 +176,18 @@ or a later `settings.splash.moduleCatalog` update: a bounded list of canonical
 a canonical source identifier, one fixed JSON type, an explicit required bit,
 and an optional plain-text description. This LSP-only projection can complete
 the current segment of a direct statement-position `use mod.*` path, or bounded
-catalog paths below a direct visible imported-module binding. A deferred leaf is
-only labeled as returning a promise; an exact visible catalog leaf also has a
+catalog paths below a direct visible imported-module binding or stable exact
+local root-alias chain of at most 16 hops. Other than the active queried
+receiver, every reference in that alias group must remain an exact group alias
+or direct member call; writes, member extraction, parenthesized/computed edges,
+escapes, and truncated alias metadata fail closed. A deferred leaf is only
+labeled as returning a promise; an exact visible catalog leaf also has a
 plain-text advisory hover. For an exact shaped leaf, it can complete an
 undeclared top-level key in the first direct literal record argument from
 `inputFields`, and documents both input and output fields in hover and signature
-help. For an exact root `let result = imported.method(input)` binding on a
-synchronous leaf, or its exact deferred `.await()` form, it can complete and
+help. For an exact root `let result = receiver.method(input)` binding on a
+synchronous leaf, where `receiver` is that import or qualifying alias, or its
+exact deferred `.await()` form, it can complete and
 hover top-level `result.field` names from `outputFields`. It also follows exact
 local `let alias = result` chains of at most 16 hops. It does not complete
 nested keys, infer values, follow computed or deeper aliases, or infer
@@ -190,7 +195,8 @@ arbitrary result-binding members. The LSP never inserts `await()` or changes sou
 beyond the selected identifier. It is not part of the core report and does not
 load a source file, resolve or validate a module, inspect runtime exports, infer
 arbitrary fields, or make a Rust adapter current or callable. `mod.tool` remains
-a fixed language surface and never receives metadata-defined members. The
+a fixed language surface, accepts only a direct visible import for its fixed
+methods, and never receives metadata-defined members. The
 client-supplied projection is advisory, potentially stale, and never authority;
 an omitted key retains the prior projection, JSON `null` explicitly clears it,
 and malformed, duplicate, or over-limit input is discarded as a whole and makes
@@ -201,8 +207,8 @@ interface projection](module-catalog.md) for the exact wire shape and limits.
 
 The LSP additionally offers bounded signature help for direct visible
 `tool.call`, `tool.start`, `tool.call_json`, and `tool.start_json` calls, plus
-an exact visible advisory module leaf that declares both `callMode` and
-`callShape: "single_json"`. Fixed tool signatures describe the text or JSON
+an exact visible advisory module leaf rooted at that import-or-qualifying-alias
+path which declares both `callMode` and `callShape: "single_json"`. Fixed tool signatures describe the text or JSON
 bridge; that direct module shape takes one JSON-compatible `input` and marks a
 deferred result as a promise. A mode-only leaf has no assumed signature. The
 editor scans only the bounded client source and advisory metadata. It does not

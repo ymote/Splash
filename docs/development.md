@@ -230,8 +230,9 @@ projection through `initializationOptions.splash.moduleCatalog` or a later
 
 The LSP completes the current segment in a direct statement-position `use
 mod.*` path, and bounded catalog paths below a direct visible imported-module
-binding. It does not offer metadata-defined members for `mod.tool`, which keeps
-its fixed four language methods. The server neither reads a module URI or file,
+binding or a stable exact local root-alias chain. It does not offer
+metadata-defined members for `mod.tool`, which keeps its fixed four language
+methods. The server neither reads a module URI or file,
 nor resolves, validates, installs, or loads a module; it also does not inspect
 runtime exports or infer general fields. An omitted `moduleCatalog` key retains
 its prior projection, JSON `null` explicitly clears it, and a malformed update
@@ -240,10 +241,15 @@ independent of each other and of the atomic workflow-data pair. A malformed
 `settings` value or non-object `settings.splash` invalidates all advisory
 catalogs so the server cannot retain stale metadata.
 
-This direct-import editor boundary is intentionally narrower than the separate
-core imported-module review API. That API can preserve a reviewed `mod.*` path
-through a bounded exact local root alias for a pre-approval surface, but local
-aliases do not receive module-catalog completion, hover, or signature metadata.
+An advisory module alias is only an exact `let alias = binding` chain of at
+most 16 hops from one visible import. The lexical, import, and alias reports
+must be complete for that group, and other than the active catalog receiver,
+each group reference must remain another exact group alias or a direct member
+call; writes, member extraction,
+parenthesized/computed edges, and other escapes suppress all catalog metadata
+for the group. This bounded source-only rule covers member completion, hover,
+signature help, input-key completion, and shaped result fields. It does not
+alias the fixed `mod.tool` API, which remains direct-import-only.
 
 Each descriptor must use a canonical `mod.*` path with at least one following
 identifier, at most 16 path segments and 256 path bytes, plus an optional
@@ -266,8 +272,9 @@ labeled as returning a promise, but the LSP never inserts `await()` or makes a
 host binding available or authorizes a capability.
 
 The LSP also serves bounded `textDocument/signatureHelp` for a direct visible
-`mod.tool` call and an exact visible advisory module leaf with both `callMode`
-and `callShape: "single_json"`. Fixed `mod.tool` signatures describe their text
+`mod.tool` call and an exact visible advisory module leaf rooted at a direct
+import or qualifying module alias, with both `callMode` and
+`callShape: "single_json"`. Fixed `mod.tool` signatures describe their text
 or JSON bridge; only that explicit shape gives a direct module one
 JSON-compatible `input` and synchronous or deferred result label. Mode-only
 metadata still completes and hovers, but has no assumed arity. The cursor
@@ -279,9 +286,9 @@ module, or grants authority. When a shaped leaf also supplies `inputFields` or
 field names, fixed JSON types, required bits, and optional descriptions. It can
 additionally complete an undeclared top-level key only in that leaf's first
 direct literal record argument from `inputFields`, after the same visible-import
-and exact-leaf checks. For an exact original binding
-`let result = imported.method(input)` on a synchronous leaf, or the exact
-deferred `.await()` form, it also completes and hovers top-level
+or qualifying-alias and exact-leaf checks. For an exact original binding such
+as `let result = receiver.method(input)`, where `receiver` is that import or
+qualifying alias, or the exact deferred `.await()` form, it also completes and hovers top-level
 `result.field` names from `outputFields`. It follows exact local
 `let alias = result` chains of at most 16 hops, but rejects computed/deeper
 aliases, mutations and escapes, nested result chains, parenthesized/computed

@@ -26,8 +26,11 @@
   arbitrary module, type, or field inference. A separate bounded,
   initialization-time or configuration-refresh advisory module interface
   projection can complete direct `use mod.*` path segments and bounded catalog
-  paths below a direct visible imported-module binding, and plainly hover an
-  exact visible catalog leaf. Exact one-JSON-value leaves can present bounded
+  paths below a direct visible imported-module binding or a stable exact local
+  root-alias chain of at most 16 hops, and plainly hover an exact visible
+  catalog leaf. Writes, member extraction, parenthesized/computed edges,
+  escapes, and truncated alias metadata fail closed; fixed `mod.tool` methods
+  remain direct-import-only. Exact one-JSON-value leaves can present bounded
   schema-derived input and output record fields in hover/signature help, with
   input-key completion only in the first direct literal record argument,
   without module loading, resolution, runtime export inspection, or authority
