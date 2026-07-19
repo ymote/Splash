@@ -45,9 +45,9 @@ and keeps UI support optional rather than making UI the language boundary.
   unbounded native entry points before source evaluation, leaving only the
   documented core plus trusted host-installed modules reachable from Splash.
 - Frozen no-authority `mod.std.math` scalar helpers, `mod.std.json` bounded
-  JSON helpers, and `mod.std.text` bounded text helpers for common dataflow
-  without restoring Makepad's broader shader-oriented `mod.math` surface or
-  granting host authority.
+  JSON helpers, `mod.std.text` bounded text helpers, and `mod.std.array`
+  bounded shallow-array helpers for common dataflow without restoring Makepad's
+  broader shader-oriented `mod.math` surface or granting host authority.
 - A bounded evaluator with source, individual-string, tracked Splash-owned
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
@@ -257,6 +257,15 @@ For local text shaping, `use mod.std.text` provides `trim`, `lower`, `upper`,
 Unicode-scalar `len`, literal predicates, and literal `replace_all`. Results
 use Splash's configured string bound; the module does not expose regexes,
 host state, filesystem, process, network, clock, entropy, or crate access.
+
+For local collection shaping, `use mod.std.array` provides `array.len(value)`,
+`array.slice(value, start, end)`, `array.concat(left, right)`, and
+`array.reverse(value)`. `slice` uses a half-open range with non-negative
+integer indexes. The transforming helpers are callback-free, shallow, and
+reject source arrays over 4,096 items; `concat` also rejects a combined result
+over that bound. `len` is constant-time and uncapped. The module does not
+expose host state, filesystem, process, network, clock, entropy, or crate
+access.
 
 ## Example
 
@@ -557,10 +566,12 @@ surfaces use no tool-catalog or adapter lookup, do not follow local aliases,
 and do not imply a capability grant. For an exact visible `use mod.std.json`
 binding, it completes `parse` and `stringify` with fixed plain-text hover and
 signature help. For an exact visible `use mod.std.text` binding, it completes
-the fixed text functions with plain-text hover and signature help. At a
+the fixed text functions with plain-text hover and signature help. For an exact
+visible `use mod.std.array` binding, it completes `len`, `slice`, `concat`, and
+`reverse` with the same fixed plain-text hover and signature help. At a
 statement-position `use mod.` path, the same static projection completes `std`;
-below `use mod.std.` it completes `assert`, `json`, `math`, and `text`. The
-frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An
+below `use mod.std.` it completes `array`, `assert`, `json`, `math`, and `text`.
+The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An
 integration may additionally supply a
 advisory tool-catalog projection through
 `initializationOptions.splash.toolCatalog` or a later

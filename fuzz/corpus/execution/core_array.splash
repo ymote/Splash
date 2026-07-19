@@ -1,0 +1,7 @@
+use mod.std.assert
+use mod.std.array
+let values = [1, 2, 3]
+let selected = array.slice(values, 1, 3)
+let joined = array.concat([0], selected)
+assert(array.len(joined) == 3)
+array.reverse(joined)

@@ -83,6 +83,13 @@ pub const DEFAULT_BUDGET_SAMPLE_INTERVAL: u32 = 1_024;
 pub const DEFAULT_MAX_JSON_DATA_BYTES: usize = 64 * 1024;
 /// Default maximum JSON container nesting accepted at a host-data boundary.
 pub const DEFAULT_MAX_JSON_DATA_DEPTH: usize = 64;
+/// Maximum source array items processed by one transforming `mod.std.array`
+/// helper.
+///
+/// The VM heap bounds retained array storage, while this independent ceiling
+/// bounds native helper work over a host-provided array. `array.len` is
+/// constant-time and does not use this ceiling.
+pub const MAX_STANDARD_ARRAY_ITEMS: usize = 4_096;
 /// Maximum byte length of a host-selected injected-global identifier.
 pub const MAX_JSON_GLOBAL_NAME_BYTES: usize = 64;
 /// Maximum structured syntax diagnostics returned for one source check.
@@ -2442,6 +2449,7 @@ fn restrict_vendored_module_surface(
     install_standard_math_module(vm, std);
     install_standard_json_module(vm, std, json_method_limits);
     install_standard_text_module(vm, std);
+    install_standard_array_module(vm, std);
     // Retained Splash core values and the VM-internal `Range` prototype are
     // setup-owned language primitives, not mutable cross-evaluation points.
     vm.bx.heap.freeze(std);
@@ -2839,6 +2847,191 @@ fn standard_text_expected_string(
     script_err_type_mismatch!(
         vm.bx.threads.cur_ref().trap,
         "std.text.{function} expects `{parameter}` to be a string"
+    )
+}
+
+/// Installs shallow, callback-free array transformations for bounded local
+/// dataflow. The module never introspects host data or grants authority.
+fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject) {
+    let array = vm.bx.heap.new_with_proto(NIL);
+    vm.add_method(
+        array,
+        id!(len),
+        script_args_def!(value = NIL),
+        standard_array_len,
+    );
+    vm.add_method(
+        array,
+        id!(slice),
+        script_args_def!(value = NIL, start = NIL, end = NIL),
+        standard_array_slice,
+    );
+    vm.add_method(
+        array,
+        id!(concat),
+        script_args_def!(left = NIL, right = NIL),
+        standard_array_concat,
+    );
+    vm.add_method(
+        array,
+        id!(reverse),
+        script_args_def!(value = NIL),
+        standard_array_reverse,
+    );
+    vm.bx
+        .heap
+        .set_value_def(std_module, id!(array).into(), array.into());
+    vm.bx.heap.freeze(array);
+}
+
+fn standard_array_len(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let Some(array) = value.as_array() else {
+        return standard_array_expected_array(vm, "len", "value");
+    };
+    vm.bx.heap.array_len(array).into()
+}
+
+fn standard_array_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let start = script_value!(vm, args.start);
+    let end = script_value!(vm, args.end);
+    let (array, length) = match standard_array_input(vm, value, "slice", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    let start = match standard_array_index(vm, start, "slice", "start") {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    let end = match standard_array_index(vm, end, "slice", "end") {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    if start > end || end > length {
+        return script_err_invalid_args!(
+            vm.bx.threads.cur_ref().trap,
+            "std.array.slice requires `start` <= `end` <= array length"
+        );
+    }
+
+    standard_array_copy_indices(vm, array, start..end)
+}
+
+fn standard_array_concat(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let left = script_value!(vm, args.left);
+    let right = script_value!(vm, args.right);
+    let (left, left_length) = match standard_array_input(vm, left, "concat", "left") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    let (right, right_length) = match standard_array_input(vm, right, "concat", "right") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    let Some(total_length) = left_length.checked_add(right_length) else {
+        return standard_array_item_limit(vm, "concat");
+    };
+    if total_length > MAX_STANDARD_ARRAY_ITEMS {
+        return standard_array_item_limit(vm, "concat");
+    }
+
+    let output = vm.bx.heap.new_array();
+    standard_array_append_indices(vm, output, left, 0..left_length);
+    standard_array_append_indices(vm, output, right, 0..right_length);
+    output.into()
+}
+
+fn standard_array_reverse(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let (array, length) = match standard_array_input(vm, value, "reverse", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+
+    standard_array_copy_indices(vm, array, (0..length).rev())
+}
+
+fn standard_array_input(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    function: &'static str,
+    parameter: &'static str,
+) -> Result<(vm::ScriptArray, usize), ScriptValue> {
+    let Some(array) = value.as_array() else {
+        return Err(standard_array_expected_array(vm, function, parameter));
+    };
+    let length = vm.bx.heap.array_len(array);
+    if length > MAX_STANDARD_ARRAY_ITEMS {
+        return Err(standard_array_item_limit(vm, function));
+    }
+    Ok((array, length))
+}
+
+fn standard_array_index(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    function: &'static str,
+    parameter: &'static str,
+) -> Result<usize, ScriptValue> {
+    let Some(value) = value.as_number() else {
+        return Err(standard_array_expected_index(vm, function, parameter));
+    };
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f64 {
+        return Err(standard_array_expected_index(vm, function, parameter));
+    }
+    Ok(value as usize)
+}
+
+fn standard_array_copy_indices(
+    vm: &mut vm::ScriptVm,
+    source: vm::ScriptArray,
+    indices: impl Iterator<Item = usize>,
+) -> ScriptValue {
+    let output = vm.bx.heap.new_array();
+    standard_array_append_indices(vm, output, source, indices);
+    output.into()
+}
+
+fn standard_array_append_indices(
+    vm: &mut vm::ScriptVm,
+    output: vm::ScriptArray,
+    source: vm::ScriptArray,
+    indices: impl Iterator<Item = usize>,
+) {
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for index in indices {
+        let value = vm.bx.heap.array_index_unchecked(source, index);
+        vm.bx.heap.array_push(output, value, trap);
+    }
+}
+
+fn standard_array_expected_array(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+    parameter: &'static str,
+) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.array.{function} expects `{parameter}` to be an array"
+    )
+}
+
+fn standard_array_expected_index(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+    parameter: &'static str,
+) -> ScriptValue {
+    script_err_invalid_args!(
+        vm.bx.threads.cur_ref().trap,
+        "std.array.{function} expects `{parameter}` to be a non-negative integer"
+    )
+}
+
+fn standard_array_item_limit(vm: &mut vm::ScriptVm, function: &'static str) -> ScriptValue {
+    script_err_limit!(
+        vm.bx.threads.cur_ref().trap,
+        "std.array.{function} supports at most {MAX_STANDARD_ARRAY_ITEMS} items"
     )
 }
 
@@ -6777,6 +6970,135 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("string allocation limit")));
+    }
+
+    #[test]
+    fn exposes_frozen_bounded_standard_array() {
+        let mut runtime = Runtime::default();
+        let report = runtime
+            .eval(
+                "use mod.std.assert\n\
+                 use mod.std.array\n\
+                 let input = [1, 2, 3]\n\
+                 assert(array.len(input) == 3)\n\
+                 assert(array.slice(input, 1, 3) == [2, 3])\n\
+                 assert(array.concat([1, 2], [3, 4]) == [1, 2, 3, 4])\n\
+                 let reversed = array.reverse(input)\n\
+                 assert(reversed == [3, 2, 1])\n\
+                 assert(input == [1, 2, 3])\n\
+                 let nested = {answer: 1}\n\
+                 let copied = array.slice([nested], 0, 1)\n\
+                 copied[0].answer = 2\n\
+                 assert(nested.answer == 2)\n\
+                 reversed",
+            )
+            .unwrap();
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    report.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!([3, 2, 1])
+        );
+
+        let mut namespace_runtime = Runtime::default();
+        let namespace = namespace_runtime
+            .eval("use mod.std\nstd.array.reverse([1, 2])")
+            .unwrap();
+        assert!(namespace.completed(), "{:?}", namespace.diagnostics);
+        assert_eq!(
+            namespace_runtime
+                .script_value_as_json(
+                    namespace.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!([2, 1])
+        );
+
+        let mutation = runtime
+            .eval("use mod.std.array\narray.reverse = || nil")
+            .unwrap();
+        assert!(!mutation.succeeded());
+        assert!(!mutation.diagnostics.is_empty());
+
+        let preserved = runtime
+            .eval("use mod.std.array\narray.concat([1], [2])")
+            .unwrap();
+        assert!(preserved.completed(), "{:?}", preserved.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    preserved.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!([1, 2])
+        );
+
+        let invalid_index = runtime
+            .eval("use mod.std.array\ntry array.slice([1], -1, 1) catch \"invalid\"")
+            .unwrap();
+        assert!(invalid_index.completed(), "{:?}", invalid_index.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_index.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let oversized_len = Runtime::default()
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
+                 array.len(values)"
+            ))
+            .unwrap();
+        assert!(oversized_len.completed(), "{:?}", oversized_len.diagnostics);
+        assert_eq!(
+            oversized_len.value.as_number(),
+            Some((MAX_STANDARD_ARRAY_ITEMS + 1) as f64)
+        );
+
+        let oversized = Runtime::default()
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
+                 array.reverse(values)"
+            ))
+            .unwrap();
+        assert!(!oversized.completed());
+        assert!(oversized
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("supports at most")));
+
+        let oversized_concat = Runtime::default()
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{}] = 0\n\
+                 array.concat(values, [1])",
+                MAX_STANDARD_ARRAY_ITEMS - 1
+            ))
+            .unwrap();
+        assert!(!oversized_concat.completed());
+        assert!(oversized_concat
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("std.array.concat supports at most")));
     }
 
     #[test]
