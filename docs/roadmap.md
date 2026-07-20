@@ -96,7 +96,8 @@
   limits and no policy-bearing fields.
 - Approval-bound bounded JSON workflow dataflow with completed-prefix output
   binding, host-owned input/per-step output schema contracts, context and
-  contract digest-only checkpoints, and a sealed mobile/embedded facade.
+  contract digest-only checkpoints, and a sealed mobile/embedded facade whose
+  dataflow boundary derives from its immutable execution limits.
 - Deny-by-default, audited string-tool bridge with a bounded in-memory audit
   view, contiguous cursor-safe host export, explicit eviction count, and an
   opt-in authenticated durable audit journal for host-owned replay.

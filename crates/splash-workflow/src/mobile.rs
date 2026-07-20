@@ -28,7 +28,8 @@ use crate::{
     Approval, WorkflowCheckpoint, WorkflowData, WorkflowDataContract, WorkflowDraft,
     WorkflowEngine, WorkflowError, WorkflowEventBatch, WorkflowEventCursorError,
     WorkflowEventHistoryError, WorkflowEventLog, WorkflowPlan, WorkflowStep,
-    WorkflowStepCapabilityPolicy, DEFAULT_MAX_WORKFLOW_EVENTS, MAX_WORKFLOW_EVENTS,
+    WorkflowStepCapabilityPolicy, DEFAULT_MAX_WORKFLOW_EVENTS, MAX_WORKFLOW_DATA_BYTES,
+    MAX_WORKFLOW_DATA_DEPTH, MAX_WORKFLOW_EVENTS,
 };
 
 /// Setup-only builder for a sealed mobile or embedded workflow catalog.
@@ -322,8 +323,19 @@ impl MobileWorkflowBuilder {
             capability_module_limits,
             max_events,
         } = self;
-        let engine = WorkflowEngine::with_event_history_capacity(runtime, max_events)
-            .expect("the builder validates workflow event capacity before sealing");
+        let dataflow_max_bytes =
+            NonZeroUsize::new(limits.max_source_bytes.min(MAX_WORKFLOW_DATA_BYTES))
+                .expect("validated execution source limit leaves a nonzero mobile dataflow limit");
+        let dataflow_max_depth =
+            NonZeroUsize::new(limits.max_syntax_nesting.min(MAX_WORKFLOW_DATA_DEPTH))
+                .expect("validated syntax nesting limit leaves a nonzero mobile dataflow limit");
+        let engine = WorkflowEngine::with_event_history_capacity_and_dataflow_limits(
+            runtime,
+            max_events,
+            dataflow_max_bytes,
+            dataflow_max_depth,
+        )
+        .expect("the builder validates workflow event capacity before sealing");
         MobileWorkflowRuntime {
             engine,
             limits,
@@ -367,6 +379,20 @@ impl MobileWorkflowRuntime {
     /// Returns the immutable workflow-event capacity selected at setup.
     pub const fn max_workflow_events(&self) -> usize {
         self.max_events.get()
+    }
+
+    /// Returns the sealed byte bound for the script-visible workflow JSON
+    /// context. It is the smaller of the selected source limit and Splash's
+    /// 64 KiB workflow-data limit.
+    pub const fn max_dataflow_bytes(&self) -> usize {
+        self.engine.max_dataflow_bytes()
+    }
+
+    /// Returns the sealed nesting bound for the script-visible workflow JSON
+    /// context. It is the smaller of the selected syntax-nesting limit and
+    /// Splash's 64-level workflow-data limit.
+    pub const fn max_dataflow_depth(&self) -> usize {
+        self.engine.max_dataflow_depth()
     }
 
     /// Returns the number of local deferred promises retained by the sealed
@@ -713,12 +739,13 @@ mod tests {
         fixed_file_catalog::FixedFileCatalog, json, AuditOutcome, CapabilityLeaseGrant,
         ToolStreamPolicy,
     };
-    use splash_core::DEFAULT_INSTRUCTION_LIMIT;
+    use splash_core::{RuntimeJsonError, DEFAULT_INSTRUCTION_LIMIT};
     use splash_schema::JsonSchema;
 
     use super::*;
     use crate::{
-        WorkflowDataContract, WorkflowEvent, WorkflowStepOutputContract, MAX_WORKFLOW_EVENTS,
+        WorkflowDataContract, WorkflowDataError, WorkflowEvent, WorkflowStepOutputContract,
+        MAX_WORKFLOW_EVENTS,
     };
 
     #[derive(serde::Deserialize)]
@@ -1125,6 +1152,84 @@ mod tests {
             checkpoint.data_contract_fingerprint(),
             Some(contract_fingerprint.as_str())
         );
+    }
+
+    #[test]
+    fn derives_workflow_dataflow_bounds_from_sealed_execution_limits() {
+        let limits = ExecutionLimits {
+            max_source_bytes: 64,
+            max_syntax_nesting: 2,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = MobileWorkflowBuilder::with_limits(limits, 1)
+            .expect("small mobile limits are valid")
+            .build();
+        assert_eq!(runtime.max_dataflow_bytes(), 64);
+        assert_eq!(runtime.max_dataflow_depth(), 2);
+
+        let plan = runtime
+            .plan(vec![WorkflowStep::new("transform", "workflow.input")])
+            .expect("short pure dataflow step is valid");
+        let empty_policy = || {
+            vec![WorkflowStepCapabilityPolicy::new(
+                "transform",
+                Vec::<CapabilityLeaseGrant>::new(),
+            )]
+        };
+
+        let oversized_input = WorkflowData::new(json!("x".repeat(64)))
+            .expect("the generic workflow boundary accepts the host value");
+        assert!(matches!(
+            runtime.approve_dataflow_with_step_capability_policies(
+                &plan,
+                oversized_input,
+                empty_policy(),
+            ),
+            Err(WorkflowError::Data(WorkflowDataError::Json(
+                RuntimeJsonError::TooLarge { maximum: 64, .. }
+            )))
+        ));
+
+        let nested_input = WorkflowData::new(json!([[0]]))
+            .expect("the generic workflow boundary accepts the host value");
+        assert_eq!(
+            runtime
+                .approve_dataflow_with_step_capability_policies(
+                    &plan,
+                    nested_input,
+                    empty_policy(),
+                )
+                .unwrap_err(),
+            WorkflowError::Data(WorkflowDataError::Json(RuntimeJsonError::TooDeep {
+                maximum: 2,
+            }))
+        );
+
+        let approval = runtime
+            .approve_dataflow_with_step_capability_policies(
+                &plan,
+                WorkflowData::new(json!("x".repeat(30))).expect("input fits the sealed context"),
+                empty_policy(),
+            )
+            .expect("small initial context approves");
+        assert!(matches!(
+            runtime.execute_dataflow(&plan, approval),
+            Err(WorkflowError::DataflowOutput {
+                step_id,
+                error: WorkflowDataError::Json(RuntimeJsonError::TooLarge { maximum: 64, .. }),
+                completed_steps: 0,
+            }) if step_id == "transform"
+        ));
+        assert_eq!(
+            runtime
+                .dataflow_snapshot()
+                .expect("failed terminal dataflow retains its valid completed prefix")
+                .outputs()
+                .len(),
+            0
+        );
+        assert!(!runtime.has_suspended_execution());
+        assert!(runtime.audit().is_empty());
     }
 
     #[test]

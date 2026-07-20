@@ -353,7 +353,7 @@ Splash source cap.
 
 ## Syntax fuzzing
 
-The standalone `fuzz` package has thirteen bounded targets. `syntax` differentially
+The standalone `fuzz` package has bounded targets. `syntax` differentially
 exercises the canonical profile and the vendored VM parser under a rotating set
 of valid resource profiles, from 64 bytes, 8 tokens, and 2 nesting levels up
 to a 16 KiB source cap, a 2,048-token cap, and a 64-level nesting cap. It also

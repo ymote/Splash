@@ -422,6 +422,19 @@ impl WorkflowData {
         Ok(())
     }
 
+    /// Validates only the script-visible `{ input, outputs }` context against
+    /// one runtime-selected boundary. Persistence metadata is intentionally
+    /// excluded because it never enters the Splash VM.
+    fn validate_script_context_with_limits(
+        &self,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<(), WorkflowDataError> {
+        let _ = serialize_bounded_json(&self.script_context(), max_bytes, max_depth)
+            .map_err(WorkflowDataError::Json)?;
+        Ok(())
+    }
+
     fn bind_contract(
         &mut self,
         data_contract: &WorkflowDataContract,
@@ -451,6 +464,23 @@ impl WorkflowData {
         }
         self.outputs.insert(step_id.to_owned(), output);
         if let Err(error) = self.validate() {
+            self.outputs.remove(step_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Inserts one output only when the next script-visible context remains
+    /// within the engine's selected JSON boundary.
+    fn insert_output_with_limits(
+        &mut self,
+        step_id: &str,
+        output: JsonValue,
+        max_bytes: usize,
+        max_depth: usize,
+    ) -> Result<(), WorkflowDataError> {
+        self.insert_output(step_id, output)?;
+        if let Err(error) = self.validate_script_context_with_limits(max_bytes, max_depth) {
             self.outputs.remove(step_id);
             return Err(error);
         }
@@ -4172,6 +4202,8 @@ pub struct WorkflowEngine {
     runtime: CapabilityRuntime,
     events: VecDeque<WorkflowEvent>,
     max_events: NonZeroUsize,
+    dataflow_max_bytes: NonZeroUsize,
+    dataflow_max_depth: NonZeroUsize,
     dropped_events: u64,
     first_event_sequence: u64,
     next_event_sequence: u64,
@@ -4200,6 +4232,29 @@ impl WorkflowEngine {
         runtime: CapabilityRuntime,
         max_events: NonZeroUsize,
     ) -> Result<Self, WorkflowEventHistoryError> {
+        Self::with_event_history_capacity_and_dataflow_limits(
+            runtime,
+            max_events,
+            NonZeroUsize::new(MAX_WORKFLOW_DATA_BYTES)
+                .expect("default workflow data byte limit is nonzero"),
+            NonZeroUsize::new(MAX_WORKFLOW_DATA_DEPTH)
+                .expect("default workflow data depth limit is nonzero"),
+        )
+    }
+
+    /// Creates an engine with a bounded event view and script-visible
+    /// dataflow boundary.
+    ///
+    /// This crate-visible constructor lets the sealed mobile facade derive
+    /// dataflow bounds from its immutable execution profile. General workflow
+    /// hosts retain the documented defaults through
+    /// [`Self::with_event_history_capacity`].
+    pub(crate) fn with_event_history_capacity_and_dataflow_limits(
+        runtime: CapabilityRuntime,
+        max_events: NonZeroUsize,
+        dataflow_max_bytes: NonZeroUsize,
+        dataflow_max_depth: NonZeroUsize,
+    ) -> Result<Self, WorkflowEventHistoryError> {
         if max_events.get() > MAX_WORKFLOW_EVENTS {
             return Err(WorkflowEventHistoryError::CapacityTooLarge {
                 requested: max_events.get(),
@@ -4211,6 +4266,8 @@ impl WorkflowEngine {
             runtime,
             events: VecDeque::new(),
             max_events,
+            dataflow_max_bytes,
+            dataflow_max_depth,
             dropped_events: 0,
             first_event_sequence: 1,
             next_event_sequence: 1,
@@ -4227,6 +4284,18 @@ impl WorkflowEngine {
 
     pub fn runtime_mut(&mut self) -> &mut CapabilityRuntime {
         &mut self.runtime
+    }
+
+    /// Returns the maximum serialized bytes allowed for the script-visible
+    /// `{ input, outputs }` workflow context.
+    pub const fn max_dataflow_bytes(&self) -> usize {
+        self.dataflow_max_bytes.get()
+    }
+
+    /// Returns the maximum container nesting allowed for the script-visible
+    /// `{ input, outputs }` workflow context.
+    pub const fn max_dataflow_depth(&self) -> usize {
+        self.dataflow_max_depth.get()
     }
 
     /// Returns whether this engine is waiting for a claimed external tool to
@@ -4953,6 +5022,11 @@ impl WorkflowEngine {
         }
         data.validate_for_completed_prefix(plan, 0)
             .map_err(WorkflowError::Data)?;
+        data.validate_script_context_with_limits(
+            self.max_dataflow_bytes(),
+            self.max_dataflow_depth(),
+        )
+        .map_err(WorkflowError::Data)?;
         if let Some(data_contract) = &data_contract {
             data_contract
                 .validate_for(plan, &data, 0)
@@ -5021,6 +5095,11 @@ impl WorkflowEngine {
         if !self.owns_plan(plan) {
             return Err(WorkflowError::PlanOwnershipMismatch);
         }
+        data.validate_script_context_with_limits(
+            self.max_dataflow_bytes(),
+            self.max_dataflow_depth(),
+        )
+        .map_err(WorkflowError::Data)?;
         let checkpoint = WorkflowCheckpoint::for_dataflow(plan, data, completed_step_count)
             .map_err(WorkflowError::Checkpoint)?;
         self.record_event(WorkflowEvent::Checkpointed {
@@ -5046,6 +5125,11 @@ impl WorkflowEngine {
         if !self.owns_plan(plan) {
             return Err(WorkflowError::PlanOwnershipMismatch);
         }
+        data.validate_script_context_with_limits(
+            self.max_dataflow_bytes(),
+            self.max_dataflow_depth(),
+        )
+        .map_err(WorkflowError::Data)?;
         data_contract
             .validate_for(plan, data, completed_step_count)
             .map_err(|error| {
@@ -6280,6 +6364,11 @@ impl WorkflowEngine {
                 .validate_dataflow_for(plan, &data)
                 .map_err(WorkflowError::Checkpoint)?;
         }
+        data.validate_script_context_with_limits(
+            self.max_dataflow_bytes(),
+            self.max_dataflow_depth(),
+        )
+        .map_err(WorkflowError::Data)?;
         leases.validate(&self.runtime)?;
         let approval = self.issue_approval(
             plan,
@@ -6756,8 +6845,8 @@ impl WorkflowEngine {
             if let Err(error) = self.runtime.set_json_global(
                 WORKFLOW_DATA_GLOBAL,
                 &context,
-                MAX_WORKFLOW_DATA_BYTES,
-                MAX_WORKFLOW_DATA_DEPTH,
+                self.max_dataflow_bytes(),
+                self.max_dataflow_depth(),
             ) {
                 self.last_dataflow = Some(dataflow.data);
                 return Err(WorkflowError::Runtime(error));
@@ -6875,8 +6964,8 @@ impl WorkflowEngine {
         self.drain_unawaited_local_work()?;
         let output = self.runtime.script_value_as_json(
             report.value,
-            MAX_WORKFLOW_DATA_BYTES,
-            MAX_WORKFLOW_DATA_DEPTH,
+            self.max_dataflow_bytes(),
+            self.max_dataflow_depth(),
         );
         self.clear_dataflow_context()?;
         let output = match output {
@@ -6906,7 +6995,12 @@ impl WorkflowEngine {
                 });
             }
         }
-        if let Err(error) = dataflow.data.insert_output(&step.id, output) {
+        if let Err(error) = dataflow.data.insert_output_with_limits(
+            &step.id,
+            output,
+            self.max_dataflow_bytes(),
+            self.max_dataflow_depth(),
+        ) {
             self.record_event(WorkflowEvent::StepFailed {
                 plan_id: plan.id,
                 step_id: step.id.clone(),

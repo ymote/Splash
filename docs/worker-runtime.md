@@ -476,6 +476,14 @@ immutable mapping, advisory LSP projection, and a read-only
 bounded exact local root alias to its underlying named tool during app-owned
 review. That report cannot approve or grant a workflow capability.
 
+The script-visible `{ input, outputs }` context is capped by the smaller of
+the builder's source-byte and syntax-nesting limits and Splash's 64 KiB and
+64-level workflow-data limits. The facade rejects an oversized or too-deep
+initial or resumed context before approval, and rejects a step result that
+would make the retained aggregate context exceed those same bounds. Persistence
+metadata such as a contract digest is never injected into Splash source and
+does not consume this script-visible data budget.
+
 ```rust
 use splash_capabilities::{CapabilityLeaseGrant, ToolMetadata, ToolPolicy};
 use splash_workflow::{
