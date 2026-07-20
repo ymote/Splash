@@ -62,9 +62,9 @@ The separate `Sustained Fuzzing` workflow runs daily and can be started
 manually from GitHub Actions. It gives the differential `syntax` target and
 the bounded `execution` target ten minutes each, the `lsp_document` target two
 minutes for source and bounded advisory initialization/configuration-refresh
-parsing, and the variable-limit `execution_limits`
-target and no-spawn `bubblewrap_policy` target three minutes each, all with
-per-input timeout and RSS ceilings. A failure uploads its ignored
+parsing, the capability-free replay target two minutes, and the variable-limit
+`execution_limits` target and no-spawn `bubblewrap_policy` target three minutes
+each, all with per-input timeout and RSS ceilings. A failure uploads its ignored
 `fuzz/artifacts` directory for 14 days.
 
 Triage a downloaded crash before adding it to the repository:
@@ -405,6 +405,17 @@ capability or Rust adapter can run; a panic or hang is a fuzz failure.
 state cannot mask resource behavior. Their tracked `.splash` seeds cover
 canonical dataflow, deferred tools, loops, lambdas, recoverable error control
 flow, intentional instruction-limit behavior, and exponential string growth.
+`execution_replay` runs each accepted source in two independent fresh
+capability-free runtimes under the same 8 KiB source and individual-string,
+1,024-token, 64-level nesting, 4,096-instruction, and terminal one-second
+deadline profile. It rejects a divergent terminal status, diagnostics, or
+bounded JSON observation. A successful value that cannot cross the bounded JSON
+boundary is still compared by its exact boundary rejection, so functions,
+cycles, non-finite numbers, and oversized values stay covered without exposing
+VM references. It never installs adapters, globals, capabilities, or promises;
+this is deterministic evaluator regression coverage, not an effect replay
+claim. Its reviewed seeds cover core data shaping, recoverable failures,
+non-JSON values, and instruction termination.
 `execution_limits` rotates valid source, individual-string, retained-heap,
 operand-stack, call-frame, syntax, instruction, sampling, and deadline profiles
 through a fresh capability-free runtime. Equal soft and hard deadlines must terminate rather than leave a
@@ -499,11 +510,11 @@ successive authenticated-frame reads. Every framing, UTF-8, size, or protocol
 error must poison the channel before another read. The target owns only in-memory
 I/O and never starts a worker or invokes a capability.
 
-CI compiles all thirteen targets and performs a short 128-run coverage-only
-smoke pass with `--sanitizer none`, plus separate short AddressSanitizer
-campaigns for the LSP document lifecycle and Bubblewrap policy compiler. Run
-the longer local commands below with the default sanitizer whenever the
-platform supports it.
+CI compiles every fuzz target and performs a short 128-run coverage-only smoke
+campaign for the selected targets with `--sanitizer none`, plus separate short
+AddressSanitizer campaigns for evaluator replay, the LSP document lifecycle,
+and Bubblewrap policy compilation. Run the longer local commands below with the
+default sanitizer whenever the platform supports it.
 
 Install `cargo-fuzz` once, then run the target with nightly Rust:
 
@@ -513,6 +524,7 @@ cd fuzz
 cargo +nightly fuzz run syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run execution_replay -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run bubblewrap_policy -- -max_total_time=60 -max_len=64
 cargo +nightly fuzz run workflow_draft -- -max_total_time=60 -max_len=65536
@@ -534,6 +546,7 @@ instrumentation:
 cargo +nightly fuzz run --sanitizer none syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
+cargo +nightly fuzz run --sanitizer none execution_replay -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none workflow_draft -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run --sanitizer none capability_lease -- -max_total_time=60 -max_len=8192
@@ -551,6 +564,7 @@ Reproduce a saved failure from the same directory with:
 cargo +nightly fuzz run syntax artifacts/syntax/<artifact>
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document artifacts/lsp_document/<artifact>
 cargo +nightly fuzz run execution artifacts/execution/<artifact>
+cargo +nightly fuzz run execution_replay artifacts/execution_replay/<artifact>
 cargo +nightly fuzz run execution_limits artifacts/execution_limits/<artifact>
 cargo +nightly fuzz run workflow_draft artifacts/workflow_draft/<artifact>
 cargo +nightly fuzz run capability_lease artifacts/capability_lease/<artifact>

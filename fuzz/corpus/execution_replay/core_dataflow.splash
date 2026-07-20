@@ -1,0 +1,22 @@
+use mod.std.array
+use mod.std.assert
+use mod.std.json
+use mod.std.object
+use mod.std.text
+
+let request = json.parse("{\"label\":\" release total \",\"tags\":[\"release\",\"math\",\"release\"]}")
+let normalized = []
+
+for tag in array.reverse(request.tags) {
+    array.push(normalized, text.upper(tag))
+}
+
+let summary = object.with(
+    object.pick(request, ["label", "tags"]),
+    "primary",
+    array.get(normalized, 0, "UNTAGGED"),
+)
+
+assert(array.contains(normalized, "RELEASE"))
+assert(array.index_of(normalized, "RELEASE") == 0)
+json.parse(json.stringify(summary))

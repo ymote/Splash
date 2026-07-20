@@ -393,7 +393,10 @@ checks canonical preflight, VM parsing, and formatting. The separate
 capability-free `execution` target runs accepted programs under strict source,
 token, individual-string, instruction, and wall-clock bounds. This is
 regression coverage, not a claim that the two parsers are formally equivalent.
-Sustained parser/VM
+The separate capability-free `execution_replay` target evaluates each accepted
+program in two independent fresh runtimes and compares terminal status,
+diagnostics, and either bounded JSON output or the exact JSON-boundary
+rejection; it never installs a host effect. Sustained parser/VM
 differential fuzzing and corpus triage remain release requirements before the
 language profile is stable.
 

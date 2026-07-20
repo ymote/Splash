@@ -12,6 +12,9 @@ vendor/makepad/target/
 !/fuzz/corpus/execution/
 /fuzz/corpus/execution/*
 !/fuzz/corpus/execution/*.splash
+!/fuzz/corpus/execution_replay/
+/fuzz/corpus/execution_replay/*
+!/fuzz/corpus/execution_replay/*.splash
 !/fuzz/corpus/execution_limits/
 /fuzz/corpus/execution_limits/*
 !/fuzz/corpus/execution_limits/*.splash

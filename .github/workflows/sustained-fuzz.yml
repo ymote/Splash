@@ -38,6 +38,12 @@ jobs:
           -max_total_time=600 -timeout=5 -rss_limit_mb=1024 -max_len=8192
           -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
+      - name: Capability-free evaluator replay fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none execution_replay --
+          -max_total_time=120 -timeout=5 -rss_limit_mb=1024 -max_len=8192
+          -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
       - name: Variable-limit evaluator fuzzing
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none execution_limits --

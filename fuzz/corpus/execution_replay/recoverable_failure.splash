@@ -1,0 +1,10 @@
+use mod.std.assert
+
+let result = try {
+    assert(false)
+    "unreachable"
+} catch {
+    {recovered: true}
+}
+
+result
