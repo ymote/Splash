@@ -4,10 +4,10 @@
 //! app-provided adapters. Calling
 //! [`crate::mobile::MobileRuntimeBuilder::build`] consumes that builder and
 //! yields a [`crate::mobile::MobileRuntime`] without any registration or
-//! external-dispatch API. Dynamic Splash source can still use the catalog
-//! through `mod.tool` or setup-defined direct capability modules, but cannot
-//! add tools or modules, claim work, or complete an externally dispatched
-//! operation.
+//! external-dispatch API. Dynamic Splash source can receive bounded host-owned
+//! JSON and use the catalog through `mod.tool` or setup-defined direct
+//! capability modules, but cannot add tools or modules, claim work, or
+//! complete an externally dispatched operation.
 //!
 //! This is a capability boundary, not operating-system containment. Every
 //! adapter runs with the embedding application's authority. Do not expose an
@@ -17,7 +17,10 @@
 use std::num::NonZeroUsize;
 
 use serde::{de::DeserializeOwned, Serialize};
-use splash_core::{Evaluation, ExecutionLimits, RuntimeError};
+use splash_core::{
+    vm::ScriptValue, Evaluation, ExecutionLimits, RuntimeError, DEFAULT_MAX_JSON_DATA_BYTES,
+    DEFAULT_MAX_JSON_DATA_DEPTH,
+};
 
 use crate::{
     fixed_file_catalog::FixedFileCatalog, CapabilityCatalogLimits, CapabilityModule,
@@ -315,6 +318,45 @@ impl MobileRuntime {
         self.runtime.eval(source)
     }
 
+    /// Injects bounded host-owned JSON under one identifier for a later
+    /// canonical Splash evaluation.
+    ///
+    /// The data limits are derived from the sealed execution profile: JSON is
+    /// capped by the smaller of its source-byte limit and Splash's 64 KiB data
+    /// boundary, and by the smaller of its syntax-nesting limit and Splash's
+    /// 64-level JSON boundary. This changes data only; it cannot add a tool,
+    /// alter the sealed catalog, issue a lease, or expose a Rust binding.
+    /// Changes are rejected while an evaluation is suspended so a resumed
+    /// continuation observes its original context.
+    pub fn set_json_global(&mut self, name: &str, value: &JsonValue) -> Result<(), RuntimeError> {
+        let (max_bytes, max_depth) = self.json_data_limits();
+        self.runtime
+            .set_json_global(name, value, max_bytes, max_depth)
+    }
+
+    /// Clears one host-injected JSON global after a completed evaluation.
+    ///
+    /// The identifier remains present with a `nil` value, allowing the prior
+    /// value to be reclaimed at the next explicit garbage-collection point.
+    /// Clearing is rejected while an evaluation is suspended.
+    pub fn clear_json_global(&mut self, name: &str) -> Result<(), RuntimeError> {
+        self.runtime.clear_json_global(name)
+    }
+
+    /// Converts one value from this sealed runtime into bounded host-owned
+    /// JSON for local dataflow or an app-owned result boundary.
+    ///
+    /// The same sealed JSON limits as [`Self::set_json_global`] apply.
+    /// Functions, handles, cycles, non-string object keys, non-finite numbers,
+    /// and oversized values are rejected instead of being coerced. `value`
+    /// must originate from this runtime, such as [`Evaluation::value`] returned
+    /// by [`Self::eval`] or a resumed evaluation from [`Self::pump`].
+    pub fn script_value_as_json(&mut self, value: ScriptValue) -> Result<JsonValue, RuntimeError> {
+        let (max_bytes, max_depth) = self.json_data_limits();
+        self.runtime
+            .script_value_as_json(value, max_bytes, max_depth)
+    }
+
     /// Returns the immutable execution bounds selected during setup.
     pub const fn limits(&self) -> ExecutionLimits {
         self.limits
@@ -443,6 +485,17 @@ impl MobileRuntime {
     pub fn clear_audit(&mut self) {
         self.runtime.clear_audit();
     }
+
+    fn json_data_limits(&self) -> (usize, usize) {
+        (
+            self.limits
+                .max_source_bytes
+                .min(DEFAULT_MAX_JSON_DATA_BYTES),
+            self.limits
+                .max_syntax_nesting
+                .min(DEFAULT_MAX_JSON_DATA_DEPTH),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +503,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
-    use splash_core::{DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MAX_SOURCE_BYTES};
+    use splash_core::{RuntimeJsonError, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MAX_SOURCE_BYTES};
 
     use super::*;
     #[cfg(feature = "http-endpoint-catalog")]
@@ -462,7 +515,7 @@ mod tests {
     use crate::platform_keyring_secret_resolver::{
         PlatformKeyringSecretEntry, PlatformKeyringSecretResolver,
     };
-    use crate::{json, CapabilityCatalogLimits, ToolDataFormat, ToolDispatch};
+    use crate::{json, CapabilityCatalogLimits, JsonValue, ToolDataFormat, ToolDispatch};
 
     #[derive(serde::Deserialize)]
     struct AddInput {
@@ -551,6 +604,71 @@ mod tests {
     }
 
     #[test]
+    fn injects_and_extracts_bounded_mobile_json_dataflow() {
+        let mut runtime = MobileRuntimeBuilder::new()
+            .expect("default limits are valid")
+            .build();
+
+        runtime
+            .set_json_global("workflow", &json!({"input": {"left": 20, "right": 22}}))
+            .expect("bounded host input installs without changing the catalog");
+        let report = runtime
+            .eval(
+                "let total = workflow.input.left + workflow.input.right\n\
+                 {total: total}",
+            )
+            .expect("canonical dataflow evaluates");
+
+        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert_eq!(
+            runtime
+                .script_value_as_json(report.value)
+                .expect("completed record crosses the sealed JSON boundary"),
+            json!({"total": 42})
+        );
+        assert!(runtime.tool_catalog().is_empty());
+
+        runtime
+            .clear_json_global("workflow")
+            .expect("completed input can be cleared");
+        let cleared = runtime
+            .eval("workflow")
+            .expect("cleared host input remains a nil global");
+        assert_eq!(
+            runtime
+                .script_value_as_json(cleared.value)
+                .expect("nil crosses the sealed JSON boundary"),
+            JsonValue::Null
+        );
+    }
+
+    #[test]
+    fn derives_mobile_json_data_bounds_from_sealed_execution_limits() {
+        let limits = ExecutionLimits {
+            max_source_bytes: 64,
+            max_syntax_nesting: 2,
+            ..ExecutionLimits::default()
+        };
+        let mut runtime = MobileRuntimeBuilder::with_limits(limits, 1)
+            .expect("small mobile limits are valid")
+            .build();
+
+        assert!(matches!(
+            runtime.set_json_global("payload", &JsonValue::String("x".repeat(65))),
+            Err(RuntimeError::JsonData(RuntimeJsonError::TooLarge {
+                maximum: 64,
+                ..
+            }))
+        ));
+        assert_eq!(
+            runtime
+                .set_json_global("payload", &json!([[[0]]]))
+                .unwrap_err(),
+            RuntimeError::JsonData(RuntimeJsonError::TooDeep { maximum: 2 })
+        );
+    }
+
+    #[test]
     fn seals_direct_deferred_capability_modules_for_mobile_dataflow() {
         let mut builder = MobileRuntimeBuilder::new().expect("default limits are valid");
         builder
@@ -599,6 +717,16 @@ mod tests {
             .expect("direct module dataflow succeeds");
 
         assert!(initial.suspended);
+        assert_eq!(
+            runtime
+                .set_json_global("workflow", &json!({"input": {}}))
+                .unwrap_err(),
+            RuntimeError::EvaluationInProgress
+        );
+        assert_eq!(
+            runtime.clear_json_global("workflow").unwrap_err(),
+            RuntimeError::EvaluationInProgress
+        );
         let pumped = runtime.pump().expect("local adapter pump succeeds");
         assert_eq!(pumped.completed, 1);
         assert_eq!(pumped.resumed.len(), 1);

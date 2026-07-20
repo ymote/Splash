@@ -384,10 +384,13 @@ semantics, and containment appropriate to the target.
 For direct mobile and embedded scripting, use
 `splash_capabilities::mobile::MobileRuntimeBuilder`. It accepts reviewed local
 adapters during setup, and `build()` consumes it to yield a `MobileRuntime`
-with canonical evaluation, bounded host pumping, catalog inspection, audit
-inspection, and explicit garbage collection only. The resulting profile has no
-API to register more tools, claim or complete external work, or attach a worker
-transport. Structured adapters require an executable `JsonToolContract`.
+with canonical evaluation, bounded host-owned JSON input and output conversion,
+bounded host pumping, catalog inspection, audit inspection, and explicit garbage
+collection only. JSON input and output use the smaller of the builder's source
+and syntax-nesting limits and Splash's 64 KiB / 64-level data limits. The
+resulting profile has no API to register more tools, claim or complete external
+work, or attach a worker transport. Structured adapters require an executable
+`JsonToolContract`.
 `MobileRuntimeBuilder::register_capability_module` can also expose one of those
 contract-enforced local JSON adapters as a fixed direct `mod.<name>` method
 before `build()` seals the profile; it retains the adapter's policy and audit
@@ -430,11 +433,15 @@ builder.register_json_tool(
     },
 )?;
 let mut runtime = builder.build();
+runtime.set_json_global("workflow", &json!({"input": {"name": "Ada"}}))?;
 
 let report = runtime.eval(
-    "use mod.tool\nlet reply = tool.call_json(\"device.greet\", {name: \"Ada\"})\nreply",
+    "use mod.tool\nlet reply = tool.call_json(\"device.greet\", workflow.input).parse_json()\nreply",
 )?;
 assert!(report.completed());
+let output = runtime.script_value_as_json(report.value)?;
+assert_eq!(output["message"], "hello Ada");
+runtime.clear_json_global("workflow")?;
 runtime.collect_garbage(); // Schedule this at an app-selected idle point.
 ```
 
@@ -446,7 +453,9 @@ app's authority despite the sealed catalog. Rust code can choose a lower-level
 runtime instead, so only expose the mobile profile to code that must honor this
 contract. `collect_garbage()` is intentionally explicit because a full VM
 sweep can take time proportional to the live heap; use it at an application
-idle point to reclaim settled promise records.
+idle point to reclaim settled promise records. `set_json_global` and
+`clear_json_global` reject changes while a deferred evaluation is suspended, so
+the resumed continuation observes the same host data it started with.
 
 For an ordered mobile or embedded workflow, use
 `splash_workflow::mobile::MobileWorkflowBuilder` instead. It repeats the
