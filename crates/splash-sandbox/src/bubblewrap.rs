@@ -6557,7 +6557,28 @@ mod tests {
         create_script_executable(&program, "#!/bin/sh\nexit 99\n");
 
         let (command_path, descriptor) = executable.prepare_for_execution().unwrap();
-        let status = Command::new(command_path).status().unwrap();
+        const MAX_EXECUTION_ATTEMPTS: usize = 4;
+        const EXECUTION_RETRY_DELAY: Duration = Duration::from_millis(10);
+        let mut status = None;
+        for attempt in 0..MAX_EXECUTION_ATTEMPTS {
+            match Command::new(&command_path).status() {
+                Ok(result) => {
+                    status = Some(result);
+                    break;
+                }
+                // A freshly copied fixture can briefly retain a kernel write
+                // reference. Retry only this transient Linux condition; every
+                // other launch failure remains direct.
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
+                        && attempt + 1 < MAX_EXECUTION_ATTEMPTS =>
+                {
+                    std::thread::sleep(EXECUTION_RETRY_DELAY);
+                }
+                Err(error) => panic!("pinned ELF execution failed: {error}"),
+            }
+        }
+        let status = status.expect("bounded ELF execution retry returns or panics");
         drop(descriptor);
 
         assert!(status.success());
