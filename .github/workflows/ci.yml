@@ -26,9 +26,13 @@ jobs:
       - run: cargo check --locked -p splash-sandbox --tests --target x86_64-pc-windows-gnu
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-script
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
+      # The project-quota positive-path test requires an explicitly provisioned host fixture.
       - run: >
           sudo -E env RUSTUP_HOME="$HOME/.rustup"
-          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox -- --ignored
+          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox --lib -- --ignored
+      - run: >
+          sudo -E env RUSTUP_HOME="$HOME/.rustup"
+          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox --test cgroup_v2 -- --ignored
 
   fuzz-target:
     runs-on: ubuntu-latest
