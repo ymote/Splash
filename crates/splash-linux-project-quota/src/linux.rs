@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn encodes_the_linux_project_get_quota_command() {
-        assert_eq!(PROJECT_GET_QUOTA_COMMAND as u32, 0x8000_0702);
+        assert_eq!(PROJECT_GET_QUOTA_COMMAND, 0x8000_0702);
     }
 
     #[test]
