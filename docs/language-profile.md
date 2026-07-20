@@ -171,11 +171,11 @@ receiver, unknown member, or source outside the valid prefix gets no fixed-core
 result; a matching advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.object`
-binding. At a direct `object.` member site it completes only `len`, `keys`,
-`entries`, `values`, and `merge`, with plain-text hover and fixed function
-signatures. This is a compiled-in description of bounded own-field record
-shaping: it does not inspect module-catalog metadata, resolve a module, follow
-a local alias, or expose a host capability. A shadowed `object` binding,
+binding. At a direct `object.` member site it completes only `len`, `has`,
+`get`, `keys`, `entries`, `values`, and `merge`, with plain-text hover and fixed
+function signatures. This is a compiled-in description of bounded own-field
+record shaping: it does not inspect module-catalog metadata, resolve a module,
+follow a local alias, or expose a host capability. A shadowed `object` binding,
 chained receiver, unknown member, or source outside the valid prefix gets no
 fixed-core result; a matching advisory catalog path cannot extend the core
 surface.
@@ -491,17 +491,20 @@ uncapped. The module has no I/O, clock, entropy, host-state, crate-loading, or
 capability access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
-shaping. It provides `object.len(value)`, `object.keys(value)`,
+shaping. It provides `object.len(value)`, `object.has(value, key)`,
+`object.get(value, key, fallback)`, `object.keys(value)`,
 `object.entries(value)`, `object.values(value)`, and
 `object.merge(left, right)`. It accepts plain record or JSON-object data only,
 reads own fields only, and does not traverse prototypes or invoke callbacks.
-`keys`, `entries`, `values`, and `merge` process at most 4,096 own text-keyed
-source fields; `merge` also rejects a combined source count over that bound.
-`keys` and `values` return shallow arrays in stored field order; `entries`
-returns fresh `[text_key, value]` pairs in that order; and `merge` preserves
-first field positions and applies right-side values. `len` is constant-time and
-uncapped. The module has no I/O, clock, entropy, host-state, crate-loading, or
-capability access.
+`has` distinguishes a present `nil` own text field from an absent one; `get`
+returns its fallback only when that own text field is absent. Neither traverses
+record fields. `keys`, `entries`, `values`, and `merge` process at most 4,096
+own text-keyed source fields; `merge` also rejects a combined source count over
+that bound. `keys` and `values` return shallow arrays in stored field order;
+`entries` returns fresh `[text_key, value]` pairs in that order; and `merge`
+preserves first field positions and applies right-side values. `len` is
+constant-time and uncapped. The module has no I/O, clock, entropy, host-state,
+crate-loading, or capability access.
 
 ## Effect rules
 
@@ -695,7 +698,10 @@ or mutate its keys, input digest, worker observation, or restart policy.
   its combined result.
 - Import `mod.std.object` before using `object.*`; transforms are bounded
   own-field operations over plain record or JSON-object data, not capabilities.
-  Keep transforming inputs and combined `merge` source fields at or below 4,096.
+  `object.has(value, key)` distinguishes a missing own text field from a
+  present `nil`; `object.get(value, key, fallback)` returns the fallback only
+  for a missing own text field. Keep transforming inputs and combined `merge`
+  source fields at or below 4,096.
 - For a data-driven plain record or JSON-object field, use text-key indexing
   such as `record[field_name]`. A missing field evaluates to `nil`; this is
   local data access and does not expose reflection, host objects, or a

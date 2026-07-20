@@ -35,6 +35,8 @@
 "array.push("
 "object.keys("
 "object.entries("
+"object.has("
+"object.get("
 "object.merge("
 "text.trim("
 "text.replace_all("

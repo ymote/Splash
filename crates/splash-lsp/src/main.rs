@@ -451,6 +451,18 @@ const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
         description: "Returns an own-field count without traversing the record.",
     },
     StandardObjectFunction {
+        name: "has",
+        parameters: &["value", "key"],
+        result: "boolean",
+        description: "Tests whether an own text field is present, including a nil value.",
+    },
+    StandardObjectFunction {
+        name: "get",
+        parameters: &["value", "key", "fallback"],
+        result: "value",
+        description: "Returns an own text field or the fallback.",
+    },
+    StandardObjectFunction {
         name: "keys",
         parameters: &["value"],
         result: "array",
@@ -1963,6 +1975,8 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let collected = []\n",
     "array.push(collected, 4)\n",
     "let merged = object.merge({left: 1}, {right: 2})\n",
+    "object.has(merged, \"left\")\n",
+    "object.get(merged, \"missing\", 0)\n",
     "object.keys(merged)\n",
     "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
@@ -2369,6 +2383,26 @@ fn fuzz_exercise_fixed_standard_object_requests(
         position_at_byte(source, merge_start + "object.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, merge_argument));
+
+    let Some(has_start) = source.find("object.has") else {
+        return;
+    };
+    let has_argument = has_start + "object.has(merged, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, has_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, has_argument));
+
+    let Some(get_start) = source.find("object.get") else {
+        return;
+    };
+    let get_argument = get_start + "object.get(merged, \"missing\", ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, get_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, get_argument));
 
     let Some(keys_start) = source.find("object.keys") else {
         return;
@@ -9626,7 +9660,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["entries", "keys", "len", "merge", "values"]
+            ["entries", "get", "has", "keys", "len", "merge", "values"]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9662,7 +9696,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core object completion succeeds");
-        assert_eq!(partial.items.len(), 5);
+        assert_eq!(partial.items.len(), 7);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9676,6 +9710,8 @@ mod tests {
         let source = concat!(
             "use mod.std.object\n",
             "let merged = object.merge({left: 1}, {right: 2})\n",
+            "object.has(merged, \"left\")\n",
+            "object.get(merged, \"missing\", 0)\n",
             "object.keys(merged)\n",
             "object.entries(merged)"
         );
@@ -9719,6 +9755,32 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "object.entries(value) -> array\n\nReturns shallow [text key, value] pairs in stored field order.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let has_start = source.find("object.has").expect("has member exists") + "object.".len();
+        let has_hover = server
+            .hover(&test_uri(), position_at_byte(source, has_start + 1))
+            .expect("core object has hover succeeds")
+            .expect("has has fixed hover metadata");
+        assert_eq!(
+            has_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.has(value, key) -> boolean\n\nTests whether an own text field is present, including a nil value.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let get_start = source.find("object.get").expect("get member exists") + "object.".len();
+        let get_hover = server
+            .hover(&test_uri(), position_at_byte(source, get_start + 1))
+            .expect("core object get hover succeeds")
+            .expect("get has fixed hover metadata");
+        assert_eq!(
+            get_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.get(value, key, fallback) -> value\n\nReturns an own text field or the fallback.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -9774,6 +9836,36 @@ mod tests {
             "object.entries(value) -> array"
         );
         assert_eq!(entries_help.active_parameter, Some(0));
+
+        let has_cursor = source
+            .find("object.has(merged, \"left\")")
+            .expect("has input exists")
+            + "object.has(merged, ".len()
+            + 1;
+        let has_help = server
+            .signature_help(&test_uri(), position_at_byte(source, has_cursor))
+            .expect("core object has signature help succeeds")
+            .expect("has has a fixed signature");
+        assert_eq!(
+            has_help.signatures[0].label,
+            "object.has(value, key) -> boolean"
+        );
+        assert_eq!(has_help.active_parameter, Some(1));
+
+        let get_cursor = source
+            .find("object.get(merged, \"missing\", 0)")
+            .expect("get input exists")
+            + "object.get(merged, \"missing\", ".len()
+            + 1;
+        let get_help = server
+            .signature_help(&test_uri(), position_at_byte(source, get_cursor))
+            .expect("core object get signature help succeeds")
+            .expect("get has a fixed signature");
+        assert_eq!(
+            get_help.signatures[0].label,
+            "object.get(value, key, fallback) -> value"
+        );
+        assert_eq!(get_help.active_parameter, Some(2));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -15849,7 +15941,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["entries", "keys", "len", "merge", "values"]
+            ["entries", "get", "has", "keys", "len", "merge", "values"]
         );
     }
 

@@ -3332,6 +3332,18 @@ fn install_standard_object_module(vm: &mut vm::ScriptVm, std_module: ScriptObjec
     );
     vm.add_method(
         object,
+        id!(has),
+        script_args_def!(value = NIL, key = NIL),
+        standard_object_has,
+    );
+    vm.add_method(
+        object,
+        id!(get),
+        script_args_def!(value = NIL, key = NIL, fallback = NIL),
+        standard_object_get,
+    );
+    vm.add_method(
+        object,
         id!(keys),
         script_args_def!(value = NIL),
         standard_object_keys,
@@ -3367,6 +3379,34 @@ fn standard_object_len(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue
         Err(error) => return error,
     };
     ScriptValue::from_f64(length as f64)
+}
+
+fn standard_object_has(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let key = script_value!(vm, args.key);
+    let (object, _) = match standard_object_input(vm, value, "has", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    match standard_object_own_text_field(vm, object, key, "has") {
+        Ok(value) => value.is_some().into(),
+        Err(error) => error,
+    }
+}
+
+fn standard_object_get(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let key = script_value!(vm, args.key);
+    let fallback = script_value!(vm, args.fallback);
+    let (object, _) = match standard_object_input(vm, value, "get", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    match standard_object_own_text_field(vm, object, key, "get") {
+        Ok(Some(value)) => value,
+        Ok(None) => fallback,
+        Err(error) => error,
+    }
 }
 
 fn standard_object_keys(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
@@ -3452,6 +3492,27 @@ fn standard_object_input(
     Ok((object, data.map_len()))
 }
 
+/// Resolves an own text field without using the VM's prototype-chain lookup.
+/// Records can store identifier or string keys, so check both representations.
+fn standard_object_own_text_field(
+    vm: &mut vm::ScriptVm,
+    object: ScriptObject,
+    key: ScriptValue,
+    function: &'static str,
+) -> Result<Option<ScriptValue>, ScriptValue> {
+    let Some(value) = vm.string_with(key, |vm, key_text| {
+        let canonical_key = vm.bx.heap.check_intern_string(key_text);
+        let identifier_key: ScriptValue = LiveId::from_str(key_text).into();
+        let data = vm.bx.heap.object_data(object);
+        data.map_get(&key)
+            .or_else(|| canonical_key.and_then(|key| data.map_get(&key)))
+            .or_else(|| data.map_get(&identifier_key))
+    }) else {
+        return Err(standard_object_expected_lookup_key(vm, function));
+    };
+    Ok(value)
+}
+
 fn standard_object_entries(
     vm: &mut vm::ScriptVm,
     value: ScriptValue,
@@ -3527,6 +3588,16 @@ fn standard_object_expected_record(
     script_err_type_mismatch!(
         vm.bx.threads.cur_ref().trap,
         "std.object.{function} expects `{parameter}` to be a plain record"
+    )
+}
+
+fn standard_object_expected_lookup_key(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.{function} expects `key` to be a string"
     )
 }
 
@@ -7909,6 +7980,13 @@ compute(outer, 2)
                  use mod.std.object\n\
                  let record = {first: 1, second: 2}\n\
                  assert(object.len(record) == 2)\n\
+                 assert(object.has(record, \"first\"))\n\
+                 assert(!object.has(record, \"missing\"))\n\
+                 assert(object.get(record, \"first\", -1) == 1)\n\
+                 assert(object.get(record, \"missing\", \"fallback\") == \"fallback\")\n\
+                 let present_nil = {value: nil}\n\
+                 assert(object.has(present_nil, \"value\"))\n\
+                 assert(object.get(present_nil, \"value\", \"fallback\") == nil)\n\
                  assert(object.keys(record) == [\"first\", \"second\"])\n\
                  let pairs = object.entries(record)\n\
                  assert(pairs[0][0] == \"first\")\n\
@@ -7921,6 +7999,8 @@ compute(outer, 2)
                  assert(merged.second == 20)\n\
                  assert(merged.third == 3)\n\
                  let json_record = json.parse(\"{\\\"second\\\":30,\\\"fourth\\\":4}\")\n\
+                 assert(object.has(json_record, \"second\"))\n\
+                 assert(object.get(json_record, \"second\", -1) == 30)\n\
                  let mixed = object.merge(merged, json_record)\n\
                  assert(mixed.second == 30)\n\
                  assert(mixed.fourth == 4)\n\
@@ -8001,6 +8081,25 @@ compute(outer, 2)
             serde_json::json!("invalid")
         );
 
+        let invalid_lookup_key = runtime
+            .eval("use mod.std.object\ntry object.has({first: 1}, 1) catch \"invalid-key\"")
+            .unwrap();
+        assert!(
+            invalid_lookup_key.completed(),
+            "{:?}",
+            invalid_lookup_key.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_lookup_key.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-key")
+        );
+
         let non_text_key = runtime
             .eval(
                 "use mod.std.object\n\
@@ -8030,7 +8129,7 @@ compute(outer, 2)
             oversized_source.push_str(&format!("field_{index}: 0"));
         }
         oversized_source.push_str(&format!(
-            "}}\nassert(object.len(values) == {})\nobject.entries(values)",
+            "}}\nassert(object.len(values) == {})\nassert(object.has(values, \"field_0\"))\nassert(object.get(values, \"missing\", -1) == -1)\nobject.entries(values)",
             MAX_STANDARD_OBJECT_FIELDS + 1
         ));
         let limits = ExecutionLimits {

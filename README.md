@@ -277,15 +277,17 @@ not expose host state, filesystem, process, network, clock, entropy, or crate
 access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
+`object.has(value, key)`, `object.get(value, key, fallback)`,
 `object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
-`object.merge(left, right)`.
-It accepts plain record or JSON-object data only, never follows prototypes, and
-never invokes callbacks. `keys`, `entries`, `values`, and `merge` shallowly
-process at most 4,096 own text-keyed fields; `entries` returns fresh
-`[text_key, value]` pairs in stored field order, and `merge` also rejects a
-combined source count over that bound. `len` is constant-time and uncapped. The
-module does not expose host state, filesystem, process, network, clock,
-entropy, or crate access.
+`object.merge(left, right)`. It accepts plain record or JSON-object data only,
+never follows prototypes, and never invokes callbacks. `has` distinguishes a
+present `nil` own text field from an absent one; `get` returns its fallback only
+when that own text field is absent. Neither traverses record fields. `keys`,
+`entries`, `values`, and `merge` shallowly process at most 4,096 own text-keyed
+fields; `entries` returns fresh `[text_key, value]` pairs in stored field order,
+and `merge` also rejects a combined source count over that bound. `len` is
+constant-time and uncapped. The module does not expose host state, filesystem,
+process, network, clock, entropy, or crate access.
 
 ## Example
 
