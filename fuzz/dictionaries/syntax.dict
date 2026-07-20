@@ -32,6 +32,7 @@
 "array.slice("
 "array.has_index("
 "array.get("
+"array.compact("
 "array.reverse("
 "array.flatten("
 "array.push("

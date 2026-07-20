@@ -3118,6 +3118,12 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
     );
     vm.add_method(
         array,
+        id!(compact),
+        script_args_def!(value = NIL),
+        standard_array_compact,
+    );
+    vm.add_method(
+        array,
         id!(flatten),
         script_args_def!(value = NIL),
         standard_array_flatten,
@@ -3229,6 +3235,24 @@ fn standard_array_concat(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptVal
     let output = vm.bx.heap.new_array();
     standard_array_append_indices(vm, output, left, 0..left_length);
     standard_array_append_indices(vm, output, right, 0..right_length);
+    output.into()
+}
+
+fn standard_array_compact(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let (array, length) = match standard_array_input(vm, value, "compact", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+
+    let output = vm.bx.heap.new_array();
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for index in 0..length {
+        let value = vm.bx.heap.array_index_unchecked(array, index);
+        if value != NIL {
+            vm.bx.heap.array_push(output, value, trap);
+        }
+    }
     output.into()
 }
 
@@ -8054,6 +8078,17 @@ compute(outer, 2)
                  assert(array.get(present_nil, 0, \"fallback\") == nil)\n\
                  assert(array.slice(input, 1, 3) == [2, 3])\n\
                  assert(array.concat([1, 2], [3, 4]) == [1, 2, 3, 4])\n\
+                 let optional_nested = {answer: 1}\n\
+                 let optional = [nil, false, 0, \"\", optional_nested, nil]\n\
+                 let compacted = array.compact(optional)\n\
+                 assert(array.len(compacted) == 4)\n\
+                 assert(compacted[0] == false)\n\
+                 assert(compacted[1] == 0)\n\
+                 assert(compacted[2] == \"\")\n\
+                 assert(array.len(optional) == 6)\n\
+                 assert(optional[0] == nil)\n\
+                 compacted[3].answer = 2\n\
+                 assert(optional_nested.answer == 2)\n\
                  assert(array.flatten([[1, 2], [], [3]]) == [1, 2, 3])\n\
                  let reversed = array.reverse(input)\n\
                  assert(reversed == [3, 2, 1])\n\
@@ -8090,7 +8125,9 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nstd.array.get([[1], [2]], 2, \"fallback\")")
+            .eval(
+                "use mod.std\nlet compacted = std.array.compact([nil, [2], nil])\ncompacted[0][0]",
+            )
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
         assert_eq!(
@@ -8101,17 +8138,17 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!("fallback")
+            serde_json::json!(2)
         );
 
         let mutation = runtime
-            .eval("use mod.std.array\narray.reverse = || nil")
+            .eval("use mod.std.array\narray.compact = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
 
         let preserved = runtime
-            .eval("use mod.std.array\narray.concat([1], [2])")
+            .eval("use mod.std.array\narray.compact([nil, 1, nil])")
             .unwrap();
         assert!(preserved.completed(), "{:?}", preserved.diagnostics);
         assert_eq!(
@@ -8122,7 +8159,26 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!([1, 2])
+            serde_json::json!([1])
+        );
+
+        let invalid_compact = runtime
+            .eval("use mod.std.array\ntry array.compact(\"items\") catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_compact.completed(),
+            "{:?}",
+            invalid_compact.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_compact.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
         );
 
         let invalid_index = runtime
@@ -8209,6 +8265,27 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("supports at most")));
+
+        let mut compact_limit_runtime = Runtime::default();
+        let compact_limit = compact_limit_runtime
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
+                 try array.compact(values) catch \"limit\""
+            ))
+            .unwrap();
+        assert!(compact_limit.completed(), "{:?}", compact_limit.diagnostics);
+        assert_eq!(
+            compact_limit_runtime
+                .script_value_as_json(
+                    compact_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
 
         let oversized_concat = Runtime::default()
             .eval(&format!(

@@ -428,10 +428,10 @@ add members to this core module.
 An exact visible direct `use mod.std.array` binding has a separate fixed core
 projection for only `array.len(value)`, `array.has_index(value, index)`,
 `array.get(value, index, fallback)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, `array.reverse(value)`, `array.flatten(value)`,
-and `array.push(value, item)`, with plain-text member hover and function
-signature help. Its descriptors are compiled into the LSP rather than read from
-a catalog, and describe the runtime's bounded local array operations without
+`array.concat(left, right)`, `array.compact(value)`, `array.reverse(value)`,
+`array.flatten(value)`, and `array.push(value, item)`, with plain-text member
+hover and function signature help. Its descriptors are compiled into the LSP
+rather than read from a catalog, and describe the runtime's bounded local array operations without
 resolving a host module or granting a capability. A shadowed binding, chained
 receiver, unknown member, or invalid source prefix has no fixed-array result,
 and advisory metadata cannot add members to this core module.

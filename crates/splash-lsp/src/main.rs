@@ -442,6 +442,13 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
         description: "Returns a shallow concatenation of two arrays.",
     },
     StandardArrayFunction {
+        name: "compact",
+        parameters: &["value"],
+        result: "array",
+        description:
+            "Returns a shallow copy without nil items; false, zero, and empty strings remain.",
+    },
+    StandardArrayFunction {
         name: "flatten",
         parameters: &["value"],
         result: "array",
@@ -2004,6 +2011,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "array.has_index(sliced, 0)\n",
     "array.get(sliced, 2, 0)\n",
     "let flattened = array.flatten([sliced, [4]])\n",
+    "let compacted = array.compact([nil, 1, nil])\n",
     "array.reverse(sliced)\n",
     "let collected = []\n",
     "array.push(collected, 4)\n",
@@ -2390,6 +2398,16 @@ fn fuzz_exercise_fixed_standard_array_requests(
         position_at_byte(source, get_start + "array.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, get_argument));
+
+    let Some(compact_start) = source.find("array.compact") else {
+        return;
+    };
+    let compact_argument = compact_start + "array.compact(".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, compact_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, compact_argument));
 
     let Some(flatten_start) = source.find("array.flatten") else {
         return;
@@ -9488,6 +9506,7 @@ mod tests {
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
             [
+                "compact",
                 "concat",
                 "flatten",
                 "get",
@@ -9532,7 +9551,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 8);
+        assert_eq!(partial.items.len(), 9);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9549,6 +9568,7 @@ mod tests {
             "let first = array.get(selected, 0, -1)\n",
             "array.has_index(selected, 1)\n",
             "let flattened = array.flatten([selected, [4]])\n",
+            "let compacted = array.compact([nil, 1, nil])\n",
             "array.reverse(selected)\n",
             "let collected = []\n",
             "array.push(collected, 4)"
@@ -9670,6 +9690,35 @@ mod tests {
             "array.has_index(value, index) -> boolean"
         );
         assert_eq!(has_index_help.active_parameter, Some(1));
+
+        let compact_start =
+            source.find("array.compact").expect("compact member exists") + "array.".len();
+        let compact_hover = server
+            .hover(&test_uri(), position_at_byte(source, compact_start + 1))
+            .expect("core array compact hover succeeds")
+            .expect("compact has fixed hover metadata");
+        assert_eq!(
+            compact_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.compact(value) -> array\n\nReturns a shallow copy without nil items; false, zero, and empty strings remain.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let compact_cursor = source
+            .find("array.compact([nil, 1, nil])")
+            .expect("compact input exists")
+            + "array.compact(".len()
+            + 1;
+        let compact_help = server
+            .signature_help(&test_uri(), position_at_byte(source, compact_cursor))
+            .expect("core array compact signature help succeeds")
+            .expect("compact has a fixed signature");
+        assert_eq!(
+            compact_help.signatures[0].label,
+            "array.compact(value) -> array"
+        );
+        assert_eq!(compact_help.active_parameter, Some(0));
 
         let flatten_start =
             source.find("array.flatten").expect("flatten member exists") + "array.".len();
@@ -16184,6 +16233,7 @@ mod tests {
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
             [
+                "compact",
                 "concat",
                 "flatten",
                 "get",
