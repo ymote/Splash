@@ -94,8 +94,9 @@ documented in `vendor/makepad/PATCHES.md`.
 `splash-lsp` is a host-only stdio server for editor clients. It advertises
 UTF-16 positions, full document synchronization, syntax diagnostics,
 whole-document canonical formatting, top-level `fn`/`let` document symbols,
-same-document lexical definition/reference requests, binding-kind hover, and
-symbol highlights, lexical completion, and guarded rename:
+same-document lexical definition/reference requests, binding-kind and bounded
+named-function-signature hover, symbol highlights, lexical completion, and
+guarded rename:
 
 ```sh
 cargo run -p splash-lsp
@@ -292,9 +293,10 @@ alias, with both `callMode` and
 or JSON bridge; only that explicit shape gives a direct module one
 JSON-compatible `input` and synchronous or deferred result label. Mode-only
 metadata still completes and hovers, but has no assumed arity. A named function
-signature reads only its completed canonical declaration header, retains at
-most 64 parameters from a 64 KiB declaration window, and never reports a
-partial list.
+signature or hover reads only its completed canonical declaration header,
+retains at most 64 parameters from a 64 KiB declaration window, and never
+reports a partial list; malformed or oversized headers receive no named
+signature hover.
 The cursor scanner accepts an in-progress string argument, but rejects a cursor
 inside a comment, mismatched delimiters, deep nesting, shadowed receivers,
 truncated scope/import metadata, and unknown paths. It never reads a runtime,

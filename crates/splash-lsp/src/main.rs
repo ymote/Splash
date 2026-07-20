@@ -1338,6 +1338,12 @@ impl SplashLanguageServer {
             }
         }
 
+        if symbol.kind == LexicalSymbolKind::Function {
+            if let Some(hover) = named_function_hover(source, symbol, occurrence) {
+                return Ok(Some(hover));
+            }
+        }
+
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -2072,6 +2078,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "object.has(merged, \"left\")\n",
     "object.get(merged, \"missing\", 0)\n",
     "let picked = object.pick(merged, [\"left\"])\n",
+    "let omitted = object.omit(merged, [\"right\"])\n",
     "object.keys(merged)\n",
     "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
@@ -2301,11 +2308,7 @@ pub fn fuzz_exercise_document(source: &str) {
     fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_named_function_signature_requests(
-        &server,
-        &uri,
-        FUZZ_ADVISORY_CONFIGURATION_SOURCE,
-    );
+    fuzz_exercise_named_function_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 4);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
@@ -2389,11 +2392,7 @@ fn fuzz_exercise_advisory_configuration_requests(server: &SplashLanguageServer, 
     fuzz_exercise_fixed_standard_json_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_assert_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_named_function_signature_requests(
-        server,
-        uri,
-        FUZZ_ADVISORY_CONFIGURATION_SOURCE,
-    );
+    fuzz_exercise_named_function_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 }
 
 #[cfg(fuzzing)]
@@ -2444,14 +2443,17 @@ fn fuzz_exercise_advisory_input_field_requests(
 }
 
 #[cfg(fuzzing)]
-fn fuzz_exercise_named_function_signature_requests(
-    server: &SplashLanguageServer,
-    uri: &Uri,
-    source: &str,
-) {
-    let Some(call_start) = source.find("summarize(20, 22)") else {
+fn fuzz_exercise_named_function_requests(server: &SplashLanguageServer, uri: &Uri, source: &str) {
+    let Some(declaration_start) = source.find("fn summarize") else {
         return;
     };
+    let declaration_name_start = declaration_start + "fn ".len();
+    let _ = server.hover(uri, position_at_byte(source, declaration_name_start + 1));
+
+    let Some(call_start) = source.rfind("summarize(20, 22)") else {
+        return;
+    };
+    let _ = server.hover(uri, position_at_byte(source, call_start + 1));
     let second_argument = call_start + "summarize(20, ".len();
     let _ = server.signature_help(uri, position_at_byte(source, second_argument));
 }
@@ -2681,6 +2683,16 @@ fn fuzz_exercise_fixed_standard_object_requests(
         position_at_byte(source, pick_start + "object.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, pick_argument));
+
+    let Some(omit_start) = source.find("object.omit") else {
+        return;
+    };
+    let omit_argument = omit_start + "object.omit(merged, [".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, omit_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, omit_argument));
 
     let Some(keys_start) = source.find("object.keys") else {
         return;
@@ -7512,6 +7524,28 @@ fn named_function_signature_help(
     ))
 }
 
+/// Presents a retained named function's completed declaration header without
+/// evaluating source or inferring a result type. An oversized or malformed
+/// header does not receive a named signature hover.
+fn named_function_hover(
+    source: &str,
+    function: &LexicalSymbol,
+    occurrence: SourceSpan,
+) -> Option<Hover> {
+    let parameters = named_function_parameter_names(source, source.len(), function)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: format!(
+                "{}({})\n\n{NAMED_FUNCTION_SIGNATURE_DOCUMENTATION}",
+                function.name,
+                parameters.join(", "),
+            ),
+        }),
+        range: Some(span_range(source, occurrence)),
+    })
+}
+
 /// Reads only the canonical parameter list immediately following a lexical
 /// function declaration. A malformed, oversized, or incomplete header is
 /// omitted rather than presented with a partial signature.
@@ -11290,6 +11324,137 @@ mod tests {
             )
             .expect("crowded signature request succeeds")
             .is_none());
+    }
+
+    #[test]
+    fn presents_visible_named_function_hover_signature_without_runtime_access() {
+        let source = concat!(
+            "fn summarize(left /* first value */, right) {\n",
+            "    left + right\n",
+            "}\n",
+            "summarize(20, 22)"
+        );
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let expected_value =
+            format!("summarize(left, right)\n\n{NAMED_FUNCTION_SIGNATURE_DOCUMENTATION}");
+        let declaration_start = source.find("summarize").expect("declaration exists");
+        let declaration_hover = server
+            .hover(&test_uri(), position_at_byte(source, declaration_start + 1))
+            .expect("named declaration hover succeeds")
+            .expect("named declaration has a signature hover");
+        assert_eq!(
+            declaration_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: expected_value.clone(),
+            })
+        );
+        assert_eq!(
+            declaration_hover.range,
+            Some(Range::new(
+                position_at_byte(source, declaration_start),
+                position_at_byte(source, declaration_start + "summarize".len()),
+            ))
+        );
+
+        let reference_start = source.rfind("summarize").expect("reference exists");
+        let reference_hover = server
+            .hover(&test_uri(), position_at_byte(source, reference_start + 1))
+            .expect("named reference hover succeeds")
+            .expect("named reference has a signature hover");
+        assert_eq!(
+            reference_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: expected_value,
+            })
+        );
+        assert_eq!(
+            reference_hover.range,
+            Some(Range::new(
+                position_at_byte(source, reference_start),
+                position_at_byte(source, reference_start + "summarize".len()),
+            ))
+        );
+
+        let zero_source = "fn ping() {\nnil\n}\nping()";
+        let mut zero_server = SplashLanguageServer::default();
+        zero_server.open_document(document(1, zero_source));
+        let zero_start = zero_source
+            .rfind("ping")
+            .expect("zero-argument reference exists");
+        let zero_hover = zero_server
+            .hover(&test_uri(), position_at_byte(zero_source, zero_start + 1))
+            .expect("zero-argument hover succeeds")
+            .expect("zero-argument function has a signature hover");
+        assert_eq!(
+            zero_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: format!("ping()\n\n{NAMED_FUNCTION_SIGNATURE_DOCUMENTATION}"),
+            })
+        );
+
+        let shadowed_source = concat!(
+            "fn summarize(value) {\n",
+            "    value\n",
+            "}\n",
+            "let summarize = true\n",
+            "summarize"
+        );
+        let mut shadowed_server = SplashLanguageServer::default();
+        shadowed_server.open_document(document(1, shadowed_source));
+        let shadowed_start = shadowed_source
+            .rfind("summarize")
+            .expect("shadowed reference exists");
+        let shadowed_hover = shadowed_server
+            .hover(
+                &test_uri(),
+                position_at_byte(shadowed_source, shadowed_start + 1),
+            )
+            .expect("shadowed hover succeeds")
+            .expect("shadowed binding retains generic hover");
+        assert_eq!(
+            shadowed_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "**binding** `summarize`".to_owned(),
+            })
+        );
+
+        let forward_source = "summarize(20)\nfn summarize(value) {\nvalue\n}";
+        let mut forward_server = SplashLanguageServer::default();
+        forward_server.open_document(document(1, forward_source));
+        let forward_start = forward_source
+            .find("summarize")
+            .expect("forward call exists");
+        assert!(forward_server
+            .hover(
+                &test_uri(),
+                position_at_byte(forward_source, forward_start + 1),
+            )
+            .expect("forward hover succeeds")
+            .is_none());
+
+        let parameters = (0..=MAX_LSP_NAMED_FUNCTION_SIGNATURE_PARAMETERS)
+            .map(|index| format!("value{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let crowded_source = format!("fn crowded({parameters}) {{ nil }}");
+        let mut crowded_server = SplashLanguageServer::default();
+        crowded_server.open_document(document(1, &crowded_source));
+        let crowded_start = crowded_source
+            .find("crowded")
+            .expect("crowded declaration exists");
+        let crowded_hover = crowded_server
+            .hover(
+                &test_uri(),
+                position_at_byte(&crowded_source, crowded_start + 1),
+            )
+            .expect("crowded hover succeeds");
+        assert!(crowded_hover.is_none());
     }
 
     #[test]

@@ -97,9 +97,10 @@ not load imported modules, infer forward references, resolve record keys or
 member fields, evaluate source, create a capability host, or authorize a tool.
 The LSP can serve a retained definition from a truncated report, but rejects a
 reference request instead of presenting an incomplete set as exhaustive. It
-also exposes binding-kind hover for a retained occurrence and neutral
-same-document highlights; a truncated report cannot produce an exhaustive
-highlight set. A client with versioned-document-edit support can also request a
+also exposes binding-kind hover for a retained occurrence, enriching a named
+function with its completed bounded source signature, and neutral same-document
+highlights; a truncated report cannot produce an exhaustive highlight set. A
+client with versioned-document-edit support can also request a
 guarded same-document rename. Splash validates the new name through
 `splash_core::is_canonical_identifier`, reparses the bounded rewritten source,
 and returns a version-bound edit only when the complete remapped lexical report
@@ -173,9 +174,9 @@ advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.object`
 binding. At a direct `object.` member site it completes only `len`, `has`,
-`get`, `pick`, `from_entries`, `with`, `keys`, `entries`, `values`, and `merge`,
-with plain-text hover and fixed function signatures. This is a compiled-in
-description of bounded own-field record shaping: it does not inspect
+`get`, `pick`, `omit`, `from_entries`, `with`, `keys`, `entries`, `values`, and
+`merge`, with plain-text hover and fixed function signatures. This is a
+compiled-in description of bounded own-field record shaping: it does not inspect
 module-catalog metadata, resolve a module, follow a local alias, or expose a
 host capability. A shadowed `object` binding, chained receiver, unknown member,
 or source outside the valid prefix gets no fixed-core result; a matching
