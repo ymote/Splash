@@ -30,7 +30,7 @@ pub use serde_json::Value as JsonValue;
 use vm::parser::ScriptParser;
 use vm::tokenizer::{ScriptToken, ScriptTokenizer};
 use vm::{
-    id, id_lut, script_args_def, script_err_invalid_args, script_err_limit, script_err_not_allowed,
+    id, id_lut, script_args_def, script_err_invalid_args, script_err_limit,
     script_err_type_mismatch, script_err_unexpected, script_value, LiveId, ScriptIp, ScriptObject,
     ScriptStringSink, ScriptValue, NIL,
 };
@@ -2451,6 +2451,7 @@ fn restrict_vendored_module_surface(
             .heap
             .set_value_def(std, member.into(), ScriptValue::NIL);
     }
+    restrict_vendored_primitive_method_surface(vm);
     install_standard_math_module(vm, std);
     install_standard_json_module(vm, std, json_method_limits);
     install_standard_text_module(vm, std);
@@ -2460,23 +2461,33 @@ fn restrict_vendored_module_surface(
     // setup-owned language primitives, not mutable cross-evaluation points.
     vm.bx.heap.freeze(std);
     vm.bx.heap.freeze(vm.bx.code.builtins.range);
+}
 
-    // Makepad's HTML parser is registered as a string method rather than a
-    // module. Override it explicitly: its native backing storage is outside
-    // Splash's tracked VM-heap budget and it is not part of the published
-    // standalone language profile.
-    vm.bx.code.native.borrow_mut().add_type_method(
-        &mut vm.bx.heap,
+/// Clears every primitive type method inherited from Makepad before Splash
+/// installs its own documented data boundary. This is an allowlist boundary:
+/// upstream additions cannot become source-reachable merely because the VM
+/// bootstrap registered them.
+fn restrict_vendored_primitive_method_surface(vm: &mut vm::ScriptVm) {
+    let primitive_types = [
+        vm::ScriptValueType::REDUX_NUMBER,
+        vm::ScriptValueType::REDUX_NAN,
+        vm::ScriptValueType::REDUX_BOOL,
+        vm::ScriptValueType::REDUX_NIL,
+        vm::ScriptValueType::REDUX_COLOR,
         vm::ScriptValueType::REDUX_STRING,
-        id!(parse_html),
-        &[],
-        |vm, _| {
-            script_err_not_allowed!(
-                vm.bx.threads.cur_ref().trap,
-                "unreviewed Makepad platform APIs are unavailable in Splash"
-            )
-        },
-    );
+        vm::ScriptValueType::REDUX_OBJECT,
+        vm::ScriptValueType::REDUX_ARRAY,
+        vm::ScriptValueType::REDUX_POD,
+        vm::ScriptValueType::REDUX_POD_TYPE,
+        vm::ScriptValueType::REDUX_REGEX,
+        vm::ScriptValueType::REDUX_OPCODE,
+        vm::ScriptValueType::REDUX_ERR,
+        vm::ScriptValueType::REDUX_ID,
+    ];
+    let mut native = vm.bx.code.native.borrow_mut();
+    for value_type in primitive_types {
+        native.clear_type_methods(value_type);
+    }
 }
 
 /// Installs a small Splash-owned scalar math module without restoring the
@@ -2884,6 +2895,12 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
         script_args_def!(value = NIL),
         standard_array_reverse,
     );
+    vm.add_method(
+        array,
+        id!(push),
+        script_args_def!(value = NIL, item = NIL),
+        standard_array_push,
+    );
     vm.bx
         .heap
         .set_value_def(std_module, id!(array).into(), array.into());
@@ -2956,6 +2973,22 @@ fn standard_array_reverse(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptVa
     };
 
     standard_array_copy_indices(vm, array, (0..length).rev())
+}
+
+fn standard_array_push(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let item = script_value!(vm, args.item);
+    let (array, length) = match standard_array_input(vm, value, "push", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    if length == MAX_STANDARD_ARRAY_ITEMS {
+        return standard_array_item_limit(vm, "push");
+    }
+
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    vm.bx.heap.array_push(array, item, trap);
+    NIL
 }
 
 fn standard_array_input(
@@ -3375,6 +3408,17 @@ fn install_bounded_json_methods(vm: &mut vm::ScriptVm, limits: Rc<Cell<ScriptJso
             },
         );
     }
+
+    native.add_type_method(
+        &mut vm.bx.heap,
+        vm::ScriptValueType::REDUX_STRING,
+        id!(to_bytes),
+        &[],
+        |vm, args| {
+            let value = script_value!(vm, args.self);
+            vm.bx.heap.string_to_bytes_array(value).into()
+        },
+    );
 
     let string_limits = limits.clone();
     native.add_type_method(
@@ -7000,7 +7044,7 @@ compute(outer, 2)
     }
 
     #[test]
-    fn does_not_expose_unreviewed_makepad_platform_or_debug_apis() {
+    fn does_not_expose_unreviewed_makepad_platform_or_primitive_apis() {
         for source in [
             "use mod.fs\nfs.read(\"/etc/passwd\")",
             "use mod.run\nrun.child({cmd:\"whoami\"})",
@@ -7013,6 +7057,16 @@ compute(outer, 2)
             "use mod.std\nstd.assert = || nil",
             "use mod.std\nstd.Range.blocked = true",
             "\"<p>blocked</p>\".parse_html()",
+            "\"a,b\".split(\",\")",
+            "\"abc\".to_chars()",
+            "let value = 1\nvalue.to_string()",
+            "let value = 1\nvalue.to_number()",
+            "let value = 1\nvalue.ty()",
+            "let values = [1, 2]\nvalues.push(3)",
+            "let values = [1, 2]\nvalues.retain(|value| value > 1)",
+            "let record = {first: 1}\nrecord.proto()",
+            "let record = {first: 1}\nrecord.gc_id()",
+            "let record = {first: 1}\nrecord.freeze_api()",
             "use mod.gc\ngc.run()",
             "use mod.math\nmath.sin(0)",
             "use mod.shader\nshader.instance(0)",
@@ -7216,6 +7270,10 @@ compute(outer, 2)
                  let reversed = array.reverse(input)\n\
                  assert(reversed == [3, 2, 1])\n\
                  assert(input == [1, 2, 3])\n\
+                 let appended = []\n\
+                 assert(array.push(appended, 1) == nil)\n\
+                 array.push(appended, 2)\n\
+                 assert(appended == [1, 2])\n\
                  let nested = {answer: 1}\n\
                  let copied = array.slice([nested], 0, 1)\n\
                  copied[0].answer = 2\n\
@@ -7329,6 +7387,28 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("std.array.concat supports at most")));
+
+        let mut push_limit_runtime = Runtime::default();
+        let push_limit = push_limit_runtime
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{}] = 0\n\
+                 try array.push(values, 1) catch \"limit\"",
+                MAX_STANDARD_ARRAY_ITEMS - 1
+            ))
+            .unwrap();
+        assert!(push_limit.completed(), "{:?}", push_limit.diagnostics);
+        assert_eq!(
+            push_limit_runtime
+                .script_value_as_json(
+                    push_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
     }
 
     #[test]

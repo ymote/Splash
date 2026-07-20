@@ -409,6 +409,12 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
         result: "array",
         description: "Returns a shallow reversed copy of an array.",
     },
+    StandardArrayFunction {
+        name: "push",
+        parameters: &["value", "item"],
+        result: "nil",
+        description: "Appends one item in place and returns nil.",
+    },
 ];
 
 const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
@@ -489,7 +495,7 @@ const FIXED_STANDARD_MODULE_PATH_CHILDREN: &[FixedCoreModulePathChild] = &[
         name: "array",
         detail: "Splash core module; bounded array helpers",
         documentation:
-            "Fixed Splash core array helpers. They make bounded shallow copies and do not access the host or grant authority.",
+            "Fixed Splash core array helpers. They perform bounded local array operations and do not access the host or grant authority.",
     },
     FixedCoreModulePathChild {
         name: "assert",
@@ -1927,6 +1933,8 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "json.stringify(parsed)\n",
     "let sliced = array.slice([1, 2, 3], 1, 3)\n",
     "array.reverse(sliced)\n",
+    "let collected = []\n",
+    "array.push(collected, 4)\n",
     "let merged = object.merge({left: 1}, {right: 2})\n",
     "object.keys(merged)\n",
     "object.entries(merged)\n",
@@ -2290,6 +2298,16 @@ fn fuzz_exercise_fixed_standard_array_requests(
         uri,
         position_at_byte(source, reverse_start + "array.".len() + 1),
     );
+
+    let Some(push_start) = source.find("array.push") else {
+        return;
+    };
+    let push_argument = push_start + "array.push(".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, push_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, push_argument));
 }
 
 #[cfg(fuzzing)]
@@ -9279,7 +9297,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["concat", "len", "reverse", "slice"]
+            ["concat", "len", "push", "reverse", "slice"]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9315,7 +9333,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 4);
+        assert_eq!(partial.items.len(), 5);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9329,7 +9347,9 @@ mod tests {
         let source = concat!(
             "use mod.std.array\n",
             "let selected = array.slice([1, 2, 3], 1, 3)\n",
-            "array.reverse(selected)"
+            "array.reverse(selected)\n",
+            "let collected = []\n",
+            "array.push(collected, 4)"
         );
         let mut server = SplashLanguageServer::default();
         server.open_document(document(1, source));
@@ -9400,6 +9420,34 @@ mod tests {
             "array.reverse(value) -> array"
         );
         assert_eq!(reverse_help.active_parameter, Some(0));
+
+        let push_start = source.find("array.push").expect("push member exists") + "array.".len();
+        let push_hover = server
+            .hover(&test_uri(), position_at_byte(source, push_start + 1))
+            .expect("core array push hover succeeds")
+            .expect("push has fixed hover metadata");
+        assert_eq!(
+            push_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.push(value, item) -> nil\n\nAppends one item in place and returns nil.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let push_cursor = source
+            .find("array.push(collected, 4)")
+            .expect("push call exists")
+            + "array.push(collected, ".len()
+            + 1;
+        let push_help = server
+            .signature_help(&test_uri(), position_at_byte(source, push_cursor))
+            .expect("core array push signature help succeeds")
+            .expect("push has a fixed signature");
+        assert_eq!(
+            push_help.signatures[0].label,
+            "array.push(value, item) -> nil"
+        );
+        assert_eq!(push_help.active_parameter, Some(1));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -15586,7 +15634,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["concat", "len", "reverse", "slice"]
+            ["concat", "len", "push", "reverse", "slice"]
         );
     }
 

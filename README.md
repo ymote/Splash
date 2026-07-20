@@ -53,8 +53,9 @@ and keeps UI support optional rather than making UI the language boundary.
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
   opaque trusted Rust adapter allocations.
-- Direct `Runtime` JSON conversion through `.parse_json()`/`.to_json()` and
-  frozen `mod.std.json`: strict, byte- and depth-bounded input plus
+- Direct `Runtime` JSON conversion through `.parse_json()`/`.to_json()`, the
+  bounded `string.to_bytes()` bridge, and frozen `mod.std.json`: strict,
+  byte- and depth-bounded input plus
   cycle-aware, byte- and depth-bounded output, with ordinary script errors
   rather than unbounded VM work.
 - Recoverable `try ... catch ...` control flow across Splash function calls,
@@ -261,12 +262,13 @@ host state, filesystem, process, network, clock, entropy, or crate access.
 
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 `array.slice(value, start, end)`, `array.concat(left, right)`, and
-`array.reverse(value)`. `slice` uses a half-open range with non-negative
-integer indexes. The transforming helpers are callback-free, shallow, and
-reject source arrays over 4,096 items; `concat` also rejects a combined result
-over that bound. `len` is constant-time and uncapped. The module does not
-expose host state, filesystem, process, network, clock, entropy, or crate
-access.
+`array.reverse(value)`, plus `array.push(value, item)`. `slice` uses a
+half-open range with non-negative integer indexes. `push` mutates its array,
+returns `nil`, and rejects a result over 4,096 items. The transforming helpers
+are callback-free, shallow, and reject source arrays over 4,096 items; `concat`
+also rejects a combined result over that bound. `len` is constant-time and
+uncapped. The module does not expose host state, filesystem, process, network,
+clock, entropy, or crate access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
@@ -586,10 +588,11 @@ binding, it completes `parse` and `stringify` with fixed plain-text hover and
 signature help. For an exact visible `use mod.std.text` binding, it completes
 the fixed text functions with plain-text hover and signature help. For an exact
 visible `use mod.std.array` binding, it completes `len`, `slice`, `concat`, and
-`reverse` with the same fixed plain-text hover and signature help. For an exact
-visible `use mod.std.object` binding, it completes `len`, `keys`, `entries`,
-`values`, and `merge` with the same fixed plain-text hover and signature help. At a
-statement-position `use mod.` path, the same static projection completes `std`;
+`reverse`, and `push` with the same fixed plain-text hover and signature help.
+For an exact visible `use mod.std.object` binding, it completes `len`, `keys`,
+`entries`, `values`, and `merge` with the same fixed plain-text hover and
+signature help. At a statement-position `use mod.` path, the same static
+projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.
 The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An

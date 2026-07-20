@@ -9,7 +9,7 @@ let route = request["route"]
 let tags = []
 
 for tag in array.reverse(request.tags) {
-    tags.push(text.upper(tag))
+    array.push(tags, text.upper(tag))
 }
 
 let summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: 42}, {tag_count: array.len(tags), tags: tags})

@@ -214,15 +214,18 @@ source. The development CLI performs canonical preflight automatically for
 
 Before either canonical or compatibility evaluation, standalone `Runtime`
 masks inherited Makepad UI, debug, shader, pod, GC, math, regex, HTML, and
-direct-output entry points. In particular, generated source cannot reach the
-vendored `std.log`, `std.print`, `std.println`, `std.regex`, or
-`String.parse_html()` APIs. `mod.std.assert`, normal language operations, the
-frozen Splash-owned `mod.std.math` scalar helpers, and the bounded
-`mod.std.json` data, `mod.std.text`, `mod.std.array`, and `mod.std.object`
-helpers remain available, along with reviewed host-installed `mod.tool` or
-direct capability modules. A trusted host that needs the broader Makepad
-surface must embed the raw Makepad VM itself; the compatibility APIs do not
-restore those bindings.
+direct-output entry points and clears inherited primitive type methods. In
+particular, generated source cannot reach the vendored `std.log`, `std.print`,
+`std.println`, `std.regex`, `String.parse_html()`, raw `array.push()`, or
+record-prototype APIs. The only direct primitive boundary restored by Splash is
+bounded `value.to_json()`, `document.parse_json()`, and `string.to_bytes()`;
+local array mutation uses `array.push(value, item)`. `mod.std.assert`, normal
+language operations, the frozen Splash-owned `mod.std.math` scalar helpers,
+and the bounded `mod.std.json` data, `mod.std.text`, `mod.std.array`, and
+`mod.std.object` helpers remain available, along with reviewed host-installed
+`mod.tool` or direct capability modules. A trusted host that needs the broader
+Makepad surface must embed the raw Makepad VM itself; the compatibility APIs do
+not restore those bindings.
 
 The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
 fixture passes the bounded compatibility preflight to catch parser drift, but
@@ -424,13 +427,13 @@ add members to this core module.
 
 An exact visible direct `use mod.std.array` binding has a separate fixed core
 projection for only `array.len(value)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, and `array.reverse(value)`, with plain-text member
-hover and function signature help. Its descriptors are compiled into the LSP
-rather than read from a catalog, and describe the runtime's bounded local
-array operations without resolving a host module or granting a capability. A
-shadowed binding, chained receiver, unknown member, or invalid source prefix
-has no fixed-array result, and advisory metadata cannot add members to this
-core module.
+`array.concat(left, right)`, `array.reverse(value)`, and
+`array.push(value, item)`, with plain-text member hover and function signature
+help. Its descriptors are compiled into the LSP rather than read from a
+catalog, and describe the runtime's bounded local array operations without
+resolving a host module or granting a capability. A shadowed binding, chained
+receiver, unknown member, or invalid source prefix has no fixed-array result,
+and advisory metadata cannot add members to this core module.
 
 An exact visible direct `use mod.std.object` binding has a separate fixed core
 projection for only `object.len(value)`, `object.keys(value)`,

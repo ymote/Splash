@@ -163,12 +163,12 @@ matching advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.array`
 binding. At a direct `array.` member site it completes only `len`, `slice`,
-`concat`, and `reverse`, with plain-text hover and fixed function signatures.
-This is a compiled-in description of bounded local array shaping: it does not
-inspect module-catalog metadata, resolve a module, follow a local alias, or
-expose a host capability. A shadowed `array` binding, chained receiver, unknown
-member, or source outside the valid prefix gets no fixed-core result; a matching
-advisory catalog path cannot extend the core surface.
+`concat`, `reverse`, and `push`, with plain-text hover and fixed function
+signatures. This is a compiled-in description of bounded local array shaping:
+it does not inspect module-catalog metadata, resolve a module, follow a local
+alias, or expose a host capability. A shadowed `array` binding, chained
+receiver, unknown member, or source outside the valid prefix gets no fixed-core
+result; a matching advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.object`
 binding. At a direct `object.` member site it completes only `len`, `keys`,
@@ -471,13 +471,14 @@ I/O, clock, entropy, host-state, crate-loading, or capability access.
 
 `use mod.std.array` imports a frozen Splash-owned module for local collection
 shaping. It provides `array.len(value)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, and `array.reverse(value)`. `slice` requires
-non-negative integer indexes and a half-open range inside the input array.
-Transforms have no callbacks, allocate a new shallow array, and reject source
-arrays over 4,096 items before native traversal; `concat` also rejects a
-combined result over that bound. `len` is constant-time and uncapped. The
-module has no I/O, clock, entropy, host-state, crate-loading, or capability
-access.
+`array.concat(left, right)`, `array.reverse(value)`, and
+`array.push(value, item)`. `slice` requires non-negative integer indexes and a
+half-open range inside the input array. Transforms have no callbacks, allocate
+a new shallow array, and reject source arrays over 4,096 items before native
+traversal; `concat` also rejects a combined result over that bound. `push`
+mutates its first argument, returns `nil`, and refuses to grow an array beyond
+4,096 items. `len` is constant-time and uncapped. The module has no I/O,
+clock, entropy, host-state, crate-loading, or capability access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.keys(value)`,
@@ -495,8 +496,11 @@ capability access.
 ## Effect rules
 
 The core runtime does not expose inherited `mod.fs`, `mod.run`, `mod.net`,
-Makepad UI/debug modules, direct standard-output methods, or unbounded regex
-and HTML entry points. A script cannot acquire authority by importing a name.
+Makepad UI/debug modules, direct standard-output methods, primitive type
+methods, or unbounded regex and HTML entry points. The direct primitive data
+boundary is limited to bounded `value.to_json()`, `document.parse_json()`, and
+`string.to_bytes()`; local appends use `array.push(value, item)` rather than an
+inherited array method. A script cannot acquire authority by importing a name.
 The host must create a runtime with a registered tool policy before `tool.call`
 or `tool.start` can succeed. Standalone initialization masks those vendored
 entry points before canonical and compatibility evaluation; it preserves only
@@ -550,9 +554,11 @@ included in every later capability-lease fingerprint. See
 `document.parse_json()` dispatch with the same bounded JSON reader and writer
 used at the Rust data boundary. The frozen `mod.std.json` module exposes that
 same boundary through `json.parse(document)` and `json.stringify(value)`.
-`parse_json()` and `json.parse()` accept only strict JSON from a string or
-UTF-8 byte array, then reconstruct a Splash value from bounded canonical JSON;
-they do not accept Makepad's nonstandard JSON extensions. `to_json()` and
+`string.to_bytes()` creates the bounded UTF-8 byte-array form accepted by
+`parse_json()` and `json.parse()`. Those parsing APIs accept only strict JSON
+from a string or UTF-8 byte array, then reconstruct a Splash value from bounded
+canonical JSON; they do not accept Makepad's nonstandard JSON extensions.
+`to_json()` and
 `json.stringify()` return a JSON string only for JSON-safe values. Cycles,
 unsupported values, non-finite numbers, and duplicate object keys are rejected
 on serialization; malformed or non-UTF-8 input is rejected on parsing. Either

@@ -11,7 +11,7 @@ let route = request[route_key]
 let normalized_tags = []
 
 for tag in array.reverse(request.tags) {
-    normalized_tags.push(text.upper(tag))
+    array.push(normalized_tags, text.upper(tag))
 }
 
 let summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: 42}, {tag_count: array.len(normalized_tags), tags: normalized_tags})
