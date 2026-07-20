@@ -84,6 +84,9 @@
 - Bounded LSP advisory-configuration lifecycle fuzzing across initialization,
   independent catalog replacement, explicit clear, malformed state, and
   recovery, without runtime or capability access.
+- Short, sanitizer, and sustained fuzz campaigns for exact-origin HTTP policy,
+  capability-secret authorization and no-leak diagnostics, and rollback-anchor
+  service framing.
 - Bounded effect-free direct tool-call outline for LLM and operator
   pre-approval review; it is explicitly non-authoritative and backed by
   runtime leases.

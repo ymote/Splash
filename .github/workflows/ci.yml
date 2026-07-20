@@ -73,6 +73,18 @@ jobs:
           -runs=128 -max_len=64
         working-directory: fuzz
       - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none http_origin_policy --
+          -runs=128 -max_len=4096
+        working-directory: fuzz
+      - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none secret_broker --
+          -runs=128 -max_len=1024
+        working-directory: fuzz
+      - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none rollback_anchor_service --
+          -runs=128 -max_len=8192
+        working-directory: fuzz
+      - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none workflow_draft --
           -runs=128 -max_len=65536
         working-directory: fuzz
@@ -145,6 +157,21 @@ jobs:
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run bubblewrap_policy --
           -runs=128 -max_len=64
+        working-directory: fuzz
+      - name: AddressSanitizer exact-origin HTTP policy fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run http_origin_policy --
+          -runs=128 -max_len=4096
+        working-directory: fuzz
+      - name: AddressSanitizer capability secret-broker fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run secret_broker --
+          -runs=128 -max_len=1024
+        working-directory: fuzz
+      - name: AddressSanitizer rollback-anchor service fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run rollback_anchor_service --
+          -runs=128 -max_len=8192
         working-directory: fuzz
       - name: AddressSanitizer capability-lease fuzzing
         run: >

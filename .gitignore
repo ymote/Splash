@@ -42,6 +42,9 @@ vendor/makepad/target/
 !/fuzz/corpus/http_origin_policy/
 /fuzz/corpus/http_origin_policy/*
 !/fuzz/corpus/http_origin_policy/*.seed
+!/fuzz/corpus/secret_broker/
+/fuzz/corpus/secret_broker/*
+!/fuzz/corpus/secret_broker/*.seed
 !/fuzz/corpus/rollback_anchor_service/
 /fuzz/corpus/rollback_anchor_service/*
 !/fuzz/corpus/rollback_anchor_service/*.json

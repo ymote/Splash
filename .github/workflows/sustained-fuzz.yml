@@ -73,7 +73,7 @@ jobs:
 
   authority-and-durability:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -91,6 +91,21 @@ jobs:
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none bubblewrap_policy --
           -max_total_time=180 -timeout=5 -rss_limit_mb=1024 -max_len=64
+        working-directory: fuzz
+      - name: Exact-origin HTTP policy fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none http_origin_policy --
+          -max_total_time=120 -timeout=5 -rss_limit_mb=1024 -max_len=4096
+        working-directory: fuzz
+      - name: Capability secret-broker fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none secret_broker --
+          -max_total_time=120 -timeout=5 -rss_limit_mb=1024 -max_len=1024
+        working-directory: fuzz
+      - name: Rollback-anchor service fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none rollback_anchor_service --
+          -max_total_time=120 -timeout=5 -rss_limit_mb=1024 -max_len=8192
         working-directory: fuzz
       - name: Workflow draft fuzzing
         run: >

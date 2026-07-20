@@ -69,8 +69,11 @@ sealed `mobile_workflow` target two minutes for plan, named-policy approval,
 and bounded pure-dataflow execution, the
 capability-free replay target two minutes, and the variable-limit
 `execution_limits` target and no-spawn `bubblewrap_policy` target three minutes
-each, all with per-input timeout and RSS ceilings. A failure uploads its ignored
-`fuzz/artifacts` directory for 14 days.
+each. The authority-and-durability campaign additionally fuzzes exact-origin
+HTTP policy, capability secret-broker authorization, and rollback-anchor service
+framing for two minutes each. Every sustained target has per-input timeout and
+RSS ceilings. A failure uploads its ignored `fuzz/artifacts` directory for 14
+days.
 
 Triage a downloaded crash before adding it to the repository:
 
@@ -477,7 +480,15 @@ request dispatcher backed by a process-local test anchor. It never starts a
 listener or claims that the test backend is durable; every accepted server
 response must remain within the fixed protocol response limit. Its reviewed
 JSON seeds include valid load and compare-and-swap requests as well as client
-response shapes. `workflow_draft` feeds
+response shapes. `http_origin_policy` maps at most 4 KiB of arbitrary bytes to
+a candidate exact origin for fixed HTTPS GET and explicitly enabled HTTP POST
+entries. Every accepted origin must survive insertion into a one-entry bounded
+catalog; the target never opens a network connection. `secret_broker` builds a
+fixed configured binding plus byte-selected grants and resource selectors. It
+asserts that the in-memory provider runs only after an exact tool and `Secret`
+resource match, and that rejected diagnostics do not echo the generated marker;
+it never reads a platform credential store or exposes a secret to Splash.
+`workflow_draft` feeds
 bounded UTF-8 JSON into the data-only `WorkflowDraft` decoder, then checks that
 every accepted draft
 round-trips through the current wire format and produces exactly one review
