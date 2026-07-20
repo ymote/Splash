@@ -437,6 +437,18 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
         description: "Returns an indexed item or the fallback without traversing the array.",
     },
     StandardArrayFunction {
+        name: "contains",
+        parameters: &["value", "item"],
+        result: "boolean",
+        description: "Tests for a direct-equality match; scalar values compare by value and arrays or records by reference.",
+    },
+    StandardArrayFunction {
+        name: "index_of",
+        parameters: &["value", "item"],
+        result: "number",
+        description: "Returns the first direct-equality index or -1; scalar values compare by value and arrays or records by reference.",
+    },
+    StandardArrayFunction {
         name: "slice",
         parameters: &["value", "start", "end"],
         result: "array",
@@ -2023,6 +2035,8 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let sliced = array.slice([1, 2, 3], 1, 3)\n",
     "array.has_index(sliced, 0)\n",
     "array.get(sliced, 2, 0)\n",
+    "array.contains(sliced, 2)\n",
+    "array.index_of(sliced, 2)\n",
     "let flattened = array.flatten([sliced, [4]])\n",
     "let compacted = array.compact([nil, 1, nil])\n",
     "array.reverse(sliced)\n",
@@ -2413,6 +2427,26 @@ fn fuzz_exercise_fixed_standard_array_requests(
         position_at_byte(source, get_start + "array.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, get_argument));
+
+    let Some(contains_start) = source.find("array.contains") else {
+        return;
+    };
+    let contains_argument = contains_start + "array.contains(sliced, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, contains_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, contains_argument));
+
+    let Some(index_of_start) = source.find("array.index_of") else {
+        return;
+    };
+    let index_of_argument = index_of_start + "array.index_of(sliced, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, index_of_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, index_of_argument));
 
     let Some(compact_start) = source.find("array.compact") else {
         return;
@@ -9543,9 +9577,11 @@ mod tests {
             [
                 "compact",
                 "concat",
+                "contains",
                 "flatten",
                 "get",
                 "has_index",
+                "index_of",
                 "len",
                 "push",
                 "reverse",
@@ -9586,7 +9622,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 9);
+        assert_eq!(partial.items.len(), 11);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9602,6 +9638,8 @@ mod tests {
             "let selected = array.slice([1, 2, 3], 1, 3)\n",
             "let first = array.get(selected, 0, -1)\n",
             "array.has_index(selected, 1)\n",
+            "array.contains(selected, 2)\n",
+            "array.index_of(selected, 2)\n",
             "let flattened = array.flatten([selected, [4]])\n",
             "let compacted = array.compact([nil, 1, nil])\n",
             "array.reverse(selected)\n",
@@ -9634,6 +9672,22 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "array.get(value, index, fallback) -> value\n\nReturns an indexed item or the fallback without traversing the array.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let contains_start = source
+            .find("array.contains")
+            .expect("contains member exists")
+            + "array.".len();
+        let contains_hover = server
+            .hover(&test_uri(), position_at_byte(source, contains_start + 1))
+            .expect("core array contains hover succeeds")
+            .expect("contains has fixed hover metadata");
+        assert_eq!(
+            contains_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.contains(value, item) -> boolean\n\nTests for a direct-equality match; scalar values compare by value and arrays or records by reference.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -9710,6 +9764,21 @@ mod tests {
             "array.get(value, index, fallback) -> value"
         );
         assert_eq!(get_help.active_parameter, Some(2));
+
+        let index_of_cursor = source
+            .find("array.index_of(selected, 2)")
+            .expect("index_of call exists")
+            + "array.index_of(selected, ".len()
+            + 1;
+        let index_of_help = server
+            .signature_help(&test_uri(), position_at_byte(source, index_of_cursor))
+            .expect("core array index_of signature help succeeds")
+            .expect("index_of has a fixed signature");
+        assert_eq!(
+            index_of_help.signatures[0].label,
+            "array.index_of(value, item) -> number"
+        );
+        assert_eq!(index_of_help.active_parameter, Some(1));
 
         let has_index_cursor = source
             .find("array.has_index(selected, 1)")
@@ -16336,9 +16405,11 @@ mod tests {
             [
                 "compact",
                 "concat",
+                "contains",
                 "flatten",
                 "get",
                 "has_index",
+                "index_of",
                 "len",
                 "push",
                 "reverse",

@@ -271,12 +271,16 @@ state, filesystem, process, network, clock, entropy, or crate access.
 
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 `array.has_index(value, index)`, `array.get(value, index, fallback)`,
+`array.contains(value, item)`, `array.index_of(value, item)`,
 `array.slice(value, start, end)`, `array.concat(left, right)`,
 `array.compact(value)`, `array.reverse(value)`, `array.flatten(value)`, and
 `array.push(value, item)`.
 `has_index` distinguishes an in-range `nil` item from an absent index, while
 `get` returns its fallback only when the index is absent. Neither traverses the
-array. `slice` uses a half-open range with non-negative integer indexes.
+array. `contains` and `index_of` scan at most 4,096 items with direct equality:
+scalar values compare by value, while arrays and records match only by
+reference; `index_of` returns the first match or `-1`. `slice` uses a half-open
+range with non-negative integer indexes.
 `compact` returns a fresh shallow array without `nil` items while preserving
 `false`, zero, empty strings, and order. `flatten` is one level only: every
 outer item must be an array, and it rejects any source or result over 4,096
@@ -620,8 +624,8 @@ the fixed text functions, including Unicode-scalar `slice`, `index_of`, and
 literal `split`, and string-array `join`, with plain-text hover and signature
 help. For an
 exact visible `use mod.std.array` binding, it completes `len`, `has_index`,
-`get`, `slice`, `concat`, `reverse`, `flatten`, and `push` with the same fixed
-plain-text hover and signature help.
+`get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `reverse`,
+`flatten`, and `push` with the same fixed plain-text hover and signature help.
 For an exact visible `use mod.std.object` binding, it completes `len`, `has`,
 `get`, `pick`, `from_entries`, `with`, `keys`, `entries`, `values`, and
 `merge` with the same fixed plain-text hover and signature help. At a statement-position `use

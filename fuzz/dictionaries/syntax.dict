@@ -32,6 +32,8 @@
 "array.slice("
 "array.has_index("
 "array.get("
+"array.contains("
+"array.index_of("
 "array.compact("
 "array.reverse("
 "array.flatten("

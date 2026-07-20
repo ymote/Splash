@@ -484,22 +484,25 @@ clock, entropy, host-state, crate-loading, or capability access.
 
 `use mod.std.array` imports a frozen Splash-owned module for local collection
 shaping. It provides `array.len(value)`, `array.has_index(value, index)`,
-`array.get(value, index, fallback)`, `array.slice(value, start, end)`,
+`array.get(value, index, fallback)`, `array.contains(value, item)`,
+`array.index_of(value, item)`, `array.slice(value, start, end)`,
 `array.concat(left, right)`, `array.compact(value)`, `array.reverse(value)`,
 `array.flatten(value)`, and `array.push(value, item)`. `has_index`
 distinguishes an in-range `nil` item from an absent index; `get` returns its
 fallback only when the index is absent. Both require a non-negative integer
-index and never traverse the array. `slice` requires non-negative integer
-indexes and a half-open range inside the input array. Transforms have no
-callbacks and allocate a new shallow array. `compact` removes only `nil`
-items, preserving `false`, zero, empty strings, nested references, and order.
-`flatten` is exactly one level: every outer item must be an array, and every
-source array plus the combined result must contain at most 4,096 items before
-native copying begins. `concat` enforces the same combined-result bound. `push`
-mutates its first argument, returns `nil`, and refuses to grow an array beyond
-4,096 items. `len`, `has_index`, and `get` are constant-time and uncapped. The
-module has no I/O, clock, entropy, host-state, crate-loading, or capability
-access.
+index and never traverse the array. `contains` and `index_of` scan at most
+4,096 items with direct equality: scalar values compare by value, while arrays
+and records match only by reference; `index_of` returns the first match or
+`-1`. `slice` requires non-negative integer indexes and a half-open range
+inside the input array. Transforms have no callbacks and allocate a new shallow
+array. `compact` removes only `nil` items, preserving `false`, zero, empty
+strings, nested references, and order. `flatten` is exactly one level: every
+outer item must be an array, and every source array plus the combined result
+must contain at most 4,096 items before native copying begins. `concat`
+enforces the same combined-result bound. `push` mutates its first argument,
+returns `nil`, and refuses to grow an array beyond 4,096 items. `len`,
+`has_index`, and `get` are constant-time and uncapped. The module has no I/O,
+clock, entropy, host-state, crate-loading, or capability access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.has(value, key)`,
@@ -719,8 +722,11 @@ or mutate its keys, input digest, worker observation, or restart policy.
   `array.has_index(value, index)` to distinguish an in-range `nil` item from
   an absent index, and `array.get(value, index, fallback)` for an optional
   indexed read. Both require a non-negative integer index and do not traverse
-  the array. Keep each transforming source array and concatenated result at or
-  below 4,096 items. `array.compact(value)` removes only `nil` items, preserving
+  the array. `array.contains(value, item)` and `array.index_of(value, item)`
+  scan at most 4,096 items; scalar values compare by value, while arrays and
+  records match only by reference, and `index_of` returns `-1` when absent.
+  Keep each transforming source array and concatenated result at or below
+  4,096 items. `array.compact(value)` removes only `nil` items, preserving
   `false`, zero, empty strings, nested references, and order.
   `array.flatten(value)` accepts only one level of nested arrays and applies
   the same limit to every input and its combined result.

@@ -3126,6 +3126,18 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
     );
     vm.add_method(
         array,
+        id!(contains),
+        script_args_def!(value = NIL, item = NIL),
+        standard_array_contains,
+    );
+    vm.add_method(
+        array,
+        id!(index_of),
+        script_args_def!(value = NIL, item = NIL),
+        standard_array_index_of,
+    );
+    vm.add_method(
+        array,
         id!(slice),
         script_args_def!(value = NIL, start = NIL, end = NIL),
         standard_array_slice,
@@ -3206,6 +3218,60 @@ fn standard_array_get(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue 
     } else {
         fallback
     }
+}
+
+fn standard_array_contains(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let item = script_value!(vm, args.item);
+    let (array, length) = match standard_array_input(vm, value, "contains", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    standard_array_find_index(vm, array, length, item)
+        .is_some()
+        .into()
+}
+
+fn standard_array_index_of(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let item = script_value!(vm, args.item);
+    let (array, length) = match standard_array_input(vm, value, "index_of", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    standard_array_find_index(vm, array, length, item)
+        .map_or((-1.0).into(), |index| (index as f64).into())
+}
+
+/// Performs bounded shallow membership without invoking the VM's recursive
+/// equality operator. Scalar values compare by value; arrays and records only
+/// compare when they reference the same VM value.
+fn standard_array_find_index(
+    vm: &vm::ScriptVm,
+    array: vm::ScriptArray,
+    length: usize,
+    item: ScriptValue,
+) -> Option<usize> {
+    (0..length).find(|&index| {
+        standard_array_direct_equal(vm, vm.bx.heap.array_index_unchecked(array, index), item)
+    })
+}
+
+fn standard_array_direct_equal(vm: &vm::ScriptVm, left: ScriptValue, right: ScriptValue) -> bool {
+    if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
+        return left == right;
+    }
+    if left.is_string_like() || right.is_string_like() {
+        return vm
+            .bx
+            .heap
+            .string_with(left, |heap, left| {
+                heap.string_with(right, |_, right| left == right)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    }
+    left == right
 }
 
 fn standard_array_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
@@ -8161,6 +8227,21 @@ compute(outer, 2)
                  assert(!array.has_index(input, 3))\n\
                  assert(array.get(input, 1, -1) == 2)\n\
                  assert(array.get(input, 3, \"fallback\") == \"fallback\")\n\
+                 let candidate = {answer: 1}\n\
+                 let equivalent = {answer: 1}\n\
+                 let searchable = [nil, false, 1, \"tag\", candidate, \"tag\"]\n\
+                 assert(array.contains(searchable, nil))\n\
+                 assert(array.contains(searchable, false))\n\
+                 assert(array.contains(searchable, 1.0))\n\
+                 assert(array.contains(searchable, \"tag\"))\n\
+                 assert(array.contains(searchable, candidate))\n\
+                 assert(!array.contains(searchable, equivalent))\n\
+                 assert(array.index_of(searchable, nil) == 0)\n\
+                 assert(array.index_of(searchable, \"tag\") == 3)\n\
+                 assert(array.index_of(searchable, candidate) == 4)\n\
+                 assert(array.index_of(searchable, equivalent) == -1)\n\
+                 assert(array.index_of(searchable, \"missing\") == -1)\n\
+                 assert(array.len(searchable) == 6)\n\
                  let present_nil = [nil]\n\
                  assert(array.has_index(present_nil, 0))\n\
                  assert(array.get(present_nil, 0, \"fallback\") == nil)\n\
@@ -8214,7 +8295,7 @@ compute(outer, 2)
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
             .eval(
-                "use mod.std\nlet compacted = std.array.compact([nil, [2], nil])\ncompacted[0][0]",
+                "use mod.std\nlet nested = [2]\nlet compacted = std.array.compact([nil, nested, nil])\nstd.array.contains(compacted, nested) && std.array.index_of(compacted, nested) == 0",
             )
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
@@ -8226,17 +8307,17 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!(2)
+            serde_json::json!(true)
         );
 
         let mutation = runtime
-            .eval("use mod.std.array\narray.compact = || nil")
+            .eval("use mod.std.array\narray.contains = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
 
         let preserved = runtime
-            .eval("use mod.std.array\narray.compact([nil, 1, nil])")
+            .eval("use mod.std.array\narray.index_of([nil, 1, nil], 1)")
             .unwrap();
         assert!(preserved.completed(), "{:?}", preserved.diagnostics);
         assert_eq!(
@@ -8247,21 +8328,21 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!([1])
+            serde_json::json!(1)
         );
 
-        let invalid_compact = runtime
-            .eval("use mod.std.array\ntry array.compact(\"items\") catch \"invalid\"")
+        let invalid_membership = runtime
+            .eval("use mod.std.array\ntry array.contains(\"items\", 1) catch \"invalid\"")
             .unwrap();
         assert!(
-            invalid_compact.completed(),
+            invalid_membership.completed(),
             "{:?}",
-            invalid_compact.diagnostics
+            invalid_membership.diagnostics
         );
         assert_eq!(
             runtime
                 .script_value_as_json(
-                    invalid_compact.value,
+                    invalid_membership.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
@@ -8368,6 +8449,31 @@ compute(outer, 2)
             compact_limit_runtime
                 .script_value_as_json(
                     compact_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
+        let mut membership_limit_runtime = Runtime::default();
+        let membership_limit = membership_limit_runtime
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
+                 try array.index_of(values, 0) catch \"limit\""
+            ))
+            .unwrap();
+        assert!(
+            membership_limit.completed(),
+            "{:?}",
+            membership_limit.diagnostics
+        );
+        assert_eq!(
+            membership_limit_runtime
+                .script_value_as_json(
+                    membership_limit.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
