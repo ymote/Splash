@@ -365,6 +365,13 @@ const STANDARD_TEXT_FUNCTIONS: &[StandardTextFunction] = &[
         description: "Returns the Unicode-scalar half-open [start, end) slice.",
     },
     StandardTextFunction {
+        name: "index_of",
+        parameters: &["value", "needle"],
+        result: "number",
+        description:
+            "Returns the Unicode-scalar index of a literal match, or -1; an empty needle is 0.",
+    },
+    StandardTextFunction {
         name: "join",
         parameters: &["values", "separator"],
         result: "string",
@@ -1996,6 +2003,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let normalized = text.trim(\"  splash  \")\n",
     "text.replace_all(normalized, \"splash\", \"Splash\")\n",
     "text.slice(normalized, 0, text.len(normalized))\n",
+    "text.index_of(normalized, \"splash\")\n",
     "let parts = text.split(normalized, \"-\")\n",
     "text.join(parts, \"-\")\n",
     "assert(true)\n",
@@ -2486,6 +2494,16 @@ fn fuzz_exercise_fixed_standard_text_requests(
         position_at_byte(source, slice_start + "text.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, slice_argument));
+
+    let Some(index_of_start) = source.find("text.index_of") else {
+        return;
+    };
+    let index_of_argument = index_of_start + "text.index_of(normalized, \"".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, index_of_start + "text.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, index_of_argument));
 
     let Some(replace_start) = source.find("text.replace_all") else {
         return;
@@ -10055,6 +10073,7 @@ mod tests {
             [
                 "contains",
                 "ends_with",
+                "index_of",
                 "join",
                 "len",
                 "lower",
@@ -10100,7 +10119,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core text completion succeeds");
-        assert_eq!(partial.items.len(), 11);
+        assert_eq!(partial.items.len(), 12);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -10115,6 +10134,7 @@ mod tests {
             "use mod.std.text\n",
             "let value = text.trim(\"  Splash  \")\n",
             "text.slice(value, 1, 4)\n",
+            "text.index_of(value, \"la\")\n",
             "text.replace_all(value, \"S\", \"s\")\n",
             "text.split(\"a,,b,\", \",\")\n",
             "text.join([\"a\", \"\", \"b\", \"\"], \",\")"
@@ -10178,6 +10198,22 @@ mod tests {
             })
         );
 
+        let index_of_start = source
+            .find("text.index_of")
+            .expect("index_of member exists")
+            + "text.".len();
+        let index_of_hover = server
+            .hover(&test_uri(), position_at_byte(source, index_of_start + 1))
+            .expect("core text index_of hover succeeds")
+            .expect("index_of has fixed hover metadata");
+        assert_eq!(
+            index_of_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "text.index_of(value, needle) -> number\n\nReturns the Unicode-scalar index of a literal match, or -1; an empty needle is 0.\n\nBounded Splash core text helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
         let slice_cursor = source
             .find("text.slice(value, 1, 4)")
             .expect("slice call exists")
@@ -10192,6 +10228,21 @@ mod tests {
             "text.slice(value, start, end) -> string"
         );
         assert_eq!(slice_help.active_parameter, Some(2));
+
+        let index_of_cursor = source
+            .find("text.index_of(value, \"la\")")
+            .expect("index_of call exists")
+            + "text.index_of(value, ".len()
+            + 1;
+        let index_of_help = server
+            .signature_help(&test_uri(), position_at_byte(source, index_of_cursor))
+            .expect("core text index_of signature help succeeds")
+            .expect("index_of has a fixed signature");
+        assert_eq!(
+            index_of_help.signatures[0].label,
+            "text.index_of(value, needle) -> number"
+        );
+        assert_eq!(index_of_help.active_parameter, Some(1));
 
         let replace_cursor = source.rfind("\"s\"").expect("replacement exists") + 1;
         let replace_help = server
@@ -16086,6 +16137,7 @@ mod tests {
             [
                 "contains",
                 "ends_with",
+                "index_of",
                 "join",
                 "len",
                 "lower",

@@ -2703,6 +2703,12 @@ fn install_standard_text_module(vm: &mut vm::ScriptVm, std_module: ScriptObject)
     );
     vm.add_method(
         text,
+        id!(index_of),
+        script_args_def!(value = NIL, needle = NIL),
+        standard_text_index_of,
+    );
+    vm.add_method(
+        text,
         id!(contains),
         script_args_def!(value = NIL, needle = NIL),
         |vm, args| {
@@ -2854,6 +2860,23 @@ fn standard_text_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue
         Some(Some(result)) => result,
         Some(None) => standard_text_slice_range(vm),
         None => standard_text_expected_string(vm, "slice", "value"),
+    }
+}
+
+fn standard_text_index_of(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let needle = script_value!(vm, args.needle);
+    match vm.string_with(value, |vm, value| {
+        vm.string_with(needle, |_, needle| {
+            value
+                .find(needle)
+                .map(|byte_index| value[..byte_index].chars().count() as f64)
+                .unwrap_or(-1.0)
+        })
+    }) {
+        Some(Some(index)) => ScriptValue::from_f64(index),
+        Some(None) => standard_text_expected_string(vm, "index_of", "needle"),
+        None => standard_text_expected_string(vm, "index_of", "value"),
     }
 }
 
@@ -7563,6 +7586,10 @@ compute(outer, 2)
                  assert(text.len(\"🙂\") == 1)\n\
                  assert(text.slice(\"a🙂b\", 1, 2) == \"🙂\")\n\
                  assert(text.slice(\"a🙂b\", 3, 3) == \"\")\n\
+                 assert(text.index_of(\"a🙂b🙂\", \"🙂\") == 1)\n\
+                 assert(text.index_of(\"a🙂b🙂\", \"b\") == 2)\n\
+                 assert(text.index_of(\"splash\", \"z\") == -1)\n\
+                 assert(text.index_of(\"splash\", \"\") == 0)\n\
                  assert(text.contains(value, \"Xe\"))\n\
                  assert(text.starts_with(value, \"Mi\"))\n\
                  assert(text.ends_with(value, \"eD\"))\n\
@@ -7621,6 +7648,44 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("`prefix`")));
+
+        let invalid_index_of = runtime
+            .eval("use mod.std.text\ntry text.index_of(\"splash\", 1) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_index_of.completed(),
+            "{:?}",
+            invalid_index_of.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_index_of.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_index_of_value = runtime
+            .eval("use mod.std.text\ntry text.index_of(1, \"splash\") catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_index_of_value.completed(),
+            "{:?}",
+            invalid_index_of_value.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_index_of_value.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
 
         let invalid_delimiter_type = runtime
             .eval("use mod.std.text\ntext.split(\"splash\", 1)")

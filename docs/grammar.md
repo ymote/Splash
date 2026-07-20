@@ -449,8 +449,9 @@ advisory metadata cannot add members to this core module.
 
 An exact visible direct `use mod.std.text` binding has a separate fixed core
 projection for the documented text-shaping functions, including
-`text.slice(value, start, end)`, `text.split(value, delimiter)`, and
-`text.join(values, separator)`, with plain-text member hover and function
+`text.slice(value, start, end)`, `text.index_of(value, needle)`,
+`text.split(value, delimiter)`, and `text.join(values, separator)`, with
+plain-text member hover and function
 signature help. Its descriptors are compiled into the LSP rather than read from
 a catalog, and describe bounded local string operations without resolving a
 host module or granting a capability. A shadowed binding, chained receiver,
