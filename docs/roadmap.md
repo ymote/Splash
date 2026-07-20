@@ -84,9 +84,9 @@
 - Bounded effect-free direct tool-call outline for LLM and operator
   pre-approval review; it is explicitly non-authoritative and backed by
   runtime leases.
-- Bounded sealed-mobile JSON dataflow fuzzing across host JSON injection,
-  canonical capability-free evaluation, result conversion, and data-bound
-  derivation.
+- Bounded sealed-mobile runtime and workflow fuzzing across host JSON
+  injection, canonical capability-free evaluation, result conversion,
+  data-bound derivation, plan/policy approval, and pure dataflow execution.
 - Bounded effect-free per-step workflow review that pairs syntax status with
   direct tool-call hints before ordered capability approval.
 - Bounded, data-only versioned workflow-draft interchange and CLI review for

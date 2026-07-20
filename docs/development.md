@@ -65,6 +65,8 @@ the bounded `execution` target ten minutes each, the `lsp_document` target two
 minutes for source and bounded advisory initialization/configuration-refresh
 parsing, the sealed `mobile_dataflow` target two minutes for host JSON
 injection, canonical evaluation, and bounded result conversion, the
+sealed `mobile_workflow` target two minutes for plan, named-policy approval,
+and bounded pure-dataflow execution, the
 capability-free replay target two minutes, and the variable-limit
 `execution_limits` target and no-spawn `bubblewrap_policy` target three minutes
 each, all with per-input timeout and RSS ceilings. A failure uploads its ignored
@@ -410,6 +412,15 @@ boundaries. The target never registers a tool, module, or external dispatcher,
 so it covers host-data crossing and limit derivation without creating ambient
 authority. Its reviewed JSON seeds cover a completed dataflow result, a nesting
 rejection, and an invalid host-global identifier.
+`mobile_workflow` decodes one bounded JSON case containing workflow input,
+canonical one-step source, and optional source/nesting limits. It uses the
+public sealed `MobileWorkflowBuilder` with no registered tools or modules,
+plans the fixed step, approves it with an empty named policy, and executes the
+dataflow. A completed run must retain one bounded output and round-trip its
+host-owned context; every terminal path must have no pending work or suspended
+continuation. The target does not register an adapter, grant a capability, or
+invoke an external dispatcher. Its reviewed JSON seeds cover an accepted
+one-step transform and mobile aggregate-byte and nesting boundary rejection.
 `execution` starts a fresh, capability-free runtime for each syntactically
 accepted input with an 8 KiB source cap, 1,024-token cap, 64-level nesting
 cap, 8 KiB individual-string cap, 1,024 live operand values, 256 active call
@@ -529,9 +540,9 @@ I/O and never starts a worker or invokes a capability.
 CI compiles every fuzz target and performs a short 128-run coverage-only smoke
 campaign for the selected targets with `--sanitizer none`, plus separate short
 AddressSanitizer campaigns for evaluator replay, the LSP document lifecycle,
-the sealed mobile dataflow boundary, and Bubblewrap policy compilation. Run the
-longer local commands below with the default sanitizer whenever the platform
-supports it.
+the sealed mobile dataflow and workflow boundaries, and Bubblewrap policy
+compilation. Run the longer local commands below with the default sanitizer
+whenever the platform supports it.
 
 Install `cargo-fuzz` once, then run the target with nightly Rust:
 
@@ -541,6 +552,7 @@ cd fuzz
 cargo +nightly fuzz run syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run mobile_dataflow -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run mobile_workflow -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution_replay -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
@@ -564,6 +576,7 @@ instrumentation:
 cargo +nightly fuzz run --sanitizer none syntax -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none lsp_document -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none mobile_dataflow -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none mobile_workflow -- -max_total_time=60 -max_len=16384 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution_replay -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
 cargo +nightly fuzz run --sanitizer none execution_limits -- -max_total_time=60 -max_len=8192 -dict=dictionaries/syntax.dict
@@ -583,6 +596,7 @@ Reproduce a saved failure from the same directory with:
 cargo +nightly fuzz run syntax artifacts/syntax/<artifact>
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run lsp_document artifacts/lsp_document/<artifact>
 RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run mobile_dataflow artifacts/mobile_dataflow/<artifact>
+RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run mobile_workflow artifacts/mobile_workflow/<artifact>
 cargo +nightly fuzz run execution artifacts/execution/<artifact>
 cargo +nightly fuzz run execution_replay artifacts/execution_replay/<artifact>
 cargo +nightly fuzz run execution_limits artifacts/execution_limits/<artifact>

@@ -53,6 +53,10 @@ jobs:
           -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
       - run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none mobile_workflow --
+          -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
+      - run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none execution --
           -runs=128 -max_len=8192 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
@@ -125,6 +129,11 @@ jobs:
       - name: AddressSanitizer sealed mobile dataflow fuzzing
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run mobile_dataflow --
+          -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
+      - name: AddressSanitizer sealed mobile workflow fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run mobile_workflow --
           -runs=128 -max_len=16384 -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
       - name: AddressSanitizer variable-limit evaluator fuzzing

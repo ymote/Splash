@@ -38,6 +38,12 @@ jobs:
           -max_total_time=120 -timeout=5 -rss_limit_mb=1024 -max_len=16384
           -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
         working-directory: fuzz
+      - name: Sealed mobile workflow fuzzing
+        run: >
+          RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none mobile_workflow --
+          -max_total_time=120 -timeout=5 -rss_limit_mb=1024 -max_len=16384
+          -dict=$GITHUB_WORKSPACE/fuzz/dictionaries/syntax.dict
+        working-directory: fuzz
       - name: Bounded evaluator fuzzing
         run: >
           RUSTFLAGS='--cfg fuzzing' cargo +nightly fuzz run --sanitizer none execution --

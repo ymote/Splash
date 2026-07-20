@@ -46,6 +46,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "mobile_workflow"
+path = "fuzz_targets/mobile_workflow.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "execution"
 path = "fuzz_targets/execution.rs"
 test = false

@@ -1,0 +1,9 @@
+{
+  "input": {
+    "left": 20,
+    "right": 22
+  },
+  "source": "{total: workflow.input.left + workflow.input.right}",
+  "maxSourceBytes": 8192,
+  "maxSyntaxNesting": 16
+}
