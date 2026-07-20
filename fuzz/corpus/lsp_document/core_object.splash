@@ -2,4 +2,5 @@ use mod.std.object
 let merged = object.merge({left: 1}, {right: 2})
 object.has(merged, "left")
 object.get(merged, "missing", 0)
+object.pick(merged, ["left"])
 object.keys(merged)

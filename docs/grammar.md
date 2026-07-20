@@ -438,8 +438,8 @@ and advisory metadata cannot add members to this core module.
 
 An exact visible direct `use mod.std.object` binding has a separate fixed core
 projection for only `object.len(value)`, `object.has(value, key)`,
-`object.get(value, key, fallback)`, `object.keys(value)`,
-`object.entries(value)`, `object.values(value)`, and
+`object.get(value, key, fallback)`, `object.pick(value, keys)`,
+`object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
 `object.merge(left, right)`, with plain-text member hover and function
 signature help. Its descriptors are compiled into the LSP rather than read from
 a catalog, and describe bounded own-field record shaping without resolving a

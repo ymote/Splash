@@ -499,15 +499,18 @@ capability access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.has(value, key)`,
-`object.get(value, key, fallback)`, `object.keys(value)`,
-`object.entries(value)`, `object.values(value)`, and
+`object.get(value, key, fallback)`, `object.pick(value, keys)`,
+`object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
 `object.merge(left, right)`. It accepts plain record or JSON-object data only,
 reads own fields only, and does not traverse prototypes or invoke callbacks.
 `has` distinguishes a present `nil` own text field from an absent one; `get`
 returns its fallback only when that own text field is absent. Neither traverses
-record fields. `keys`, `entries`, `values`, and `merge` process at most 4,096
-own text-keyed source fields; `merge` also rejects a combined source count over
-that bound. `keys` and `values` return shallow arrays in stored field order;
+source fields. `pick` accepts an array of at most 4,096 strings and returns a
+fresh shallow record of requested existing own fields in key-array order;
+missing fields are omitted. `keys`, `entries`, `values`, and `merge` process at
+most 4,096 own text-keyed source fields; `merge` also rejects a combined source
+count over that bound. `keys` and `values` return shallow arrays in stored field
+order;
 `entries` returns fresh `[text_key, value]` pairs in that order; and `merge`
 preserves first field positions and applies right-side values. `len` is
 constant-time and uncapped. The module has no I/O, clock, entropy, host-state,
@@ -712,8 +715,10 @@ or mutate its keys, input digest, worker observation, or restart policy.
   own-field operations over plain record or JSON-object data, not capabilities.
   `object.has(value, key)` distinguishes a missing own text field from a
   present `nil`; `object.get(value, key, fallback)` returns the fallback only
-  for a missing own text field. Keep transforming inputs and combined `merge`
-  source fields at or below 4,096.
+  for a missing own text field. `object.pick(value, keys)` whitelists existing
+  own text fields into a fresh shallow record; `keys` must be an array of at
+  most 4,096 strings, and missing fields are omitted. Keep transforming inputs
+  and combined `merge` source fields at or below 4,096.
 - For a data-driven plain record or JSON-object field, use text-key indexing
   such as `record[field_name]`. A missing field evaluates to `nil`; this is
   local data access and does not expose reflection, host objects, or a

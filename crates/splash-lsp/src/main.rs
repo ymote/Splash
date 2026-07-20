@@ -482,6 +482,12 @@ const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
         description: "Returns an own text field or the fallback.",
     },
     StandardObjectFunction {
+        name: "pick",
+        parameters: &["value", "keys"],
+        result: "object",
+        description: "Returns a shallow record of requested existing own text fields; missing keys are omitted.",
+    },
+    StandardObjectFunction {
         name: "keys",
         parameters: &["value"],
         result: "array",
@@ -1998,6 +2004,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let merged = object.merge({left: 1}, {right: 2})\n",
     "object.has(merged, \"left\")\n",
     "object.get(merged, \"missing\", 0)\n",
+    "let picked = object.pick(merged, [\"left\"])\n",
     "object.keys(merged)\n",
     "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
@@ -2445,6 +2452,16 @@ fn fuzz_exercise_fixed_standard_object_requests(
         position_at_byte(source, get_start + "object.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, get_argument));
+
+    let Some(pick_start) = source.find("object.pick") else {
+        return;
+    };
+    let pick_argument = pick_start + "object.pick(merged, [".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, pick_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, pick_argument));
 
     let Some(keys_start) = source.find("object.keys") else {
         return;
@@ -9786,7 +9803,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["entries", "get", "has", "keys", "len", "merge", "values"]
+            ["entries", "get", "has", "keys", "len", "merge", "pick", "values"]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9822,7 +9839,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core object completion succeeds");
-        assert_eq!(partial.items.len(), 7);
+        assert_eq!(partial.items.len(), 8);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9838,6 +9855,7 @@ mod tests {
             "let merged = object.merge({left: 1}, {right: 2})\n",
             "object.has(merged, \"left\")\n",
             "object.get(merged, \"missing\", 0)\n",
+            "object.pick(merged, [\"left\"])\n",
             "object.keys(merged)\n",
             "object.entries(merged)"
         );
@@ -9907,6 +9925,19 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "object.get(value, key, fallback) -> value\n\nReturns an own text field or the fallback.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let pick_start = source.find("object.pick").expect("pick member exists") + "object.".len();
+        let pick_hover = server
+            .hover(&test_uri(), position_at_byte(source, pick_start + 1))
+            .expect("core object pick hover succeeds")
+            .expect("pick has fixed hover metadata");
+        assert_eq!(
+            pick_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.pick(value, keys) -> object\n\nReturns a shallow record of requested existing own text fields; missing keys are omitted.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -9992,6 +10023,21 @@ mod tests {
             "object.get(value, key, fallback) -> value"
         );
         assert_eq!(get_help.active_parameter, Some(2));
+
+        let pick_cursor = source
+            .find("object.pick(merged, [\"left\"])")
+            .expect("pick input exists")
+            + "object.pick(merged, ".len()
+            + 1;
+        let pick_help = server
+            .signature_help(&test_uri(), position_at_byte(source, pick_cursor))
+            .expect("core object pick signature help succeeds")
+            .expect("pick has a fixed signature");
+        assert_eq!(
+            pick_help.signatures[0].label,
+            "object.pick(value, keys) -> object"
+        );
+        assert_eq!(pick_help.active_parameter, Some(1));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -16109,7 +16155,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["entries", "get", "has", "keys", "len", "merge", "values"]
+            ["entries", "get", "has", "keys", "len", "merge", "pick", "values"]
         );
     }
 

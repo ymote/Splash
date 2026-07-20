@@ -3,7 +3,7 @@
   "steps": [
     {
       "id": "prepare",
-      "source": "use mod.tool\nlet request = workflow.input\nlet response_json = tool.call_json(\"math.add\", {left: request.left, right: request.right})\nresponse_json.parse_json()"
+      "source": "use mod.tool\nuse mod.std.object\nlet request = object.pick(workflow.input, [\"left\", \"right\"])\nlet response_json = tool.call_json(\"math.add\", request)\nresponse_json.parse_json()"
     },
     {
       "id": "summarize",

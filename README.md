@@ -283,11 +283,14 @@ network, clock, entropy, or crate access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.has(value, key)`, `object.get(value, key, fallback)`,
-`object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
-`object.merge(left, right)`. It accepts plain record or JSON-object data only,
-never follows prototypes, and never invokes callbacks. `has` distinguishes a
-present `nil` own text field from an absent one; `get` returns its fallback only
-when that own text field is absent. Neither traverses record fields. `keys`,
+`object.pick(value, keys)`, `object.keys(value)`, `object.entries(value)`,
+`object.values(value)`, and `object.merge(left, right)`. It accepts plain
+record or JSON-object data only, never follows prototypes, and never invokes
+callbacks. `has` distinguishes a present `nil` own text field from an absent
+one; `get` returns its fallback only when that own text field is absent. `has`,
+`get`, and `pick` do not traverse source fields. `pick` accepts at most 4,096
+string keys and returns a fresh shallow record of existing requested fields in
+key-array order; missing fields are omitted. `keys`,
 `entries`, `values`, and `merge` shallowly process at most 4,096 own text-keyed
 fields; `entries` returns fresh `[text_key, value]` pairs in stored field order,
 and `merge` also rejects a combined source count over that bound. `len` is
@@ -525,8 +528,9 @@ cargo run -p splash-cli -- workflow-run --allow-json-add \
 ```
 
 The `prepare` step explicitly narrows the host input to the reviewed
-`math.add` envelope. The pure `summarize` step then uses a dynamic own-field
-fallback lookup, bounded indexed-array lookup with an empty-input fallback, a
+`math.add` envelope with `object.pick`. The pure `summarize` step then uses a
+dynamic own-field fallback lookup, bounded indexed-array lookup with an
+empty-input fallback, a
 bounded array transformation and loop, text normalization, own-field record
 merging, and a bounded JSON round trip. It receives no tool grant; only
 `prepare` can issue the reviewed effect.
@@ -607,9 +611,9 @@ exact visible `use mod.std.array` binding, it completes `len`, `has_index`,
 `get`, `slice`, `concat`, `reverse`, `flatten`, and `push` with the same fixed
 plain-text hover and signature help.
 For an exact visible `use mod.std.object` binding, it completes `len`, `has`,
-`get`, `keys`, `entries`, `values`, and `merge` with the same fixed plain-text
-hover and signature help. At a statement-position `use mod.` path, the same
-static projection completes `std`;
+`get`, `pick`, `keys`, `entries`, `values`, and `merge` with the same fixed
+plain-text hover and signature help. At a statement-position `use mod.` path,
+the same static projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.
 The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An
