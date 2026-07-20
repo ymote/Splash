@@ -342,6 +342,15 @@ text kind rather than claiming read/write analysis. The index is bounded to
 results remain sound after truncation, but exhaustive reference, highlight, and
 rename requests fail when that bound is exceeded.
 
+For a direct expression call `name(...)`, signature help can show the parameter
+names of an exact visible named `fn` declaration from the same document. It
+requires a retained expression site and untruncated lexical symbols, scans at
+most 64 KiB and 64 parameters from the completed declaration header, and
+presents no partial signature. Aliases, members, computed callees, shadowed or
+forward bindings, incomplete headers, and source outside the safe diagnostic
+prefix have no named-function result. This is lexical source metadata only: it
+does not infer a result type, inspect a runtime value, or grant authority.
+
 Completion sites are identifiers parsed in expression position. Declarations,
 import paths, record keys, and names after `.` are excluded. The cursor may be
 inside the identifier or exactly at its end. The result contains the complete

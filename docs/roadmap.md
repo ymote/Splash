@@ -23,9 +23,10 @@
   reads, evaluation, type inference, or authority.
 - Binding-kind hover and neutral same-document symbol highlights over the same
   bounded lexical index.
-- Bounded scope-aware lexical completion at expression identifiers, including
-  exact-token edits, conservative invalid-prefix support, independent site
-  truncation, and fixed direct-import-only `mod.tool` methods plus documented
+- Bounded scope-aware lexical completion at expression identifiers and direct
+  same-document named-`fn` signature help, including exact-token edits,
+  conservative invalid-prefix support, independent site truncation, and fixed
+  direct-import-only `mod.tool` methods plus documented
   `mod.std` import-path completion, `mod.std.math` function/constant completion,
   hover, and signature help, direct `mod.std.json`, `mod.std.text`, and
   `mod.std.array` and `mod.std.object` function completion, hover, and

@@ -196,6 +196,14 @@ after `use mod.std` receives the same fixed signature. This is compiled-in
 source metadata, not a host lookup or capability grant; aliases, shadowed
 bindings, and non-core imports receive no fixed assertion result.
 
+For a direct expression call `name(...)`, the LSP can also show the parameter
+names of an exact visible same-document named `fn` declaration. This bounded
+lexical view retains no result type: it scans no more than 64 KiB and 64
+parameters from a completed declaration header and fails closed for aliases,
+member or computed calls, shadowed or forward bindings, incomplete headers,
+truncated lexical metadata, and source after the first diagnostic. It does not
+inspect a runtime or grant authority.
+
 The same static projection completes `std` at a statement-position `use mod.`
 path and `array`/`assert`/`json`/`math`/`object`/`text` below `use mod.std.`. The frozen
 `mod.std` namespace has no advisory catalog children, so metadata cannot add

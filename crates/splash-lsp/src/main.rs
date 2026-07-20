@@ -100,6 +100,13 @@ const MAX_SIGNATURE_HELP_DELIMITER_DEPTH: usize = DEFAULT_MAX_SYNTAX_NESTING;
 /// unhelpful, so the source-only scanner stops rather than tracking unbounded
 /// comma state for one editor request.
 const MAX_SIGNATURE_HELP_ARGUMENTS: usize = 64;
+/// Named-function signatures are extracted only from a short declaration
+/// window. This keeps one source-only editor request bounded without turning
+/// the LSP into a second general parser.
+const MAX_LSP_NAMED_FUNCTION_SIGNATURE_BYTES: usize = 64 * 1024;
+/// The presentation cap matches the maximum active argument tracked by the
+/// direct-call scanner. A larger declaration gets no partial signature.
+const MAX_LSP_NAMED_FUNCTION_SIGNATURE_PARAMETERS: usize = MAX_SIGNATURE_HELP_ARGUMENTS;
 /// A direct module-result initializer is deliberately recognized from a small
 /// source window rather than by general expression parsing or type inference.
 /// This keeps one completion or hover request bounded even when a document is
@@ -570,6 +577,10 @@ const STANDARD_ASSERT_DOCUMENTATION: &str = concat!(
     "assert(condition)\n\n",
     "Raises a script error when the condition is false.\n\n",
     "Fixed Splash core helper; it does not access the host or grant authority."
+);
+const NAMED_FUNCTION_SIGNATURE_DOCUMENTATION: &str = concat!(
+    "Named Splash function declared in this document.\n\n",
+    "Lexical source metadata only; it does not infer a result type, inspect a runtime, or grant authority."
 );
 
 /// One fixed path child in Splash's documented core import tree.
@@ -1644,9 +1655,9 @@ impl SplashLanguageServer {
         })
     }
 
-    /// Returns only fixed language signatures or exact visible advisory module
-    /// leaves. This is source-only editor metadata, never a module lookup or
-    /// capability decision.
+    /// Returns fixed language signatures, exact visible named-function
+    /// signatures, or exact visible advisory module leaves. This is source-only
+    /// editor metadata, never a module lookup or capability decision.
     fn signature_help(
         &self,
         uri: &Uri,
@@ -1660,11 +1671,14 @@ impl SplashLanguageServer {
             return Ok(None);
         };
         if let Some(context) = direct_function_signature_help_call_context(source, byte_offset) {
+            if context.callee.end_byte > lexical.valid_prefix_end_byte {
+                return Ok(None);
+            }
+            if let Some(signature) = named_function_signature_help(source, lexical, context) {
+                return Ok(Some(signature));
+            }
             let imports = self.module_imports(uri)?;
-            if imports.truncated
-                || context.callee.end_byte > lexical.valid_prefix_end_byte
-                || context.callee.end_byte > imports.valid_prefix_end_byte
-            {
+            if imports.truncated || context.callee.end_byte > imports.valid_prefix_end_byte {
                 return Ok(None);
             }
             if is_visible_builtin_standard_assert_receiver(source, lexical, imports, context.callee)
@@ -2064,6 +2078,10 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "assert(true)\n",
     "std.assert(true)\n",
     "tool.call(\"\", \"\")\n",
+    "fn summarize(left, right) {\n",
+    "    left + right\n",
+    "}\n",
+    "summarize(20, 22)\n",
     "workflow.input.request\n",
     "workflow.outputs.prepare.total"
 );
@@ -2277,6 +2295,11 @@ pub fn fuzz_exercise_document(source: &str) {
     fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_named_function_signature_requests(
+        &server,
+        &uri,
+        FUZZ_ADVISORY_CONFIGURATION_SOURCE,
+    );
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 4);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
@@ -2360,6 +2383,11 @@ fn fuzz_exercise_advisory_configuration_requests(server: &SplashLanguageServer, 
     fuzz_exercise_fixed_standard_json_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_text_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_assert_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_named_function_signature_requests(
+        server,
+        uri,
+        FUZZ_ADVISORY_CONFIGURATION_SOURCE,
+    );
 }
 
 #[cfg(fuzzing)]
@@ -2407,6 +2435,19 @@ fn fuzz_exercise_advisory_input_field_requests(
         let _ = server.hover(uri, position);
         let _ = server.signature_help(uri, position);
     }
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_named_function_signature_requests(
+    server: &SplashLanguageServer,
+    uri: &Uri,
+    source: &str,
+) {
+    let Some(call_start) = source.find("summarize(20, 22)") else {
+        return;
+    };
+    let second_argument = call_start + "summarize(20, ".len();
+    let _ = server.signature_help(uri, position_at_byte(source, second_argument));
 }
 
 #[cfg(fuzzing)]
@@ -7439,6 +7480,88 @@ fn standard_assert_signature_help(callee: &str, active_argument: usize) -> Signa
     )
 }
 
+/// Returns metadata for a direct lexical call to a named function declared in
+/// the same document. It never follows aliases or inspects a runtime value.
+fn named_function_signature_help(
+    source: &str,
+    lexical: &LexicalCompletionReport,
+    context: DirectFunctionSignatureHelpCallContext,
+) -> Option<SignatureHelp> {
+    if !lexical.sites.contains(&context.callee) {
+        return None;
+    }
+    let callee = source.get(context.callee.start_byte..context.callee.end_byte)?;
+    let function = visible_symbol_at(lexical, callee, context.callee.start_byte)?;
+    if function.kind != LexicalSymbolKind::Function {
+        return None;
+    }
+
+    let parameters =
+        named_function_parameter_names(source, lexical.valid_prefix_end_byte, function)?;
+    let parameter_names = parameters.iter().map(String::as_str).collect::<Vec<_>>();
+    Some(signature_help_with_parameters(
+        format!("{callee}({})", parameter_names.join(", ")),
+        NAMED_FUNCTION_SIGNATURE_DOCUMENTATION,
+        &parameter_names,
+        context.active_argument,
+    ))
+}
+
+/// Reads only the canonical parameter list immediately following a lexical
+/// function declaration. A malformed, oversized, or incomplete header is
+/// omitted rather than presented with a partial signature.
+fn named_function_parameter_names(
+    source: &str,
+    valid_prefix_end_byte: usize,
+    function: &LexicalSymbol,
+) -> Option<Vec<String>> {
+    if function.definition.end_byte > valid_prefix_end_byte {
+        return None;
+    }
+    let maximum_end_byte = function
+        .definition
+        .end_byte
+        .saturating_add(MAX_LSP_NAMED_FUNCTION_SIGNATURE_BYTES)
+        .min(valid_prefix_end_byte);
+    let bytes = source.as_bytes();
+    let mut index =
+        skip_splash_trivia_before(source, function.definition.end_byte, maximum_end_byte)?;
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+    index += 1;
+    index = skip_splash_trivia_before(source, index, maximum_end_byte)?;
+
+    let mut parameters = Vec::new();
+    if bytes.get(index) == Some(&b')') {
+        index += 1;
+    } else {
+        loop {
+            if parameters.len() == MAX_LSP_NAMED_FUNCTION_SIGNATURE_PARAMETERS {
+                return None;
+            }
+            let parameter_end =
+                direct_module_output_identifier_end(source, index, maximum_end_byte)?;
+            parameters.push(source.get(index..parameter_end)?.to_owned());
+            index = skip_splash_trivia_before(source, parameter_end, maximum_end_byte)?;
+            match bytes.get(index) {
+                Some(b',') => {
+                    index += 1;
+                    index = skip_splash_trivia_before(source, index, maximum_end_byte)?;
+                }
+                Some(b')') => {
+                    index += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    index = skip_splash_trivia_before(source, index, maximum_end_byte)?;
+    (bytes.get(index) == Some(&b'{')).then_some(parameters)
+}
+
 fn standard_assert_member_signature_help(
     source: &str,
     context: SignatureHelpCallContext,
@@ -11021,6 +11144,117 @@ mod tests {
                 .expect("non-code assertion signature request succeeds")
                 .is_none());
         }
+    }
+
+    #[test]
+    fn presents_visible_named_function_signature_help_without_runtime_access() {
+        let source = concat!(
+            "fn summarize(left /* first value */, right) {\n",
+            "    left + right\n",
+            "}\n",
+            "summarize(20, 22)"
+        );
+        let mut server = SplashLanguageServer::default();
+        server.open_document(document(1, source));
+
+        let second_argument = source.rfind("22").expect("second argument exists") + 1;
+        let signature = server
+            .signature_help(&test_uri(), position_at_byte(source, second_argument))
+            .expect("named function signature request succeeds")
+            .expect("visible named function has a signature");
+        assert_eq!(signature.signatures.len(), 1);
+        assert_eq!(signature.signatures[0].label, "summarize(left, right)");
+        assert_eq!(signature.active_signature, Some(0));
+        assert_eq!(signature.active_parameter, Some(1));
+        assert_eq!(
+            signature.signatures[0].documentation,
+            Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: NAMED_FUNCTION_SIGNATURE_DOCUMENTATION.to_owned(),
+            }))
+        );
+        assert_eq!(
+            signature.signatures[0].parameters,
+            Some(vec![
+                ParameterInformation {
+                    label: ParameterLabel::Simple("left".to_owned()),
+                    documentation: None,
+                },
+                ParameterInformation {
+                    label: ParameterLabel::Simple("right".to_owned()),
+                    documentation: None,
+                },
+            ])
+        );
+
+        let zero_source = "fn ping() {\nnil\n}\nping()";
+        let mut zero_server = SplashLanguageServer::default();
+        zero_server.open_document(document(1, zero_source));
+        let zero_signature = zero_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(zero_source, zero_source.len() - 1),
+            )
+            .expect("zero-argument signature request succeeds")
+            .expect("zero-argument named function has a signature");
+        assert_eq!(zero_signature.signatures[0].label, "ping()");
+        assert_eq!(zero_signature.active_parameter, None);
+        assert_eq!(zero_signature.signatures[0].parameters, Some(Vec::new()));
+
+        let incomplete_source = concat!(
+            "fn join(left, right) {\n",
+            "    left + right\n",
+            "}\n",
+            "join(\"left\", \""
+        );
+        let mut incomplete_server = SplashLanguageServer::default();
+        incomplete_server.open_document(document(1, incomplete_source));
+        let incomplete_signature = incomplete_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(incomplete_source, incomplete_source.len()),
+            )
+            .expect("in-progress named call signature request succeeds")
+            .expect("in-progress named call retains a signature");
+        assert_eq!(
+            incomplete_signature.signatures[0].label,
+            "join(left, right)"
+        );
+        assert_eq!(incomplete_signature.active_parameter, Some(1));
+
+        for source in [
+            "summarize(20)\nfn summarize(value) {\nvalue\n}",
+            "fn summarize(value) {\nvalue\n}\nlet alias = summarize\nalias(20)",
+            "fn summarize(value) {\nvalue\n}\nlet summarize = || nil\nsummarize(20)",
+            "fn summarize(value) {\nvalue\n}\nlet holder = {run: summarize}\nholder.run(20)",
+        ] {
+            let mut rejected_server = SplashLanguageServer::default();
+            rejected_server.open_document(document(1, source));
+            let argument = source.rfind("20").expect("call argument exists") + 1;
+            assert!(
+                rejected_server
+                    .signature_help(&test_uri(), position_at_byte(source, argument))
+                    .expect("rejected named signature request succeeds")
+                    .is_none(),
+                "unexpected named signature for {source:?}"
+            );
+        }
+
+        let parameters = (0..=MAX_LSP_NAMED_FUNCTION_SIGNATURE_PARAMETERS)
+            .map(|index| format!("value{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let crowded_source = format!("fn crowded({parameters}) {{ nil }}\ncrowded(0)");
+        let mut crowded_server = SplashLanguageServer::default();
+        crowded_server.open_document(document(1, &crowded_source));
+        let crowded_argument = crowded_source.rfind('0').expect("call argument exists") + 1;
+        assert!(crowded_server
+            .signature_help(
+                &test_uri(),
+                position_at_byte(&crowded_source, crowded_argument)
+            )
+            .expect("crowded signature request succeeds")
+            .is_none());
     }
 
     #[test]

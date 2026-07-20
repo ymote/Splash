@@ -285,17 +285,22 @@ labeled as returning a promise, but the LSP never inserts `await()` or makes a
 host binding available or authorizes a capability.
 
 The LSP also serves bounded `textDocument/signatureHelp` for a direct visible
-`mod.tool` call and an exact visible advisory module leaf rooted at a direct
-import or qualifying module alias, with both `callMode` and
+same-document named `fn` call, a direct visible `mod.tool` call, and an exact
+visible advisory module leaf rooted at a direct import or qualifying module
+alias, with both `callMode` and
 `callShape: "single_json"`. Fixed `mod.tool` signatures describe their text
 or JSON bridge; only that explicit shape gives a direct module one
 JSON-compatible `input` and synchronous or deferred result label. Mode-only
-metadata still completes and hovers, but has no assumed arity. The cursor
-scanner accepts an in-progress string argument, but rejects a cursor inside a
-comment, mismatched delimiters, deep nesting, shadowed receivers, truncated
-scope/import metadata, and unknown paths. It never reads a runtime, resolves a
-module, or grants authority. When a shaped leaf also supplies `inputFields` or
-`outputFields`, its plain-text hover and signature documentation list bounded
+metadata still completes and hovers, but has no assumed arity. A named function
+signature reads only its completed canonical declaration header, retains at
+most 64 parameters from a 64 KiB declaration window, and never reports a
+partial list.
+The cursor scanner accepts an in-progress string argument, but rejects a cursor
+inside a comment, mismatched delimiters, deep nesting, shadowed receivers,
+truncated scope/import metadata, and unknown paths. It never reads a runtime,
+resolves a module, infers a named-function result type, or grants authority.
+When a shaped leaf also supplies `inputFields` or `outputFields`, its plain-text
+hover and signature documentation list bounded
 field names, fixed JSON types, required bits, and optional descriptions. It can
 additionally complete an undeclared root key or one direct object-child key and
 hover an exact known key only in that leaf's first direct literal record
