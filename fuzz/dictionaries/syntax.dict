@@ -43,6 +43,7 @@
 "object.has("
 "object.get("
 "object.pick("
+"object.omit("
 "object.from_entries("
 "object.with("
 "object.merge("

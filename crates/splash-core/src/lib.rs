@@ -11,7 +11,7 @@ mod profile;
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::time::Duration;
@@ -3541,6 +3541,12 @@ fn install_standard_object_module(vm: &mut vm::ScriptVm, std_module: ScriptObjec
     );
     vm.add_method(
         object,
+        id!(omit),
+        script_args_def!(value = NIL, keys = NIL),
+        standard_object_omit,
+    );
+    vm.add_method(
+        object,
         id!(from_entries),
         script_args_def!(entries = NIL),
         standard_object_from_entries,
@@ -3625,7 +3631,7 @@ fn standard_object_pick(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValu
         Ok(input) => input,
         Err(error) => return error,
     };
-    let (keys, key_count) = match standard_object_pick_keys(vm, keys) {
+    let (keys, key_count) = match standard_object_text_keys(vm, keys, "pick") {
         Ok(input) => input,
         Err(error) => return error,
     };
@@ -3633,7 +3639,7 @@ fn standard_object_pick(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValu
     for index in 0..key_count {
         let key = vm.bx.heap.array_index_unchecked(keys, index);
         if vm.string_with(key, |_, _| ()).is_none() {
-            return standard_object_expected_pick_text_key(vm);
+            return standard_object_expected_text_key_list_item(vm, "pick");
         }
     }
 
@@ -3647,6 +3653,39 @@ fn standard_object_pick(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValu
         };
         if let Some(value) = value {
             let trap = vm.bx.threads.cur_ref().trap.pass();
+            vm.bx.heap.set_value(output, key, value, trap);
+        }
+    }
+    output.into()
+}
+
+fn standard_object_omit(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let keys = script_value!(vm, args.keys);
+    let entries = match standard_object_entries(vm, value, "omit", "value") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    let (keys, key_count) = match standard_object_text_keys(vm, keys, "omit") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+
+    let mut omitted = HashSet::with_capacity(key_count);
+    for index in 0..key_count {
+        let key = vm.bx.heap.array_index_unchecked(keys, index);
+        let key = match standard_object_text_key(vm, key, "omit") {
+            Ok(key) => key,
+            Err(_) => return standard_object_expected_text_key_list_item(vm, "omit"),
+        };
+        omitted.insert(key);
+    }
+
+    let output = vm.bx.heap.new_object();
+    vm.bx.heap.set_string_keys(output);
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for (key, value) in entries {
+        if !omitted.contains(&key) {
             vm.bx.heap.set_value(output, key, value, trap);
         }
     }
@@ -3799,19 +3838,20 @@ fn standard_object_input(
     Ok((object, data.map_len()))
 }
 
-fn standard_object_pick_keys(
+fn standard_object_text_keys(
     vm: &mut vm::ScriptVm,
     value: ScriptValue,
+    function: &'static str,
 ) -> Result<(vm::ScriptArray, usize), ScriptValue> {
     let Some(keys) = value.as_array() else {
         return Err(script_err_type_mismatch!(
             vm.bx.threads.cur_ref().trap,
-            "std.object.pick expects `keys` to be an array"
+            "std.object.{function} expects `keys` to be an array"
         ));
     };
     let key_count = vm.bx.heap.array_len(keys);
     if key_count > MAX_STANDARD_OBJECT_FIELDS {
-        return Err(standard_object_pick_key_limit(vm));
+        return Err(standard_object_text_key_limit(vm, function));
     }
     Ok((keys, key_count))
 }
@@ -3966,10 +4006,13 @@ fn standard_object_expected_lookup_key(
     )
 }
 
-fn standard_object_expected_pick_text_key(vm: &mut vm::ScriptVm) -> ScriptValue {
+fn standard_object_expected_text_key_list_item(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+) -> ScriptValue {
     script_err_type_mismatch!(
         vm.bx.threads.cur_ref().trap,
-        "std.object.pick expects every `keys` item to be a string"
+        "std.object.{function} expects every `keys` item to be a string"
     )
 }
 
@@ -4001,10 +4044,10 @@ fn standard_object_field_limit(vm: &mut vm::ScriptVm, function: &'static str) ->
     )
 }
 
-fn standard_object_pick_key_limit(vm: &mut vm::ScriptVm) -> ScriptValue {
+fn standard_object_text_key_limit(vm: &mut vm::ScriptVm, function: &'static str) -> ScriptValue {
     script_err_limit!(
         vm.bx.threads.cur_ref().trap,
-        "std.object.pick supports at most {MAX_STANDARD_OBJECT_FIELDS} keys"
+        "std.object.{function} supports at most {MAX_STANDARD_OBJECT_FIELDS} keys"
     )
 }
 
@@ -8579,6 +8622,9 @@ compute(outer, 2)
                  assert(object.has(picked_nil, \"value\"))\n\
                  assert(!object.has(picked_nil, \"missing\"))\n\
                  assert(object.get(picked_nil, \"value\", \"fallback\") == nil)\n\
+                 let omitted_nil = object.omit(present_nil, [\"missing\"])\n\
+                 assert(object.has(omitted_nil, \"value\"))\n\
+                 assert(object.get(omitted_nil, \"value\", \"fallback\") == nil)\n\
                  assert(object.len(object.pick(record, [])) == 0)\n\
                  assert(object.keys(record) == [\"first\", \"second\"])\n\
                  let pairs = object.entries(record)\n\
@@ -8626,6 +8672,11 @@ compute(outer, 2)
                  assert(object.keys(picked) == [\"third\", \"first\"])\n\
                  assert(picked.third == 3)\n\
                  assert(!object.has(picked, \"missing\"))\n\
+                 let omitted = object.omit(mixed, [\"second\", \"missing\", \"second\"])\n\
+                 assert(object.keys(omitted) == [\"first\", \"third\", \"fourth\"])\n\
+                 assert(!object.has(omitted, \"second\"))\n\
+                 assert(omitted.third == 3)\n\
+                 assert(mixed.second == 30)\n\
                  let with_nested_source = {answer: 1}\n\
                  let with_nested = object.with({nested: with_nested_source}, \"nested\", with_nested_source)\n\
                  with_nested.nested.answer = 2\n\
@@ -8637,12 +8688,15 @@ compute(outer, 2)
                  let picked_nested = object.pick({nested: nested, ignored: 0}, [\"nested\"])\n\
                  picked_nested.nested.answer = 3\n\
                  assert(nested.answer == 3)\n\
-                 let copied = object.merge({nested: nested}, {})\n\
-                 copied.nested.answer = 4\n\
+                 let omitted_nested = object.omit({nested: nested, ignored: 0}, [\"ignored\"])\n\
+                 omitted_nested.nested.answer = 4\n\
                  assert(nested.answer == 4)\n\
-                 let entry_pairs = object.entries({nested: nested})\n\
-                 entry_pairs[0][1].answer = 5\n\
+                 let copied = object.merge({nested: nested}, {})\n\
+                 copied.nested.answer = 5\n\
                  assert(nested.answer == 5)\n\
+                 let entry_pairs = object.entries({nested: nested})\n\
+                 entry_pairs[0][1].answer = 6\n\
+                 assert(nested.answer == 6)\n\
                  object.keys(mixed)",
             )
             .unwrap();
@@ -8660,7 +8714,7 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nlet picked = std.object.pick({first: 1, second: 2}, [\"second\"])\nstd.object.with({second: picked.second}, \"second\", 20).second")
+            .eval("use mod.std\nlet picked = std.object.pick({first: 1, second: 2}, [\"second\"])\nstd.object.omit(std.object.with({first: 0, second: picked.second}, \"second\", 20), [\"first\"]).second")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
         assert_eq!(
@@ -8675,7 +8729,7 @@ compute(outer, 2)
         );
 
         let mutation = runtime
-            .eval("use mod.std.object\nobject.with = || nil")
+            .eval("use mod.std.object\nobject.omit = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
@@ -8788,6 +8842,46 @@ compute(outer, 2)
             serde_json::json!("invalid-key")
         );
 
+        let invalid_omit_keys = runtime
+            .eval(
+                "use mod.std.object\ntry object.omit({first: 1}, \"first\") catch \"invalid-keys\"",
+            )
+            .unwrap();
+        assert!(
+            invalid_omit_keys.completed(),
+            "{:?}",
+            invalid_omit_keys.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_omit_keys.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-keys")
+        );
+
+        let invalid_omit_key = runtime
+            .eval("use mod.std.object\ntry object.omit({first: 1}, [1]) catch \"invalid-key\"")
+            .unwrap();
+        assert!(
+            invalid_omit_key.completed(),
+            "{:?}",
+            invalid_omit_key.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_omit_key.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-key")
+        );
+
         let invalid_entries = runtime
             .eval("use mod.std.object\ntry object.from_entries(\"entries\") catch \"invalid-entries\"")
             .unwrap();
@@ -8874,7 +8968,7 @@ compute(outer, 2)
             oversized_source.push_str(&format!("field_{index}: 0"));
         }
         oversized_source.push_str(&format!(
-            "}}\nassert(object.len(values) == {})\nassert(object.has(values, \"field_0\"))\nassert(object.get(values, \"missing\", -1) == -1)\nlet selected = object.pick(values, [\"field_0\"])\nassert(object.get(selected, \"field_0\", -1) == 0)\nobject.entries(values)",
+            "}}\nassert(object.len(values) == {})\nassert(object.has(values, \"field_0\"))\nassert(object.get(values, \"missing\", -1) == -1)\nlet selected = object.pick(values, [\"field_0\"])\nassert(object.get(selected, \"field_0\", -1) == 0)\nlet omitted = try object.omit(values, [\"field_0\"]) catch \"limit\"\nassert(omitted == \"limit\")\nobject.entries(values)",
             MAX_STANDARD_OBJECT_FIELDS + 1
         ));
         let limits = ExecutionLimits {
@@ -8905,6 +8999,27 @@ compute(outer, 2)
             pick_limit_runtime
                 .script_value_as_json(
                     pick_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
+        let mut omit_limit_runtime = Runtime::default();
+        let omit_limit = omit_limit_runtime
+            .eval(&format!(
+                "use mod.std.object\n\
+                 let keys = []\n\
+                 keys[{MAX_STANDARD_OBJECT_FIELDS}] = \"first\"\n\
+                 try object.omit({{first: 1}}, keys) catch \"limit\""
+            ))
+            .unwrap();
+        assert!(omit_limit.completed(), "{:?}", omit_limit.diagnostics);
+        assert_eq!(
+            omit_limit_runtime
+                .script_value_as_json(
+                    omit_limit.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )

@@ -292,7 +292,8 @@ entropy, or crate access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.has(value, key)`, `object.get(value, key, fallback)`,
-`object.pick(value, keys)`, `object.from_entries(entries)`,
+`object.pick(value, keys)`, `object.omit(value, keys)`,
+`object.from_entries(entries)`,
 `object.with(value, key, item)`, `object.keys(value)`, `object.entries(value)`,
 `object.values(value)`, and `object.merge(left, right)`.
 The helpers with a record input accept plain record or JSON-object data only,
@@ -305,10 +306,14 @@ accepts at most 4,096 exact `[string, value]` pairs, preserves first key
 positions, and applies later duplicate values. `with` returns a fresh shallow
 record with one string key updated or appended; an existing key keeps
 its position, while a new key is rejected when the source already has 4,096
-fields. `keys`,
-`entries`, `values`, and `merge` shallowly process at most 4,096 own text-keyed
-fields; `entries` returns fresh `[text_key, value]` pairs in stored field order,
-and `merge` also rejects a combined source count over that bound. `len` is
+fields. `omit` accepts at most 4,096 string keys and returns a fresh shallow
+record in source field order without matching own text fields; duplicate and
+missing keys are ignored. It is a local denylist transform, not a boundary
+whitelist: use `pick` before a tool boundary when unknown fields must be
+excluded. `omit`, `keys`, `entries`, `values`, and `merge` shallowly process at
+most 4,096 own text-keyed fields; `entries` returns fresh `[text_key, value]`
+pairs in stored field order, and `merge` also rejects a combined source count
+over that bound. `len` is
 constant-time and uncapped. The module does not expose host state, filesystem,
 process, network, clock, entropy, or crate access.
 

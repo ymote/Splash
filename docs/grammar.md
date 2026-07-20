@@ -450,7 +450,8 @@ and advisory metadata cannot add members to this core module.
 An exact visible direct `use mod.std.object` binding has a separate fixed core
 projection for only `object.len(value)`, `object.has(value, key)`,
 `object.get(value, key, fallback)`, `object.pick(value, keys)`,
-`object.from_entries(entries)`, `object.with(value, key, item)`,
+`object.omit(value, keys)`, `object.from_entries(entries)`,
+`object.with(value, key, item)`,
 `object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
 `object.merge(left, right)`, with plain-text member
 hover and function

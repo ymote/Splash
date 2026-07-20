@@ -521,6 +521,12 @@ const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
         description: "Returns a shallow record of requested existing own text fields; missing keys are omitted.",
     },
     StandardObjectFunction {
+        name: "omit",
+        parameters: &["value", "keys"],
+        result: "object",
+        description: "Returns a shallow record without requested own text fields; missing keys are ignored.",
+    },
+    StandardObjectFunction {
         name: "from_entries",
         parameters: &["entries"],
         result: "object",
@@ -10203,6 +10209,7 @@ mod tests {
                 "keys",
                 "len",
                 "merge",
+                "omit",
                 "pick",
                 "values",
                 "with"
@@ -10242,7 +10249,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core object completion succeeds");
-        assert_eq!(partial.items.len(), 10);
+        assert_eq!(partial.items.len(), 11);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -10261,6 +10268,7 @@ mod tests {
             "object.has(merged, \"left\")\n",
             "object.get(merged, \"missing\", 0)\n",
             "object.pick(merged, [\"left\"])\n",
+            "object.omit(merged, [\"right\"])\n",
             "object.keys(merged)\n",
             "object.entries(merged)"
         );
@@ -10343,6 +10351,19 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "object.pick(value, keys) -> object\n\nReturns a shallow record of requested existing own text fields; missing keys are omitted.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let omit_start = source.find("object.omit").expect("omit member exists") + "object.".len();
+        let omit_hover = server
+            .hover(&test_uri(), position_at_byte(source, omit_start + 1))
+            .expect("core object omit hover succeeds")
+            .expect("omit has fixed hover metadata");
+        assert_eq!(
+            omit_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.omit(value, keys) -> object\n\nReturns a shallow record without requested own text fields; missing keys are ignored.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -10475,6 +10496,21 @@ mod tests {
             "object.pick(value, keys) -> object"
         );
         assert_eq!(pick_help.active_parameter, Some(1));
+
+        let omit_cursor = source
+            .find("object.omit(merged, [\"right\"])")
+            .expect("omit input exists")
+            + "object.omit(merged, ".len()
+            + 1;
+        let omit_help = server
+            .signature_help(&test_uri(), position_at_byte(source, omit_cursor))
+            .expect("core object omit signature help succeeds")
+            .expect("omit has a fixed signature");
+        assert_eq!(
+            omit_help.signatures[0].label,
+            "object.omit(value, keys) -> object"
+        );
+        assert_eq!(omit_help.active_parameter, Some(1));
 
         let from_entries_cursor = source
             .find("object.from_entries([[\"left\", 1]])")
@@ -16780,6 +16816,7 @@ mod tests {
                 "keys",
                 "len",
                 "merge",
+                "omit",
                 "pick",
                 "values",
                 "with"
