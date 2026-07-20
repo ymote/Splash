@@ -464,10 +464,13 @@ shaping. It provides `text.trim(value)`, `text.lower(value)`,
 `text.upper(value)`, Unicode-scalar `text.len(value)`, literal
 `text.contains(value, needle)`, `text.starts_with(value, prefix)`,
 `text.ends_with(value, suffix)`, and
-`text.replace_all(value, from, to)`. Casing and replacement build results
-through the configured individual-string bound; a limit hit is the same hard
-resource failure as any other new script string. It does not expose regexes,
-I/O, clock, entropy, host-state, crate-loading, or capability access.
+`text.replace_all(value, from, to)`, plus
+`text.split(value, delimiter)`. `split` matches a non-empty delimiter literally,
+preserves empty fields, and rejects a result over 4,096 segments. Casing,
+replacement, and splitting build results through the configured individual-string
+and tracked-heap bounds; a limit hit is the same hard resource failure as any
+other new script allocation. It does not expose regexes, I/O, clock, entropy,
+host-state, crate-loading, or capability access.
 
 `use mod.std.array` imports a frozen Splash-owned module for local collection
 shaping. It provides `array.len(value)`, `array.slice(value, start, end)`,
@@ -672,7 +675,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
   `json.stringify(...)`; these are bounded local data operations, not
   capabilities.
 - Import `mod.std.text` before using `text.*`; its operations are bounded,
-  literal local data shaping, not regex processing or capabilities.
+  literal local data shaping, not regex processing or capabilities. Use
+  `text.split(value, delimiter)` with a non-empty delimiter matched literally,
+  and keep its result at or below 4,096 segments.
 - Import `mod.std.array` before using `array.*`; transforms are bounded,
   callback-free shallow copies, not capabilities. Keep each source array and
   concatenated result at or below 4,096 items.

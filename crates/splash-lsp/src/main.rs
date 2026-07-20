@@ -382,6 +382,13 @@ const STANDARD_TEXT_FUNCTIONS: &[StandardTextFunction] = &[
         result: "string",
         description: "Replaces every non-overlapping literal substring match.",
     },
+    StandardTextFunction {
+        name: "split",
+        parameters: &["value", "delimiter"],
+        result: "array",
+        description:
+            "Splits on a non-empty delimiter using literal matching and preserves empty fields.",
+    },
 ];
 
 const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
@@ -1940,6 +1947,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
     "text.replace_all(normalized, \"splash\", \"Splash\")\n",
+    "text.split(normalized, \"-\")\n",
     "assert(true)\n",
     "std.assert(true)\n",
     "tool.call(\"\", \"\")\n",
@@ -2376,6 +2384,16 @@ fn fuzz_exercise_fixed_standard_text_requests(
         uri,
         position_at_byte(source, replace_start + "text.".len() + 1),
     );
+
+    let Some(split_start) = source.find("text.split") else {
+        return;
+    };
+    let split_argument = split_start + "text.split(".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, split_start + "text.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, split_argument));
 }
 
 #[cfg(fuzzing)]
@@ -9758,6 +9776,7 @@ mod tests {
                 "len",
                 "lower",
                 "replace_all",
+                "split",
                 "starts_with",
                 "trim",
                 "upper",
@@ -9797,7 +9816,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core text completion succeeds");
-        assert_eq!(partial.items.len(), 8);
+        assert_eq!(partial.items.len(), 9);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9811,7 +9830,8 @@ mod tests {
         let source = concat!(
             "use mod.std.text\n",
             "let value = text.trim(\"  Splash  \")\n",
-            "text.replace_all(value, \"S\", \"s\")"
+            "text.replace_all(value, \"S\", \"s\")\n",
+            "text.split(\"a,,b,\", \",\")"
         );
         let mut server = SplashLanguageServer::default();
         server.open_document(document(1, source));
@@ -9886,6 +9906,34 @@ mod tests {
                 },
             ])
         );
+
+        let split_start = source.find("text.split").expect("split member exists") + "text.".len();
+        let split_hover = server
+            .hover(&test_uri(), position_at_byte(source, split_start + 1))
+            .expect("core text split hover succeeds")
+            .expect("split has fixed hover metadata");
+        assert_eq!(
+            split_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "text.split(value, delimiter) -> array\n\nSplits on a non-empty delimiter using literal matching and preserves empty fields.\n\nBounded Splash core text helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let split_cursor = source
+            .find("text.split(\"a,,b,\", \",\")")
+            .expect("split call exists")
+            + "text.split(\"a,,b,\", ".len()
+            + 1;
+        let split_help = server
+            .signature_help(&test_uri(), position_at_byte(source, split_cursor))
+            .expect("core text split signature help succeeds")
+            .expect("split has a fixed signature");
+        assert_eq!(
+            split_help.signatures[0].label,
+            "text.split(value, delimiter) -> array"
+        );
+        assert_eq!(split_help.active_parameter, Some(1));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -15690,6 +15738,7 @@ mod tests {
                 "len",
                 "lower",
                 "replace_all",
+                "split",
                 "starts_with",
                 "trim",
                 "upper",

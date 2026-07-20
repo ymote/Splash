@@ -2748,6 +2748,12 @@ fn install_standard_text_module(vm: &mut vm::ScriptVm, std_module: ScriptObject)
         script_args_def!(value = NIL, from = NIL, to = NIL),
         standard_text_replace_all,
     );
+    vm.add_method(
+        text,
+        id!(split),
+        script_args_def!(value = NIL, delimiter = NIL),
+        standard_text_split,
+    );
     vm.bx
         .heap
         .set_value_def(std_module, id!(text).into(), text.into());
@@ -2854,6 +2860,48 @@ fn standard_text_replace_all(vm: &mut vm::ScriptVm, args: ScriptObject) -> Scrip
         Some(Some(Some(result))) => result,
         _ => standard_text_expected_string(vm, "replace_all", "value, from, and to"),
     }
+}
+
+fn standard_text_split(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let delimiter = script_value!(vm, args.delimiter);
+    match vm.string_with(value, |vm, value| {
+        vm.string_with(delimiter, |vm, delimiter| {
+            if delimiter.is_empty() {
+                return script_err_invalid_args!(
+                    vm.bx.threads.cur_ref().trap,
+                    "std.text.split requires a non-empty `delimiter`"
+                );
+            }
+            if value
+                .split(delimiter)
+                .take(MAX_STANDARD_ARRAY_ITEMS + 1)
+                .count()
+                > MAX_STANDARD_ARRAY_ITEMS
+            {
+                return standard_text_segment_limit(vm);
+            }
+
+            let output = vm.bx.heap.new_array();
+            let trap = vm.bx.threads.cur_ref().trap.pass();
+            for segment in value.split(delimiter) {
+                let segment = vm.bx.heap.new_string_from_str(segment);
+                vm.bx.heap.array_push(output, segment, trap);
+            }
+            output.into()
+        })
+    }) {
+        Some(Some(result)) => result,
+        Some(None) => standard_text_expected_string(vm, "split", "delimiter"),
+        None => standard_text_expected_string(vm, "split", "value"),
+    }
+}
+
+fn standard_text_segment_limit(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_limit!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.split supports at most {MAX_STANDARD_ARRAY_ITEMS} segments"
+    )
 }
 
 fn standard_text_expected_string(
@@ -7189,6 +7237,7 @@ compute(outer, 2)
                  assert(text.contains(value, \"Xe\"))\n\
                  assert(text.starts_with(value, \"Mi\"))\n\
                  assert(text.ends_with(value, \"eD\"))\n\
+                 assert(text.split(\"a,,b,\", \",\") == [\"a\", \"\", \"b\", \"\"])\n\
                  text.replace_all(\"a-b-a\", \"a\", \"x\")",
             )
             .unwrap();
@@ -7240,6 +7289,53 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("`prefix`")));
+
+        let invalid_delimiter_type = runtime
+            .eval("use mod.std.text\ntext.split(\"splash\", 1)")
+            .unwrap();
+        assert!(!invalid_delimiter_type.succeeded());
+        assert!(invalid_delimiter_type
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("`delimiter`")));
+
+        let invalid_delimiter = runtime
+            .eval("use mod.std.text\ntry text.split(\"splash\", \"\") catch \"empty\"")
+            .unwrap();
+        assert!(
+            invalid_delimiter.completed(),
+            "{:?}",
+            invalid_delimiter.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_delimiter.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("empty")
+        );
+
+        let too_many_segments = format!("{}x", "x,".repeat(MAX_STANDARD_ARRAY_ITEMS));
+        let mut segment_limit_runtime = Runtime::default();
+        let segment_limit = segment_limit_runtime
+            .eval(&format!(
+                "use mod.std.text\ntry text.split(\"{too_many_segments}\", \",\") catch \"limit\""
+            ))
+            .unwrap();
+        assert!(segment_limit.completed(), "{:?}", segment_limit.diagnostics);
+        assert_eq!(
+            segment_limit_runtime
+                .script_value_as_json(
+                    segment_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
 
         let limits = ExecutionLimits {
             max_string_bytes: 4,

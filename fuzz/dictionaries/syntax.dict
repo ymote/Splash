@@ -37,6 +37,7 @@
 "object.merge("
 "text.trim("
 "text.replace_all("
+"text.split("
 "record["
 "workflow.input["
 "assert("
