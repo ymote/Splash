@@ -2709,6 +2709,12 @@ fn install_standard_text_module(vm: &mut vm::ScriptVm, std_module: ScriptObject)
     );
     vm.add_method(
         text,
+        id!(last_index_of),
+        script_args_def!(value = NIL, needle = NIL),
+        standard_text_last_index_of,
+    );
+    vm.add_method(
+        text,
         id!(contains),
         script_args_def!(value = NIL, needle = NIL),
         |vm, args| {
@@ -2864,19 +2870,33 @@ fn standard_text_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue
 }
 
 fn standard_text_index_of(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    standard_text_literal_index(vm, args, "index_of", |value, needle| value.find(needle))
+}
+
+fn standard_text_last_index_of(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    standard_text_literal_index(vm, args, "last_index_of", |value, needle| {
+        value.rfind(needle)
+    })
+}
+
+fn standard_text_literal_index(
+    vm: &mut vm::ScriptVm,
+    args: ScriptObject,
+    function: &'static str,
+    search: impl FnOnce(&str, &str) -> Option<usize>,
+) -> ScriptValue {
     let value = script_value!(vm, args.value);
     let needle = script_value!(vm, args.needle);
     match vm.string_with(value, |vm, value| {
         vm.string_with(needle, |_, needle| {
-            value
-                .find(needle)
+            search(value, needle)
                 .map(|byte_index| value[..byte_index].chars().count() as f64)
                 .unwrap_or(-1.0)
         })
     }) {
         Some(Some(index)) => ScriptValue::from_f64(index),
-        Some(None) => standard_text_expected_string(vm, "index_of", "needle"),
-        None => standard_text_expected_string(vm, "index_of", "value"),
+        Some(None) => standard_text_expected_string(vm, function, "needle"),
+        None => standard_text_expected_string(vm, function, "value"),
     }
 }
 
@@ -7778,6 +7798,10 @@ compute(outer, 2)
                  assert(text.index_of(\"a🙂b🙂\", \"b\") == 2)\n\
                  assert(text.index_of(\"splash\", \"z\") == -1)\n\
                  assert(text.index_of(\"splash\", \"\") == 0)\n\
+                 assert(text.last_index_of(\"a🙂b🙂\", \"🙂\") == 3)\n\
+                 assert(text.last_index_of(\"a🙂b🙂\", \"b\") == 2)\n\
+                 assert(text.last_index_of(\"splash\", \"z\") == -1)\n\
+                 assert(text.last_index_of(\"a🙂b\", \"\") == 3)\n\
                  assert(text.contains(value, \"Xe\"))\n\
                  assert(text.starts_with(value, \"Mi\"))\n\
                  assert(text.ends_with(value, \"eD\"))\n\
@@ -7802,19 +7826,19 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nstd.text.starts_with(\"splash\", \"spl\")")
+            .eval("use mod.std\nstd.text.last_index_of(\"a🙂b🙂\", \"🙂\")")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
-        assert_eq!(namespace.value.as_bool(), Some(true));
+        assert_eq!(namespace.value.as_number(), Some(3.0));
 
         let mutation = runtime
-            .eval("use mod.std.text\ntext.trim = || nil")
+            .eval("use mod.std.text\ntext.last_index_of = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
 
         let preserved = runtime
-            .eval("use mod.std.text\ntext.replace_all(\"splash\", \"s\", \"S\")")
+            .eval("use mod.std.text\ntext.last_index_of(\"a-b-a\", \"a\")")
             .unwrap();
         assert!(preserved.completed(), "{:?}", preserved.diagnostics);
         assert_eq!(
@@ -7825,7 +7849,7 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!("SplaSh")
+            serde_json::json!(4)
         );
 
         let invalid_predicate = runtime
@@ -7868,6 +7892,25 @@ compute(outer, 2)
             runtime
                 .script_value_as_json(
                     invalid_index_of_value.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_last_index_of = runtime
+            .eval("use mod.std.text\ntry text.last_index_of(\"splash\", 1) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_last_index_of.completed(),
+            "{:?}",
+            invalid_last_index_of.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_last_index_of.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )

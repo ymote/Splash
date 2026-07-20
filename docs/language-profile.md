@@ -464,15 +464,17 @@ host-state, crate-loading, or capability access.
 shaping. It provides `text.trim(value)`, `text.lower(value)`,
 `text.upper(value)`, Unicode-scalar `text.len(value)`,
 Unicode-scalar `text.slice(value, start, end)`, Unicode-scalar literal
-`text.index_of(value, needle)`, `text.contains(value, needle)`,
+`text.index_of(value, needle)`, `text.last_index_of(value, needle)`,
+`text.contains(value, needle)`,
 `text.starts_with(value, prefix)`, `text.ends_with(value, suffix)`, and
 `text.replace_all(value, from, to)`, plus `text.split(value, delimiter)` and
 `text.join(values, separator)`. `slice` uses the same Unicode-scalar positions
 as `len`, requires non-negative integer bounds, and accepts only
 `start <= end <= text.len(value)`. `index_of` returns the first scalar position
-of a literal match or `-1`; an empty needle returns `0`. `split` matches a
-non-empty delimiter literally, preserves empty fields, and rejects a result
-over 4,096 segments.
+of a literal match or `-1`; an empty needle returns `0`. `last_index_of`
+returns the last scalar position or `-1`; an empty needle returns
+`text.len(value)`. `split` matches a non-empty delimiter literally, preserves empty
+fields, and rejects a result over 4,096 segments.
 `join` accepts only an array of at most 4,096 strings and a string separator,
 preserves item order, and permits an empty separator. Casing, slicing,
 replacement, splitting, and joining build results through the configured
@@ -703,7 +705,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
   `text.slice(value, start, end)` with non-negative Unicode-scalar positions
   satisfying `start <= end <= text.len(value)`. `text.index_of(value, needle)`
   uses literal matching and returns the first Unicode-scalar position or `-1`
-  (`0` for an empty needle). Use `text.split(value, delimiter)` with a non-empty
+  (`0` for an empty needle). `text.last_index_of(value, needle)` uses the same
+  literal matching and returns the last Unicode-scalar position or `-1`
+  (`text.len(value)` for an empty needle). Use `text.split(value, delimiter)` with a non-empty
   delimiter matched literally,
   and keep its result at or below 4,096 segments. `text.join(values, separator)`
   accepts only an array of at most 4,096 strings and a string separator.

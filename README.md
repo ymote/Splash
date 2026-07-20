@@ -257,10 +257,12 @@ access.
 
 For local text shaping, `use mod.std.text` provides `trim`, `lower`, `upper`,
 Unicode-scalar `len`, Unicode-scalar `slice`, Unicode-scalar literal
-`index_of`, literal predicates, literal `replace_all`, `split` with literal
-matching, and `join`. `slice` uses a half-open scalar range with
-`0 <= start <= end <= text.len(value)`. `index_of` returns the first scalar
-position of a literal match or `-1`; an empty needle returns `0`. `split`
+`index_of` and `last_index_of`, literal predicates, literal `replace_all`,
+`split` with literal matching, and `join`. `slice` uses a half-open scalar
+range with `0 <= start <= end <= text.len(value)`. `index_of` returns the first
+scalar position of a literal match or `-1`; an empty needle returns `0`.
+`last_index_of` returns the last scalar position or `-1`; an empty needle returns
+`text.len(value)`. `split`
 matches a non-empty delimiter literally, preserves empty fields, and returns at
 most 4,096 segments. `join` accepts an array of at most 4,096 strings,
 preserves their order, and permits an empty string separator. Results use
@@ -609,7 +611,8 @@ surfaces use no tool-catalog or adapter lookup, do not follow local aliases,
 and do not imply a capability grant. For an exact visible `use mod.std.json`
 binding, it completes `parse` and `stringify` with fixed plain-text hover and
 signature help. For an exact visible `use mod.std.text` binding, it completes
-the fixed text functions, including Unicode-scalar `slice` and `index_of`,
+the fixed text functions, including Unicode-scalar `slice`, `index_of`, and
+`last_index_of`,
 literal `split`, and string-array `join`, with plain-text hover and signature
 help. For an
 exact visible `use mod.std.array` binding, it completes `len`, `has_index`,

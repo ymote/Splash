@@ -47,6 +47,7 @@
 "text.replace_all("
 "text.slice("
 "text.index_of("
+"text.last_index_of("
 "text.split("
 "text.join("
 "record["
