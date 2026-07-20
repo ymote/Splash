@@ -523,10 +523,11 @@ cargo run -p splash-cli -- workflow-run --allow-json-add \
 ```
 
 The `prepare` step explicitly narrows the host input to the reviewed
-`math.add` envelope. The pure `summarize` step then uses a dynamic text-key
-lookup, a bounded array transformation and loop, text normalization,
-own-field record merging, and a bounded JSON round trip. It receives no tool
-grant; only `prepare` can issue the reviewed effect.
+`math.add` envelope. The pure `summarize` step then uses a dynamic own-field
+fallback lookup, bounded indexed-array lookup with an empty-input fallback, a
+bounded array transformation and loop, text normalization, own-field record
+merging, and a bounded JSON round trip. It receives no tool grant; only
+`prepare` can issue the reviewed effect.
 
 `workflow-run` accepts only the two opt-in local demo adapters and prints a
 structured execution/audit summary. It never derives grants from source hints,
@@ -599,13 +600,13 @@ binding, it completes `parse` and `stringify` with fixed plain-text hover and
 signature help. For an exact visible `use mod.std.text` binding, it completes
 the fixed text functions, including Unicode-scalar `slice`, literal `split`,
 and string-array `join`, with plain-text hover and signature help. For an
-exact visible `use mod.std.array` binding, it completes `len`, `slice`,
-`concat`, `reverse`, `flatten`, and `push` with the same fixed plain-text hover
-and signature help.
-For an exact visible `use mod.std.object` binding, it completes `len`, `keys`,
-`entries`, `values`, and `merge` with the same fixed plain-text hover and
-signature help. At a statement-position `use mod.` path, the same static
-projection completes `std`;
+exact visible `use mod.std.array` binding, it completes `len`, `has_index`,
+`get`, `slice`, `concat`, `reverse`, `flatten`, and `push` with the same fixed
+plain-text hover and signature help.
+For an exact visible `use mod.std.object` binding, it completes `len`, `has`,
+`get`, `keys`, `entries`, `values`, and `merge` with the same fixed plain-text
+hover and signature help. At a statement-position `use mod.` path, the same
+static projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.
 The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An

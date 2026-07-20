@@ -2151,10 +2151,48 @@ mod tests {
                 "route": "primary",
                 "total": 42,
                 "tag_count": 2,
-                "tags": ["MATH", "RELEASE"]
+                "tags": ["MATH", "RELEASE"],
+                "primary_tag": "MATH"
             })
         );
         assert!(output["dataflow"]["fingerprint"].is_string());
+
+        let (fallback_output, fallback_completed) = workflow_execution_output_with_input(
+            include_str!("../../../examples/dataflow_workflow_draft.json"),
+            &[CliWorkflowGrant {
+                step_id: "prepare".to_owned(),
+                tool: "math.add".to_owned(),
+                max_calls: 1,
+            }],
+            Some(
+                WorkflowData::from_input_json(
+                    r#"{
+                        "left": 20,
+                        "right": 22,
+                        "label": " release total ",
+                        "tags": []
+                    }"#,
+                )
+                .unwrap(),
+            ),
+            false,
+            true,
+        )
+        .expect("bounded dataflow fallback path runs through the sealed demo catalog");
+
+        assert!(fallback_completed);
+        assert_eq!(fallback_output["status"], json!("completed"));
+        assert_eq!(
+            fallback_output["dataflow"]["outputs"]["summarize"],
+            json!({
+                "label": "RELEASE TOTAL",
+                "route": "unrouted",
+                "total": 42,
+                "tag_count": 0,
+                "tags": [],
+                "primary_tag": "UNTAGGED"
+            })
+        );
     }
 
     #[test]

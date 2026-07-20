@@ -7,7 +7,7 @@
     },
     {
       "id": "summarize",
-      "source": "use mod.std.array\nuse mod.std.assert\nuse mod.std.json\nuse mod.std.object\nuse mod.std.text\nlet request = workflow.input\nlet total = workflow.outputs.prepare.total\nlet route_key = \"route\"\nlet route = request[route_key]\nlet normalized_tags = []\nfor tag in array.reverse(request.tags) {\n    array.push(normalized_tags, text.upper(tag))\n}\nlet summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: total}, {tag_count: array.len(normalized_tags), tags: normalized_tags})\nlet fields = object.entries(summary)\nassert(fields[0] == [\"label\", \"RELEASE TOTAL\"])\nassert(fields[4] == [\"tags\", [\"MATH\", \"RELEASE\"]])\nassert(normalized_tags == [\"MATH\", \"RELEASE\"])\njson.parse(json.stringify(summary))"
+      "source": "use mod.std.array\nuse mod.std.assert\nuse mod.std.json\nuse mod.std.object\nuse mod.std.text\nlet request = workflow.input\nlet total = workflow.outputs.prepare.total\nlet route_key = \"route\"\nlet route = object.get(request, route_key, \"unrouted\")\nlet normalized_tags = []\nfor tag in array.reverse(request.tags) {\n    array.push(normalized_tags, text.upper(tag))\n}\nlet primary_tag = array.get(normalized_tags, 0, \"UNTAGGED\")\nassert(!array.has_index(normalized_tags, array.len(normalized_tags)))\nlet summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: total}, {tag_count: array.len(normalized_tags), tags: normalized_tags, primary_tag: primary_tag})\nlet fields = object.entries(summary)\nassert(fields[0] == [\"label\", \"RELEASE TOTAL\"])\nassert(fields[4][0] == \"tags\")\nassert(fields[5][0] == \"primary_tag\")\njson.parse(json.stringify(summary))"
     }
   ]
 }

@@ -7,17 +7,19 @@ use mod.std.text
 let document = "{\"label\":\" release total \",\"route\":\"primary\",\"tags\":[\"release\",\"math\"]}"
 let request = json.parse(document)
 let route_key = "route"
-let route = request[route_key]
+let route = object.get(request, route_key, "unrouted")
 let normalized_tags = []
 
 for tag in array.reverse(request.tags) {
     array.push(normalized_tags, text.upper(tag))
 }
 
-let summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: 42}, {tag_count: array.len(normalized_tags), tags: normalized_tags})
+let primary_tag = array.get(normalized_tags, 0, "UNTAGGED")
+assert(!array.has_index(normalized_tags, array.len(normalized_tags)))
+let summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: 42}, {tag_count: array.len(normalized_tags), tags: normalized_tags, primary_tag: primary_tag})
 let fields = object.entries(summary)
 
 assert(fields[0] == ["label", "RELEASE TOTAL"])
-assert(fields[4] == ["tags", ["MATH", "RELEASE"]])
-assert(normalized_tags == ["MATH", "RELEASE"])
+assert(fields[4][0] == "tags")
+assert(fields[5][0] == "primary_tag")
 json.parse(json.stringify(summary))

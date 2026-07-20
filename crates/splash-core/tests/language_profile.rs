@@ -54,7 +54,8 @@ fn structured_dataflow_fixture_runs_with_only_standard_modules() {
             "route": "primary",
             "total": 42,
             "tag_count": 2,
-            "tags": ["MATH", "RELEASE"]
+            "tags": ["MATH", "RELEASE"],
+            "primary_tag": "MATH"
         })
     );
 }
