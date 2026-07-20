@@ -1,3 +1,4 @@
 use mod.std.array
 let selected = array.slice([1, 2, 3], 1, 3)
+array.flatten([selected, [4]])
 array.reverse(selected)

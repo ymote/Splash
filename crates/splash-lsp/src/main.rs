@@ -417,6 +417,13 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
         description: "Returns a shallow concatenation of two arrays.",
     },
     StandardArrayFunction {
+        name: "flatten",
+        parameters: &["value"],
+        result: "array",
+        description:
+            "Flattens one level when every outer item is an array, with a 4,096-item total limit.",
+    },
+    StandardArrayFunction {
         name: "reverse",
         parameters: &["value"],
         result: "array",
@@ -1945,6 +1952,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let parsed = json.parse(\"{\\\"answer\\\":42}\")\n",
     "json.stringify(parsed)\n",
     "let sliced = array.slice([1, 2, 3], 1, 3)\n",
+    "let flattened = array.flatten([sliced, [4]])\n",
     "array.reverse(sliced)\n",
     "let collected = []\n",
     "array.push(collected, 4)\n",
@@ -2305,6 +2313,16 @@ fn fuzz_exercise_fixed_standard_array_requests(
         position_at_byte(source, slice_start + "array.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, slice_argument));
+
+    let Some(flatten_start) = source.find("array.flatten") else {
+        return;
+    };
+    let flatten_argument = flatten_start + "array.flatten([".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, flatten_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, flatten_argument));
 
     let Some(reverse_start) = source.find("array.reverse") else {
         return;
@@ -9332,7 +9350,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["concat", "len", "push", "reverse", "slice"]
+            ["concat", "flatten", "len", "push", "reverse", "slice"]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9368,7 +9386,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 5);
+        assert_eq!(partial.items.len(), 6);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9382,6 +9400,7 @@ mod tests {
         let source = concat!(
             "use mod.std.array\n",
             "let selected = array.slice([1, 2, 3], 1, 3)\n",
+            "let flattened = array.flatten([selected, [4]])\n",
             "array.reverse(selected)\n",
             "let collected = []\n",
             "array.push(collected, 4)"
@@ -9444,6 +9463,35 @@ mod tests {
                 },
             ])
         );
+
+        let flatten_start =
+            source.find("array.flatten").expect("flatten member exists") + "array.".len();
+        let flatten_hover = server
+            .hover(&test_uri(), position_at_byte(source, flatten_start + 1))
+            .expect("core array flatten hover succeeds")
+            .expect("flatten has fixed hover metadata");
+        assert_eq!(
+            flatten_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.flatten(value) -> array\n\nFlattens one level when every outer item is an array, with a 4,096-item total limit.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let flatten_cursor = source
+            .find("array.flatten([selected, [4]])")
+            .expect("flatten call exists")
+            + "array.flatten([".len()
+            + 1;
+        let flatten_help = server
+            .signature_help(&test_uri(), position_at_byte(source, flatten_cursor))
+            .expect("core array flatten signature help succeeds")
+            .expect("flatten has a fixed signature");
+        assert_eq!(
+            flatten_help.signatures[0].label,
+            "array.flatten(value) -> array"
+        );
+        assert_eq!(flatten_help.active_parameter, Some(0));
 
         let reverse_cursor = source.rfind("selected").expect("reverse input exists") + 1;
         let reverse_help = server
@@ -15729,7 +15777,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["concat", "len", "push", "reverse", "slice"]
+            ["concat", "flatten", "len", "push", "reverse", "slice"]
         );
     }
 

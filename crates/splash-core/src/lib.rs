@@ -2982,8 +2982,8 @@ fn standard_text_expected_string(
     )
 }
 
-/// Installs shallow, callback-free array transformations for bounded local
-/// dataflow. The module never introspects host data or grants authority.
+/// Installs bounded, callback-free array transformations for local dataflow.
+/// The module never introspects host data or grants authority.
 fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject) {
     let array = vm.bx.heap.new_with_proto(NIL);
     vm.add_method(
@@ -3003,6 +3003,12 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
         id!(concat),
         script_args_def!(left = NIL, right = NIL),
         standard_array_concat,
+    );
+    vm.add_method(
+        array,
+        id!(flatten),
+        script_args_def!(value = NIL),
+        standard_array_flatten,
     );
     vm.add_method(
         array,
@@ -3077,6 +3083,44 @@ fn standard_array_concat(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptVal
     let output = vm.bx.heap.new_array();
     standard_array_append_indices(vm, output, left, 0..left_length);
     standard_array_append_indices(vm, output, right, 0..right_length);
+    output.into()
+}
+
+fn standard_array_flatten(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let (outer, outer_length) = match standard_array_input(vm, value, "flatten", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+
+    let mut output_length = 0usize;
+    for index in 0..outer_length {
+        let value = vm.bx.heap.array_index_unchecked(outer, index);
+        let Some(inner) = value.as_array() else {
+            return standard_array_expected_nested_array(vm, "flatten");
+        };
+        let inner_length = vm.bx.heap.array_len(inner);
+        if inner_length > MAX_STANDARD_ARRAY_ITEMS {
+            return standard_array_item_limit(vm, "flatten");
+        }
+        let Some(next_length) = output_length.checked_add(inner_length) else {
+            return standard_array_item_limit(vm, "flatten");
+        };
+        if next_length > MAX_STANDARD_ARRAY_ITEMS {
+            return standard_array_item_limit(vm, "flatten");
+        }
+        output_length = next_length;
+    }
+
+    let output = vm.bx.heap.new_array();
+    for index in 0..outer_length {
+        let value = vm.bx.heap.array_index_unchecked(outer, index);
+        let Some(inner) = value.as_array() else {
+            return standard_array_expected_nested_array(vm, "flatten");
+        };
+        let inner_length = vm.bx.heap.array_len(inner);
+        standard_array_append_indices(vm, output, inner, 0..inner_length);
+    }
     output.into()
 }
 
@@ -3179,6 +3223,16 @@ fn standard_array_expected_index(
     script_err_invalid_args!(
         vm.bx.threads.cur_ref().trap,
         "std.array.{function} expects `{parameter}` to be a non-negative integer"
+    )
+}
+
+fn standard_array_expected_nested_array(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.array.{function} expects every `value` item to be an array"
     )
 }
 
@@ -7488,6 +7542,7 @@ compute(outer, 2)
                  assert(array.len(input) == 3)\n\
                  assert(array.slice(input, 1, 3) == [2, 3])\n\
                  assert(array.concat([1, 2], [3, 4]) == [1, 2, 3, 4])\n\
+                 assert(array.flatten([[1, 2], [], [3]]) == [1, 2, 3])\n\
                  let reversed = array.reverse(input)\n\
                  assert(reversed == [3, 2, 1])\n\
                  assert(input == [1, 2, 3])\n\
@@ -7499,6 +7554,13 @@ compute(outer, 2)
                  let copied = array.slice([nested], 0, 1)\n\
                  copied[0].answer = 2\n\
                  assert(nested.answer == 2)\n\
+                 let groups = [[1], [2]]\n\
+                 let flattened = array.flatten(groups)\n\
+                 array.push(flattened, 3)\n\
+                 assert(groups == [[1], [2]])\n\
+                 let flattened_nested = array.flatten([[nested]])\n\
+                 flattened_nested[0].answer = 3\n\
+                 assert(nested.answer == 3)\n\
                  reversed",
             )
             .unwrap();
@@ -7516,7 +7578,7 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nstd.array.reverse([1, 2])")
+            .eval("use mod.std\nstd.array.flatten([[1], [2]])")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
         assert_eq!(
@@ -7527,7 +7589,7 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!([2, 1])
+            serde_json::json!([1, 2])
         );
 
         let mutation = runtime
@@ -7559,6 +7621,25 @@ compute(outer, 2)
             runtime
                 .script_value_as_json(
                     invalid_index.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_flatten = runtime
+            .eval("use mod.std.array\ntry array.flatten([[1], 2]) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_flatten.completed(),
+            "{:?}",
+            invalid_flatten.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_flatten.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
@@ -7608,6 +7689,45 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("std.array.concat supports at most")));
+
+        let oversized_inner = Runtime::default()
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let inner = []\n\
+                 inner[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
+                 array.flatten([inner])"
+            ))
+            .unwrap();
+        assert!(!oversized_inner.completed());
+        assert!(oversized_inner
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("std.array.flatten supports at most")));
+
+        let mut flatten_limit_runtime = Runtime::default();
+        let flatten_limit = flatten_limit_runtime
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let left = []\n\
+                 left[{}] = 0\n\
+                 let right = []\n\
+                 right[{}] = 0\n\
+                 try array.flatten([left, right]) catch \"limit\"",
+                MAX_STANDARD_ARRAY_ITEMS / 2,
+                MAX_STANDARD_ARRAY_ITEMS / 2,
+            ))
+            .unwrap();
+        assert!(flatten_limit.completed(), "{:?}", flatten_limit.diagnostics);
+        assert_eq!(
+            flatten_limit_runtime
+                .script_value_as_json(
+                    flatten_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
 
         let mut push_limit_runtime = Runtime::default();
         let push_limit = push_limit_runtime

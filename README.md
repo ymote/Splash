@@ -266,13 +266,14 @@ entropy, or crate access.
 
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 `array.slice(value, start, end)`, `array.concat(left, right)`, and
-`array.reverse(value)`, plus `array.push(value, item)`. `slice` uses a
-half-open range with non-negative integer indexes. `push` mutates its array,
-returns `nil`, and rejects a result over 4,096 items. The transforming helpers
-are callback-free, shallow, and reject source arrays over 4,096 items; `concat`
-also rejects a combined result over that bound. `len` is constant-time and
-uncapped. The module does not expose host state, filesystem, process, network,
-clock, entropy, or crate access.
+`array.reverse(value)`, `array.flatten(value)`, and `array.push(value, item)`.
+`slice` uses a half-open range with non-negative integer indexes. `flatten` is
+one level only: every outer item must be an array, and it rejects any source or
+result over 4,096 items before copying. `push` mutates its array, returns `nil`,
+and rejects a result over 4,096 items. The transforming helpers are
+callback-free and shallow; `len` is constant-time and uncapped. The module does
+not expose host state, filesystem, process, network, clock, entropy, or crate
+access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
@@ -591,12 +592,13 @@ and do not imply a capability grant. For an exact visible `use mod.std.json`
 binding, it completes `parse` and `stringify` with fixed plain-text hover and
 signature help. For an exact visible `use mod.std.text` binding, it completes
 the fixed text functions, including literal `split` and string-array `join`,
-with plain-text hover and signature help. For an exact visible `use mod.std.array`
-binding, it completes `len`, `slice`, `concat`, `reverse`, and `push` with the
-same fixed plain-text hover and signature help. For an exact visible `use mod.std.object` binding,
-it completes `len`, `keys`, `entries`, `values`, and `merge` with the same
-fixed plain-text hover and signature help. At a statement-position `use mod.`
-path, the same static projection completes `std`;
+with plain-text hover and signature help. For an exact visible
+`use mod.std.array` binding, it completes `len`, `slice`, `concat`, `reverse`,
+`flatten`, and `push` with the same fixed plain-text hover and signature help.
+For an exact visible `use mod.std.object` binding, it completes `len`, `keys`,
+`entries`, `values`, and `merge` with the same fixed plain-text hover and
+signature help. At a statement-position `use mod.` path, the same static
+projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.
 The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An

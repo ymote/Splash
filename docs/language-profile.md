@@ -477,14 +477,16 @@ access.
 
 `use mod.std.array` imports a frozen Splash-owned module for local collection
 shaping. It provides `array.len(value)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, `array.reverse(value)`, and
-`array.push(value, item)`. `slice` requires non-negative integer indexes and a
-half-open range inside the input array. Transforms have no callbacks, allocate
-a new shallow array, and reject source arrays over 4,096 items before native
-traversal; `concat` also rejects a combined result over that bound. `push`
-mutates its first argument, returns `nil`, and refuses to grow an array beyond
-4,096 items. `len` is constant-time and uncapped. The module has no I/O,
-clock, entropy, host-state, crate-loading, or capability access.
+`array.concat(left, right)`, `array.reverse(value)`, `array.flatten(value)`,
+and `array.push(value, item)`. `slice` requires non-negative integer indexes
+and a half-open range inside the input array. Transforms have no callbacks and
+allocate a new shallow array. `flatten` is exactly one level: every outer item
+must be an array, and every source array plus the combined result must contain
+at most 4,096 items before native copying begins. `concat` enforces the same
+combined-result bound. `push` mutates its first argument, returns `nil`, and
+refuses to grow an array beyond 4,096 items. `len` is constant-time and
+uncapped. The module has no I/O, clock, entropy, host-state, crate-loading, or
+capability access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.keys(value)`,
@@ -684,7 +686,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
   accepts only an array of at most 4,096 strings and a string separator.
 - Import `mod.std.array` before using `array.*`; transforms are bounded,
   callback-free shallow copies, not capabilities. Keep each source array and
-  concatenated result at or below 4,096 items.
+  concatenated result at or below 4,096 items. `array.flatten(value)` accepts
+  only one level of nested arrays and applies the same limit to every input and
+  its combined result.
 - Import `mod.std.object` before using `object.*`; transforms are bounded
   own-field operations over plain record or JSON-object data, not capabilities.
   Keep transforming inputs and combined `merge` source fields at or below 4,096.

@@ -31,6 +31,7 @@
 "json.stringify("
 "array.slice("
 "array.reverse("
+"array.flatten("
 "array.push("
 "object.keys("
 "object.entries("
