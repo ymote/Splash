@@ -425,6 +425,12 @@ const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
         description: "Returns own text field names in stored field order.",
     },
     StandardObjectFunction {
+        name: "entries",
+        parameters: &["value"],
+        result: "array",
+        description: "Returns shallow [text key, value] pairs in stored field order.",
+    },
+    StandardObjectFunction {
         name: "values",
         parameters: &["value"],
         result: "array",
@@ -1923,6 +1929,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "array.reverse(sliced)\n",
     "let merged = object.merge({left: 1}, {right: 2})\n",
     "object.keys(merged)\n",
+    "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
     "text.replace_all(normalized, \"splash\", \"Splash\")\n",
     "assert(true)\n",
@@ -2312,6 +2319,16 @@ fn fuzz_exercise_fixed_standard_object_requests(
         uri,
         position_at_byte(source, keys_start + "object.".len() + 1),
     );
+
+    let Some(entries_start) = source.find("object.entries") else {
+        return;
+    };
+    let entries_argument = entries_start + "object.entries(".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, entries_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, entries_argument));
 }
 
 #[cfg(fuzzing)]
@@ -9461,7 +9478,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["keys", "len", "merge", "values"]
+            ["entries", "keys", "len", "merge", "values"]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9497,7 +9514,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core object completion succeeds");
-        assert_eq!(partial.items.len(), 4);
+        assert_eq!(partial.items.len(), 5);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9511,7 +9528,8 @@ mod tests {
         let source = concat!(
             "use mod.std.object\n",
             "let merged = object.merge({left: 1}, {right: 2})\n",
-            "object.keys(merged)"
+            "object.keys(merged)\n",
+            "object.entries(merged)"
         );
         let mut server = SplashLanguageServer::default();
         server.open_document(document(1, source));
@@ -9543,6 +9561,19 @@ mod tests {
             })
         );
 
+        let entries_start = source.rfind("entries").expect("entries member exists");
+        let entries_hover = server
+            .hover(&test_uri(), position_at_byte(source, entries_start + 1))
+            .expect("core object entries hover succeeds")
+            .expect("entries has fixed hover metadata");
+        assert_eq!(
+            entries_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.entries(value) -> array\n\nReturns shallow [text key, value] pairs in stored field order.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
         let merge_cursor = source.find("{right").expect("merge right input exists") + 2;
         let merge_help = server
             .signature_help(&test_uri(), position_at_byte(source, merge_cursor))
@@ -9569,13 +9600,32 @@ mod tests {
             ])
         );
 
-        let keys_cursor = source.rfind("merged").expect("keys input exists") + 1;
+        let keys_cursor = source
+            .find("object.keys(merged)")
+            .expect("keys input exists")
+            + "object.keys(".len()
+            + 1;
         let keys_help = server
             .signature_help(&test_uri(), position_at_byte(source, keys_cursor))
             .expect("core object keys signature help succeeds")
             .expect("keys has a fixed signature");
         assert_eq!(keys_help.signatures[0].label, "object.keys(value) -> array");
         assert_eq!(keys_help.active_parameter, Some(0));
+
+        let entries_cursor = source
+            .find("object.entries(merged)")
+            .expect("entries input exists")
+            + "object.entries(".len()
+            + 1;
+        let entries_help = server
+            .signature_help(&test_uri(), position_at_byte(source, entries_cursor))
+            .expect("core object entries signature help succeeds")
+            .expect("entries has a fixed signature");
+        assert_eq!(
+            entries_help.signatures[0].label,
+            "object.entries(value) -> array"
+        );
+        assert_eq!(entries_help.active_parameter, Some(0));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -15561,7 +15611,7 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["keys", "len", "merge", "values"]
+            ["entries", "keys", "len", "merge", "values"]
         );
     }
 

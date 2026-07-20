@@ -13,6 +13,8 @@ for tag in array.reverse(request.tags) {
 }
 
 let summary = object.merge({label: text.upper(text.trim(request.label)), route: route, total: 42}, {tag_count: array.len(tags), tags: tags})
+let fields = object.entries(summary)
 
-assert(object.keys(summary) == ["label", "route", "total", "tag_count", "tags"])
+assert(fields[0] == ["label", "RELEASE TOTAL"])
+assert(fields[4] == ["tags", ["MATH", "RELEASE"]])
 json.parse(json.stringify(summary))

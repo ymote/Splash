@@ -434,12 +434,13 @@ core module.
 
 An exact visible direct `use mod.std.object` binding has a separate fixed core
 projection for only `object.len(value)`, `object.keys(value)`,
-`object.values(value)`, and `object.merge(left, right)`, with plain-text member
-hover and function signature help. Its descriptors are compiled into the LSP
-rather than read from a catalog, and describe bounded own-field record shaping
-without resolving a host module or granting a capability. A shadowed binding,
-chained receiver, unknown member, or invalid source prefix has no fixed-object
-result, and advisory metadata cannot add members to this core module.
+`object.entries(value)`, `object.values(value)`, and
+`object.merge(left, right)`, with plain-text member hover and function
+signature help. Its descriptors are compiled into the LSP rather than read from
+a catalog, and describe bounded own-field record shaping without resolving a
+host module or granting a capability. A shadowed binding, chained receiver,
+unknown member, or invalid source prefix has no fixed-object result, and
+advisory metadata cannot add members to this core module.
 
 An exact visible direct `use mod.std.text` binding has a separate fixed core
 projection for the documented literal text-shaping functions, with plain-text

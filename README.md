@@ -269,12 +269,15 @@ expose host state, filesystem, process, network, clock, entropy, or crate
 access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
-`object.keys(value)`, `object.values(value)`, and `object.merge(left, right)`.
+`object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
+`object.merge(left, right)`.
 It accepts plain record or JSON-object data only, never follows prototypes, and
-never invokes callbacks. `keys`, `values`, and `merge` shallowly process at
-most 4,096 own text-keyed fields; `merge` also rejects a combined source count
-over that bound. `len` is constant-time and uncapped. The module does not expose
-host state, filesystem, process, network, clock, entropy, or crate access.
+never invokes callbacks. `keys`, `entries`, `values`, and `merge` shallowly
+process at most 4,096 own text-keyed fields; `entries` returns fresh
+`[text_key, value]` pairs in stored field order, and `merge` also rejects a
+combined source count over that bound. `len` is constant-time and uncapped. The
+module does not expose host state, filesystem, process, network, clock,
+entropy, or crate access.
 
 ## Example
 
@@ -584,8 +587,8 @@ signature help. For an exact visible `use mod.std.text` binding, it completes
 the fixed text functions with plain-text hover and signature help. For an exact
 visible `use mod.std.array` binding, it completes `len`, `slice`, `concat`, and
 `reverse` with the same fixed plain-text hover and signature help. For an exact
-visible `use mod.std.object` binding, it completes `len`, `keys`, `values`, and
-`merge` with the same fixed plain-text hover and signature help. At a
+visible `use mod.std.object` binding, it completes `len`, `keys`, `entries`,
+`values`, and `merge` with the same fixed plain-text hover and signature help. At a
 statement-position `use mod.` path, the same static projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.

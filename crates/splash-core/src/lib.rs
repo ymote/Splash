@@ -3059,6 +3059,12 @@ fn install_standard_object_module(vm: &mut vm::ScriptVm, std_module: ScriptObjec
     );
     vm.add_method(
         object,
+        id!(entries),
+        script_args_def!(value = NIL),
+        standard_object_entry_pairs,
+    );
+    vm.add_method(
+        object,
         id!(values),
         script_args_def!(value = NIL),
         standard_object_values,
@@ -3091,6 +3097,24 @@ fn standard_object_keys(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValu
         Err(error) => return error,
     };
     standard_object_values_array(vm, entries.into_iter().map(|(key, _)| key))
+}
+
+fn standard_object_entry_pairs(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let entries = match standard_object_entries(vm, value, "entries", "value") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+
+    let output = vm.bx.heap.new_array();
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for (key, value) in entries {
+        let pair = vm.bx.heap.new_array();
+        vm.bx.heap.array_push(pair, key, trap);
+        vm.bx.heap.array_push(pair, value, trap);
+        vm.bx.heap.array_push(output, pair.into(), trap);
+    }
+    output.into()
 }
 
 fn standard_object_values(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
@@ -7318,6 +7342,11 @@ compute(outer, 2)
                  let record = {first: 1, second: 2}\n\
                  assert(object.len(record) == 2)\n\
                  assert(object.keys(record) == [\"first\", \"second\"])\n\
+                 let pairs = object.entries(record)\n\
+                 assert(pairs[0][0] == \"first\")\n\
+                 assert(pairs[0][1] == 1)\n\
+                 assert(pairs[1][0] == \"second\")\n\
+                 assert(pairs[1][1] == 2)\n\
                  assert(object.values(record) == [1, 2])\n\
                  let merged = object.merge(record, {second: 20, third: 3})\n\
                  assert(merged.first == 1)\n\
@@ -7327,10 +7356,16 @@ compute(outer, 2)
                  let mixed = object.merge(merged, json_record)\n\
                  assert(mixed.second == 30)\n\
                  assert(mixed.fourth == 4)\n\
+                 let mixed_pairs = object.entries(mixed)\n\
+                 assert(mixed_pairs[3][0] == \"fourth\")\n\
+                 assert(mixed_pairs[3][1] == 4)\n\
                  let nested = {answer: 1}\n\
                  let copied = object.merge({nested: nested}, {})\n\
                  copied.nested.answer = 2\n\
                  assert(nested.answer == 2)\n\
+                 let entry_pairs = object.entries({nested: nested})\n\
+                 entry_pairs[0][1].answer = 3\n\
+                 assert(nested.answer == 3)\n\
                  object.keys(mixed)",
             )
             .unwrap();
@@ -7348,10 +7383,19 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nstd.object.len({first: 1, second: 2})")
+            .eval("use mod.std\nstd.object.entries({first: 1, second: 2})[1][0]")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
-        assert_eq!(namespace.value.as_number(), Some(2.0));
+        assert_eq!(
+            namespace_runtime
+                .script_value_as_json(
+                    namespace.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("second")
+        );
 
         let mutation = runtime
             .eval("use mod.std.object\nobject.merge = || nil")
@@ -7394,7 +7438,7 @@ compute(outer, 2)
                 "use mod.std.object\n\
                  let record = {}\n\
                  record[true] = 1\n\
-                 try object.keys(record) catch \"invalid-key\"",
+                 try object.entries(record) catch \"invalid-key\"",
             )
             .unwrap();
         assert!(non_text_key.completed(), "{:?}", non_text_key.diagnostics);
@@ -7418,7 +7462,7 @@ compute(outer, 2)
             oversized_source.push_str(&format!("field_{index}: 0"));
         }
         oversized_source.push_str(&format!(
-            "}}\nassert(object.len(values) == {})\nobject.keys(values)",
+            "}}\nassert(object.len(values) == {})\nobject.entries(values)",
             MAX_STANDARD_OBJECT_FIELDS + 1
         ));
         let limits = ExecutionLimits {
@@ -7433,7 +7477,7 @@ compute(outer, 2)
         assert!(oversized
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.contains("std.object.keys supports at most")));
+            .any(|diagnostic| diagnostic.contains("std.object.entries supports at most")));
     }
 
     #[test]

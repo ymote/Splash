@@ -172,12 +172,13 @@ advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.object`
 binding. At a direct `object.` member site it completes only `len`, `keys`,
-`values`, and `merge`, with plain-text hover and fixed function signatures.
-This is a compiled-in description of bounded own-field record shaping: it does
-not inspect module-catalog metadata, resolve a module, follow a local alias, or
-expose a host capability. A shadowed `object` binding, chained receiver,
-unknown member, or source outside the valid prefix gets no fixed-core result; a
-matching advisory catalog path cannot extend the core surface.
+`entries`, `values`, and `merge`, with plain-text hover and fixed function
+signatures. This is a compiled-in description of bounded own-field record
+shaping: it does not inspect module-catalog metadata, resolve a module, follow
+a local alias, or expose a host capability. A shadowed `object` binding,
+chained receiver, unknown member, or source outside the valid prefix gets no
+fixed-core result; a matching advisory catalog path cannot extend the core
+surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.text`
 binding. At a direct `text.` member site it completes only the documented
@@ -480,14 +481,16 @@ access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.keys(value)`,
-`object.values(value)`, and `object.merge(left, right)`. It accepts plain
-record or JSON-object data only, reads own fields only, and does not traverse
-prototypes or invoke callbacks. `keys`, `values`, and `merge` process at most
-4,096 own text-keyed source fields; `merge` also rejects a combined source
-count over that bound. `keys` and `values` return shallow arrays in stored field
-order, while `merge` preserves first field positions and applies right-side
-values. `len` is constant-time and uncapped. The module has no I/O, clock,
-entropy, host-state, crate-loading, or capability access.
+`object.entries(value)`, `object.values(value)`, and
+`object.merge(left, right)`. It accepts plain record or JSON-object data only,
+reads own fields only, and does not traverse prototypes or invoke callbacks.
+`keys`, `entries`, `values`, and `merge` process at most 4,096 own text-keyed
+source fields; `merge` also rejects a combined source count over that bound.
+`keys` and `values` return shallow arrays in stored field order; `entries`
+returns fresh `[text_key, value]` pairs in that order; and `merge` preserves
+first field positions and applies right-side values. `len` is constant-time and
+uncapped. The module has no I/O, clock, entropy, host-state, crate-loading, or
+capability access.
 
 ## Effect rules
 

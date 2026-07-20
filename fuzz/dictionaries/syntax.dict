@@ -32,6 +32,7 @@
 "array.slice("
 "array.reverse("
 "object.keys("
+"object.entries("
 "object.merge("
 "text.trim("
 "text.replace_all("
