@@ -3431,6 +3431,12 @@ fn install_standard_object_module(vm: &mut vm::ScriptVm, std_module: ScriptObjec
     );
     vm.add_method(
         object,
+        id!(from_entries),
+        script_args_def!(entries = NIL),
+        standard_object_from_entries,
+    );
+    vm.add_method(
+        object,
         id!(keys),
         script_args_def!(value = NIL),
         standard_object_keys,
@@ -3527,6 +3533,41 @@ fn standard_object_pick(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValu
             let trap = vm.bx.threads.cur_ref().trap.pass();
             vm.bx.heap.set_value(output, key, value, trap);
         }
+    }
+    output.into()
+}
+
+fn standard_object_from_entries(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let entries = script_value!(vm, args.entries);
+    let (entries, entry_count) = match standard_object_from_entries_input(vm, entries) {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+
+    for index in 0..entry_count {
+        let entry = vm.bx.heap.array_index_unchecked(entries, index);
+        let pair = match standard_object_from_entries_pair(vm, entry) {
+            Ok(pair) => pair,
+            Err(error) => return error,
+        };
+        let key = vm.bx.heap.array_index_unchecked(pair, 0);
+        if vm.string_with(key, |_, _| ()).is_none() {
+            return standard_object_expected_entry_key(vm);
+        }
+    }
+
+    let output = vm.bx.heap.new_object();
+    vm.bx.heap.set_string_keys(output);
+    for index in 0..entry_count {
+        let entry = vm.bx.heap.array_index_unchecked(entries, index);
+        let pair = match standard_object_from_entries_pair(vm, entry) {
+            Ok(pair) => pair,
+            Err(error) => return error,
+        };
+        let key = vm.bx.heap.array_index_unchecked(pair, 0);
+        let value = vm.bx.heap.array_index_unchecked(pair, 1);
+        let trap = vm.bx.threads.cur_ref().trap.pass();
+        vm.bx.heap.set_value(output, key, value, trap);
     }
     output.into()
 }
@@ -3629,6 +3670,36 @@ fn standard_object_pick_keys(
         return Err(standard_object_pick_key_limit(vm));
     }
     Ok((keys, key_count))
+}
+
+fn standard_object_from_entries_input(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+) -> Result<(vm::ScriptArray, usize), ScriptValue> {
+    let Some(entries) = value.as_array() else {
+        return Err(script_err_type_mismatch!(
+            vm.bx.threads.cur_ref().trap,
+            "std.object.from_entries expects `entries` to be an array"
+        ));
+    };
+    let entry_count = vm.bx.heap.array_len(entries);
+    if entry_count > MAX_STANDARD_OBJECT_FIELDS {
+        return Err(standard_object_entry_limit(vm));
+    }
+    Ok((entries, entry_count))
+}
+
+fn standard_object_from_entries_pair(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+) -> Result<vm::ScriptArray, ScriptValue> {
+    let Some(pair) = value.as_array() else {
+        return Err(standard_object_expected_entry_pair(vm));
+    };
+    if vm.bx.heap.array_len(pair) != 2 {
+        return Err(standard_object_expected_entry_pair(vm));
+    }
+    Ok(pair)
 }
 
 /// Resolves an own text field without using the VM's prototype-chain lookup.
@@ -3747,6 +3818,20 @@ fn standard_object_expected_pick_text_key(vm: &mut vm::ScriptVm) -> ScriptValue 
     )
 }
 
+fn standard_object_expected_entry_pair(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.from_entries expects every `entries` item to be a two-item array"
+    )
+}
+
+fn standard_object_expected_entry_key(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.from_entries expects every entry key to be a string"
+    )
+}
+
 fn standard_object_expected_text_key(vm: &mut vm::ScriptVm, function: &'static str) -> ScriptValue {
     script_err_type_mismatch!(
         vm.bx.threads.cur_ref().trap,
@@ -3765,6 +3850,13 @@ fn standard_object_pick_key_limit(vm: &mut vm::ScriptVm) -> ScriptValue {
     script_err_limit!(
         vm.bx.threads.cur_ref().trap,
         "std.object.pick supports at most {MAX_STANDARD_OBJECT_FIELDS} keys"
+    )
+}
+
+fn standard_object_entry_limit(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_limit!(
+        vm.bx.threads.cur_ref().trap,
+        "std.object.from_entries supports at most {MAX_STANDARD_OBJECT_FIELDS} entries"
     )
 }
 
@@ -8224,6 +8316,13 @@ compute(outer, 2)
                  assert(pairs[1][0] == \"second\")\n\
                  assert(pairs[1][1] == 2)\n\
                  assert(object.values(record) == [1, 2])\n\
+                 let rebuilt = object.from_entries([[\"third\", 3], [\"first\", 1], [\"third\", 30]])\n\
+                 assert(object.keys(rebuilt) == [\"third\", \"first\"])\n\
+                 assert(rebuilt.third == 30)\n\
+                 let rebuilt_nil = object.from_entries([[\"value\", nil]])\n\
+                 assert(object.has(rebuilt_nil, \"value\"))\n\
+                 assert(object.get(rebuilt_nil, \"value\", \"fallback\") == nil)\n\
+                 assert(object.len(object.from_entries([])) == 0)\n\
                  let merged = object.merge(record, {second: 20, third: 3})\n\
                  assert(merged.first == 1)\n\
                  assert(merged.second == 20)\n\
@@ -8242,15 +8341,18 @@ compute(outer, 2)
                  assert(picked.third == 3)\n\
                  assert(!object.has(picked, \"missing\"))\n\
                  let nested = {answer: 1}\n\
-                 let picked_nested = object.pick({nested: nested, ignored: 0}, [\"nested\"])\n\
-                 picked_nested.nested.answer = 2\n\
+                 let rebuilt_nested = object.from_entries([[\"nested\", nested]])\n\
+                 rebuilt_nested.nested.answer = 2\n\
                  assert(nested.answer == 2)\n\
-                 let copied = object.merge({nested: nested}, {})\n\
-                 copied.nested.answer = 3\n\
+                 let picked_nested = object.pick({nested: nested, ignored: 0}, [\"nested\"])\n\
+                 picked_nested.nested.answer = 3\n\
                  assert(nested.answer == 3)\n\
-                 let entry_pairs = object.entries({nested: nested})\n\
-                 entry_pairs[0][1].answer = 4\n\
+                 let copied = object.merge({nested: nested}, {})\n\
+                 copied.nested.answer = 4\n\
                  assert(nested.answer == 4)\n\
+                 let entry_pairs = object.entries({nested: nested})\n\
+                 entry_pairs[0][1].answer = 5\n\
+                 assert(nested.answer == 5)\n\
                  object.keys(mixed)",
             )
             .unwrap();
@@ -8268,7 +8370,7 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nstd.object.pick({first: 1, second: 2}, [\"second\"]).second")
+            .eval("use mod.std\nlet picked = std.object.pick({first: 1, second: 2}, [\"second\"])\nstd.object.from_entries([[\"second\", picked.second]]).second")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
         assert_eq!(
@@ -8283,13 +8385,13 @@ compute(outer, 2)
         );
 
         let mutation = runtime
-            .eval("use mod.std.object\nobject.merge = || nil")
+            .eval("use mod.std.object\nobject.from_entries = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
 
         let preserved = runtime
-            .eval("use mod.std.object\nobject.merge({left: 1}, {right: 2})")
+            .eval("use mod.std.object\nobject.from_entries([[\"left\", 1], [\"right\", 2]])")
             .unwrap();
         assert!(preserved.completed(), "{:?}", preserved.diagnostics);
         assert_eq!(
@@ -8377,6 +8479,63 @@ compute(outer, 2)
             serde_json::json!("invalid-key")
         );
 
+        let invalid_entries = runtime
+            .eval("use mod.std.object\ntry object.from_entries(\"entries\") catch \"invalid-entries\"")
+            .unwrap();
+        assert!(
+            invalid_entries.completed(),
+            "{:?}",
+            invalid_entries.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_entries.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-entries")
+        );
+
+        let invalid_entry_pair = runtime
+            .eval("use mod.std.object\ntry object.from_entries([[\"first\", 1, 2]]) catch \"invalid-pair\"")
+            .unwrap();
+        assert!(
+            invalid_entry_pair.completed(),
+            "{:?}",
+            invalid_entry_pair.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_entry_pair.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-pair")
+        );
+
+        let invalid_entry_key = runtime
+            .eval("use mod.std.object\ntry object.from_entries([[1, 2]]) catch \"invalid-key\"")
+            .unwrap();
+        assert!(
+            invalid_entry_key.completed(),
+            "{:?}",
+            invalid_entry_key.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_entry_key.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-key")
+        );
+
         let non_text_key = runtime
             .eval(
                 "use mod.std.object\n\
@@ -8437,6 +8596,27 @@ compute(outer, 2)
             pick_limit_runtime
                 .script_value_as_json(
                     pick_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
+        let mut entry_limit_runtime = Runtime::default();
+        let entry_limit = entry_limit_runtime
+            .eval(&format!(
+                "use mod.std.object\n\
+                 let entries = []\n\
+                 entries[{MAX_STANDARD_OBJECT_FIELDS}] = [\"first\", 1]\n\
+                 try object.from_entries(entries) catch \"limit\""
+            ))
+            .unwrap();
+        assert!(entry_limit.completed(), "{:?}", entry_limit.diagnostics);
+        assert_eq!(
+            entry_limit_runtime
+                .script_value_as_json(
+                    entry_limit.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )

@@ -488,6 +488,12 @@ const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
         description: "Returns a shallow record of requested existing own text fields; missing keys are omitted.",
     },
     StandardObjectFunction {
+        name: "from_entries",
+        parameters: &["entries"],
+        result: "object",
+        description: "Builds a shallow plain record from two-item [text key, value] entries; later duplicates replace values.",
+    },
+    StandardObjectFunction {
         name: "keys",
         parameters: &["value"],
         result: "array",
@@ -2002,6 +2008,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let collected = []\n",
     "array.push(collected, 4)\n",
     "let merged = object.merge({left: 1}, {right: 2})\n",
+    "let rebuilt = object.from_entries([[\"left\", 1]])\n",
     "object.has(merged, \"left\")\n",
     "object.get(merged, \"missing\", 0)\n",
     "let picked = object.pick(merged, [\"left\"])\n",
@@ -2432,6 +2439,16 @@ fn fuzz_exercise_fixed_standard_object_requests(
         position_at_byte(source, merge_start + "object.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, merge_argument));
+
+    let Some(from_entries_start) = source.find("object.from_entries") else {
+        return;
+    };
+    let from_entries_argument = from_entries_start + "object.from_entries(".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, from_entries_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, from_entries_argument));
 
     let Some(has_start) = source.find("object.has") else {
         return;
@@ -9803,7 +9820,17 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["entries", "get", "has", "keys", "len", "merge", "pick", "values"]
+            [
+                "entries",
+                "from_entries",
+                "get",
+                "has",
+                "keys",
+                "len",
+                "merge",
+                "pick",
+                "values"
+            ]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9839,7 +9866,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core object completion succeeds");
-        assert_eq!(partial.items.len(), 8);
+        assert_eq!(partial.items.len(), 9);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9853,6 +9880,7 @@ mod tests {
         let source = concat!(
             "use mod.std.object\n",
             "let merged = object.merge({left: 1}, {right: 2})\n",
+            "object.from_entries([[\"left\", 1]])\n",
             "object.has(merged, \"left\")\n",
             "object.get(merged, \"missing\", 0)\n",
             "object.pick(merged, [\"left\"])\n",
@@ -9938,6 +9966,25 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "object.pick(value, keys) -> object\n\nReturns a shallow record of requested existing own text fields; missing keys are omitted.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let from_entries_start = source
+            .find("object.from_entries")
+            .expect("from_entries member exists")
+            + "object.".len();
+        let from_entries_hover = server
+            .hover(
+                &test_uri(),
+                position_at_byte(source, from_entries_start + 1),
+            )
+            .expect("core object from_entries hover succeeds")
+            .expect("from_entries has fixed hover metadata");
+        assert_eq!(
+            from_entries_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.from_entries(entries) -> object\n\nBuilds a shallow plain record from two-item [text key, value] entries; later duplicates replace values.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -10038,6 +10085,21 @@ mod tests {
             "object.pick(value, keys) -> object"
         );
         assert_eq!(pick_help.active_parameter, Some(1));
+
+        let from_entries_cursor = source
+            .find("object.from_entries([[\"left\", 1]])")
+            .expect("from_entries input exists")
+            + "object.from_entries(".len()
+            + 1;
+        let from_entries_help = server
+            .signature_help(&test_uri(), position_at_byte(source, from_entries_cursor))
+            .expect("core object from_entries signature help succeeds")
+            .expect("from_entries has a fixed signature");
+        assert_eq!(
+            from_entries_help.signatures[0].label,
+            "object.from_entries(entries) -> object"
+        );
+        assert_eq!(from_entries_help.active_parameter, Some(0));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -16155,7 +16217,17 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["entries", "get", "has", "keys", "len", "merge", "pick", "values"]
+            [
+                "entries",
+                "from_entries",
+                "get",
+                "has",
+                "keys",
+                "len",
+                "merge",
+                "pick",
+                "values"
+            ]
         );
     }
 
