@@ -273,8 +273,8 @@ For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 `array.has_index(value, index)`, `array.get(value, index, fallback)`,
 `array.contains(value, item)`, `array.index_of(value, item)`,
 `array.slice(value, start, end)`, `array.concat(left, right)`,
-`array.compact(value)`, `array.reverse(value)`, `array.flatten(value)`, and
-`array.push(value, item)`.
+`array.compact(value)`, `array.unique(value)`, `array.reverse(value)`,
+`array.flatten(value)`, and `array.push(value, item)`.
 `has_index` distinguishes an in-range `nil` item from an absent index, while
 `get` returns its fallback only when the index is absent. Neither traverses the
 array. `contains` and `index_of` scan at most 4,096 items with direct equality:
@@ -282,13 +282,15 @@ scalar values compare by value, while arrays and records match only by
 reference; `index_of` returns the first match or `-1`. `slice` uses a half-open
 range with non-negative integer indexes.
 `compact` returns a fresh shallow array without `nil` items while preserving
-`false`, zero, empty strings, and order. `flatten` is one level only: every
-outer item must be an array, and it rejects any source or result over 4,096
-items before copying. `push` mutates its array, returns `nil`, and rejects a
-result over 4,096 items. The transforming helpers are callback-free and
-shallow; `len`, `has_index`, and `get` are constant-time and uncapped. The
-module does not expose host state, filesystem, process, network, clock,
-entropy, or crate access.
+`false`, zero, empty strings, and order. `unique` returns a fresh shallow
+array in first-occurrence order, removing later values with the same direct
+equality as `contains` and `index_of`. `flatten` is one level only: every outer
+item must be an array, and it rejects any source or result over 4,096 items
+before copying. `push` mutates its array, returns `nil`, and rejects a result
+over 4,096 items. The transforming helpers are callback-free and shallow;
+`len`, `has_index`, and `get` are constant-time and uncapped. The module does
+not expose host state, filesystem, process, network, clock, entropy, or crate
+access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.has(value, key)`, `object.get(value, key, fallback)`,
@@ -630,11 +632,12 @@ literal `split`, and string-array `join`, with plain-text hover and signature
 help. For an
 exact visible `use mod.std.array` binding, it completes `len`, `has_index`,
 `get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `reverse`,
-`flatten`, and `push` with the same fixed plain-text hover and signature help.
+`unique`, `flatten`, and `push` with the same fixed plain-text hover and
+signature help.
 For an exact visible `use mod.std.object` binding, it completes `len`, `has`,
-`get`, `pick`, `from_entries`, `with`, `keys`, `entries`, `values`, and
-`merge` with the same fixed plain-text hover and signature help. At a statement-position `use
-mod.` path, the same static projection completes `std`;
+`get`, `pick`, `omit`, `from_entries`, `with`, `keys`, `entries`, `values`,
+and `merge` with the same fixed plain-text hover and signature help. At a
+statement-position `use mod.` path, the same static projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.
 The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An

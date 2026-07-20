@@ -475,6 +475,13 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
             "Returns a shallow copy without nil items; false, zero, and empty strings remain.",
     },
     StandardArrayFunction {
+        name: "unique",
+        parameters: &["value"],
+        result: "array",
+        description:
+            "Returns a stable shallow copy with later direct-equality duplicates removed.",
+    },
+    StandardArrayFunction {
         name: "flatten",
         parameters: &["value"],
         result: "array",
@@ -2069,6 +2076,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "array.index_of(sliced, 2)\n",
     "let flattened = array.flatten([sliced, [4]])\n",
     "let compacted = array.compact([nil, 1, nil])\n",
+    "let unique = array.unique([1, 1, 2])\n",
     "array.reverse(sliced)\n",
     "let collected = []\n",
     "array.push(collected, 4)\n",
@@ -2584,6 +2592,16 @@ fn fuzz_exercise_fixed_standard_array_requests(
         position_at_byte(source, compact_start + "array.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, compact_argument));
+
+    let Some(unique_start) = source.find("array.unique") else {
+        return;
+    };
+    let unique_argument = unique_start + "array.unique([".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, unique_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, unique_argument));
 
     let Some(flatten_start) = source.find("array.flatten") else {
         return;
@@ -9847,7 +9865,8 @@ mod tests {
                 "len",
                 "push",
                 "reverse",
-                "slice"
+                "slice",
+                "unique"
             ]
         );
         assert!(completion.items.iter().all(|item| {
@@ -9884,7 +9903,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 11);
+        assert_eq!(partial.items.len(), 12);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9904,6 +9923,7 @@ mod tests {
             "array.index_of(selected, 2)\n",
             "let flattened = array.flatten([selected, [4]])\n",
             "let compacted = array.compact([nil, 1, nil])\n",
+            "let unique = array.unique([1, 1, 2])\n",
             "array.reverse(selected)\n",
             "let collected = []\n",
             "array.push(collected, 4)"
@@ -10085,6 +10105,35 @@ mod tests {
             "array.compact(value) -> array"
         );
         assert_eq!(compact_help.active_parameter, Some(0));
+
+        let unique_start =
+            source.find("array.unique").expect("unique member exists") + "array.".len();
+        let unique_hover = server
+            .hover(&test_uri(), position_at_byte(source, unique_start + 1))
+            .expect("core array unique hover succeeds")
+            .expect("unique has fixed hover metadata");
+        assert_eq!(
+            unique_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.unique(value) -> array\n\nReturns a stable shallow copy with later direct-equality duplicates removed.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let unique_cursor = source
+            .find("array.unique([1, 1, 2])")
+            .expect("unique input exists")
+            + "array.unique([".len()
+            + 1;
+        let unique_help = server
+            .signature_help(&test_uri(), position_at_byte(source, unique_cursor))
+            .expect("core array unique signature help succeeds")
+            .expect("unique has a fixed signature");
+        assert_eq!(
+            unique_help.signatures[0].label,
+            "array.unique(value) -> array"
+        );
+        assert_eq!(unique_help.active_parameter, Some(0));
 
         let flatten_start =
             source.find("array.flatten").expect("flatten member exists") + "array.".len();
@@ -16947,7 +16996,8 @@ mod tests {
                 "len",
                 "push",
                 "reverse",
-                "slice"
+                "slice",
+                "unique"
             ]
         );
     }

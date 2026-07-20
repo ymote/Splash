@@ -164,8 +164,9 @@ matching advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.array`
 binding. At a direct `array.` member site it completes only `len`, `has_index`,
-`get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `flatten`,
-`reverse`, and `push`, with plain-text hover and fixed function signatures.
+`get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `unique`,
+`flatten`, `reverse`, and `push`, with plain-text hover and fixed function
+signatures.
 This is a compiled-in description of bounded local array shaping: it does not
 inspect module-catalog metadata, resolve a module, follow a local alias, or
 expose a host capability. A shadowed `array` binding, chained receiver, unknown
@@ -498,8 +499,8 @@ clock, entropy, host-state, crate-loading, or capability access.
 shaping. It provides `array.len(value)`, `array.has_index(value, index)`,
 `array.get(value, index, fallback)`, `array.contains(value, item)`,
 `array.index_of(value, item)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, `array.compact(value)`, `array.reverse(value)`,
-`array.flatten(value)`, and `array.push(value, item)`. `has_index`
+`array.concat(left, right)`, `array.compact(value)`, `array.unique(value)`,
+`array.reverse(value)`, `array.flatten(value)`, and `array.push(value, item)`. `has_index`
 distinguishes an in-range `nil` item from an absent index; `get` returns its
 fallback only when the index is absent. Both require a non-negative integer
 index and never traverse the array. `contains` and `index_of` scan at most
@@ -508,13 +509,15 @@ and records match only by reference; `index_of` returns the first match or
 `-1`. `slice` requires non-negative integer indexes and a half-open range
 inside the input array. Transforms have no callbacks and allocate a new shallow
 array. `compact` removes only `nil` items, preserving `false`, zero, empty
-strings, nested references, and order. `flatten` is exactly one level: every
-outer item must be an array, and every source array plus the combined result
-must contain at most 4,096 items before native copying begins. `concat`
-enforces the same combined-result bound. `push` mutates its first argument,
-returns `nil`, and refuses to grow an array beyond 4,096 items. `len`,
-`has_index`, and `get` are constant-time and uncapped. The module has no I/O,
-clock, entropy, host-state, crate-loading, or capability access.
+strings, nested references, and order. `unique` preserves first-occurrence
+order and removes later values with the same direct equality as `contains` and
+`index_of`. `flatten` is exactly one level: every outer item must be an array,
+and every source array plus the combined result must contain at most 4,096
+items before native copying begins. `concat` enforces the same combined-result
+bound. `push` mutates its first argument, returns `nil`, and refuses to grow an
+array beyond 4,096 items. `len`, `has_index`, and `get` are constant-time and
+uncapped. The module has no I/O, clock, entropy, host-state, crate-loading, or
+capability access.
 
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.has(value, key)`,
@@ -744,7 +747,8 @@ or mutate its keys, input digest, worker observation, or restart policy.
   records match only by reference, and `index_of` returns `-1` when absent.
   Keep each transforming source array and concatenated result at or below
   4,096 items. `array.compact(value)` removes only `nil` items, preserving
-  `false`, zero, empty strings, nested references, and order.
+  `false`, zero, empty strings, nested references, and order. `array.unique(value)`
+  preserves first-occurrence order and removes later direct-equality duplicates.
   `array.flatten(value)` accepts only one level of nested arrays and applies
   the same limit to every input and its combined result.
 - Import `mod.std.object` before using `object.*`; transforms are bounded

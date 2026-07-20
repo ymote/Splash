@@ -11,8 +11,9 @@ mod profile;
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -3156,6 +3157,12 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
     );
     vm.add_method(
         array,
+        id!(unique),
+        script_args_def!(value = NIL),
+        standard_array_unique,
+    );
+    vm.add_method(
+        array,
         id!(flatten),
         script_args_def!(value = NIL),
         standard_array_flatten,
@@ -3274,6 +3281,35 @@ fn standard_array_direct_equal(vm: &vm::ScriptVm, left: ScriptValue, right: Scri
     left == right
 }
 
+/// Returns a bucket key for direct array equality. Buckets are always checked
+/// with [`standard_array_direct_equal`], so a hash collision cannot alter
+/// visible duplicate semantics.
+fn standard_array_direct_hash(vm: &vm::ScriptVm, value: ScriptValue) -> Option<u64> {
+    if let Some(number) = value.as_number() {
+        if number.is_nan() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        0_u8.hash(&mut hasher);
+        let normalized = if number == 0.0 { 0.0 } else { number };
+        normalized.to_bits().hash(&mut hasher);
+        return Some(hasher.finish());
+    }
+    if value.is_string_like() {
+        return vm.bx.heap.string_with(value, |_, text| {
+            let mut hasher = DefaultHasher::new();
+            1_u8.hash(&mut hasher);
+            text.hash(&mut hasher);
+            hasher.finish()
+        });
+    }
+
+    let mut hasher = DefaultHasher::new();
+    2_u8.hash(&mut hasher);
+    value.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 fn standard_array_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
     let value = script_value!(vm, args.value);
     let start = script_value!(vm, args.start);
@@ -3338,6 +3374,40 @@ fn standard_array_compact(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptVa
         if value != NIL {
             vm.bx.heap.array_push(output, value, trap);
         }
+    }
+    output.into()
+}
+
+/// Returns a stable shallow de-duplicated copy using the same bounded direct
+/// equality as [`standard_array_contains`] and [`standard_array_index_of`].
+/// The transient index holds no more than the source's fixed item limit.
+fn standard_array_unique(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let (array, length) = match standard_array_input(vm, value, "unique", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+
+    let output = vm.bx.heap.new_array();
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    let mut candidates_by_hash = BTreeMap::<u64, Vec<ScriptValue>>::new();
+    for index in 0..length {
+        let item = vm.bx.heap.array_index_unchecked(array, index);
+        let Some(hash) = standard_array_direct_hash(vm, item) else {
+            // NaN and an invalid stale string are never direct-equal matches.
+            vm.bx.heap.array_push(output, item, trap);
+            continue;
+        };
+        let candidates = candidates_by_hash.entry(hash).or_default();
+        if candidates
+            .iter()
+            .copied()
+            .any(|candidate| standard_array_direct_equal(vm, candidate, item))
+        {
+            continue;
+        }
+        candidates.push(item);
+        vm.bx.heap.array_push(output, item, trap);
     }
     output.into()
 }
@@ -8264,6 +8334,7 @@ compute(outer, 2)
             .eval(
                 "use mod.std.assert\n\
                  use mod.std.array\n\
+                 use mod.std.text\n\
                  let input = [1, 2, 3]\n\
                  assert(array.len(input) == 3)\n\
                  assert(array.has_index(input, 0))\n\
@@ -8301,6 +8372,25 @@ compute(outer, 2)
                  assert(optional[0] == nil)\n\
                  compacted[3].answer = 2\n\
                  assert(optional_nested.answer == 2)\n\
+                 let unique_candidate = {answer: 1}\n\
+                 let unique_equivalent = {answer: 1}\n\
+                 let rebuilt_tag = text.join([\"re\", \"view\"], \"\")\n\
+                 let repeated = [nil, nil, false, false, 0, 0.0, \"review\", rebuilt_tag, unique_candidate, unique_candidate, unique_equivalent]\n\
+                 let unique = array.unique(repeated)\n\
+                 assert(array.len(unique) == 6)\n\
+                 assert(unique[0] == nil)\n\
+                 assert(unique[1] == false)\n\
+                 assert(unique[2] == 0)\n\
+                 assert(unique[3] == \"review\")\n\
+                 assert(array.index_of(unique, rebuilt_tag) == 3)\n\
+                 assert(array.index_of(unique, unique_candidate) == 4)\n\
+                 assert(array.index_of(unique, unique_equivalent) == 5)\n\
+                 assert(array.len(repeated) == 11)\n\
+                 array.push(unique, \"tail\")\n\
+                 assert(array.len(unique) == 7)\n\
+                 assert(array.len(repeated) == 11)\n\
+                 unique[4].answer = 2\n\
+                 assert(unique_candidate.answer == 2)\n\
                  assert(array.flatten([[1, 2], [], [3]]) == [1, 2, 3])\n\
                  let reversed = array.reverse(input)\n\
                  assert(reversed == [3, 2, 1])\n\
@@ -8338,7 +8428,7 @@ compute(outer, 2)
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
             .eval(
-                "use mod.std\nlet nested = [2]\nlet compacted = std.array.compact([nil, nested, nil])\nstd.array.contains(compacted, nested) && std.array.index_of(compacted, nested) == 0",
+                "use mod.std\nlet nested = [2]\nlet unique = std.array.unique([nil, nested, nested, nil])\nstd.array.len(unique) == 2 && std.array.contains(unique, nested) && std.array.index_of(unique, nested) == 1",
             )
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
@@ -8354,7 +8444,7 @@ compute(outer, 2)
         );
 
         let mutation = runtime
-            .eval("use mod.std.array\narray.contains = || nil")
+            .eval("use mod.std.array\narray.unique = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
@@ -8386,6 +8476,25 @@ compute(outer, 2)
             runtime
                 .script_value_as_json(
                     invalid_membership.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_unique = runtime
+            .eval("use mod.std.array\ntry array.unique(\"items\") catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_unique.completed(),
+            "{:?}",
+            invalid_unique.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_unique.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
@@ -8497,6 +8606,52 @@ compute(outer, 2)
                 )
                 .unwrap(),
             serde_json::json!("limit")
+        );
+
+        let mut unique_limit_runtime = Runtime::default();
+        let unique_limit = unique_limit_runtime
+            .eval(&format!(
+                "use mod.std.array\n\
+                 let values = []\n\
+                 values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
+                 try array.unique(values) catch \"limit\""
+            ))
+            .unwrap();
+        assert!(unique_limit.completed(), "{:?}", unique_limit.diagnostics);
+        assert_eq!(
+            unique_limit_runtime
+                .script_value_as_json(
+                    unique_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
+        let mut full_unique_runtime = Runtime::default();
+        let full_unique = full_unique_runtime
+            .eval(&format!(
+                "use mod.std.assert\n\
+                 use mod.std.array\n\
+                 let values = []\n\
+                 values[{}] = 0\n\
+                 let unique = array.unique(values)\n\
+                 assert(array.len(unique) == 2)\n\
+                 unique",
+                MAX_STANDARD_ARRAY_ITEMS - 1,
+            ))
+            .unwrap();
+        assert!(full_unique.completed(), "{:?}", full_unique.diagnostics);
+        assert_eq!(
+            full_unique_runtime
+                .script_value_as_json(
+                    full_unique.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!([null, 0])
         );
 
         let mut membership_limit_runtime = Runtime::default();

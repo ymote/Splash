@@ -35,6 +35,7 @@
 "array.contains("
 "array.index_of("
 "array.compact("
+"array.unique("
 "array.reverse("
 "array.flatten("
 "array.push("
