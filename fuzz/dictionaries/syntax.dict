@@ -30,6 +30,8 @@
 "json.parse("
 "json.stringify("
 "array.slice("
+"array.has_index("
+"array.get("
 "array.reverse("
 "array.flatten("
 "array.push("

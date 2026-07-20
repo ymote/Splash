@@ -162,13 +162,14 @@ member, or source outside the valid prefix gets no fixed-core result; a
 matching advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.array`
-binding. At a direct `array.` member site it completes only `len`, `slice`,
-`concat`, `reverse`, and `push`, with plain-text hover and fixed function
-signatures. This is a compiled-in description of bounded local array shaping:
-it does not inspect module-catalog metadata, resolve a module, follow a local
-alias, or expose a host capability. A shadowed `array` binding, chained
-receiver, unknown member, or source outside the valid prefix gets no fixed-core
-result; a matching advisory catalog path cannot extend the core surface.
+binding. At a direct `array.` member site it completes only `len`, `has_index`,
+`get`, `slice`, `concat`, `flatten`, `reverse`, and `push`, with plain-text
+hover and fixed function signatures. This is a compiled-in description of
+bounded local array shaping: it does not inspect module-catalog metadata,
+resolve a module, follow a local alias, or expose a host capability. A shadowed
+`array` binding, chained receiver, unknown member, or source outside the valid
+prefix gets no fixed-core result; a matching advisory catalog path cannot
+extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.object`
 binding. At a direct `object.` member site it completes only `len`, `has`,
@@ -478,15 +479,19 @@ failure as any other new script allocation. It does not expose regexes, I/O,
 clock, entropy, host-state, crate-loading, or capability access.
 
 `use mod.std.array` imports a frozen Splash-owned module for local collection
-shaping. It provides `array.len(value)`, `array.slice(value, start, end)`,
+shaping. It provides `array.len(value)`, `array.has_index(value, index)`,
+`array.get(value, index, fallback)`, `array.slice(value, start, end)`,
 `array.concat(left, right)`, `array.reverse(value)`, `array.flatten(value)`,
-and `array.push(value, item)`. `slice` requires non-negative integer indexes
-and a half-open range inside the input array. Transforms have no callbacks and
-allocate a new shallow array. `flatten` is exactly one level: every outer item
-must be an array, and every source array plus the combined result must contain
-at most 4,096 items before native copying begins. `concat` enforces the same
-combined-result bound. `push` mutates its first argument, returns `nil`, and
-refuses to grow an array beyond 4,096 items. `len` is constant-time and
+and `array.push(value, item)`. `has_index` distinguishes an in-range `nil`
+item from an absent index; `get` returns its fallback only when the index is
+absent. Both require a non-negative integer index and never traverse the
+array. `slice` requires non-negative integer indexes and a half-open range
+inside the input array. Transforms have no callbacks and allocate a new shallow
+array. `flatten` is exactly one level: every outer item must be an array, and
+every source array plus the combined result must contain at most 4,096 items
+before native copying begins. `concat` enforces the same combined-result bound.
+`push` mutates its first argument, returns `nil`, and refuses to grow an array
+beyond 4,096 items. `len`, `has_index`, and `get` are constant-time and
 uncapped. The module has no I/O, clock, entropy, host-state, crate-loading, or
 capability access.
 
@@ -692,10 +697,13 @@ or mutate its keys, input digest, worker observation, or restart policy.
   and keep its result at or below 4,096 segments. `text.join(values, separator)`
   accepts only an array of at most 4,096 strings and a string separator.
 - Import `mod.std.array` before using `array.*`; transforms are bounded,
-  callback-free shallow copies, not capabilities. Keep each source array and
-  concatenated result at or below 4,096 items. `array.flatten(value)` accepts
-  only one level of nested arrays and applies the same limit to every input and
-  its combined result.
+  callback-free shallow copies, not capabilities. Use
+  `array.has_index(value, index)` to distinguish an in-range `nil` item from
+  an absent index, and `array.get(value, index, fallback)` for an optional
+  indexed read. Both require a non-negative integer index and do not traverse
+  the array. Keep each transforming source array and concatenated result at or
+  below 4,096 items. `array.flatten(value)` accepts only one level of nested
+  arrays and applies the same limit to every input and its combined result.
 - Import `mod.std.object` before using `object.*`; transforms are bounded
   own-field operations over plain record or JSON-object data, not capabilities.
   `object.has(value, key)` distinguishes a missing own text field from a

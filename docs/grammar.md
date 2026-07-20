@@ -426,7 +426,8 @@ or invalid source prefix has no fixed-JSON result, and advisory metadata cannot
 add members to this core module.
 
 An exact visible direct `use mod.std.array` binding has a separate fixed core
-projection for only `array.len(value)`, `array.slice(value, start, end)`,
+projection for only `array.len(value)`, `array.has_index(value, index)`,
+`array.get(value, index, fallback)`, `array.slice(value, start, end)`,
 `array.concat(left, right)`, `array.reverse(value)`, `array.flatten(value)`,
 and `array.push(value, item)`, with plain-text member hover and function
 signature help. Its descriptors are compiled into the LSP rather than read from

@@ -266,15 +266,18 @@ Splash's configured string bound; the module does not expose regexes, host
 state, filesystem, process, network, clock, entropy, or crate access.
 
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
+`array.has_index(value, index)`, `array.get(value, index, fallback)`,
 `array.slice(value, start, end)`, `array.concat(left, right)`,
 `array.reverse(value)`, `array.flatten(value)`, and `array.push(value, item)`.
-`slice` uses a half-open range with non-negative integer indexes. `flatten` is
-one level only: every outer item must be an array, and it rejects any source or
-result over 4,096 items before copying. `push` mutates its array, returns `nil`,
-and rejects a result over 4,096 items. The transforming helpers are
-callback-free and shallow; `len` is constant-time and uncapped. The module does
-not expose host state, filesystem, process, network, clock, entropy, or crate
-access.
+`has_index` distinguishes an in-range `nil` item from an absent index, while
+`get` returns its fallback only when the index is absent. Neither traverses the
+array. `slice` uses a half-open range with non-negative integer indexes.
+`flatten` is one level only: every outer item must be an array, and it rejects
+any source or result over 4,096 items before copying. `push` mutates its array,
+returns `nil`, and rejects a result over 4,096 items. The transforming helpers
+are callback-free and shallow; `len`, `has_index`, and `get` are constant-time
+and uncapped. The module does not expose host state, filesystem, process,
+network, clock, entropy, or crate access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.has(value, key)`, `object.get(value, key, fallback)`,

@@ -411,6 +411,18 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
         description: "Returns an array length without traversing its items.",
     },
     StandardArrayFunction {
+        name: "has_index",
+        parameters: &["value", "index"],
+        result: "boolean",
+        description: "Tests whether a non-negative index is present without traversing the array.",
+    },
+    StandardArrayFunction {
+        name: "get",
+        parameters: &["value", "index", "fallback"],
+        result: "value",
+        description: "Returns an indexed item or the fallback without traversing the array.",
+    },
+    StandardArrayFunction {
         name: "slice",
         parameters: &["value", "start", "end"],
         result: "array",
@@ -1970,6 +1982,8 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let parsed = json.parse(\"{\\\"answer\\\":42}\")\n",
     "json.stringify(parsed)\n",
     "let sliced = array.slice([1, 2, 3], 1, 3)\n",
+    "array.has_index(sliced, 0)\n",
+    "array.get(sliced, 2, 0)\n",
     "let flattened = array.flatten([sliced, [4]])\n",
     "array.reverse(sliced)\n",
     "let collected = []\n",
@@ -2334,6 +2348,26 @@ fn fuzz_exercise_fixed_standard_array_requests(
         position_at_byte(source, slice_start + "array.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, slice_argument));
+
+    let Some(has_index_start) = source.find("array.has_index") else {
+        return;
+    };
+    let has_index_argument = has_index_start + "array.has_index(sliced, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, has_index_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, has_index_argument));
+
+    let Some(get_start) = source.find("array.get") else {
+        return;
+    };
+    let get_argument = get_start + "array.get(sliced, 2, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, get_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, get_argument));
 
     let Some(flatten_start) = source.find("array.flatten") else {
         return;
@@ -9401,7 +9435,16 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["concat", "flatten", "len", "push", "reverse", "slice"]
+            [
+                "concat",
+                "flatten",
+                "get",
+                "has_index",
+                "len",
+                "push",
+                "reverse",
+                "slice"
+            ]
         );
         assert!(completion.items.iter().all(|item| {
             item.kind == Some(CompletionItemKind::FUNCTION)
@@ -9437,7 +9480,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 6);
+        assert_eq!(partial.items.len(), 8);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9451,6 +9494,8 @@ mod tests {
         let source = concat!(
             "use mod.std.array\n",
             "let selected = array.slice([1, 2, 3], 1, 3)\n",
+            "let first = array.get(selected, 0, -1)\n",
+            "array.has_index(selected, 1)\n",
             "let flattened = array.flatten([selected, [4]])\n",
             "array.reverse(selected)\n",
             "let collected = []\n",
@@ -9469,6 +9514,35 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "array.slice(value, start, end) -> array\n\nReturns a shallow copy of the half-open [start, end) range.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let get_start = source.find("array.get").expect("get member exists") + "array.".len();
+        let get_hover = server
+            .hover(&test_uri(), position_at_byte(source, get_start + 1))
+            .expect("core array get hover succeeds")
+            .expect("get has fixed hover metadata");
+        assert_eq!(
+            get_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.get(value, index, fallback) -> value\n\nReturns an indexed item or the fallback without traversing the array.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let has_index_start = source
+            .find("array.has_index")
+            .expect("has_index member exists")
+            + "array.".len();
+        let has_index_hover = server
+            .hover(&test_uri(), position_at_byte(source, has_index_start + 1))
+            .expect("core array has_index hover succeeds")
+            .expect("has_index has fixed hover metadata");
+        assert_eq!(
+            has_index_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.has_index(value, index) -> boolean\n\nTests whether a non-negative index is present without traversing the array.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -9515,6 +9589,36 @@ mod tests {
             ])
         );
 
+        let get_cursor = source
+            .find("array.get(selected, 0, -1)")
+            .expect("get call exists")
+            + "array.get(selected, 0, ".len()
+            + 1;
+        let get_help = server
+            .signature_help(&test_uri(), position_at_byte(source, get_cursor))
+            .expect("core array get signature help succeeds")
+            .expect("get has a fixed signature");
+        assert_eq!(
+            get_help.signatures[0].label,
+            "array.get(value, index, fallback) -> value"
+        );
+        assert_eq!(get_help.active_parameter, Some(2));
+
+        let has_index_cursor = source
+            .find("array.has_index(selected, 1)")
+            .expect("has_index call exists")
+            + "array.has_index(selected, ".len()
+            + 1;
+        let has_index_help = server
+            .signature_help(&test_uri(), position_at_byte(source, has_index_cursor))
+            .expect("core array has_index signature help succeeds")
+            .expect("has_index has a fixed signature");
+        assert_eq!(
+            has_index_help.signatures[0].label,
+            "array.has_index(value, index) -> boolean"
+        );
+        assert_eq!(has_index_help.active_parameter, Some(1));
+
         let flatten_start =
             source.find("array.flatten").expect("flatten member exists") + "array.".len();
         let flatten_hover = server
@@ -9544,7 +9648,11 @@ mod tests {
         );
         assert_eq!(flatten_help.active_parameter, Some(0));
 
-        let reverse_cursor = source.rfind("selected").expect("reverse input exists") + 1;
+        let reverse_cursor = source
+            .find("array.reverse(selected)")
+            .expect("reverse input exists")
+            + "array.reverse(".len()
+            + 1;
         let reverse_help = server
             .signature_help(&test_uri(), position_at_byte(source, reverse_cursor))
             .expect("core array reverse signature help succeeds")
@@ -15916,7 +16024,16 @@ mod tests {
                 .iter()
                 .map(|item| item.label.as_str())
                 .collect::<Vec<_>>(),
-            ["concat", "flatten", "len", "push", "reverse", "slice"]
+            [
+                "concat",
+                "flatten",
+                "get",
+                "has_index",
+                "len",
+                "push",
+                "reverse",
+                "slice"
+            ]
         );
     }
 

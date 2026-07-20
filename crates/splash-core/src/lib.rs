@@ -3071,6 +3071,18 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
     );
     vm.add_method(
         array,
+        id!(has_index),
+        script_args_def!(value = NIL, index = NIL),
+        standard_array_has_index,
+    );
+    vm.add_method(
+        array,
+        id!(get),
+        script_args_def!(value = NIL, index = NIL, fallback = NIL),
+        standard_array_get,
+    );
+    vm.add_method(
+        array,
         id!(slice),
         script_args_def!(value = NIL, start = NIL, end = NIL),
         standard_array_slice,
@@ -3107,10 +3119,44 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
 
 fn standard_array_len(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
     let value = script_value!(vm, args.value);
-    let Some(array) = value.as_array() else {
-        return standard_array_expected_array(vm, "len", "value");
+    let (_, length) = match standard_array_unbounded_input(vm, value, "len", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
     };
-    vm.bx.heap.array_len(array).into()
+    length.into()
+}
+
+fn standard_array_has_index(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let index = script_value!(vm, args.index);
+    let (_, length) = match standard_array_unbounded_input(vm, value, "has_index", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    let index = match standard_array_index(vm, index, "has_index", "index") {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    (index < length).into()
+}
+
+fn standard_array_get(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let index = script_value!(vm, args.index);
+    let fallback = script_value!(vm, args.fallback);
+    let (array, length) = match standard_array_unbounded_input(vm, value, "get", "value") {
+        Ok(input) => input,
+        Err(error) => return error,
+    };
+    let index = match standard_array_index(vm, index, "get", "index") {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    if index < length {
+        vm.bx.heap.array_index_unchecked(array, index)
+    } else {
+        fallback
+    }
 }
 
 fn standard_array_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
@@ -3233,14 +3279,26 @@ fn standard_array_input(
     function: &'static str,
     parameter: &'static str,
 ) -> Result<(vm::ScriptArray, usize), ScriptValue> {
-    let Some(array) = value.as_array() else {
-        return Err(standard_array_expected_array(vm, function, parameter));
-    };
-    let length = vm.bx.heap.array_len(array);
+    let (array, length) = standard_array_unbounded_input(vm, value, function, parameter)?;
     if length > MAX_STANDARD_ARRAY_ITEMS {
         return Err(standard_array_item_limit(vm, function));
     }
     Ok((array, length))
+}
+
+/// Returns one array and its length without iterating, copying, or allocating.
+/// Lookup helpers use this path so a single indexed read remains bounded even
+/// when a host-provided array is larger than the transformation ceiling.
+fn standard_array_unbounded_input(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    function: &'static str,
+    parameter: &'static str,
+) -> Result<(vm::ScriptArray, usize), ScriptValue> {
+    let Some(array) = value.as_array() else {
+        return Err(standard_array_expected_array(vm, function, parameter));
+    };
+    Ok((array, vm.bx.heap.array_len(array)))
 }
 
 fn standard_array_index(
@@ -7758,6 +7816,13 @@ compute(outer, 2)
                  use mod.std.array\n\
                  let input = [1, 2, 3]\n\
                  assert(array.len(input) == 3)\n\
+                 assert(array.has_index(input, 0))\n\
+                 assert(!array.has_index(input, 3))\n\
+                 assert(array.get(input, 1, -1) == 2)\n\
+                 assert(array.get(input, 3, \"fallback\") == \"fallback\")\n\
+                 let present_nil = [nil]\n\
+                 assert(array.has_index(present_nil, 0))\n\
+                 assert(array.get(present_nil, 0, \"fallback\") == nil)\n\
                  assert(array.slice(input, 1, 3) == [2, 3])\n\
                  assert(array.concat([1, 2], [3, 4]) == [1, 2, 3, 4])\n\
                  assert(array.flatten([[1, 2], [], [3]]) == [1, 2, 3])\n\
@@ -7796,7 +7861,7 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nstd.array.flatten([[1], [2]])")
+            .eval("use mod.std\nstd.array.get([[1], [2]], 2, \"fallback\")")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
         assert_eq!(
@@ -7807,7 +7872,7 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!([1, 2])
+            serde_json::json!("fallback")
         );
 
         let mutation = runtime
@@ -7846,6 +7911,25 @@ compute(outer, 2)
             serde_json::json!("invalid")
         );
 
+        let invalid_lookup_index = runtime
+            .eval("use mod.std.array\ntry array.has_index([1], -1) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_lookup_index.completed(),
+            "{:?}",
+            invalid_lookup_index.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_lookup_index.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
         let invalid_flatten = runtime
             .eval("use mod.std.array\ntry array.flatten([[1], 2]) catch \"invalid\"")
             .unwrap();
@@ -7870,14 +7954,18 @@ compute(outer, 2)
                 "use mod.std.array\n\
                  let values = []\n\
                  values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
-                 array.len(values)"
+                 assert(array.len(values) == {})\n\
+                 assert(array.has_index(values, {MAX_STANDARD_ARRAY_ITEMS}))\n\
+                 assert(!array.has_index(values, {}))\n\
+                 assert(array.get(values, {MAX_STANDARD_ARRAY_ITEMS}, -1) == 0)\n\
+                 array.get(values, {}, -1)",
+                MAX_STANDARD_ARRAY_ITEMS + 1,
+                MAX_STANDARD_ARRAY_ITEMS + 1,
+                MAX_STANDARD_ARRAY_ITEMS + 1,
             ))
             .unwrap();
         assert!(oversized_len.completed(), "{:?}", oversized_len.diagnostics);
-        assert_eq!(
-            oversized_len.value.as_number(),
-            Some((MAX_STANDARD_ARRAY_ITEMS + 1) as f64)
-        );
+        assert_eq!(oversized_len.value.as_number(), Some(-1.0));
 
         let oversized = Runtime::default()
             .eval(&format!(
