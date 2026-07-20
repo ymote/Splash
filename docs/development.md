@@ -62,9 +62,9 @@ campaigns for selected coverage-critical targets.
 The separate `Sustained Fuzzing` workflow runs daily and can be started
 manually from GitHub Actions. It gives the differential `syntax` target and
 the bounded `execution` target ten minutes each, the `lsp_document` target two
-minutes for source and bounded advisory initialization/configuration-refresh
-parsing, the sealed `mobile_dataflow` target two minutes for host JSON
-injection, canonical evaluation, and bounded result conversion, the
+minutes for source plus bounded advisory initialization and configuration
+lifecycle parsing, the sealed `mobile_dataflow` target two minutes for host
+JSON injection, canonical evaluation, and bounded result conversion, the
 sealed `mobile_workflow` target two minutes for plan, named-policy approval,
 and bounded pure-dataflow execution, the
 capability-free replay target two minutes, and the variable-limit
@@ -393,12 +393,16 @@ stdio. It requests formatting, outlining, completion, hover, definition,
 references, highlights, and guarded rename across at most 33 UTF-8-boundary
 positions plus an invalid UTF-16 position on arbitrary accepted source
 snapshots, then issues fixed catalog-specific requests and closes the document.
-It accepts at most 16 KiB of fuzzer source and has reviewed source `.splash`
-and advisory-configuration `.json` seeds. For a parsed JSON value, it also
-exercises the bounded initialization and
-configuration-refresh projection around a fixed document. The server uses a
-fixed bounded advisory module catalog, including shaped direct-method input
-field metadata, only to exercise catalog completion, root/direct-child input-key
+It accepts at most 16 KiB of fuzz input and has reviewed source `.splash` and
+advisory-configuration `.json` seeds. A parsed JSON value exercises advisory
+initialization and refresh around a fixed document. A nonempty root JSON array
+is a fuzz-only lifecycle envelope: the first value initializes the server and
+up to seven later values independently refresh tool, module, and atomic
+workflow-data projections. After every state, the target issues the same
+effect-free semantic requests, covering replacement, clear, malformed, and
+recovery behavior without defining an LSP wire format. The server uses a fixed
+bounded advisory module catalog, including shaped direct-method input field
+metadata, only to exercise catalog completion, root/direct-child input-key
 completion/hover, and signature help: the target never starts stdio, reads the
 URI, resolves modules, evaluates Splash, creates a capability host, or invokes
 an adapter.

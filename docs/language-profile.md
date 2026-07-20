@@ -163,23 +163,23 @@ matching advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.array`
 binding. At a direct `array.` member site it completes only `len`, `has_index`,
-`get`, `slice`, `concat`, `flatten`, `reverse`, and `push`, with plain-text
-hover and fixed function signatures. This is a compiled-in description of
-bounded local array shaping: it does not inspect module-catalog metadata,
-resolve a module, follow a local alias, or expose a host capability. A shadowed
-`array` binding, chained receiver, unknown member, or source outside the valid
-prefix gets no fixed-core result; a matching advisory catalog path cannot
-extend the core surface.
+`get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `flatten`,
+`reverse`, and `push`, with plain-text hover and fixed function signatures.
+This is a compiled-in description of bounded local array shaping: it does not
+inspect module-catalog metadata, resolve a module, follow a local alias, or
+expose a host capability. A shadowed `array` binding, chained receiver, unknown
+member, or source outside the valid prefix gets no fixed-core result; a matching
+advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.object`
 binding. At a direct `object.` member site it completes only `len`, `has`,
-`get`, `keys`, `entries`, `values`, and `merge`, with plain-text hover and fixed
-function signatures. This is a compiled-in description of bounded own-field
-record shaping: it does not inspect module-catalog metadata, resolve a module,
-follow a local alias, or expose a host capability. A shadowed `object` binding,
-chained receiver, unknown member, or source outside the valid prefix gets no
-fixed-core result; a matching advisory catalog path cannot extend the core
-surface.
+`get`, `pick`, `from_entries`, `with`, `keys`, `entries`, `values`, and `merge`,
+with plain-text hover and fixed function signatures. This is a compiled-in
+description of bounded own-field record shaping: it does not inspect
+module-catalog metadata, resolve a module, follow a local alias, or expose a
+host capability. A shadowed `object` binding, chained receiver, unknown member,
+or source outside the valid prefix gets no fixed-core result; a matching
+advisory catalog path cannot extend the core surface.
 
 The LSP separately recognizes an exact visible direct `use mod.std.text`
 binding. At a direct `text.` member site it completes only the documented

@@ -2004,6 +2004,10 @@ impl SplashLanguageServer {
 /// case can issue several semantic requests with a predictable cost.
 #[cfg(fuzzing)]
 const MAX_FUZZ_LSP_SOURCE_BYTES: usize = 16 * 1024;
+/// Maximum initialization plus refresh states in one advisory configuration
+/// fuzz case. This bounds request amplification from a compact JSON sequence.
+#[cfg(fuzzing)]
+const MAX_FUZZ_ADVISORY_CONFIGURATION_STATES: usize = 8;
 /// Number of evenly spaced source positions sampled by the LSP fuzz hook.
 ///
 /// The inclusive sampling range produces at most 33 UTF-8 boundary positions.
@@ -2288,15 +2292,27 @@ pub fn fuzz_exercise_document(source: &str) {
     let _ = server.completion(&uri, Position::new(u32::MAX, u32::MAX));
 }
 
-/// Exercises advisory initialization and configuration parsing using one
-/// already-decoded JSON value. The projection remains editor-local: this hook
-/// does not connect to a runtime, load a module, or grant a capability.
+/// Exercises advisory initialization and configuration transitions using one
+/// already-decoded JSON value. A nonempty root array is a fuzz-only sequence:
+/// its first state initializes the server and later states refresh it. Any
+/// other value retains the single-value initialization-plus-refresh exercise.
+/// The projection remains editor-local: this hook does not connect to a
+/// runtime, load a module, or grant a capability.
 #[cfg(fuzzing)]
 pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
     use std::str::FromStr;
 
+    let (initialization_options, refreshes) = match settings.as_array() {
+        Some(states) if !states.is_empty() => {
+            if states.len() > MAX_FUZZ_ADVISORY_CONFIGURATION_STATES {
+                return;
+            }
+            (&states[0], &states[1..])
+        }
+        _ => (settings, std::slice::from_ref(settings)),
+    };
     let params = InitializeParams {
-        initialization_options: Some(settings.clone()),
+        initialization_options: Some(initialization_options.clone()),
         ..InitializeParams::default()
     };
     let (tool_catalog, module_catalog, workflow_data_catalog, workflow_data_step_context) =
@@ -2317,29 +2333,33 @@ pub fn fuzz_exercise_advisory_configuration(settings: &serde_json::Value) {
         1,
         FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
     ));
-    fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_array_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_object_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_advisory_configuration_requests(&server, &uri);
 
-    // The same untrusted value crosses the independent refresh boundary after
-    // initialization, so malformed and over-limit replacements cannot leave
-    // stale catalog state available to semantic requests.
-    server.refresh_advisory_configuration(settings);
-    fuzz_exercise_semantic_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_array_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_object_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_math_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_json_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_text_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
-    fuzz_exercise_fixed_standard_assert_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    // Every independently supplied update crosses the production refresh
+    // boundary. Malformed, partial, cleared, and later recovery states must
+    // not leave stale catalog data available to semantic requests.
+    for settings in refreshes {
+        server.refresh_advisory_configuration(settings);
+        fuzz_exercise_advisory_configuration_requests(&server, &uri);
+    }
     fuzz_exercise_fixed_core_import_path_requests(&mut server, &uri, 2);
 
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
     });
     let _ = server.completion(&uri, Position::new(u32::MAX, u32::MAX));
+}
+
+#[cfg(fuzzing)]
+fn fuzz_exercise_advisory_configuration_requests(server: &SplashLanguageServer, uri: &Uri) {
+    fuzz_exercise_semantic_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_advisory_input_field_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_array_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_object_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_math_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_json_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_text_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
+    fuzz_exercise_fixed_standard_assert_requests(server, uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
 }
 
 #[cfg(fuzzing)]

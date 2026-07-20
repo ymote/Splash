@@ -1,0 +1,72 @@
+[
+  {
+    "splash": {
+      "toolCatalog": [
+        {"name": "text.echo", "format": "text", "description": "Reviewed text adapter."}
+      ],
+      "moduleCatalog": [
+        {
+          "path": "mod.fuzz.inspect.remote_add",
+          "description": "Reviewed deferred adapter.",
+          "callMode": "deferred",
+          "callShape": "single_json",
+          "inputFields": [
+            {"name": "left", "type": "integer", "required": true},
+            {"name": "right", "type": "integer", "required": true}
+          ],
+          "outputFields": [
+            {"name": "total", "type": "integer", "required": true}
+          ]
+        }
+      ],
+      "workflowDataCatalog": {
+        "inputFields": [{"name": "request", "type": "string"}],
+        "outputs": [{"stepId": "prepare", "fields": [{"name": "total", "type": "integer"}]}]
+      },
+      "workflowDataStepContext": {
+        "currentStepId": "prepare",
+        "completedOutputStepIds": []
+      }
+    }
+  },
+  {
+    "splash": {
+      "toolCatalog": [
+        {"name": "json.echo", "format": "json", "description": "Replacement JSON adapter."}
+      ]
+    }
+  },
+  {"splash": {"moduleCatalog": null}},
+  {
+    "splash": {
+      "workflowDataCatalog": null,
+      "workflowDataStepContext": {
+        "currentStepId": "prepare",
+        "completedOutputStepIds": []
+      }
+    }
+  },
+  {"splash": []},
+  {
+    "splash": {
+      "toolCatalog": [],
+      "moduleCatalog": [],
+      "workflowDataCatalog": {
+        "inputFields": [],
+        "outputs": [{"stepId": "prepare", "fields": []}]
+      },
+      "workflowDataStepContext": {
+        "currentStepId": "prepare",
+        "completedOutputStepIds": []
+      }
+    }
+  },
+  {
+    "splash": {
+      "toolCatalog": null,
+      "moduleCatalog": null,
+      "workflowDataCatalog": null,
+      "workflowDataStepContext": null
+    }
+  }
+]

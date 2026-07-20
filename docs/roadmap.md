@@ -81,6 +81,9 @@
   import-path refusal, truncation refusal, and whole-report lexical drift
   detection.
 - Effect-free CLI top-level declaration outline for LLM and editor tooling.
+- Bounded LSP advisory-configuration lifecycle fuzzing across initialization,
+  independent catalog replacement, explicit clear, malformed state, and
+  recovery, without runtime or capability access.
 - Bounded effect-free direct tool-call outline for LLM and operator
   pre-approval review; it is explicitly non-authoritative and backed by
   runtime leases.
@@ -374,7 +377,6 @@
   local alias groups, and direct advisory workflow-data fields. General module
   resolution, computed/deeper result aliases and chains, and broader type-aware
   field semantics remain open.
-- Sustained parser/VM differential fuzzing, LSP document and advisory
-  configuration lifecycle fuzzing, expanded resource-exhaustion coverage, and
-  corpus triage.
+- Sustained parser/VM differential fuzzing, expanded resource-exhaustion
+  coverage, and corpus triage.
 - Independent security review of effectful adapters.
