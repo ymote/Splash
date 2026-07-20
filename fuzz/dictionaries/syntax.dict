@@ -38,6 +38,7 @@
 "object.merge("
 "text.trim("
 "text.replace_all("
+"text.slice("
 "text.split("
 "text.join("
 "record["

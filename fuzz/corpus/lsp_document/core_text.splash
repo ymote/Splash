@@ -1,5 +1,6 @@
 use mod.std.text
 let value = text.trim("  Splash  ")
 text.replace_all(value, "S", "s")
+text.slice(value, 1, 4)
 text.split("a,,b,", ",")
 text.join(["a", "", "b", ""], ",")

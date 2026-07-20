@@ -2697,6 +2697,12 @@ fn install_standard_text_module(vm: &mut vm::ScriptVm, std_module: ScriptObject)
     );
     vm.add_method(
         text,
+        id!(slice),
+        script_args_def!(value = NIL, start = NIL, end = NIL),
+        standard_text_slice,
+    );
+    vm.add_method(
+        text,
         id!(contains),
         script_args_def!(value = NIL, needle = NIL),
         |vm, args| {
@@ -2818,6 +2824,77 @@ fn standard_text_len(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
         Some(length) => ScriptValue::from_f64(length as f64),
         None => standard_text_expected_string(vm, "len", "value"),
     }
+}
+
+fn standard_text_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let start = script_value!(vm, args.start);
+    let end = script_value!(vm, args.end);
+    if vm.string_with(value, |_, _| ()).is_none() {
+        return standard_text_expected_string(vm, "slice", "value");
+    }
+    let start = match standard_text_scalar_index(vm, start, "slice", "start") {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+    let end = match standard_text_scalar_index(vm, end, "slice", "end") {
+        Ok(index) => index,
+        Err(error) => return error,
+    };
+
+    match vm.string_with(value, |vm, value| {
+        let length = value.chars().count();
+        if start > end || end > length {
+            return None;
+        }
+        let start_byte = standard_text_scalar_byte_index(value, start, length)?;
+        let end_byte = standard_text_scalar_byte_index(value, end, length)?;
+        Some(vm.bx.heap.new_string_from_str(&value[start_byte..end_byte]))
+    }) {
+        Some(Some(result)) => result,
+        Some(None) => standard_text_slice_range(vm),
+        None => standard_text_expected_string(vm, "slice", "value"),
+    }
+}
+
+fn standard_text_scalar_index(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    function: &'static str,
+    parameter: &'static str,
+) -> Result<usize, ScriptValue> {
+    let Some(value) = value.as_number() else {
+        return Err(standard_text_expected_scalar_index(vm, function, parameter));
+    };
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f64 {
+        return Err(standard_text_expected_scalar_index(vm, function, parameter));
+    }
+    Ok(value as usize)
+}
+
+fn standard_text_scalar_byte_index(value: &str, index: usize, length: usize) -> Option<usize> {
+    if index == length {
+        return Some(value.len());
+    }
+    value.char_indices().nth(index).map(|(offset, _)| offset)
+}
+
+fn standard_text_expected_scalar_index(
+    vm: &mut vm::ScriptVm,
+    function: &'static str,
+    parameter: &'static str,
+) -> ScriptValue {
+    script_err_invalid_args!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.{function} expects `{parameter}` to be a non-negative integer"
+    )
+}
+
+fn standard_text_slice_range(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_invalid_args!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.slice requires `start` <= `end` <= text length"
+    )
 }
 
 fn standard_text_binary_predicate(
@@ -7355,6 +7432,8 @@ compute(outer, 2)
                  assert(text.lower(value) == \"mixed\")\n\
                  assert(text.upper(\"abc\") == \"ABC\")\n\
                  assert(text.len(\"🙂\") == 1)\n\
+                 assert(text.slice(\"a🙂b\", 1, 2) == \"🙂\")\n\
+                 assert(text.slice(\"a🙂b\", 3, 3) == \"\")\n\
                  assert(text.contains(value, \"Xe\"))\n\
                  assert(text.starts_with(value, \"Mi\"))\n\
                  assert(text.ends_with(value, \"eD\"))\n\
@@ -7422,6 +7501,53 @@ compute(outer, 2)
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("`delimiter`")));
+
+        let invalid_slice_index = runtime
+            .eval("use mod.std.text\ntry text.slice(\"splash\", -1, 1) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_slice_index.completed(),
+            "{:?}",
+            invalid_slice_index.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_slice_index.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_slice_range = runtime
+            .eval("use mod.std.text\ntry text.slice(\"splash\", 3, 2) catch \"range\"")
+            .unwrap();
+        assert!(
+            invalid_slice_range.completed(),
+            "{:?}",
+            invalid_slice_range.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_slice_range.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("range")
+        );
+
+        let invalid_slice_value = runtime
+            .eval("use mod.std.text\ntext.slice(1, -1, 1)")
+            .unwrap();
+        assert!(!invalid_slice_value.succeeded());
+        assert!(invalid_slice_value
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("`value`")));
 
         let invalid_join_values = runtime
             .eval("use mod.std.text\ntext.join(\"splash\", \",\")")
@@ -7526,6 +7652,27 @@ compute(outer, 2)
             .unwrap();
         assert!(!bounded_join.completed());
         assert!(bounded_join
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("string allocation limit")));
+
+        let mut bounded_slice_runtime = Runtime::default();
+        bounded_slice_runtime
+            .set_json_global(
+                "input",
+                &serde_json::json!("slice"),
+                DEFAULT_MAX_JSON_DATA_BYTES,
+                DEFAULT_MAX_JSON_DATA_DEPTH,
+            )
+            .unwrap();
+        let mut slice_limits = bounded_slice_runtime.limits();
+        slice_limits.max_string_bytes = 4;
+        bounded_slice_runtime.set_limits(slice_limits).unwrap();
+        let bounded_slice = bounded_slice_runtime
+            .eval("use mod.std.text\ntext.slice(input, 0, 5)")
+            .unwrap();
+        assert!(!bounded_slice.completed());
+        assert!(bounded_slice
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("string allocation limit")));

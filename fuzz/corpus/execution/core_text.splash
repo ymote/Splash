@@ -2,6 +2,7 @@ use mod.std.assert
 use mod.std.text
 let value = text.trim("  Splash  ")
 assert(text.lower(value) == "splash")
+assert(text.slice("a🙂b", 1, 2) == "🙂")
 assert(text.split("a,,b,", ",") == ["a", "", "b", ""])
 assert(text.join(["a", "", "b", ""], ",") == "a,,b,")
 text.replace_all(value, "S", "s")

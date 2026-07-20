@@ -359,6 +359,12 @@ const STANDARD_TEXT_FUNCTIONS: &[StandardTextFunction] = &[
         description: "Returns the count of Unicode scalar values.",
     },
     StandardTextFunction {
+        name: "slice",
+        parameters: &["value", "start", "end"],
+        result: "string",
+        description: "Returns the Unicode-scalar half-open [start, end) slice.",
+    },
+    StandardTextFunction {
         name: "join",
         parameters: &["values", "separator"],
         result: "string",
@@ -1961,6 +1967,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
     "text.replace_all(normalized, \"splash\", \"Splash\")\n",
+    "text.slice(normalized, 0, text.len(normalized))\n",
     "let parts = text.split(normalized, \"-\")\n",
     "text.join(parts, \"-\")\n",
     "assert(true)\n",
@@ -2401,6 +2408,16 @@ fn fuzz_exercise_fixed_standard_text_requests(
         position_at_byte(source, trim_start + "text.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, trim_argument));
+
+    let Some(slice_start) = source.find("text.slice") else {
+        return;
+    };
+    let slice_argument = slice_start + "text.slice(normalized, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, slice_start + "text.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, slice_argument));
 
     let Some(replace_start) = source.find("text.replace_all") else {
         return;
@@ -9842,6 +9859,7 @@ mod tests {
                 "len",
                 "lower",
                 "replace_all",
+                "slice",
                 "split",
                 "starts_with",
                 "trim",
@@ -9882,7 +9900,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core text completion succeeds");
-        assert_eq!(partial.items.len(), 10);
+        assert_eq!(partial.items.len(), 11);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9896,6 +9914,7 @@ mod tests {
         let source = concat!(
             "use mod.std.text\n",
             "let value = text.trim(\"  Splash  \")\n",
+            "text.slice(value, 1, 4)\n",
             "text.replace_all(value, \"S\", \"s\")\n",
             "text.split(\"a,,b,\", \",\")\n",
             "text.join([\"a\", \"\", \"b\", \"\"], \",\")"
@@ -9945,6 +9964,34 @@ mod tests {
                 documentation: None,
             }])
         );
+
+        let slice_start = source.find("text.slice").expect("slice member exists") + "text.".len();
+        let slice_hover = server
+            .hover(&test_uri(), position_at_byte(source, slice_start + 1))
+            .expect("core text slice hover succeeds")
+            .expect("slice has fixed hover metadata");
+        assert_eq!(
+            slice_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "text.slice(value, start, end) -> string\n\nReturns the Unicode-scalar half-open [start, end) slice.\n\nBounded Splash core text helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let slice_cursor = source
+            .find("text.slice(value, 1, 4)")
+            .expect("slice call exists")
+            + "text.slice(value, 1, ".len()
+            + 1;
+        let slice_help = server
+            .signature_help(&test_uri(), position_at_byte(source, slice_cursor))
+            .expect("core text slice signature help succeeds")
+            .expect("slice has a fixed signature");
+        assert_eq!(
+            slice_help.signatures[0].label,
+            "text.slice(value, start, end) -> string"
+        );
+        assert_eq!(slice_help.active_parameter, Some(2));
 
         let replace_cursor = source.rfind("\"s\"").expect("replacement exists") + 1;
         let replace_help = server
@@ -15834,6 +15881,7 @@ mod tests {
                 "len",
                 "lower",
                 "replace_all",
+                "slice",
                 "split",
                 "starts_with",
                 "trim",

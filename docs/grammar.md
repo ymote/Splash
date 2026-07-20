@@ -446,14 +446,14 @@ unknown member, or invalid source prefix has no fixed-object result, and
 advisory metadata cannot add members to this core module.
 
 An exact visible direct `use mod.std.text` binding has a separate fixed core
-projection for the documented literal text-shaping functions, including
-`text.split(value, delimiter)` and `text.join(values, separator)`, with
-plain-text member hover and function signature help. Its descriptors are
-compiled into the LSP rather than read from a catalog, and describe bounded
-local string operations without resolving a host module or granting a
-capability. A shadowed binding, chained receiver, unknown member, or invalid
-source prefix has no fixed-text result, and advisory metadata cannot add
-members to this core module.
+projection for the documented text-shaping functions, including
+`text.slice(value, start, end)`, `text.split(value, delimiter)`, and
+`text.join(values, separator)`, with plain-text member hover and function
+signature help. Its descriptors are compiled into the LSP rather than read from
+a catalog, and describe bounded local string operations without resolving a
+host module or granting a capability. A shadowed binding, chained receiver,
+unknown member, or invalid source prefix has no fixed-text result, and advisory
+metadata cannot add members to this core module.
 
 An exact visible direct `use mod.std.assert` binding receives fixed plain-text
 hover and `assert(condition)` signature help. A direct `std.assert(...)` call

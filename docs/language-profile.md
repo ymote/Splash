@@ -461,19 +461,21 @@ host-state, crate-loading, or capability access.
 
 `use mod.std.text` imports a frozen Splash-owned module for local string data
 shaping. It provides `text.trim(value)`, `text.lower(value)`,
-`text.upper(value)`, Unicode-scalar `text.len(value)`, literal
-`text.contains(value, needle)`, `text.starts_with(value, prefix)`,
-`text.ends_with(value, suffix)`, and
-`text.replace_all(value, from, to)`, plus
-`text.split(value, delimiter)` and `text.join(values, separator)`. `split`
-matches a non-empty delimiter literally, preserves empty fields, and rejects a
-result over 4,096 segments. `join` accepts only an array of at most 4,096
-strings and a string separator, preserves item order, and permits an empty
-separator. Casing, replacement, splitting, and joining build results through
-the configured individual-string and tracked-heap bounds; a limit hit is the
-same hard resource failure as any other new script allocation. It does not
-expose regexes, I/O, clock, entropy, host-state, crate-loading, or capability
-access.
+`text.upper(value)`, Unicode-scalar `text.len(value)`,
+Unicode-scalar `text.slice(value, start, end)`, literal
+`text.contains(value, needle)`,
+`text.starts_with(value, prefix)`, `text.ends_with(value, suffix)`, and
+`text.replace_all(value, from, to)`, plus `text.split(value, delimiter)` and
+`text.join(values, separator)`. `slice` uses the same Unicode-scalar positions
+as `len`, requires non-negative integer bounds, and accepts only
+`start <= end <= text.len(value)`. `split` matches a non-empty delimiter
+literally, preserves empty fields, and rejects a result over 4,096 segments.
+`join` accepts only an array of at most 4,096 strings and a string separator,
+preserves item order, and permits an empty separator. Casing, slicing,
+replacement, splitting, and joining build results through the configured
+individual-string and tracked-heap bounds; a limit hit is the same hard resource
+failure as any other new script allocation. It does not expose regexes, I/O,
+clock, entropy, host-state, crate-loading, or capability access.
 
 `use mod.std.array` imports a frozen Splash-owned module for local collection
 shaping. It provides `array.len(value)`, `array.slice(value, start, end)`,
@@ -680,8 +682,10 @@ or mutate its keys, input digest, worker observation, or restart policy.
   `json.stringify(...)`; these are bounded local data operations, not
   capabilities.
 - Import `mod.std.text` before using `text.*`; its operations are bounded,
-  literal local data shaping, not regex processing or capabilities. Use
-  `text.split(value, delimiter)` with a non-empty delimiter matched literally,
+  local data shaping, not regex processing or capabilities. Use
+  `text.slice(value, start, end)` with non-negative Unicode-scalar positions
+  satisfying `start <= end <= text.len(value)`. Use `text.split(value, delimiter)`
+  with a non-empty delimiter matched literally,
   and keep its result at or below 4,096 segments. `text.join(values, separator)`
   accepts only an array of at most 4,096 strings and a string separator.
 - Import `mod.std.array` before using `array.*`; transforms are bounded,
