@@ -1,0 +1,12 @@
+{
+  "name": "workflow",
+  "input": {
+    "input": {
+      "left": 20,
+      "right": 22
+    }
+  },
+  "source": "let total = workflow.input.left + workflow.input.right\n{total: total}",
+  "maxSourceBytes": 8192,
+  "maxSyntaxNesting": 16
+}

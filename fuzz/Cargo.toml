@@ -40,6 +40,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "mobile_dataflow"
+path = "fuzz_targets/mobile_dataflow.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "execution"
 path = "fuzz_targets/execution.rs"
 test = false

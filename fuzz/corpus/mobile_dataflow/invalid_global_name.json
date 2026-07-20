@@ -1,0 +1,9 @@
+{
+  "name": "not-valid",
+  "input": {
+    "input": "ignored"
+  },
+  "source": "workflow",
+  "maxSourceBytes": 256,
+  "maxSyntaxNesting": 8
+}

@@ -1,0 +1,11 @@
+{
+  "name": "workflow",
+  "input": [
+    [
+      [0]
+    ]
+  ],
+  "source": "workflow",
+  "maxSourceBytes": 64,
+  "maxSyntaxNesting": 2
+}
