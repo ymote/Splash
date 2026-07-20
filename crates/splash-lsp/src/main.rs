@@ -5815,10 +5815,9 @@ fn standard_math_member_hover(source: &str, site: MemberCompletionSite) -> Optio
     let member = source.get(site.member.start_byte..site.member.end_byte)?;
     let value = if let Some(function) = standard_math_function(member) {
         standard_math_function_documentation(function, "math")
-    } else if let Some(constant) = standard_math_constant(member) {
-        standard_math_constant_documentation(constant, "math")
     } else {
-        return None;
+        let constant = standard_math_constant(member)?;
+        standard_math_constant_documentation(constant, "math")
     };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
