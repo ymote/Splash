@@ -38,6 +38,7 @@
 "text.trim("
 "text.replace_all("
 "text.split("
+"text.join("
 "record["
 "workflow.input["
 "assert("

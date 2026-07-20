@@ -359,6 +359,12 @@ const STANDARD_TEXT_FUNCTIONS: &[StandardTextFunction] = &[
         description: "Returns the count of Unicode scalar values.",
     },
     StandardTextFunction {
+        name: "join",
+        parameters: &["values", "separator"],
+        result: "string",
+        description: "Joins at most 4,096 strings with a string separator.",
+    },
+    StandardTextFunction {
         name: "contains",
         parameters: &["value", "needle"],
         result: "boolean",
@@ -1947,7 +1953,8 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "object.entries(merged)\n",
     "let normalized = text.trim(\"  splash  \")\n",
     "text.replace_all(normalized, \"splash\", \"Splash\")\n",
-    "text.split(normalized, \"-\")\n",
+    "let parts = text.split(normalized, \"-\")\n",
+    "text.join(parts, \"-\")\n",
     "assert(true)\n",
     "std.assert(true)\n",
     "tool.call(\"\", \"\")\n",
@@ -2394,6 +2401,16 @@ fn fuzz_exercise_fixed_standard_text_requests(
         position_at_byte(source, split_start + "text.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, split_argument));
+
+    let Some(join_start) = source.find("text.join") else {
+        return;
+    };
+    let join_argument = join_start + "text.join(parts, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, join_start + "text.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, join_argument));
 }
 
 #[cfg(fuzzing)]
@@ -9773,6 +9790,7 @@ mod tests {
             [
                 "contains",
                 "ends_with",
+                "join",
                 "len",
                 "lower",
                 "replace_all",
@@ -9816,7 +9834,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core text completion succeeds");
-        assert_eq!(partial.items.len(), 9);
+        assert_eq!(partial.items.len(), 10);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9831,7 +9849,8 @@ mod tests {
             "use mod.std.text\n",
             "let value = text.trim(\"  Splash  \")\n",
             "text.replace_all(value, \"S\", \"s\")\n",
-            "text.split(\"a,,b,\", \",\")"
+            "text.split(\"a,,b,\", \",\")\n",
+            "text.join([\"a\", \"\", \"b\", \"\"], \",\")"
         );
         let mut server = SplashLanguageServer::default();
         server.open_document(document(1, source));
@@ -9934,6 +9953,34 @@ mod tests {
             "text.split(value, delimiter) -> array"
         );
         assert_eq!(split_help.active_parameter, Some(1));
+
+        let join_start = source.find("text.join").expect("join member exists") + "text.".len();
+        let join_hover = server
+            .hover(&test_uri(), position_at_byte(source, join_start + 1))
+            .expect("core text join hover succeeds")
+            .expect("join has fixed hover metadata");
+        assert_eq!(
+            join_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "text.join(values, separator) -> string\n\nJoins at most 4,096 strings with a string separator.\n\nBounded Splash core text helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let join_cursor = source
+            .find("text.join([\"a\", \"\", \"b\", \"\"], \",\")")
+            .expect("join call exists")
+            + "text.join([\"a\", \"\", \"b\", \"\"], ".len()
+            + 1;
+        let join_help = server
+            .signature_help(&test_uri(), position_at_byte(source, join_cursor))
+            .expect("core text join signature help succeeds")
+            .expect("join has a fixed signature");
+        assert_eq!(
+            join_help.signatures[0].label,
+            "text.join(values, separator) -> string"
+        );
+        assert_eq!(join_help.active_parameter, Some(1));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -15735,6 +15782,7 @@ mod tests {
             [
                 "contains",
                 "ends_with",
+                "join",
                 "len",
                 "lower",
                 "replace_all",

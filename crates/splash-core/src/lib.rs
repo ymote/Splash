@@ -83,12 +83,13 @@ pub const DEFAULT_BUDGET_SAMPLE_INTERVAL: u32 = 1_024;
 pub const DEFAULT_MAX_JSON_DATA_BYTES: usize = 64 * 1024;
 /// Default maximum JSON container nesting accepted at a host-data boundary.
 pub const DEFAULT_MAX_JSON_DATA_DEPTH: usize = 64;
-/// Maximum source array items processed by one transforming `mod.std.array`
-/// helper.
+/// Maximum source array items processed by one transforming standard
+/// collection helper.
 ///
 /// The VM heap bounds retained array storage, while this independent ceiling
-/// bounds native helper work over a host-provided array. `array.len` is
-/// constant-time and does not use this ceiling.
+/// bounds native helper work over a script-provided array. `array.len` is
+/// constant-time and does not use this ceiling; `text.join` applies it before
+/// traversing its string input array.
 pub const MAX_STANDARD_ARRAY_ITEMS: usize = 4_096;
 /// Maximum own fields processed by one transforming `mod.std.object` helper.
 ///
@@ -2754,6 +2755,12 @@ fn install_standard_text_module(vm: &mut vm::ScriptVm, std_module: ScriptObject)
         script_args_def!(value = NIL, delimiter = NIL),
         standard_text_split,
     );
+    vm.add_method(
+        text,
+        id!(join),
+        script_args_def!(values = NIL, separator = NIL),
+        standard_text_join,
+    );
     vm.bx
         .heap
         .set_value_def(std_module, id!(text).into(), text.into());
@@ -2897,10 +2904,70 @@ fn standard_text_split(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue
     }
 }
 
+fn standard_text_join(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let values = script_value!(vm, args.values);
+    let separator = script_value!(vm, args.separator);
+    let Some(values) = values.as_array() else {
+        return standard_text_join_expected_array(vm);
+    };
+    let length = vm.bx.heap.array_len(values);
+    if length > MAX_STANDARD_ARRAY_ITEMS {
+        return standard_text_join_value_limit(vm);
+    }
+
+    match vm.string_with(separator, |vm, separator| {
+        for index in 0..length {
+            let value = vm.bx.heap.array_index_unchecked(values, index);
+            vm.bx.heap.string_with(value, |_, _| ())?;
+        }
+
+        Some(vm.bx.heap.new_bounded_string_with(|heap, output| {
+            for index in 0..length {
+                if index != 0 {
+                    output.append_str(separator);
+                    if output.is_full() {
+                        break;
+                    }
+                }
+                let value = heap.array_index_unchecked(values, index);
+                let _ = heap.string_with(value, |_, value| output.append_str(value));
+                if output.is_full() {
+                    break;
+                }
+            }
+        }))
+    }) {
+        Some(Some(result)) => result,
+        Some(None) => standard_text_join_expected_string_item(vm),
+        None => standard_text_expected_string(vm, "join", "separator"),
+    }
+}
+
 fn standard_text_segment_limit(vm: &mut vm::ScriptVm) -> ScriptValue {
     script_err_limit!(
         vm.bx.threads.cur_ref().trap,
         "std.text.split supports at most {MAX_STANDARD_ARRAY_ITEMS} segments"
+    )
+}
+
+fn standard_text_join_value_limit(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_limit!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.join supports at most {MAX_STANDARD_ARRAY_ITEMS} values"
+    )
+}
+
+fn standard_text_join_expected_array(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.join expects `values` to be an array"
+    )
+}
+
+fn standard_text_join_expected_string_item(vm: &mut vm::ScriptVm) -> ScriptValue {
+    script_err_type_mismatch!(
+        vm.bx.threads.cur_ref().trap,
+        "std.text.join expects `values` to contain only strings"
     )
 }
 
@@ -7238,6 +7305,9 @@ compute(outer, 2)
                  assert(text.starts_with(value, \"Mi\"))\n\
                  assert(text.ends_with(value, \"eD\"))\n\
                  assert(text.split(\"a,,b,\", \",\") == [\"a\", \"\", \"b\", \"\"])\n\
+                 assert(text.join([\"a\", \"\", \"b\", \"\"], \",\") == \"a,,b,\")\n\
+                 assert(text.join(text.split(\"a,,b,\", \",\"), \",\") == \"a,,b,\")\n\
+                 assert(text.join([\"a\", \"b\", \"c\"], \"\") == \"abc\")\n\
                  text.replace_all(\"a-b-a\", \"a\", \"x\")",
             )
             .unwrap();
@@ -7299,6 +7369,33 @@ compute(outer, 2)
             .iter()
             .any(|diagnostic| diagnostic.contains("`delimiter`")));
 
+        let invalid_join_values = runtime
+            .eval("use mod.std.text\ntext.join(\"splash\", \",\")")
+            .unwrap();
+        assert!(!invalid_join_values.succeeded());
+        assert!(invalid_join_values
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("`values` to be an array")));
+
+        let invalid_join_item = runtime
+            .eval("use mod.std.text\ntext.join([\"splash\", 1], \",\")")
+            .unwrap();
+        assert!(!invalid_join_item.succeeded());
+        assert!(invalid_join_item
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("contain only strings")));
+
+        let invalid_join_separator = runtime
+            .eval("use mod.std.text\ntext.join([\"splash\"], 1)")
+            .unwrap();
+        assert!(!invalid_join_separator.succeeded());
+        assert!(invalid_join_separator
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("`separator`")));
+
         let invalid_delimiter = runtime
             .eval("use mod.std.text\ntry text.split(\"splash\", \"\") catch \"empty\"")
             .unwrap();
@@ -7337,6 +7434,24 @@ compute(outer, 2)
             serde_json::json!("limit")
         );
 
+        let mut join_limit_runtime = Runtime::default();
+        let join_limit = join_limit_runtime
+            .eval(&format!(
+                "use mod.std.text\nlet values = []\nvalues[{MAX_STANDARD_ARRAY_ITEMS}] = \"x\"\ntry text.join(values, \",\") catch \"limit\""
+            ))
+            .unwrap();
+        assert!(join_limit.completed(), "{:?}", join_limit.diagnostics);
+        assert_eq!(
+            join_limit_runtime
+                .script_value_as_json(
+                    join_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
         let limits = ExecutionLimits {
             max_string_bytes: 4,
             ..ExecutionLimits::default()
@@ -7347,6 +7462,16 @@ compute(outer, 2)
             .unwrap();
         assert!(!bounded.completed());
         assert!(bounded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("string allocation limit")));
+
+        let mut bounded_join_runtime = Runtime::with_limits((), (), limits).unwrap();
+        let bounded_join = bounded_join_runtime
+            .eval("use mod.std.text\ntext.join([\"aa\", \"aa\"], \"x\")")
+            .unwrap();
+        assert!(!bounded_join.completed());
+        assert!(bounded_join
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("string allocation limit")));

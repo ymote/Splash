@@ -256,11 +256,13 @@ no host, adapter, filesystem, process, network, clock, entropy, or crate
 access.
 
 For local text shaping, `use mod.std.text` provides `trim`, `lower`, `upper`,
-Unicode-scalar `len`, literal predicates, literal `replace_all`, and `split`
-with literal matching. `split` matches a non-empty delimiter literally,
-preserves empty fields, and returns at most 4,096 segments. Results use
-Splash's configured string bound; the module does not expose regexes, host
-state, filesystem, process, network, clock, entropy, or crate access.
+Unicode-scalar `len`, literal predicates, literal `replace_all`, `split` with
+literal matching, and `join`. `split` matches a non-empty delimiter literally,
+preserves empty fields, and returns at most 4,096 segments. `join` accepts an
+array of at most 4,096 strings, preserves their order, and permits an empty
+string separator. Results use Splash's configured string bound; the module
+does not expose regexes, host state, filesystem, process, network, clock,
+entropy, or crate access.
 
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 `array.slice(value, start, end)`, `array.concat(left, right)`, and
@@ -588,10 +590,10 @@ surfaces use no tool-catalog or adapter lookup, do not follow local aliases,
 and do not imply a capability grant. For an exact visible `use mod.std.json`
 binding, it completes `parse` and `stringify` with fixed plain-text hover and
 signature help. For an exact visible `use mod.std.text` binding, it completes
-the fixed text functions, including literal `split`, with plain-text hover and
-signature help. For an exact visible `use mod.std.array` binding, it completes
-`len`, `slice`, `concat`, `reverse`, and `push` with the same fixed plain-text
-hover and signature help. For an exact visible `use mod.std.object` binding,
+the fixed text functions, including literal `split` and string-array `join`,
+with plain-text hover and signature help. For an exact visible `use mod.std.array`
+binding, it completes `len`, `slice`, `concat`, `reverse`, and `push` with the
+same fixed plain-text hover and signature help. For an exact visible `use mod.std.object` binding,
 it completes `len`, `keys`, `entries`, `values`, and `merge` with the same
 fixed plain-text hover and signature help. At a statement-position `use mod.`
 path, the same static projection completes `std`;
