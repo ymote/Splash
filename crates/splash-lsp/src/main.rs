@@ -2171,10 +2171,12 @@ fn fuzz_module_completion_catalog() -> ModuleCompletionCatalog {
 
 /// Exercises the source-only LSP document lifecycle for libFuzzer.
 ///
-/// This hook creates a fixed local URI, opens and replaces one bounded source
-/// document, calls the effect-free semantic requests, then closes the
-/// document. It does not start stdio, read a URI, resolve modules, evaluate
-/// Splash, or construct a capability host.
+/// This hook creates a fixed local URI, opens one bounded source document,
+/// rejects stale, incremental, and multi-change full-sync notifications, then
+/// applies full-document replacements through the production change handler
+/// before issuing effect-free semantic requests and closing the document. It
+/// does not start stdio, read a URI, resolve modules, evaluate Splash, or
+/// construct a capability host.
 #[cfg(fuzzing)]
 pub fn fuzz_exercise_document(source: &str) {
     use std::str::FromStr;
@@ -2200,21 +2202,70 @@ pub fn fuzz_exercise_document(source: &str) {
     ));
     fuzz_exercise_semantic_requests(&server, &uri, source);
 
-    // A distinct full-document replacement invalidates every lazy semantic
-    // report before the second request pass.
+    // Full-sync document changes must leave the current snapshot untouched
+    // until the server accepts exactly one newer whole-document replacement.
+    assert!(server
+        .change_document(fuzz_full_document_change(uri.clone(), 1, source.to_owned()))
+        .is_none());
+    assert!(server
+        .change_document(DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), 2),
+            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 0))),
+                range_length: None,
+                text: String::new(),
+            }],
+        })
+        .is_none());
+    assert!(server
+        .change_document(DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), 2),
+            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: Some(0),
+                text: String::new(),
+            }],
+        })
+        .is_none());
+
     let mut replacement = source.to_owned();
     replacement.push('\n');
-    let _ = server.replace_document(uri.clone(), 2, replacement.clone());
+    assert!(server
+        .change_document(DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), 2),
+            content_changes: vec![
+                lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: replacement.clone(),
+                },
+                lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: source.to_owned(),
+                },
+            ],
+        })
+        .is_none());
+    assert!(server
+        .change_document(fuzz_full_document_change(
+            uri.clone(),
+            2,
+            replacement.clone()
+        ))
+        .is_some());
     fuzz_exercise_semantic_requests(&server, &uri, &replacement);
 
     // Exercise exact root and direct-child input field sites independently of
     // the arbitrary source offsets above, so the fixed advisory catalog keeps
     // this bounded hover and completion path under sanitizer coverage.
-    let _ = server.replace_document(
-        uri.clone(),
-        3,
-        FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
-    );
+    assert!(server
+        .change_document(fuzz_full_document_change(
+            uri.clone(),
+            3,
+            FUZZ_ADVISORY_CONFIGURATION_SOURCE.to_owned(),
+        ))
+        .is_some());
     fuzz_exercise_advisory_input_field_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_array_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
     fuzz_exercise_fixed_standard_object_requests(&server, &uri, FUZZ_ADVISORY_CONFIGURATION_SOURCE);
@@ -2227,6 +2278,13 @@ pub fn fuzz_exercise_document(source: &str) {
     let _ = server.close_document(DidCloseTextDocumentParams {
         text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
     });
+    assert!(server
+        .change_document(fuzz_full_document_change(
+            uri.clone(),
+            i32::MAX,
+            source.to_owned()
+        ))
+        .is_none());
     let _ = server.completion(&uri, Position::new(u32::MAX, u32::MAX));
 }
 
@@ -2690,8 +2748,30 @@ fn fuzz_exercise_fixed_core_import_path_requests(
         let Some(version) = first_version.checked_add(version_offset) else {
             return;
         };
-        let _ = server.replace_document(uri.clone(), version, (*source).to_owned());
+        assert!(server
+            .change_document(fuzz_full_document_change(
+                uri.clone(),
+                version,
+                (*source).to_owned(),
+            ))
+            .is_some());
         let _ = server.completion(uri, position_at_byte(source, source.len()));
+    }
+}
+
+#[cfg(fuzzing)]
+fn fuzz_full_document_change(
+    uri: Uri,
+    version: i32,
+    source: String,
+) -> DidChangeTextDocumentParams {
+    DidChangeTextDocumentParams {
+        text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri, version),
+        content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: source,
+        }],
     }
 }
 
@@ -16907,6 +16987,15 @@ mod tests {
             }],
         };
         assert!(server.change_document(incremental).is_none());
+        let range_length_only = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(test_uri(), 4),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: Some(0),
+                text: String::new(),
+            }],
+        };
+        assert!(server.change_document(range_length_only).is_none());
         let rename = server
             .rename(&test_uri(), Position::new(0, 5), "renamed")
             .expect("rename uses the last accepted full snapshot")

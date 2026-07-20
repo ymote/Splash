@@ -381,13 +381,16 @@ and bounded nested shape spans, unique field names, direct alias binding, target
 and optional child-selector spans, safe-prefix boundaries, and the separate
 shape, aggregate literal-field, and alias caps.
 `lsp_document` feeds bounded UTF-8 source through the production language
-server's document lifecycle. It opens one fixed local URI, requests formatting,
-outlining, completion, hover, definition, references, highlights, and guarded
-rename across at most 33 UTF-8-boundary positions plus an invalid UTF-16
-position, replaces the whole document to invalidate lazy reports, repeats the
-requests, and closes the document. It accepts at most 16 KiB of fuzzer source
-and has reviewed source `.splash` and advisory-configuration `.json` seeds.
-For a parsed JSON value, it also exercises the bounded initialization and
+server's document lifecycle. It opens one fixed local URI, rejects stale,
+incremental, multi-change, and post-close `didChange` inputs, then applies
+newer whole-document replacements through the same full-sync handler used by
+stdio. It requests formatting, outlining, completion, hover, definition,
+references, highlights, and guarded rename across at most 33 UTF-8-boundary
+positions plus an invalid UTF-16 position on arbitrary accepted source
+snapshots, then issues fixed catalog-specific requests and closes the document.
+It accepts at most 16 KiB of fuzzer source and has reviewed source `.splash`
+and advisory-configuration `.json` seeds. For a parsed JSON value, it also
+exercises the bounded initialization and
 configuration-refresh projection around a fixed document. The server uses a
 fixed bounded advisory module catalog, including shaped direct-method input
 field metadata, only to exercise catalog completion, root/direct-child input-key
