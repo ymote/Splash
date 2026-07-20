@@ -504,19 +504,22 @@ access.
 `use mod.std.object` imports a frozen Splash-owned module for local record
 shaping. It provides `object.len(value)`, `object.has(value, key)`,
 `object.get(value, key, fallback)`, `object.pick(value, keys)`,
-`object.from_entries(entries)`, `object.keys(value)`, `object.entries(value)`,
-`object.values(value)`, and `object.merge(left, right)`. The helpers with a
-record input accept plain record or JSON-object data only, read own fields only,
-and do not traverse prototypes or invoke callbacks. `has` distinguishes a present
-`nil` own text field from an absent one; `get` returns its fallback only when
-that own text field is absent. Neither traverses source fields. `pick` accepts
-an array of at most 4,096 strings and returns a fresh shallow record of requested existing own
+`object.from_entries(entries)`, `object.with(value, key, item)`,
+`object.keys(value)`, `object.entries(value)`, `object.values(value)`, and
+`object.merge(left, right)`. The helpers with a record input accept plain
+record or JSON-object data only, read own fields only, and do not traverse
+prototypes or invoke callbacks. `has` distinguishes a present `nil` own text
+field from an absent one; `get` returns its fallback only when that own text
+field is absent. Neither traverses source fields. `pick` accepts an array of at
+most 4,096 strings and returns a fresh shallow record of requested existing own
 fields in key-array order; missing fields are omitted. `from_entries` accepts
 at most 4,096 exact `[string, value]` pairs, preserves first key positions, and
-applies later duplicate values. `keys`, `entries`, `values`, and `merge` process
-at most 4,096 own text-keyed source fields; `merge` also rejects a combined
-source count over that bound. `keys` and `values` return shallow arrays in
-stored field order;
+applies later duplicate values. `with` accepts a string key and returns a fresh
+shallow record with one field updated or appended; an existing key keeps its
+position, and a new key is rejected when the source already has 4,096 fields.
+`keys`, `entries`, `values`, and `merge` process at most 4,096 own text-keyed
+source fields; `merge` also rejects a combined source count over that bound.
+`keys` and `values` return shallow arrays in stored field order;
 `entries` returns fresh `[text_key, value]` pairs in that order; and `merge`
 preserves first field positions and applies right-side values. `len` is
 constant-time and uncapped. The module has no I/O, clock, entropy, host-state,
@@ -730,8 +733,12 @@ or mutate its keys, input digest, worker observation, or restart policy.
   most 4,096 strings, and missing fields are omitted. Use
   `object.from_entries(entries)` only with exact two-item `[string, value]`
   pairs; later duplicate values replace earlier values without moving their
-  first key position. Keep transforming inputs and combined `merge` source
-  fields at or below 4,096.
+  first key position. `object.with(value, key, item)` returns a shallow
+  one-field update; it requires a string key, preserves an existing key's
+  position, and rejects a new key at the 4,096-field limit. It is not an input
+  whitelist, so use `pick` before a tool boundary when unknown fields must be
+  excluded. Keep transforming inputs and combined `merge` source fields at or
+  below 4,096.
 - For a data-driven plain record or JSON-object field, use text-key indexing
   such as `record[field_name]`. A missing field evaluates to `nil`; this is
   local data access and does not expose reflection, host objects, or a

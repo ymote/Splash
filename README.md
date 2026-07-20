@@ -288,8 +288,9 @@ entropy, or crate access.
 
 For bounded record shaping, `use mod.std.object` provides `object.len(value)`,
 `object.has(value, key)`, `object.get(value, key, fallback)`,
-`object.pick(value, keys)`, `object.from_entries(entries)`, `object.keys(value)`,
-`object.entries(value)`, `object.values(value)`, and `object.merge(left, right)`.
+`object.pick(value, keys)`, `object.from_entries(entries)`,
+`object.with(value, key, item)`, `object.keys(value)`, `object.entries(value)`,
+`object.values(value)`, and `object.merge(left, right)`.
 The helpers with a record input accept plain record or JSON-object data only,
 never follow prototypes, and never invoke callbacks. `has` distinguishes a present
 `nil` own text field from an absent one; `get` returns its fallback only when
@@ -297,7 +298,10 @@ that own text field is absent. `has`, `get`, and `pick` do not traverse source
 fields. `pick` accepts at most 4,096 string keys and returns a fresh shallow record of existing
 requested fields in key-array order; missing fields are omitted. `from_entries`
 accepts at most 4,096 exact `[string, value]` pairs, preserves first key
-positions, and applies later duplicate values. `keys`,
+positions, and applies later duplicate values. `with` returns a fresh shallow
+record with one string key updated or appended; an existing key keeps
+its position, while a new key is rejected when the source already has 4,096
+fields. `keys`,
 `entries`, `values`, and `merge` shallowly process at most 4,096 own text-keyed
 fields; `entries` returns fresh `[text_key, value]` pairs in stored field order,
 and `merge` also rejects a combined source count over that bound. `len` is
@@ -619,8 +623,8 @@ exact visible `use mod.std.array` binding, it completes `len`, `has_index`,
 `get`, `slice`, `concat`, `reverse`, `flatten`, and `push` with the same fixed
 plain-text hover and signature help.
 For an exact visible `use mod.std.object` binding, it completes `len`, `has`,
-`get`, `pick`, `from_entries`, `keys`, `entries`, `values`, and `merge` with the
-same fixed plain-text hover and signature help. At a statement-position `use
+`get`, `pick`, `from_entries`, `with`, `keys`, `entries`, `values`, and
+`merge` with the same fixed plain-text hover and signature help. At a statement-position `use
 mod.` path, the same static projection completes `std`;
 below `use mod.std.` it completes `array`, `assert`, `json`, `math`, `object`,
 and `text`.

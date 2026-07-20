@@ -42,6 +42,7 @@
 "object.get("
 "object.pick("
 "object.from_entries("
+"object.with("
 "object.merge("
 "text.trim("
 "text.replace_all("

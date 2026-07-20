@@ -508,6 +508,12 @@ const STANDARD_OBJECT_FUNCTIONS: &[StandardObjectFunction] = &[
         description: "Builds a shallow plain record from two-item [text key, value] entries; later duplicates replace values.",
     },
     StandardObjectFunction {
+        name: "with",
+        parameters: &["value", "key", "item"],
+        result: "object",
+        description: "Returns a shallow record with one own text field updated or appended.",
+    },
+    StandardObjectFunction {
         name: "keys",
         parameters: &["value"],
         result: "array",
@@ -2024,6 +2030,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "array.push(collected, 4)\n",
     "let merged = object.merge({left: 1}, {right: 2})\n",
     "let rebuilt = object.from_entries([[\"left\", 1]])\n",
+    "let updated = object.with(merged, \"left\", 3)\n",
     "object.has(merged, \"left\")\n",
     "object.get(merged, \"missing\", 0)\n",
     "let picked = object.pick(merged, [\"left\"])\n",
@@ -2475,6 +2482,16 @@ fn fuzz_exercise_fixed_standard_object_requests(
         position_at_byte(source, from_entries_start + "object.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, from_entries_argument));
+
+    let Some(with_start) = source.find("object.with") else {
+        return;
+    };
+    let with_argument = with_start + "object.with(merged, \"left\", ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, with_start + "object.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, with_argument));
 
     let Some(has_start) = source.find("object.has") else {
         return;
@@ -9896,7 +9913,8 @@ mod tests {
                 "len",
                 "merge",
                 "pick",
-                "values"
+                "values",
+                "with"
             ]
         );
         assert!(completion.items.iter().all(|item| {
@@ -9933,7 +9951,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core object completion succeeds");
-        assert_eq!(partial.items.len(), 9);
+        assert_eq!(partial.items.len(), 10);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9948,6 +9966,7 @@ mod tests {
             "use mod.std.object\n",
             "let merged = object.merge({left: 1}, {right: 2})\n",
             "object.from_entries([[\"left\", 1]])\n",
+            "let updated = object.with(merged, \"left\", 3)\n",
             "object.has(merged, \"left\")\n",
             "object.get(merged, \"missing\", 0)\n",
             "object.pick(merged, [\"left\"])\n",
@@ -10052,6 +10071,19 @@ mod tests {
             HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::PlainText,
                 value: "object.from_entries(entries) -> object\n\nBuilds a shallow plain record from two-item [text key, value] entries; later duplicates replace values.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let with_start = source.find("object.with").expect("with member exists") + "object.".len();
+        let with_hover = server
+            .hover(&test_uri(), position_at_byte(source, with_start + 1))
+            .expect("core object with hover succeeds")
+            .expect("with has fixed hover metadata");
+        assert_eq!(
+            with_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "object.with(value, key, item) -> object\n\nReturns a shallow record with one own text field updated or appended.\n\nBounded Splash core object helper; it does not access the host or grant authority.".to_owned(),
             })
         );
 
@@ -10167,6 +10199,21 @@ mod tests {
             "object.from_entries(entries) -> object"
         );
         assert_eq!(from_entries_help.active_parameter, Some(0));
+
+        let with_cursor = source
+            .find("object.with(merged, \"left\", 3)")
+            .expect("with input exists")
+            + "object.with(merged, \"left\", ".len()
+            + 1;
+        let with_help = server
+            .signature_help(&test_uri(), position_at_byte(source, with_cursor))
+            .expect("core object with signature help succeeds")
+            .expect("with has a fixed signature");
+        assert_eq!(
+            with_help.signatures[0].label,
+            "object.with(value, key, item) -> object"
+        );
+        assert_eq!(with_help.active_parameter, Some(2));
 
         let hostile_catalog = module_catalog(serde_json::json!([
             {
@@ -16330,7 +16377,8 @@ mod tests {
                 "len",
                 "merge",
                 "pick",
-                "values"
+                "values",
+                "with"
             ]
         );
     }

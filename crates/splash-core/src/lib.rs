@@ -3481,6 +3481,12 @@ fn install_standard_object_module(vm: &mut vm::ScriptVm, std_module: ScriptObjec
     );
     vm.add_method(
         object,
+        id!(with),
+        script_args_def!(value = NIL, key = NIL, item = NIL),
+        standard_object_with,
+    );
+    vm.add_method(
+        object,
         id!(keys),
         script_args_def!(value = NIL),
         standard_object_keys,
@@ -3613,6 +3619,34 @@ fn standard_object_from_entries(vm: &mut vm::ScriptVm, args: ScriptObject) -> Sc
         let trap = vm.bx.threads.cur_ref().trap.pass();
         vm.bx.heap.set_value(output, key, value, trap);
     }
+    output.into()
+}
+
+fn standard_object_with(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let value = script_value!(vm, args.value);
+    let key = script_value!(vm, args.key);
+    let item = script_value!(vm, args.item);
+    let entries = match standard_object_entries(vm, value, "with", "value") {
+        Ok(entries) => entries,
+        Err(error) => return error,
+    };
+    let key = match standard_object_lookup_text_key(vm, key, "with") {
+        Ok(key) => key,
+        Err(error) => return error,
+    };
+    if entries.len() == MAX_STANDARD_OBJECT_FIELDS
+        && !entries.iter().any(|(field, _)| *field == key)
+    {
+        return standard_object_field_limit(vm, "with");
+    }
+
+    let output = vm.bx.heap.new_object();
+    vm.bx.heap.set_string_keys(output);
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for (field, value) in entries {
+        vm.bx.heap.set_value(output, field, value, trap);
+    }
+    vm.bx.heap.set_value(output, key, item, trap);
     output.into()
 }
 
@@ -3765,6 +3799,17 @@ fn standard_object_own_text_field(
         return Err(standard_object_expected_lookup_key(vm, function));
     };
     Ok(value)
+}
+
+fn standard_object_lookup_text_key(
+    vm: &mut vm::ScriptVm,
+    key: ScriptValue,
+    function: &'static str,
+) -> Result<ScriptValue, ScriptValue> {
+    vm.bx
+        .heap
+        .string_mut_self_with(key, |heap, value| heap.new_string_from_str(value))
+        .ok_or_else(|| standard_object_expected_lookup_key(vm, function))
 }
 
 fn standard_object_entries(
@@ -8439,10 +8484,25 @@ compute(outer, 2)
                  let rebuilt = object.from_entries([[\"third\", 3], [\"first\", 1], [\"third\", 30]])\n\
                  assert(object.keys(rebuilt) == [\"third\", \"first\"])\n\
                  assert(rebuilt.third == 30)\n\
+                 let rebuilt_updated = object.with(rebuilt, \"third\", 31)\n\
+                 assert(object.keys(rebuilt_updated) == [\"third\", \"first\"])\n\
+                 assert(rebuilt_updated.third == 31)\n\
+                 assert(rebuilt.third == 30)\n\
                  let rebuilt_nil = object.from_entries([[\"value\", nil]])\n\
                  assert(object.has(rebuilt_nil, \"value\"))\n\
                  assert(object.get(rebuilt_nil, \"value\", \"fallback\") == nil)\n\
                  assert(object.len(object.from_entries([])) == 0)\n\
+                 let update_key = object.keys(record)[1]\n\
+                 let updated = object.with(record, update_key, 20)\n\
+                 assert(object.keys(updated) == [\"first\", \"second\"])\n\
+                 assert(updated.second == 20)\n\
+                 assert(record.second == 2)\n\
+                 let extended = object.with(updated, \"third\", 3)\n\
+                 assert(object.keys(extended) == [\"first\", \"second\", \"third\"])\n\
+                 assert(extended.third == 3)\n\
+                 let with_nil = object.with({}, \"value\", nil)\n\
+                 assert(object.has(with_nil, \"value\"))\n\
+                 assert(object.get(with_nil, \"value\", \"fallback\") == nil)\n\
                  let merged = object.merge(record, {second: 20, third: 3})\n\
                  assert(merged.first == 1)\n\
                  assert(merged.second == 20)\n\
@@ -8460,6 +8520,10 @@ compute(outer, 2)
                  assert(object.keys(picked) == [\"third\", \"first\"])\n\
                  assert(picked.third == 3)\n\
                  assert(!object.has(picked, \"missing\"))\n\
+                 let with_nested_source = {answer: 1}\n\
+                 let with_nested = object.with({nested: with_nested_source}, \"nested\", with_nested_source)\n\
+                 with_nested.nested.answer = 2\n\
+                 assert(with_nested_source.answer == 2)\n\
                  let nested = {answer: 1}\n\
                  let rebuilt_nested = object.from_entries([[\"nested\", nested]])\n\
                  rebuilt_nested.nested.answer = 2\n\
@@ -8490,7 +8554,7 @@ compute(outer, 2)
 
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
-            .eval("use mod.std\nlet picked = std.object.pick({first: 1, second: 2}, [\"second\"])\nstd.object.from_entries([[\"second\", picked.second]]).second")
+            .eval("use mod.std\nlet picked = std.object.pick({first: 1, second: 2}, [\"second\"])\nstd.object.with({second: picked.second}, \"second\", 20).second")
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
         assert_eq!(
@@ -8501,17 +8565,17 @@ compute(outer, 2)
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
                 .unwrap(),
-            serde_json::json!(2)
+            serde_json::json!(20)
         );
 
         let mutation = runtime
-            .eval("use mod.std.object\nobject.from_entries = || nil")
+            .eval("use mod.std.object\nobject.with = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
 
         let preserved = runtime
-            .eval("use mod.std.object\nobject.from_entries([[\"left\", 1], [\"right\", 2]])")
+            .eval("use mod.std.object\nobject.with({left: 1}, \"right\", 2)")
             .unwrap();
         assert!(preserved.completed(), "{:?}", preserved.diagnostics);
         assert_eq!(
@@ -8552,6 +8616,25 @@ compute(outer, 2)
             runtime
                 .script_value_as_json(
                     invalid_lookup_key.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid-key")
+        );
+
+        let invalid_with_key = runtime
+            .eval("use mod.std.object\ntry object.with({first: 1}, 1, 2) catch \"invalid-key\"")
+            .unwrap();
+        assert!(
+            invalid_with_key.completed(),
+            "{:?}",
+            invalid_with_key.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_with_key.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
@@ -8737,6 +8820,34 @@ compute(outer, 2)
             entry_limit_runtime
                 .script_value_as_json(
                     entry_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
+        let mut with_limit_source =
+            String::from("use mod.std.assert\nuse mod.std.object\nlet values = {");
+        for index in 0..MAX_STANDARD_OBJECT_FIELDS {
+            if index > 0 {
+                with_limit_source.push_str(", ");
+            }
+            with_limit_source.push_str(&format!("field_{index}: 0"));
+        }
+        with_limit_source.push_str(
+            "}\n\
+             let updated = object.with(values, \"field_0\", 1)\n\
+             assert(updated.field_0 == 1)\n\
+             try object.with(values, \"field_new\", 1) catch \"limit\"",
+        );
+        let mut with_limit_runtime = Runtime::with_limits((), (), limits).unwrap();
+        let with_limit = with_limit_runtime.eval(&with_limit_source).unwrap();
+        assert!(with_limit.completed(), "{:?}", with_limit.diagnostics);
+        assert_eq!(
+            with_limit_runtime
+                .script_value_as_json(
+                    with_limit.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
