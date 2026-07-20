@@ -92,6 +92,10 @@ pub const DEFAULT_MAX_JSON_DATA_DEPTH: usize = 64;
 /// constant-time and does not use this ceiling; `text.join` applies it before
 /// traversing its string input array.
 pub const MAX_STANDARD_ARRAY_ITEMS: usize = 4_096;
+/// Highest endpoint accepted by `array.range`; every non-negative integer up
+/// to and including this value is exactly representable by a Splash `f64`
+/// scalar.
+const MAX_STANDARD_ARRAY_RANGE_ENDPOINT: u64 = 1_u64 << 53;
 /// Maximum own fields processed by one transforming `mod.std.object` helper.
 ///
 /// This independently bounds native traversal over a plain script record.
@@ -3145,6 +3149,12 @@ fn install_standard_array_module(vm: &mut vm::ScriptVm, std_module: ScriptObject
     );
     vm.add_method(
         array,
+        id!(range),
+        script_args_def!(start = NIL, end = NIL),
+        standard_array_range,
+    );
+    vm.add_method(
+        array,
         id!(concat),
         script_args_def!(left = NIL, right = NIL),
         standard_array_concat,
@@ -3336,6 +3346,38 @@ fn standard_array_slice(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValu
     standard_array_copy_indices(vm, array, start..end)
 }
 
+/// Builds an explicit bounded half-open index range for generated loop source.
+/// Splash deliberately does not retain inherited range operators.
+fn standard_array_range(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
+    let start = script_value!(vm, args.start);
+    let end = script_value!(vm, args.end);
+    let start = match standard_array_range_endpoint(vm, start, "start") {
+        Ok(start) => start,
+        Err(error) => return error,
+    };
+    let end = match standard_array_range_endpoint(vm, end, "end") {
+        Ok(end) => end,
+        Err(error) => return error,
+    };
+    if start > end {
+        return script_err_invalid_args!(
+            vm.bx.threads.cur_ref().trap,
+            "std.array.range requires `start` <= `end`"
+        );
+    }
+    let length = end - start;
+    if length > MAX_STANDARD_ARRAY_ITEMS as u64 {
+        return standard_array_item_limit(vm, "range");
+    }
+
+    let output = vm.bx.heap.new_array();
+    let trap = vm.bx.threads.cur_ref().trap.pass();
+    for index in start..end {
+        vm.bx.heap.array_push(output, (index as f64).into(), trap);
+    }
+    output.into()
+}
+
 fn standard_array_concat(vm: &mut vm::ScriptVm, args: ScriptObject) -> ScriptValue {
     let left = script_value!(vm, args.left);
     let right = script_value!(vm, args.right);
@@ -3519,6 +3561,24 @@ fn standard_array_index(
     Ok(value as usize)
 }
 
+fn standard_array_range_endpoint(
+    vm: &mut vm::ScriptVm,
+    value: ScriptValue,
+    parameter: &'static str,
+) -> Result<u64, ScriptValue> {
+    let Some(value) = value.as_number() else {
+        return Err(standard_array_expected_range_endpoint(vm, parameter));
+    };
+    if !value.is_finite()
+        || value < 0.0
+        || value.fract() != 0.0
+        || value > MAX_STANDARD_ARRAY_RANGE_ENDPOINT as f64
+    {
+        return Err(standard_array_expected_range_endpoint(vm, parameter));
+    }
+    Ok(value as u64)
+}
+
 fn standard_array_copy_indices(
     vm: &mut vm::ScriptVm,
     source: vm::ScriptArray,
@@ -3561,6 +3621,16 @@ fn standard_array_expected_index(
     script_err_invalid_args!(
         vm.bx.threads.cur_ref().trap,
         "std.array.{function} expects `{parameter}` to be a non-negative integer"
+    )
+}
+
+fn standard_array_expected_range_endpoint(
+    vm: &mut vm::ScriptVm,
+    parameter: &'static str,
+) -> ScriptValue {
+    script_err_invalid_args!(
+        vm.bx.threads.cur_ref().trap,
+        "std.array.range expects `{parameter}` to be a non-negative exact integer through 2^53"
     )
 }
 
@@ -8360,6 +8430,15 @@ compute(outer, 2)
                  assert(array.has_index(present_nil, 0))\n\
                  assert(array.get(present_nil, 0, \"fallback\") == nil)\n\
                  assert(array.slice(input, 1, 3) == [2, 3])\n\
+                 let indexes = array.range(1, 4)\n\
+                 assert(indexes == [1, 2, 3])\n\
+                 assert(array.range(4, 4) == [])\n\
+                 let squares = []\n\
+                 for index in array.range(0, 3) {\n\
+                     array.push(squares, index * index)\n\
+                 }\n\
+                 assert(squares == [0, 1, 4])\n\
+                 assert(array.range(9007199254740991, 9007199254740992) == [9007199254740991])\n\
                  assert(array.concat([1, 2], [3, 4]) == [1, 2, 3, 4])\n\
                  let optional_nested = {answer: 1}\n\
                  let optional = [nil, false, 0, \"\", optional_nested, nil]\n\
@@ -8428,7 +8507,7 @@ compute(outer, 2)
         let mut namespace_runtime = Runtime::default();
         let namespace = namespace_runtime
             .eval(
-                "use mod.std\nlet nested = [2]\nlet unique = std.array.unique([nil, nested, nested, nil])\nstd.array.len(unique) == 2 && std.array.contains(unique, nested) && std.array.index_of(unique, nested) == 1",
+                "use mod.std\nlet nested = [2]\nlet unique = std.array.unique([nil, nested, nested, nil])\nstd.array.len(unique) == 2 && std.array.contains(unique, nested) && std.array.index_of(unique, nested) == 1 && std.array.range(1, 3) == [1, 2]",
             )
             .unwrap();
         assert!(namespace.completed(), "{:?}", namespace.diagnostics);
@@ -8444,7 +8523,7 @@ compute(outer, 2)
         );
 
         let mutation = runtime
-            .eval("use mod.std.array\narray.unique = || nil")
+            .eval("use mod.std.array\narray.range = || nil")
             .unwrap();
         assert!(!mutation.succeeded());
         assert!(!mutation.diagnostics.is_empty());
@@ -8476,6 +8555,63 @@ compute(outer, 2)
             runtime
                 .script_value_as_json(
                     invalid_membership.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_range_endpoint = runtime
+            .eval("use mod.std.array\ntry array.range(0.5, 1) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_range_endpoint.completed(),
+            "{:?}",
+            invalid_range_endpoint.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_range_endpoint.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_range_order = runtime
+            .eval("use mod.std.array\ntry array.range(2, 1) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_range_order.completed(),
+            "{:?}",
+            invalid_range_order.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_range_order.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("invalid")
+        );
+
+        let invalid_range_precision = runtime
+            .eval("use mod.std.array\ntry array.range(0, 9007199254740994) catch \"invalid\"")
+            .unwrap();
+        assert!(
+            invalid_range_precision.completed(),
+            "{:?}",
+            invalid_range_precision.diagnostics
+        );
+        assert_eq!(
+            runtime
+                .script_value_as_json(
+                    invalid_range_precision.value,
                     DEFAULT_MAX_JSON_DATA_BYTES,
                     DEFAULT_MAX_JSON_DATA_DEPTH,
                 )
@@ -8652,6 +8788,43 @@ compute(outer, 2)
                 )
                 .unwrap(),
             serde_json::json!([null, 0])
+        );
+
+        let mut range_limit_runtime = Runtime::default();
+        let range_limit = range_limit_runtime
+            .eval(&format!(
+                "use mod.std.array\n\
+                 try array.range(0, {}) catch \"limit\"",
+                MAX_STANDARD_ARRAY_ITEMS + 1,
+            ))
+            .unwrap();
+        assert!(range_limit.completed(), "{:?}", range_limit.diagnostics);
+        assert_eq!(
+            range_limit_runtime
+                .script_value_as_json(
+                    range_limit.value,
+                    DEFAULT_MAX_JSON_DATA_BYTES,
+                    DEFAULT_MAX_JSON_DATA_DEPTH,
+                )
+                .unwrap(),
+            serde_json::json!("limit")
+        );
+
+        let mut full_range_runtime = Runtime::default();
+        let full_range = full_range_runtime
+            .eval(&format!(
+                "use mod.std.assert\n\
+                 use mod.std.array\n\
+                 let values = array.range(0, {MAX_STANDARD_ARRAY_ITEMS})\n\
+                 assert(array.len(values) == {MAX_STANDARD_ARRAY_ITEMS})\n\
+                 array.get(values, {}, -1)",
+                MAX_STANDARD_ARRAY_ITEMS - 1,
+            ))
+            .unwrap();
+        assert!(full_range.completed(), "{:?}", full_range.diagnostics);
+        assert_eq!(
+            full_range.value.as_number(),
+            Some((MAX_STANDARD_ARRAY_ITEMS - 1) as f64)
         );
 
         let mut membership_limit_runtime = Runtime::default();

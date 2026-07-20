@@ -462,6 +462,13 @@ const STANDARD_ARRAY_FUNCTIONS: &[StandardArrayFunction] = &[
         description: "Returns a shallow copy of the half-open [start, end) range.",
     },
     StandardArrayFunction {
+        name: "range",
+        parameters: &["start", "end"],
+        result: "array",
+        description:
+            "Builds a half-open [start, end) array of non-negative integers with at most 4,096 items.",
+    },
+    StandardArrayFunction {
         name: "concat",
         parameters: &["left", "right"],
         result: "array",
@@ -2070,6 +2077,7 @@ const FUZZ_ADVISORY_CONFIGURATION_SOURCE: &str = concat!(
     "let parsed = json.parse(\"{\\\"answer\\\":42}\")\n",
     "json.stringify(parsed)\n",
     "let sliced = array.slice([1, 2, 3], 1, 3)\n",
+    "let indexes = array.range(0, 3)\n",
     "array.has_index(sliced, 0)\n",
     "array.get(sliced, 2, 0)\n",
     "array.contains(sliced, 2)\n",
@@ -2562,6 +2570,16 @@ fn fuzz_exercise_fixed_standard_array_requests(
         position_at_byte(source, get_start + "array.".len() + 1),
     );
     let _ = server.signature_help(uri, position_at_byte(source, get_argument));
+
+    let Some(range_start) = source.find("array.range") else {
+        return;
+    };
+    let range_argument = range_start + "array.range(0, ".len();
+    let _ = server.hover(
+        uri,
+        position_at_byte(source, range_start + "array.".len() + 1),
+    );
+    let _ = server.signature_help(uri, position_at_byte(source, range_argument));
 
     let Some(contains_start) = source.find("array.contains") else {
         return;
@@ -9864,6 +9882,7 @@ mod tests {
                 "index_of",
                 "len",
                 "push",
+                "range",
                 "reverse",
                 "slice",
                 "unique"
@@ -9903,7 +9922,7 @@ mod tests {
         let partial = partial_server
             .completion(&test_uri(), position_at_byte(partial_source, partial_end))
             .expect("partial core array completion succeeds");
-        assert_eq!(partial.items.len(), 12);
+        assert_eq!(partial.items.len(), 13);
         assert!(partial.items.iter().all(|item| {
             matches!(
                 &item.text_edit,
@@ -9917,6 +9936,7 @@ mod tests {
         let source = concat!(
             "use mod.std.array\n",
             "let selected = array.slice([1, 2, 3], 1, 3)\n",
+            "let indexes = array.range(0, 3)\n",
             "let first = array.get(selected, 0, -1)\n",
             "array.has_index(selected, 1)\n",
             "array.contains(selected, 2)\n",
@@ -10031,6 +10051,32 @@ mod tests {
                 },
             ])
         );
+
+        let range_start = source.find("array.range").expect("range member exists") + "array.".len();
+        let range_hover = server
+            .hover(&test_uri(), position_at_byte(source, range_start + 1))
+            .expect("core array range hover succeeds")
+            .expect("range has fixed hover metadata");
+        assert_eq!(
+            range_hover.contents,
+            HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::PlainText,
+                value: "array.range(start, end) -> array\n\nBuilds a half-open [start, end) array of non-negative integers with at most 4,096 items.\n\nBounded Splash core array helper; it does not access the host or grant authority.".to_owned(),
+            })
+        );
+
+        let range_cursor = source.find("array.range(0, 3)").expect("range call exists")
+            + "array.range(0, ".len()
+            + 1;
+        let range_help = server
+            .signature_help(&test_uri(), position_at_byte(source, range_cursor))
+            .expect("core array range signature help succeeds")
+            .expect("range has a fixed signature");
+        assert_eq!(
+            range_help.signatures[0].label,
+            "array.range(start, end) -> array"
+        );
+        assert_eq!(range_help.active_parameter, Some(1));
 
         let get_cursor = source
             .find("array.get(selected, 0, -1)")
@@ -16995,6 +17041,7 @@ mod tests {
                 "index_of",
                 "len",
                 "push",
+                "range",
                 "reverse",
                 "slice",
                 "unique"

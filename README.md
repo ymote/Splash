@@ -272,7 +272,8 @@ state, filesystem, process, network, clock, entropy, or crate access.
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 `array.has_index(value, index)`, `array.get(value, index, fallback)`,
 `array.contains(value, item)`, `array.index_of(value, item)`,
-`array.slice(value, start, end)`, `array.concat(left, right)`,
+`array.slice(value, start, end)`, `array.range(start, end)`,
+`array.concat(left, right)`,
 `array.compact(value)`, `array.unique(value)`, `array.reverse(value)`,
 `array.flatten(value)`, and `array.push(value, item)`.
 `has_index` distinguishes an in-range `nil` item from an absent index, while
@@ -280,7 +281,11 @@ For local collection shaping, `use mod.std.array` provides `array.len(value)`,
 array. `contains` and `index_of` scan at most 4,096 items with direct equality:
 scalar values compare by value, while arrays and records match only by
 reference; `index_of` returns the first match or `-1`. `slice` uses a half-open
-range with non-negative integer indexes.
+range with non-negative integer indexes. `range` builds a fresh half-open
+`[start, end)` array for indexed loops; its non-negative endpoints must be
+exact Splash scalar integers through `2^53`, `start` cannot exceed `end`, and
+it returns at most 4,096 items. Canonical Splash deliberately has no range
+operator.
 `compact` returns a fresh shallow array without `nil` items while preserving
 `false`, zero, empty strings, and order. `unique` returns a fresh shallow
 array in first-occurrence order, removing later values with the same direct
@@ -631,8 +636,8 @@ the fixed text functions, including Unicode-scalar `slice`, `index_of`, and
 literal `split`, and string-array `join`, with plain-text hover and signature
 help. For an
 exact visible `use mod.std.array` binding, it completes `len`, `has_index`,
-`get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `reverse`,
-`unique`, `flatten`, and `push` with the same fixed plain-text hover and
+`get`, `contains`, `index_of`, `slice`, `range`, `concat`, `compact`,
+`reverse`, `unique`, `flatten`, and `push` with the same fixed plain-text hover and
 signature help.
 For an exact visible `use mod.std.object` binding, it completes `len`, `has`,
 `get`, `pick`, `omit`, `from_entries`, `with`, `keys`, `entries`, `values`,

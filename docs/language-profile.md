@@ -165,7 +165,7 @@ matching advisory catalog path cannot extend the core surface.
 The LSP separately recognizes an exact visible direct `use mod.std.array`
 binding. At a direct `array.` member site it completes only `len`, `has_index`,
 `get`, `contains`, `index_of`, `slice`, `concat`, `compact`, `unique`,
-`flatten`, `reverse`, and `push`, with plain-text hover and fixed function
+`range`, `flatten`, `reverse`, and `push`, with plain-text hover and fixed function
 signatures.
 This is a compiled-in description of bounded local array shaping: it does not
 inspect module-catalog metadata, resolve a module, follow a local alias, or
@@ -499,16 +499,21 @@ clock, entropy, host-state, crate-loading, or capability access.
 shaping. It provides `array.len(value)`, `array.has_index(value, index)`,
 `array.get(value, index, fallback)`, `array.contains(value, item)`,
 `array.index_of(value, item)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, `array.compact(value)`, `array.unique(value)`,
-`array.reverse(value)`, `array.flatten(value)`, and `array.push(value, item)`. `has_index`
+`array.range(start, end)`, `array.concat(left, right)`, `array.compact(value)`,
+`array.unique(value)`, `array.reverse(value)`, `array.flatten(value)`, and
+`array.push(value, item)`. `has_index`
 distinguishes an in-range `nil` item from an absent index; `get` returns its
 fallback only when the index is absent. Both require a non-negative integer
 index and never traverse the array. `contains` and `index_of` scan at most
 4,096 items with direct equality: scalar values compare by value, while arrays
 and records match only by reference; `index_of` returns the first match or
 `-1`. `slice` requires non-negative integer indexes and a half-open range
-inside the input array. Transforms have no callbacks and allocate a new shallow
-array. `compact` removes only `nil` items, preserving `false`, zero, empty
+inside the input array. `range` builds a fresh half-open `[start, end)` index
+array for generated loops. Its endpoints are non-negative exact scalar integers
+through `2^53`, `start` must not exceed `end`, and it rejects more than 4,096
+output items. Canonical Splash deliberately has no range operator. Transforms
+have no callbacks and allocate a new shallow array. `compact` removes only
+`nil` items, preserving `false`, zero, empty
 strings, nested references, and order. `unique` preserves first-occurrence
 order and removes later values with the same direct equality as `contains` and
 `index_of`. `flatten` is exactly one level: every outer item must be an array,
@@ -749,6 +754,9 @@ or mutate its keys, input digest, worker observation, or restart policy.
   4,096 items. `array.compact(value)` removes only `nil` items, preserving
   `false`, zero, empty strings, nested references, and order. `array.unique(value)`
   preserves first-occurrence order and removes later direct-equality duplicates.
+  Use `array.range(start, end)` for a bounded half-open index list instead of a
+  range operator; it accepts exact non-negative scalar endpoints through `2^53`
+  and produces at most 4,096 items.
   `array.flatten(value)` accepts only one level of nested arrays and applies
   the same limit to every input and its combined result.
 - Import `mod.std.object` before using `object.*`; transforms are bounded

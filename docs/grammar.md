@@ -195,6 +195,10 @@ The checker also rejects trailing commas where this grammar does not admit
 them. This keeps LLM output deterministic: valid source has one documented
 producer grammar rather than an inherited parser superset.
 
+For a generated indexed loop, use the bounded core helper
+`array.range(start, end)` rather than an inherited range operator. It builds a
+fresh half-open array without host access or authority.
+
 The VM remains the execution engine, but `Runtime::eval` and
 `CapabilityRuntime::eval` now enforce this profile and perform canonical
 statement-boundary lowering before evaluation. The explicit
@@ -438,8 +442,9 @@ An exact visible direct `use mod.std.array` binding has a separate fixed core
 projection for only `array.len(value)`, `array.has_index(value, index)`,
 `array.get(value, index, fallback)`, `array.contains(value, item)`,
 `array.index_of(value, item)`, `array.slice(value, start, end)`,
-`array.concat(left, right)`, `array.compact(value)`, `array.unique(value)`,
-`array.reverse(value)`, `array.flatten(value)`, and `array.push(value, item)`,
+`array.range(start, end)`, `array.concat(left, right)`, `array.compact(value)`,
+`array.unique(value)`, `array.reverse(value)`, `array.flatten(value)`, and
+`array.push(value, item)`,
 with plain-text member hover and function signature help. Its descriptors are
 compiled into the LSP rather than read from a catalog, and describe the
 runtime's bounded local array operations without resolving a host module or
