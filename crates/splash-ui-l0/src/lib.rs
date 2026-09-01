@@ -2920,7 +2920,13 @@ pub mod catalog {
     /// `vibrant` and `minimal` were declared by 43 corpus cards that could not
     /// realize — the checker refused them before they reached a colour, because
     /// the vocabulary named four moods and the generator had been writing six.
-    pub const THEMES: &[&str] = &["dark", "light", "glass", "photo", "vibrant", "minimal"];
+    pub const THEMES: &[&str] = &[
+        "dark", "light", "glass", "photo", "vibrant", "minimal",
+        // Theme PACKS — whole design systems minted from purchased kits by
+        // the lab/sketch pipeline: seeds + measured scale + family + depth.
+        // A pack is just a mood with luggage; every axis still composes on top.
+        "atro", "atro_light",
+    ];
 
     /// The theme AXES a card may name beside its mood, and the closed set each
     /// admits. A mood is one coordinate; these are the others.
@@ -2945,6 +2951,33 @@ pub mod catalog {
         ("density", &["compact", "regular", "airy"]),
         ("emphasis", &["quiet", "clear", "poster"]),
         ("icons", &["filled", "mono"]),
+        // A tiled surface grain. A NAME, like every other axis value — the card
+        // states a material and the theme owns the file, for the same reason it
+        // owns the colours. `Photo.src` refuses a literal because a literal in a
+        // data position is a model-authored fact (§4); a texture path would be
+        // the identical mistake wearing a different key.
+        ("texture", &["none", "paper", "linen", "concrete", "noise", "deco", "halftone"]),
+        // How a surface sits off the page. `soft` is the identity — the Material
+        // lift every mood already derives from elevation — so a card naming it
+        // and a card naming nothing render alike.
+        ("depth", &["soft", "flat", "hard", "glow"]),
+        // The typeface. `sans` is the identity. `display` is a serif headline
+        // over a sans body — one axis answering what the corpus counted as two
+        // separate wants (`serif_display` and `font_pair`), because a single
+        // family token cannot express a pairing and a pairing is what editorial
+        // design actually asks for.
+        ("type", &["sans", "serif", "display"]),
+        // A seeded page colour — the lever every measurement said was missing
+        // (judges named colour in 92% of failed cards; the deco teal was
+        // unreachable). Each value is NINE SEED SCALARS in its fragment;
+        // `_derive_color.splash` computes the palette in-kit via `mod.math`.
+        // v1 limitation, deliberate: a seeded ground supplies its own accent,
+        // so `ground:` + `accent:` lets the ground win — composing the two
+        // needs accent-as-seed, which is the A1 completion work.
+        ("ground", &[
+            "teal", "violet", "navy", "ivory", "sand", "terracotta", "wine",
+            "forest", "slate", "paper", "cream", "midnight", "blush", "olive",
+        ]),
     ];
 
     /// The legal values for an axis, or `None` if L0 has no such axis.
@@ -3209,6 +3242,16 @@ pub mod catalog {
                 ("unit", TokenOrPath(UNIT)),
                 ("format", Token(FORMAT)),
             ],
+        ),
+        (
+            // A person as initials in a tinted circle — the avatar every list
+            // design carries, WITHOUT an image: kits render exactly this when a
+            // photo is absent, so the no-photo form is a real design element,
+            // not a degraded one. The card passes the INITIALS ("TC"), because
+            // deriving them from "Tom Castle" needs string ops L0 does not have
+            // and the author writing the card already knows the name.
+            "Avatar",
+            &[("text", Text)],
         ),
         (
             "Chip",
@@ -10122,10 +10165,14 @@ pub mod kit {
             "Col" => "l0_col",
             "Row" => "l0_row",
             "Grid" => "l0_grid",
-            "Panel" | "Card" => "l0_panel",
+            "Panel" => "l0_panel",
+            // Card lowers separately: a CONTENT card may take the pack's
+            // signature gradient (`l0_card_1/2`); a section Panel never does.
+            "Card" => "l0_card",
             "Rule" => "l0_rule",
             "Tile" => "l0_tile",
             "Chip" => "l0_chip",
+            "Avatar" => "l0_avatar",
             "Photo" => "l0_photo",
             "Thumb" => "l0_thumb",
             "WeatherIcon" => "l0_weathericon",
