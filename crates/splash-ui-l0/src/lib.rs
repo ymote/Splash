@@ -2981,9 +2981,9 @@ pub mod catalog {
         // (judges named colour in 92% of failed cards; the deco teal was
         // unreachable). Each value is NINE SEED SCALARS in its fragment;
         // `_derive_color.splash` computes the palette in-kit via `mod.math`.
-        // v1 limitation, deliberate: a seeded ground supplies its own accent,
-        // so `ground:` + `accent:` lets the ground win — composing the two
-        // needs accent-as-seed, which is the A1 completion work.
+        // Composes with `accent:` — the accent arrives as a hue SEED and
+        // `_derive_color` re-solves the ink against the seeded ground in-kit
+        // (unrolled contrast search; all 112 pairs audited AA-clean).
         ("ground", &[
             "teal", "violet", "navy", "ivory", "sand", "terracotta", "wine",
             "forest", "slate", "paper", "cream", "midnight", "blush", "olive",
@@ -3074,6 +3074,22 @@ pub mod catalog {
     pub const TONE: &[&str] = &["normal", "primary", "danger"];
     pub const ALIGN: &[&str] = &["start", "center", "end", "baseline"];
     pub const PAD: &[&str] = &["page", "tight", "none"];
+    /// The semantic icon vocabulary — meanings, never drawings. Measured off
+    /// the Atro corpus: a ~40-name set covered 86% of icon uses on 150
+    /// commercial screens, and designers already name icons this way
+    /// (`bell-S-light`); the card states the meaning, the theme decides the
+    /// glyph set that answers it.
+    pub const ICON: &[&str] = &[
+        "activity", "alert", "arrow_down", "arrow_left", "arrow_right",
+        "arrow_up", "bell", "bookmark", "calendar", "camera", "chat", "check",
+        "chevron_down", "chevron_left", "chevron_right", "chevron_up", "clock",
+        "close", "cloud", "edit", "filter", "heart", "home", "image", "info",
+        "location", "lock", "mail", "map", "menu", "mic", "minus", "moon",
+        "more", "phone", "play", "plus", "refresh", "search", "send",
+        "settings", "share", "star", "sun", "trash", "user", "users", "video",
+        "wifi", "zap",
+    ];
+
     pub const ICON_SIZE: &[&str] = &["hero", "row", "tile"];
 
     pub type Args = &'static [(&'static str, ArgKind)];
@@ -3252,6 +3268,14 @@ pub mod catalog {
                 ("unit", TokenOrPath(UNIT)),
                 ("format", Token(FORMAT)),
             ],
+        ),
+        (
+            // A semantic icon: the card names a MEANING from the closed set,
+            // the theme's icon font answers it. The §4-compatible form of what
+            // full translation showed as the largest single "cannot say"
+            // (2,564 dropped icon instances across one kit's screens).
+            "Icon",
+            &[("name", Token(ICON)), ("size", Token(ICON_SIZE))],
         ),
         (
             // A person as initials in a tinted circle — the avatar every list
@@ -9256,6 +9280,66 @@ pub fn state_initials(source: &str) -> std::collections::BTreeMap<String, serde_
 /// Read before realize for the same reason [`card_theme`] is: a host choosing
 /// a palette needs the card's stated intent, and that is a fact about the
 /// source rather than about a realized tree.
+
+/// The theme's default answer for each semantic icon name — Font Awesome
+/// solid codepoints, resolved AT LOWER TIME so the kit never carries a string
+/// table and the card never carries a glyph.
+pub fn icon_glyph(name: &str) -> &'static str {
+    match name {
+        "activity" => "\u{f201}",
+        "alert" => "\u{f071}",
+        "arrow_down" => "\u{f063}",
+        "arrow_left" => "\u{f060}",
+        "arrow_right" => "\u{f061}",
+        "arrow_up" => "\u{f062}",
+        "bell" => "\u{f0f3}",
+        "bookmark" => "\u{f02e}",
+        "calendar" => "\u{f073}",
+        "camera" => "\u{f030}",
+        "chat" => "\u{f075}",
+        "check" => "\u{f00c}",
+        "chevron_down" => "\u{f078}",
+        "chevron_left" => "\u{f053}",
+        "chevron_right" => "\u{f054}",
+        "chevron_up" => "\u{f077}",
+        "clock" => "\u{f017}",
+        "close" => "\u{f00d}",
+        "cloud" => "\u{f0c2}",
+        "edit" => "\u{f304}",
+        "filter" => "\u{f0b0}",
+        "heart" => "\u{f004}",
+        "home" => "\u{f015}",
+        "image" => "\u{f03e}",
+        "info" => "\u{f129}",
+        "location" => "\u{f3c5}",
+        "lock" => "\u{f023}",
+        "mail" => "\u{f0e0}",
+        "map" => "\u{f279}",
+        "menu" => "\u{f0c9}",
+        "mic" => "\u{f130}",
+        "minus" => "\u{f068}",
+        "moon" => "\u{f186}",
+        "more" => "\u{f141}",
+        "phone" => "\u{f095}",
+        "play" => "\u{f04b}",
+        "plus" => "\u{f067}",
+        "refresh" => "\u{f021}",
+        "search" => "\u{f002}",
+        "send" => "\u{f1d8}",
+        "settings" => "\u{f013}",
+        "share" => "\u{f064}",
+        "star" => "\u{f005}",
+        "sun" => "\u{f185}",
+        "trash" => "\u{f1f8}",
+        "user" => "\u{f007}",
+        "users" => "\u{f0c0}",
+        "video" => "\u{f03d}",
+        "wifi" => "\u{f1eb}",
+        "zap" => "\u{f0e7}",
+        _ => "\u{f128}", // question — unreachable behind the Token set
+    }
+}
+
 pub fn card_theme_axes(source: &str) -> Vec<(String, String)> {
     let mut sink = Diagnostics::default();
     let Some(tokens) = lex(source, &mut sink) else {
@@ -10183,6 +10267,7 @@ pub mod kit {
             "Tile" => "l0_tile",
             "Chip" => "l0_chip",
             "Avatar" => "l0_avatar",
+            "Icon" => "l0_icon",
             "Photo" => "l0_photo",
             "Thumb" => "l0_thumb",
             "WeatherIcon" => "l0_weathericon",
@@ -10842,6 +10927,21 @@ pub mod kit {
                     makepad::map_pins(node).unwrap_or_else(|| "\"\"".to_owned()),
                     makepad::map_badge(node).unwrap_or_else(|| "\"\"".to_owned()),
                 );
+            }
+            "Icon" => {
+                // The MEANING token resolves to the theme's glyph HERE, at
+                // lower time — the kit never carries a string table and the
+                // card never carries a codepoint. Size names WHERE it sits;
+                // the kit's type scale decides how big that is.
+                let name = match arg(node, "name") {
+                    Some(NodeValue::Token(t)) => t.clone(),
+                    _ => "info".to_owned(),
+                };
+                let size = match arg(node, "size") {
+                    Some(NodeValue::Token(t)) => t.clone(),
+                    _ => "row".to_owned(),
+                };
+                let _ = write!(out, "{f}({:?}, {size:?})", crate::icon_glyph(&name));
             }
             // `cond` is a NUMBER — the WMO code the forecast returns — and this
             // matched only `Text` and `Token`, so every one of them fell through
