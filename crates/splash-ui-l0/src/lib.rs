@@ -2967,6 +2967,16 @@ pub mod catalog {
         // family token cannot express a pairing and a pairing is what editorial
         // design actually asks for.
         ("type", &["sans", "serif", "display"]),
+        // The request's own language. A feel RESOLVES to axis defaults in the
+        // host (explicit axes still override), so a card can carry the user's
+        // actual word — "premium", "calm" — and re-resolve as the theme
+        // library improves. Every value ships only after a blind paired judge
+        // confirms it reads as its word; an unvalidated feel is the
+        // disconnected knob wearing a nicer name.
+        ("feel", &[
+            "bright", "calm", "bold", "premium", "playful", "warm", "cool",
+            "minimal", "inspirational",
+        ]),
         // A seeded page colour — the lever every measurement said was missing
         // (judges named colour in 92% of failed cards; the deco teal was
         // unreachable). Each value is NINE SEED SCALARS in its fragment;
