@@ -3091,6 +3091,9 @@ pub mod catalog {
     ];
 
     pub const ICON_SIZE: &[&str] = &["hero", "row", "tile"];
+    /// A thumbnail is a list-row 16:9 tile unless the design shows a square
+    /// mosaic cell — a gallery is squares, a feed row is wide.
+    pub const THUMB_SHAPE: &[&str] = &["wide", "square"];
 
     pub type Args = &'static [(&'static str, ArgKind)];
 
@@ -3102,7 +3105,7 @@ pub mod catalog {
         ("Photo", &[("src", Path), ("pad", Token(PAD))]),
         // A row-sized image. `Photo` fills its width (it is a backdrop); a list
         // row needs a fixed 16:9 tile beside its text.
-        ("Thumb", &[("src", Path)]),
+        ("Thumb", &[("src", Path), ("shape", Token(THUMB_SHAPE))]),
         // A map. The card names the TRIP; the widget fetches its own route.
         //
         // The same correction `AqiContour` and `StockPlot` already took. The
@@ -3216,6 +3219,10 @@ pub mod catalog {
         ),
         ("Grid", &[("cols", Number)]),
         ("Rule", &[]),
+        // A flexible blank. Zero arguments: its whole meaning is "the height
+        // that is left" — before a bottom bar it pins the bar to the bottom,
+        // around a centered stack it centers the stack vertically.
+        ("Space", &[]),
         (
             "TextHero",
             &[
@@ -8398,6 +8405,9 @@ pub mod makepad {
                     "{p}SolidView{{ width: Fill height: 1 draw_bg.color: {HAIRLINE} }}"
                 );
             }
+            "Space" => {
+                let _ = writeln!(out, "{p}View{{ width: Fill height: Fill }}");
+            }
             "Tile" => {
                 let _ = writeln!(
                     out,
@@ -8488,10 +8498,18 @@ pub mod makepad {
                 );
             }
             "Thumb" => {
-                // A fixed 16:9 tile, the size a list row wants beside its text.
+                // A fixed 16:9 tile, the size a list row wants beside its text —
+                // or a square mosaic cell when the card says so.
+                let (w, h) = if matches!(arg(node, "shape"),
+                    Some(NodeValue::Token(t)) if t == "square")
+                {
+                    (102, 102)
+                } else {
+                    (108, 61)
+                };
                 let _ = writeln!(
                     out,
-                    "{p}Image{{ width: 108 height: 61 fit: ImageFit.CropToFill \
+                    "{p}Image{{ width: {w} height: {h} fit: ImageFit.CropToFill \
                      src: http_resource({}) }}",
                     expr_of(node, "src")
                 );
@@ -8507,6 +8525,21 @@ pub mod makepad {
                     text_of(arg(node, "indicator")),
                     expr_of(node, "years"),
                 );
+            }
+            "Avatar" => {
+                // A tinted initials circle; this backend's fixed palette stands
+                // in for the theme's accent tint.
+                let _ = writeln!(
+                    out,
+                    "{p}RoundedView{{ width: 36 height: 36 draw_bg.color: {ACTIVE} \
+                     draw_bg.border_radius: 18.0 align: {{x: 0.5, y: 0.5}}"
+                );
+                let _ = writeln!(
+                    out,
+                    "{p}  TextCaption{{ text: {} draw_text.color: {TEXT} }}",
+                    expr_of(node, "text")
+                );
+                let _ = writeln!(out, "{p}}}");
             }
             "Chip" => {
                 // `active` selects the fill. Dropping it made every range chip
@@ -10142,6 +10175,7 @@ fn dsl_kind(role: &str) -> Option<&'static str> {
         "Grid" => "grid",
         "Panel" | "Card" => "card",
         "Rule" => "divider",
+        "Space" => "column",
         "Tile" => "listitem",
         "Chip" => "chip",
         "Photo" => "image",
@@ -10264,6 +10298,7 @@ pub mod kit {
             // signature gradient (`l0_card_1/2`); a section Panel never does.
             "Card" => "l0_card",
             "Rule" => "l0_rule",
+            "Space" => "l0_space",
             "Tile" => "l0_tile",
             "Chip" => "l0_chip",
             "Avatar" => "l0_avatar",
@@ -10369,6 +10404,21 @@ pub mod kit {
             let _ = write!(out, "{}", "  ".repeat(depth + 1));
             element(child, depth + 1, out);
             if i + 1 < node.children.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        let _ = write!(out, "{}]", "  ".repeat(depth));
+    }
+
+    /// A `[...]` list from an explicit slice — the Surface layer split hands
+    /// segments of children rather than a node.
+    fn children_list(nodes: &[&UiNode], depth: usize, out: &mut String) {
+        out.push_str("[\n");
+        for (i, child) in nodes.iter().enumerate() {
+            let _ = write!(out, "{}", "  ".repeat(depth + 1));
+            element(child, depth + 1, out);
+            if i + 1 < nodes.len() {
                 out.push(',');
             }
             out.push('\n');
@@ -10775,9 +10825,36 @@ pub mod kit {
                 out.push(')');
             }
             "Surface" => {
-                let _ = write!(out, "{f}(");
-                children(node, depth, out);
-                out.push(')');
+                // Top-level `Space()` children split the page into ALIGNED
+                // layers: [pre] Space [post] pins post to the page floor; a
+                // second Space centers the middle segment. Deferred fills are
+                // greedy in the app's layout fork — anything walked after one
+                // never fits — so the pin is alignment, not fill.
+                let n_spaces = node.children.iter().filter(|c| c.kind == "Space").count();
+                let n_real = node.children.len() - n_spaces;
+                if (1..=2).contains(&n_spaces) && n_real > 0 {
+                    let mut segs: Vec<Vec<&UiNode>> = vec![Vec::new()];
+                    for c in &node.children {
+                        if c.kind == "Space" {
+                            segs.push(Vec::new());
+                        } else {
+                            segs.last_mut().expect("seeded non-empty").push(c);
+                        }
+                    }
+                    let fname = if segs.len() == 2 { "l0_surface_pin2" } else { "l0_surface_pin3" };
+                    let _ = write!(out, "{fname}(");
+                    for (i, seg) in segs.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        children_list(seg, depth, out);
+                    }
+                    out.push(')');
+                } else {
+                    let _ = write!(out, "{f}(");
+                    children(node, depth, out);
+                    out.push(')');
+                }
             }
             "Col" | "Row" => {
                 // `gap` is a declared spacing, so it stays a semantic argument
@@ -10836,7 +10913,7 @@ pub mod kit {
                 children(node, depth, out);
                 out.push(')');
             }
-            "Rule" => {
+            "Rule" | "Space" => {
                 let _ = write!(out, "{f}()");
             }
             "Tile" => {
@@ -10896,8 +10973,16 @@ pub mod kit {
                 children(node, depth, out);
                 out.push(')');
             }
-            "Photo" | "Thumb" => {
+            "Photo" => {
                 let _ = write!(out, "{f}({})", makepad::expr_of(node, "src"));
+            }
+            "Thumb" => {
+                // The shape token becomes a number: the kit picks with arithmetic,
+                // not string compares.
+                let sq = i32::from(
+                    matches!(arg(node, "shape"), Some(NodeValue::Token(t)) if t == "square"),
+                );
+                let _ = write!(out, "{f}({}, {sq})", makepad::expr_of(node, "src"));
             }
             // The trip, as the kit takes it: which member of the map family, how
             // close, where to centre, and the route already resolved.
