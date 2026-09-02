@@ -3093,7 +3093,7 @@ pub mod catalog {
     pub const ICON_SIZE: &[&str] = &["hero", "row", "tile"];
     /// A thumbnail is a list-row 16:9 tile unless the design shows a square
     /// mosaic cell — a gallery is squares, a feed row is wide.
-    pub const THUMB_SHAPE: &[&str] = &["wide", "square"];
+    pub const THUMB_SHAPE: &[&str] = &["wide", "square", "hero"];
 
     pub type Args = &'static [(&'static str, ArgKind)];
 
@@ -8500,12 +8500,10 @@ pub mod makepad {
             "Thumb" => {
                 // A fixed 16:9 tile, the size a list row wants beside its text —
                 // or a square mosaic cell when the card says so.
-                let (w, h) = if matches!(arg(node, "shape"),
-                    Some(NodeValue::Token(t)) if t == "square")
-                {
-                    (102, 102)
-                } else {
-                    (108, 61)
+                let (w, h) = match arg(node, "shape") {
+                    Some(NodeValue::Token(t)) if t == "square" => ("102", "102"),
+                    Some(NodeValue::Token(t)) if t == "hero" => ("Fill", "210"),
+                    _ => ("108", "61"),
                 };
                 let _ = writeln!(
                     out,
@@ -10888,7 +10886,7 @@ pub mod kit {
                     _ => 2,
                 };
                 let pad = "  ".repeat(depth + 1);
-                let _ = writeln!(out, "l0_col([");
+                let _ = writeln!(out, "l0_grid_rows([");
                 let rows: Vec<&[UiNode]> = node.children.chunks(cols).collect();
                 for (r, row) in rows.iter().enumerate() {
                     let _ = writeln!(out, "{pad}l0_row([");
@@ -10979,9 +10977,11 @@ pub mod kit {
             "Thumb" => {
                 // The shape token becomes a number: the kit picks with arithmetic,
                 // not string compares.
-                let sq = i32::from(
-                    matches!(arg(node, "shape"), Some(NodeValue::Token(t)) if t == "square"),
-                );
+                let sq = match arg(node, "shape") {
+                    Some(NodeValue::Token(t)) if t == "square" => 1,
+                    Some(NodeValue::Token(t)) if t == "hero" => 2,
+                    _ => 0,
+                };
                 let _ = write!(out, "{f}({}, {sq})", makepad::expr_of(node, "src"));
             }
             // The trip, as the kit takes it: which member of the map family, how
