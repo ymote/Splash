@@ -9385,14 +9385,16 @@ pub fn state_initials(source: &str) -> std::collections::BTreeMap<String, serde_
 /// closed HUE ROLE, this is where the numbers live.
 pub fn card_tint(t: &str) -> (u32, u32) {
     match t {
-        "green" => (0xffd3_efd9, 0xffbf_e4c9),
-        "pink" => (0xfff9_d8e8, 0xfff3_c2dc),
-        "blue" => (0xffd6_e4fa, 0xffc2_d6f5),
-        "amber" => (0xfffb_eacb, 0xfff6_ddb0),
-        "violet" => (0xffe2_dbf8, 0xffd2_c8f2),
-        "cyan" => (0xffd2_eef2, 0xffbd_e4ea),
-        "red" => (0xfff9_d9d5, 0xfff3_c3bd),
-        _ => (0xffe7_e9ee, 0xffd9_dce4),
+        // Sampled off the kit's own stat cards — mid-saturation, not pastel;
+        // `inkdark` keeps the text readable on them in every mood.
+        "green" => (0xff37_d7a3, 0xff2a_c6b1),
+        "pink" => (0xfff2_92c1, 0xffea_79b2),
+        "blue" => (0xff6f_a8f5, 0xff4f_8fee),
+        "amber" => (0xfff5_b84f, 0xffef_a53a),
+        "violet" => (0xffb5_7df0, 0xffc3_8cea),
+        "cyan" => (0xff4f_c8dd, 0xff36_b8d0),
+        "red" => (0xfff0_7a6e, 0xffe9_604f),
+        _ => (0xffba_c1cb, 0xffa5_aeba),
     }
 }
 
@@ -11036,10 +11038,19 @@ pub mod kit {
                 out.push(')');
             }
             "Bubble" => {
-                let f = if matches!(arg(node, "side"), Some(NodeValue::Token(t)) if t == "me") {
-                    "l0_bubble_me"
-                } else {
-                    "l0_bubble_them"
+                let me = matches!(arg(node, "side"), Some(NodeValue::Token(t)) if t == "me");
+                // A literal longer than a line gets the capped wrapping form;
+                // an unmeasurable live value is assumed long, which only costs
+                // a short message some air.
+                let long = match arg(node, "text") {
+                    Some(NodeValue::Text(t)) => t.chars().count() > 40,
+                    _ => true,
+                };
+                let f = match (me, long) {
+                    (true, true) => "l0_bubble_me_long",
+                    (true, false) => "l0_bubble_me",
+                    (false, true) => "l0_bubble_them_long",
+                    (false, false) => "l0_bubble_them",
                 };
                 let _ = write!(out, "{f}({})", makepad::expr_of(node, "text"));
             }
