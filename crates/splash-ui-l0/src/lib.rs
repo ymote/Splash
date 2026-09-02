@@ -2925,7 +2925,7 @@ pub mod catalog {
         // Theme PACKS — whole design systems minted from purchased kits by
         // the lab/sketch pipeline: seeds + measured scale + family + depth.
         // A pack is just a mood with luggage; every axis still composes on top.
-        "atro", "atro_light",
+        "atro", "atro_light", "camo", "camo_light",
     ];
 
     /// The theme AXES a card may name beside its mood, and the closed set each
