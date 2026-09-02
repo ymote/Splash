@@ -2985,8 +2985,9 @@ pub mod catalog {
         // `_derive_color` re-solves the ink against the seeded ground in-kit
         // (unrolled contrast search; all 112 pairs audited AA-clean).
         ("ground", &[
-            "teal", "violet", "navy", "ivory", "sand", "terracotta", "wine",
-            "forest", "slate", "paper", "cream", "midnight", "blush", "olive",
+            "teal", "violet", "indigo", "navy", "ivory", "sand", "terracotta",
+            "wine", "forest", "slate", "paper", "cream", "midnight", "blush",
+            "olive",
         ]),
     ];
 
@@ -3097,6 +3098,13 @@ pub mod catalog {
     /// A tile is a stat card unless the design shows a compact SQUARE cell —
     /// a calendar day is a square, never a content-grown pill.
     pub const TILE_SHAPE: &[&str] = &["card", "square"];
+    /// A card\'s design colour when it differs from the pack gradient —
+    /// closed pastel roles; the numbers live in `card_tint`.
+    pub const CARD_TINT: &[&str] = &[
+        "neutral", "green", "pink", "blue", "amber", "violet", "cyan", "red",
+    ];
+    /// Which party a chat bubble belongs to.
+    pub const BUBBLE_SIDE: &[&str] = &["them", "me"];
 
     pub type Args = &'static [(&'static str, ArgKind)];
 
@@ -3191,7 +3199,7 @@ pub mod catalog {
         ("Panel", &[("dock", Token(DOCK))]),
         // Content a swipe reveals. See the catalog.
         ("Reveal", &[]),
-        ("Card", &[("on_tap", Event), ("value", Any)]),
+        ("Card", &[("on_tap", Event), ("value", Any), ("tint", Token(CARD_TINT))]),
         // A column may say how WIDE, because a row of columns has to divide the
         // line somehow and only the card knows which column is the one that
         // should absorb what is left. A mover row is ticker-and-name beside a
@@ -3222,6 +3230,11 @@ pub mod catalog {
         ),
         ("Grid", &[("cols", Number)]),
         ("Rule", &[]),
+        // One chat message. The side is meaning (who said it); the theme
+        // decides what mine-vs-theirs looks like.
+        ("Bubble", &[("text", Text), ("side", Token(BUBBLE_SIDE))]),
+        // The floating round action button, pinned over the page corner.
+        ("Fab", &[("name", Token(ICON))]),
         // A full-bleed inverse section band — a month strip, a dark app-bar
         // stripe. Takes the strip's own title; it is chrome, not a container.
         ("Band", &[("text", Text)]),
@@ -8416,6 +8429,35 @@ pub mod makepad {
             "Space" => {
                 let _ = writeln!(out, "{p}View{{ width: Fill height: Fill }}");
             }
+            "Bubble" => {
+                let me = matches!(arg(node, "side"), Some(NodeValue::Token(t)) if t == "me");
+                let (fill, ink) = if me { (ACTIVE, TEXT) } else { (PANEL, SOFT) };
+                let _ = writeln!(
+                    out,
+                    "{p}View{{ width: Fill height: Fit flow: Right align: Align{{x: {}}}",
+                    if me { "1.0" } else { "0.0" }
+                );
+                let _ = writeln!(
+                    out,
+                    "{p}  RoundedView{{ width: Fit height: Fit draw_bg.color: {fill} \
+                     draw_bg.border_radius: 12.0 \
+                     padding: Inset{{left: 12 right: 12 top: 7 bottom: 7}}"
+                );
+                let _ = writeln!(
+                    out,
+                    "{p}    TextBody{{ text: {} draw_text.color: {ink} }}",
+                    expr_of(node, "text")
+                );
+                let _ = writeln!(out, "{p}  }}");
+                let _ = writeln!(out, "{p}}}");
+            }
+            "Fab" => {
+                let _ = writeln!(
+                    out,
+                    "{p}RoundedView{{ width: 54 height: 54 draw_bg.color: {ACTIVE} \
+                     draw_bg.border_radius: 27.0 align: {{x: 0.5, y: 0.5}} }}"
+                );
+            }
             "Band" => {
                 let _ = writeln!(
                     out,
@@ -9337,6 +9379,23 @@ pub fn state_initials(source: &str) -> std::collections::BTreeMap<String, serde_
 /// The theme's default answer for each semantic icon name — Font Awesome
 /// solid codepoints, resolved AT LOWER TIME so the kit never carries a string
 /// table and the card never carries a glyph.
+
+/// The pastel pair a card tint token resolves to — first stop, second stop.
+/// One table, lower-time, the same shape as `icon_glyph`: the card names a
+/// closed HUE ROLE, this is where the numbers live.
+pub fn card_tint(t: &str) -> (u32, u32) {
+    match t {
+        "green" => (0xffd3_efd9, 0xffbf_e4c9),
+        "pink" => (0xfff9_d8e8, 0xfff3_c2dc),
+        "blue" => (0xffd6_e4fa, 0xffc2_d6f5),
+        "amber" => (0xfffb_eacb, 0xfff6_ddb0),
+        "violet" => (0xffe2_dbf8, 0xffd2_c8f2),
+        "cyan" => (0xffd2_eef2, 0xffbd_e4ea),
+        "red" => (0xfff9_d9d5, 0xfff3_c3bd),
+        _ => (0xffe7_e9ee, 0xffd9_dce4),
+    }
+}
+
 pub fn icon_glyph(name: &str) -> &'static str {
     match name {
         "activity" => "\u{f201}",
@@ -10197,6 +10256,8 @@ fn dsl_kind(role: &str) -> Option<&'static str> {
         "Rule" => "divider",
         "Space" => "column",
         "Band" => "card",
+        "Bubble" => "card",
+        "Fab" => "card",
         "Tile" => "listitem",
         "Chip" => "chip",
         "Photo" => "image",
@@ -10321,6 +10382,8 @@ pub mod kit {
             "Rule" => "l0_rule",
             "Space" => "l0_space",
             "Band" => "l0_band",
+            "Bubble" => "l0_bubble_them",
+            "Fab" => "l0_fab",
             "Tile" => "l0_tile",
             "Chip" => "l0_chip",
             "Avatar" => "l0_avatar",
@@ -10847,16 +10910,24 @@ pub mod kit {
                 out.push(')');
             }
             "Surface" => {
+                // A `Fab` child floats OVER the page, whatever else the page
+                // does — hoisted here so the author writes it as a sibling.
+                let fab = node.children.iter().find(|c| c.kind == "Fab");
+                let body: Vec<&UiNode> =
+                    node.children.iter().filter(|c| c.kind != "Fab").collect();
+                if fab.is_some() {
+                    out.push_str("l0_surface_fab(");
+                }
                 // Top-level `Space()` children split the page into ALIGNED
                 // layers: [pre] Space [post] pins post to the page floor; a
                 // second Space centers the middle segment. Deferred fills are
                 // greedy in the app's layout fork — anything walked after one
                 // never fits — so the pin is alignment, not fill.
-                let n_spaces = node.children.iter().filter(|c| c.kind == "Space").count();
-                let n_real = node.children.len() - n_spaces;
+                let n_spaces = body.iter().filter(|c| c.kind == "Space").count();
+                let n_real = body.len() - n_spaces;
                 if (1..=2).contains(&n_spaces) && n_real > 0 {
                     let mut segs: Vec<Vec<&UiNode>> = vec![Vec::new()];
-                    for c in &node.children {
+                    for c in &body {
                         if c.kind == "Space" {
                             segs.push(Vec::new());
                         } else {
@@ -10874,8 +10945,15 @@ pub mod kit {
                     out.push(')');
                 } else {
                     let _ = write!(out, "{f}(");
-                    children(node, depth, out);
+                    children_list(&body, depth, out);
                     out.push(')');
+                }
+                if let Some(fabnode) = fab {
+                    let name = match arg(fabnode, "name") {
+                        Some(NodeValue::Token(t)) => t.clone(),
+                        _ => "plus".to_owned(),
+                    };
+                    let _ = write!(out, ", l0_fab({:?}))", crate::icon_glyph(&name));
                 }
             }
             "Col" | "Row" => {
@@ -10943,10 +11021,34 @@ pub mod kit {
                 }
                 let _ = write!(out, "{}])", "  ".repeat(depth));
             }
+            "Card" if arg(node, "tint").is_some() => {
+                let (c1, c2) = match arg(node, "tint") {
+                    Some(NodeValue::Token(t)) => crate::card_tint(t),
+                    _ => crate::card_tint("neutral"),
+                };
+                let _ = write!(out, "l0_card_tinted({c1}, {c2}, ");
+                children(node, depth, out);
+                out.push(')');
+            }
             "Panel" | "Card" => {
                 let _ = write!(out, "{f}(");
                 children(node, depth, out);
                 out.push(')');
+            }
+            "Bubble" => {
+                let f = if matches!(arg(node, "side"), Some(NodeValue::Token(t)) if t == "me") {
+                    "l0_bubble_me"
+                } else {
+                    "l0_bubble_them"
+                };
+                let _ = write!(out, "{f}({})", makepad::expr_of(node, "text"));
+            }
+            "Fab" => {
+                let name = match arg(node, "name") {
+                    Some(NodeValue::Token(t)) => t.clone(),
+                    _ => "plus".to_owned(),
+                };
+                let _ = write!(out, "l0_fab({:?})", crate::icon_glyph(&name));
             }
             "Rule" | "Space" => {
                 let _ = write!(out, "{f}()");
