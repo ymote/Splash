@@ -3094,6 +3094,9 @@ pub mod catalog {
     /// A thumbnail is a list-row 16:9 tile unless the design shows a square
     /// mosaic cell — a gallery is squares, a feed row is wide.
     pub const THUMB_SHAPE: &[&str] = &["wide", "square", "hero"];
+    /// A tile is a stat card unless the design shows a compact SQUARE cell —
+    /// a calendar day is a square, never a content-grown pill.
+    pub const TILE_SHAPE: &[&str] = &["card", "square"];
 
     pub type Args = &'static [(&'static str, ArgKind)];
 
@@ -3219,6 +3222,9 @@ pub mod catalog {
         ),
         ("Grid", &[("cols", Number)]),
         ("Rule", &[]),
+        // A full-bleed inverse section band — a month strip, a dark app-bar
+        // stripe. Takes the strip's own title; it is chrome, not a container.
+        ("Band", &[("text", Text)]),
         // A flexible blank. Zero arguments: its whole meaning is "the height
         // that is left" — before a bottom bar it pins the bar to the bottom,
         // around a centered stack it centers the stack vertically.
@@ -3274,6 +3280,8 @@ pub mod catalog {
                 ("value", Data),
                 ("unit", TokenOrPath(UNIT)),
                 ("format", Token(FORMAT)),
+                ("glyph", Text),
+                ("shape", Token(TILE_SHAPE)),
             ],
         ),
         (
@@ -8408,6 +8416,20 @@ pub mod makepad {
             "Space" => {
                 let _ = writeln!(out, "{p}View{{ width: Fill height: Fill }}");
             }
+            "Band" => {
+                let _ = writeln!(
+                    out,
+                    "{p}SolidView{{ width: Fill height: Fit draw_bg.color: {TEXT} \
+                     padding: Inset{{left: 17 right: 17 top: 9 bottom: 9}} \
+                     margin: Inset{{left: -17 right: -17}}"
+                );
+                let _ = writeln!(
+                    out,
+                    "{p}  TextTitle{{ text: {} draw_text.color: {PANEL} }}",
+                    expr_of(node, "text")
+                );
+                let _ = writeln!(out, "{p}}}");
+            }
             "Tile" => {
                 let _ = writeln!(
                     out,
@@ -10174,6 +10196,7 @@ fn dsl_kind(role: &str) -> Option<&'static str> {
         "Panel" | "Card" => "card",
         "Rule" => "divider",
         "Space" => "column",
+        "Band" => "card",
         "Tile" => "listitem",
         "Chip" => "chip",
         "Photo" => "image",
@@ -10297,6 +10320,7 @@ pub mod kit {
             "Card" => "l0_card",
             "Rule" => "l0_rule",
             "Space" => "l0_space",
+            "Band" => "l0_band",
             "Tile" => "l0_tile",
             "Chip" => "l0_chip",
             "Avatar" => "l0_avatar",
@@ -10886,10 +10910,23 @@ pub mod kit {
                     _ => 2,
                 };
                 let pad = "  ".repeat(depth + 1);
-                let _ = writeln!(out, "l0_grid_rows([");
+                // A grid of nothing but SQUARE tiles is a calendar: it spreads
+                // at the day pitch instead of the list gutter.
+                let all_sq = !node.children.is_empty()
+                    && node.children.iter().all(|c| {
+                        c.kind == "Tile"
+                            && matches!(arg(c, "shape"),
+                                Some(NodeValue::Token(t)) if t == "square")
+                    });
+                let (rows_fn, row_fn) = if all_sq {
+                    ("l0_day_rows", "l0_day_row")
+                } else {
+                    ("l0_grid_rows", "l0_row")
+                };
+                let _ = writeln!(out, "{rows_fn}([");
                 let rows: Vec<&[UiNode]> = node.children.chunks(cols).collect();
                 for (r, row) in rows.iter().enumerate() {
-                    let _ = writeln!(out, "{pad}l0_row([");
+                    let _ = writeln!(out, "{pad}{row_fn}([");
                     for (i, cell) in row.iter().enumerate() {
                         let _ = write!(out, "{pad}  ");
                         element(cell, depth + 2, out);
@@ -10914,13 +10951,29 @@ pub mod kit {
             "Rule" | "Space" => {
                 let _ = write!(out, "{f}()");
             }
+            "Band" => {
+                let _ = write!(out, "{f}({})", makepad::expr_of(node, "text"));
+            }
             "Tile" => {
-                let _ = write!(
-                    out,
-                    "{f}({}, {})",
-                    makepad::expr_of(node, "label"),
-                    makepad::valued(node)
-                );
+                let square = matches!(arg(node, "shape"),
+                    Some(NodeValue::Token(t)) if t == "square");
+                if square {
+                    // A calendar day: fixed square, flat, bordered. The dot is
+                    // a GLYPH (a literal mark), not a value — values render data.
+                    let label = makepad::expr_of(node, "label");
+                    if let Some(NodeValue::Text(g)) = arg(node, "glyph") {
+                        let _ = write!(out, "l0_tile_sq2({label}, {g:?})");
+                    } else {
+                        let _ = write!(out, "l0_tile_sq1({label})");
+                    }
+                } else {
+                    let _ = write!(
+                        out,
+                        "{f}({}, {})",
+                        makepad::expr_of(node, "label"),
+                        makepad::valued(node)
+                    );
+                }
             }
             "Chip" => {
                 // `.danger` is a different role in the kit, not a parameter: it is
