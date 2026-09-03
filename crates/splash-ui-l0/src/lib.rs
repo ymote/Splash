@@ -3073,6 +3073,8 @@ pub mod catalog {
     /// `primary` is the action a screen is FOR — the one thing you came to do. The
     /// theme draws it larger; the card only says which action it is.
     pub const TONE: &[&str] = &["normal", "primary", "danger"];
+    /// A tab\'s selected state — the current screen\'s tab is `.on`.
+    pub const ONOFF: &[&str] = &["off", "on"];
     pub const ALIGN: &[&str] = &["start", "center", "end", "baseline"];
     pub const PAD: &[&str] = &["page", "tight", "none"];
     /// The semantic icon vocabulary — meanings, never drawings. Measured off
@@ -3235,6 +3237,9 @@ pub mod catalog {
         ("Bubble", &[("text", Text), ("side", Token(BUBBLE_SIDE))]),
         // The floating round action button, pinned over the page corner.
         ("Fab", &[("name", Token(ICON))]),
+        // The bottom tab bar and its tabs — pinned to the page floor.
+        ("TabBar", &[]),
+        ("Tab", &[("icon", Token(ICON)), ("label", Text), ("active", Token(ONOFF))]),
         // A full-bleed inverse section band — a month strip, a dark app-bar
         // stripe. Takes the strip's own title; it is chrome, not a container.
         ("Band", &[("text", Text)]),
@@ -8458,6 +8463,45 @@ pub mod makepad {
                      draw_bg.border_radius: 27.0 align: {{x: 0.5, y: 0.5}} }}"
                 );
             }
+            "Tab" => {
+                // A tab is only ever emitted by TabBar's own arm; this stands in
+                // when one appears alone so every admitted role draws.
+                let g = match arg(node, "icon") {
+                    Some(NodeValue::Token(t)) => crate::icon_glyph(t),
+                    _ => crate::icon_glyph("home"),
+                };
+                let _ = writeln!(out,
+                    "{p}TextCaption{{ text: {} draw_text.color: {DIM} }}",
+                    text_of(arg(node, "label")).replace('"', &format!("{g} ")));
+                let _ = g;
+            }
+            "TabBar" => {
+                let _ = writeln!(
+                    out,
+                    "{p}RoundedView{{ width: Fill height: Fit flow: Right draw_bg.color: {PANEL} \
+                     draw_bg.border_radius: 16.0 padding: Inset{{left: 8 right: 8 top: 10 bottom: 10}}"
+                );
+                for tab in &node.children {
+                    let g = match arg(tab, "icon") {
+                        Some(NodeValue::Token(t)) => crate::icon_glyph(t),
+                        _ => crate::icon_glyph("home"),
+                    };
+                    let on = matches!(arg(tab, "active"), Some(NodeValue::Token(t)) if t == "on");
+                    let ink = if on { ACTIVE } else { DIM };
+                    let _ = writeln!(out,
+                        "{p}  View{{ width: Fill height: Fit flow: Down align: {{x: 0.5}} spacing: 3");
+                    let _ = writeln!(out,
+                        "{p}    Label{{ height: Fit text: {g:?} draw_text.color: {ink} \
+                         draw_text.text_style: TextStyle{{ font_family: FontFamily{{ latin := \
+                         FontMember{{ res: crate_resource(\"makepad_widgets:resources/fa-solid-900.ttf\") \
+                         asc: 0.0 desc: 0.0 }} }} font_size: 9 }} }}");
+                    let _ = writeln!(out,
+                        "{p}    TextCaption{{ text: {} draw_text.color: {ink} }}",
+                        text_of(arg(tab, "label")));
+                    let _ = writeln!(out, "{p}  }}");
+                }
+                let _ = writeln!(out, "{p}}}");
+            }
             "Band" => {
                 let _ = writeln!(
                     out,
@@ -10260,6 +10304,8 @@ fn dsl_kind(role: &str) -> Option<&'static str> {
         "Band" => "card",
         "Bubble" => "card",
         "Fab" => "card",
+        "TabBar" => "row",
+        "Tab" => "column",
         "Tile" => "listitem",
         "Chip" => "chip",
         "Photo" => "image",
@@ -10386,6 +10432,8 @@ pub mod kit {
             "Band" => "l0_band",
             "Bubble" => "l0_bubble_them",
             "Fab" => "l0_fab",
+            "TabBar" => "l0_tabbar",
+            "Tab" => "l0_tab",
             "Tile" => "l0_tile",
             "Chip" => "l0_chip",
             "Avatar" => "l0_avatar",
@@ -10912,11 +10960,19 @@ pub mod kit {
                 out.push(')');
             }
             "Surface" => {
-                // A `Fab` child floats OVER the page, whatever else the page
-                // does — hoisted here so the author writes it as a sibling.
+                // A `Fab` child floats OVER the page corner; a `TabBar` pins
+                // to the page floor. Both hoisted here so the author writes
+                // them as plain siblings.
                 let fab = node.children.iter().find(|c| c.kind == "Fab");
-                let body: Vec<&UiNode> =
-                    node.children.iter().filter(|c| c.kind != "Fab").collect();
+                let tabbar = node.children.iter().find(|c| c.kind == "TabBar");
+                let body: Vec<&UiNode> = node
+                    .children
+                    .iter()
+                    .filter(|c| c.kind != "Fab" && c.kind != "TabBar")
+                    .collect();
+                if tabbar.is_some() {
+                    out.push_str("l0_surface_tabbar(");
+                }
                 if fab.is_some() {
                     out.push_str("l0_surface_fab(");
                 }
@@ -10956,6 +11012,11 @@ pub mod kit {
                         _ => "plus".to_owned(),
                     };
                     let _ = write!(out, ", l0_fab({:?}))", crate::icon_glyph(&name));
+                }
+                if let Some(bar) = tabbar {
+                    out.push_str(", ");
+                    element(bar, depth, out);
+                    out.push(')');
                 }
             }
             "Col" | "Row" => {
@@ -11060,6 +11121,20 @@ pub mod kit {
                     _ => "plus".to_owned(),
                 };
                 let _ = write!(out, "l0_fab({:?})", crate::icon_glyph(&name));
+            }
+            "TabBar" => {
+                let _ = write!(out, "l0_tabbar(");
+                children(node, depth, out);
+                out.push(')');
+            }
+            "Tab" => {
+                let g = match arg(node, "icon") {
+                    Some(NodeValue::Token(t)) => t.clone(),
+                    _ => "home".to_owned(),
+                };
+                let on = i32::from(matches!(arg(node, "active"), Some(NodeValue::Token(t)) if t == "on"));
+                let _ = write!(out, "l0_tab({:?}, {}, {on})",
+                    crate::icon_glyph(&g), makepad::expr_of(node, "label"));
             }
             "Rule" | "Space" => {
                 let _ = write!(out, "{f}()");
