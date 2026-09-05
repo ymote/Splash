@@ -23,6 +23,7 @@ fn cyclic_and_shared_graph_equality_terminates() {
             "let a=[nil];a[0]=a;let b=[nil];b[0]=b;a==b",
             "let a={next:nil};a.next=a;let b={next:nil};b.next=b;a==b",
             "let a=[0];let b=[0];let i=0;while i<29 {a=[a,a];b=[b,b];i+=1;};a==b",
+            "let a=[0];let b=[0];let i=0;while i<1000 {a=[a];b=[b];i+=1;};a==b",
         ] {
             assert_eq!(evaluate(source), json!(true));
         }
