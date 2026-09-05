@@ -108,6 +108,7 @@ dock = { kind = "token", tokens = ["top", "bottom", "right"] }
 [Card]
 on_tap = { kind = "event" }
 value  = { kind = "any" }
+tint   = { kind = "token" }
 
 # `width` says which column absorbs the leftover space. A row of columns has to
 # divide the line somehow, and only the card knows which one should yield.
@@ -142,6 +143,33 @@ cols = { kind = "number" }
 [Reveal]
 
 [Rule]
+
+# A flexible blank: absorbs the leftover height of the column it sits in.
+# Before a bottom bar it pins the bar to the bottom; around a centered stack it
+# centers the stack vertically. Zero arguments — its whole meaning is "the
+# height that is left".
+[Space]
+
+# A full-bleed inverse section band — a month strip, a dark app-bar stripe.
+[Band]
+text = { kind = "text" }
+
+# One chat message; the side is who said it, the theme styles the parties.
+[Bubble]
+text = { kind = "text" }
+side = { kind = "token" }
+
+# The floating round action button, pinned over the page corner.
+[Fab]
+name = { kind = "token" }
+
+# The bottom tab bar and its tabs, pinned to the page floor.
+[TabBar]
+
+[Tab]
+icon   = { kind = "token" }
+label  = { kind = "text" }
+active = { kind = "token" }
 
 # ─── text roles ───────────────────────────────────────────────────────────────
 # Seven ROLES. A role says what a piece of text is FOR; the active theme decides
@@ -201,6 +229,15 @@ label  = { kind = "text" }
 value  = { kind = "data" }
 unit   = { kind = "unit" }
 format = { kind = "format" }
+glyph  = { kind = "text" }
+shape  = { kind = "token" }
+
+[Icon]
+name = { kind = "token" }
+size = { kind = "token" }
+
+[Avatar]
+text = { kind = "text" }
 
 [Chip]
 text   = { kind = "text" }
@@ -278,7 +315,8 @@ span = { kind = "number" }
 # A list row's image: a fixed 16:9 tile. `Photo` fills its width (it is a
 # backdrop); a row needs a thumbnail beside its text.
 [Thumb]
-src = { kind = "path" }
+src   = { kind = "path" }
+shape = { kind = "token" }
 
 # One YouTube search result. `embed` is a player url ready for sys.link — a
 # card cannot build one, because L0 has no string concatenation.
