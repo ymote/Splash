@@ -4063,6 +4063,7 @@ fn realization_depth_is_bounded_independently_of_node_count() {
         max_nodes: 100_000, // far above what this tree needs
         max_depth: 64,
         max_collection: 512,
+        ..RealizeLimits::default()
     };
     let report = realize(&source, &serde_json::json!({}), limits);
     assert!(
@@ -4075,6 +4076,36 @@ fn realization_depth_is_bounded_independently_of_node_count() {
         report.nodes < 100_000,
         "and it must stop well short of the node cap, or this proves nothing"
     );
+}
+
+#[test]
+fn empty_nested_expansion_consumes_aggregate_work() {
+    let source = "source movers sys.movers()\nstate show {shape: bool, initial: false}\nview root Panel {for a in movers key a.id {for b in movers key b.id {for c in movers key c.id {for d in movers key d.id {when show {Rule()}}}}}}";
+    assert!(check_ui_l0_named("bounded", source).valid);
+    let rows: Vec<_> = (0..128).map(|id| serde_json::json!({"id":id})).collect();
+    let report = realize(
+        source,
+        &serde_json::json!({"movers":rows}),
+        RealizeLimits {
+            max_work: 100,
+            ..Default::default()
+        },
+    );
+    assert!(
+        report.truncated,
+        "empty expansion must exhaust work even without emitted nodes"
+    );
+    assert_eq!(report.nodes, 1);
+    let small = realize(
+        source,
+        &serde_json::json!({"movers":[{"id":0}]}),
+        RealizeLimits {
+            max_work: 100,
+            ..Default::default()
+        },
+    );
+    assert!(!small.truncated);
+    assert_eq!(small.nodes, 1);
 }
 
 /// §1.1 as a check rather than a paragraph: a card must have no way to state a

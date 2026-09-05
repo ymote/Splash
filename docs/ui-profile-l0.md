@@ -8,6 +8,14 @@ the workflow language. `check_syntax` rejects UI source and `eval_vm_compatibili
 receive generated source, so neither canonical entry point admits a generated card. This
 profile is the third path, and `check_ui_l0` is its entry point.
 
+Realization has four independent host-selected bounds in `RealizeLimits`:
+8,192 emitted nodes, depth 64, 512 items per collection, and 65,536 aggregate
+work units by default. Visiting an element and entering a loop iteration each
+consume work, even when a false guard or empty component emits no nodes.
+Exhaustion stops expansion and sets `RealizeReport::truncated`; hosts must
+treat that report as partial. These bounds apply to a single realization,
+including nested loops and component expansion.
+
 ---
 
 ## 1. What Level 0 is for

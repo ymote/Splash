@@ -178,7 +178,9 @@ impl<'a> ScriptVm<'a> {
                 value
             }
         } else if let Some(arr) = object.as_array() {
-            let idx = index.as_index();
+            let Some(idx) = self.checked_array_index(index) else {
+                return;
+            };
             let value = self
                 .bx
                 .heap
@@ -205,7 +207,9 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .set_value(obj, index, built_object, self.bx.threads.cur().trap.pass());
         } else if let Some(arr) = object.as_array() {
-            let idx = index.as_index();
+            let Some(idx) = self.checked_array_index(index) else {
+                return;
+            };
             self.bx
                 .heap
                 .set_array_index(arr, idx, built_object, self.bx.threads.cur().trap.pass());
@@ -519,6 +523,20 @@ impl<'a> ScriptVm<'a> {
         self.bx.threads.cur().trap.goto_next();
     }
 
+    /// Validate before touching storage, so rejected writes are atomic.
+    pub(crate) fn checked_array_index(&mut self, index: ScriptValue) -> Option<usize> {
+        if let Some(index) = index.checked_index() {
+            return Some(index);
+        }
+        let error = script_err_invalid_args!(
+            self.bx.threads.cur_ref().trap,
+            "array index must be a finite nonnegative integer"
+        );
+        self.bx.threads.cur().push_stack_unchecked(error);
+        self.bx.threads.cur().trap.goto_next();
+        None
+    }
+
     // Array index handler
 
     pub(crate) fn handle_array_index(&mut self) {
@@ -543,14 +561,18 @@ impl<'a> ScriptVm<'a> {
             };
             self.bx.threads.cur().push_stack_unchecked(value)
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let value = self
                 .bx
                 .heap
                 .array_index(arr, index, self.bx.threads.cur().trap.pass());
             self.bx.threads.cur().push_stack_unchecked(value)
         } else if let Some(pod) = object.as_pod() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let value = self.bx.heap.pod_array_index(
                 pod,
                 index,
@@ -653,6 +675,15 @@ impl<'a> ScriptVm<'a> {
     // Log handler
 
     pub(crate) fn handle_log(&mut self) {
+        if !self.bx.allow_debug_output {
+            let error = script_err_not_allowed!(
+                self.bx.threads.cur_ref().trap,
+                "direct script logging is disabled by this host"
+            );
+            self.bx.threads.cur().push_stack_unchecked(error);
+            self.bx.threads.cur().trap.goto_next();
+            return;
+        }
         let value = self.bx.threads.cur().peek_stack_resolved(&self.bx.heap);
         self.log(value);
         self.bx.threads.cur().trap.goto_next();
@@ -691,6 +722,9 @@ impl<'a> ScriptVm<'a> {
     // Log implementation
 
     pub fn log(&self, value: ScriptValue) {
+        if !self.bx.allow_debug_output {
+            return;
+        }
         if let Some(loc) = self.bx.code.ip_to_loc(self.bx.threads.cur_ref().trap.ip) {
             if value != NIL {
                 if let Some(err_ptr) = value.as_err() {
@@ -785,7 +819,9 @@ impl<'a> ScriptVm<'a> {
         let source = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
 
         let value = if let Some(arr) = source.as_array() {
-            let idx = index.as_index();
+            let Some(idx) = self.checked_array_index(index) else {
+                return;
+            };
             // Try to get, return NIL if out of bounds or error
             let result = self
                 .bx

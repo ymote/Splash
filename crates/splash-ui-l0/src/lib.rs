@@ -2671,14 +2671,14 @@ fn expr_paths(operand: &Operand, out: &mut Vec<String>) {
 }
 
 fn data_path(data: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
-    let mut current = data.clone();
+    let mut current = data;
     for segment in path.split('.') {
         current = match segment.parse::<usize>() {
-            Ok(i) => current.get(i)?.clone(),
-            Err(_) => current.get(segment)?.clone(),
+            Ok(i) => current.get(i)?,
+            Err(_) => current.get(segment)?,
         };
     }
-    Some(current)
+    Some(current.clone())
 }
 
 fn scope_value(scope: &ValueScope, operand: &Operand) -> Option<serde_json::Value> {
@@ -2921,11 +2921,19 @@ pub mod catalog {
     /// realize — the checker refused them before they reached a colour, because
     /// the vocabulary named four moods and the generator had been writing six.
     pub const THEMES: &[&str] = &[
-        "dark", "light", "glass", "photo", "vibrant", "minimal",
+        "dark",
+        "light",
+        "glass",
+        "photo",
+        "vibrant",
+        "minimal",
         // Theme PACKS — whole design systems minted from purchased kits by
         // the lab/sketch pipeline: seeds + measured scale + family + depth.
         // A pack is just a mood with luggage; every axis still composes on top.
-        "atro", "atro_light", "camo", "camo_light",
+        "atro",
+        "atro_light",
+        "camo",
+        "camo_light",
     ];
 
     /// The theme AXES a card may name beside its mood, and the closed set each
@@ -2956,7 +2964,12 @@ pub mod catalog {
         // owns the colours. `Photo.src` refuses a literal because a literal in a
         // data position is a model-authored fact (§4); a texture path would be
         // the identical mistake wearing a different key.
-        ("texture", &["none", "paper", "linen", "concrete", "noise", "deco", "halftone"]),
+        (
+            "texture",
+            &[
+                "none", "paper", "linen", "concrete", "noise", "deco", "halftone",
+            ],
+        ),
         // How a surface sits off the page. `soft` is the identity — the Material
         // lift every mood already derives from elevation — so a card naming it
         // and a card naming nothing render alike.
@@ -2973,10 +2986,20 @@ pub mod catalog {
         // library improves. Every value ships only after a blind paired judge
         // confirms it reads as its word; an unvalidated feel is the
         // disconnected knob wearing a nicer name.
-        ("feel", &[
-            "bright", "calm", "bold", "premium", "playful", "warm", "cool",
-            "minimal", "inspirational",
-        ]),
+        (
+            "feel",
+            &[
+                "bright",
+                "calm",
+                "bold",
+                "premium",
+                "playful",
+                "warm",
+                "cool",
+                "minimal",
+                "inspirational",
+            ],
+        ),
         // A seeded page colour — the lever every measurement said was missing
         // (judges named colour in 92% of failed cards; the deco teal was
         // unreachable). Each value is NINE SEED SCALARS in its fragment;
@@ -2984,11 +3007,26 @@ pub mod catalog {
         // Composes with `accent:` — the accent arrives as a hue SEED and
         // `_derive_color` re-solves the ink against the seeded ground in-kit
         // (unrolled contrast search; all 112 pairs audited AA-clean).
-        ("ground", &[
-            "teal", "violet", "indigo", "navy", "ivory", "sand", "terracotta",
-            "wine", "forest", "slate", "paper", "cream", "midnight", "blush",
-            "olive",
-        ]),
+        (
+            "ground",
+            &[
+                "teal",
+                "violet",
+                "indigo",
+                "navy",
+                "ivory",
+                "sand",
+                "terracotta",
+                "wine",
+                "forest",
+                "slate",
+                "paper",
+                "cream",
+                "midnight",
+                "blush",
+                "olive",
+            ],
+        ),
     ];
 
     /// The legal values for an axis, or `None` if L0 has no such axis.
@@ -3083,14 +3121,56 @@ pub mod catalog {
     /// (`bell-S-light`); the card states the meaning, the theme decides the
     /// glyph set that answers it.
     pub const ICON: &[&str] = &[
-        "activity", "alert", "arrow_down", "arrow_left", "arrow_right",
-        "arrow_up", "bell", "bookmark", "calendar", "camera", "chat", "check",
-        "chevron_down", "chevron_left", "chevron_right", "chevron_up", "clock",
-        "close", "cloud", "edit", "filter", "heart", "home", "image", "info",
-        "location", "lock", "mail", "map", "menu", "mic", "minus", "moon",
-        "more", "phone", "play", "plus", "refresh", "search", "send",
-        "settings", "share", "star", "sun", "trash", "user", "users", "video",
-        "wifi", "zap",
+        "activity",
+        "alert",
+        "arrow_down",
+        "arrow_left",
+        "arrow_right",
+        "arrow_up",
+        "bell",
+        "bookmark",
+        "calendar",
+        "camera",
+        "chat",
+        "check",
+        "chevron_down",
+        "chevron_left",
+        "chevron_right",
+        "chevron_up",
+        "clock",
+        "close",
+        "cloud",
+        "edit",
+        "filter",
+        "heart",
+        "home",
+        "image",
+        "info",
+        "location",
+        "lock",
+        "mail",
+        "map",
+        "menu",
+        "mic",
+        "minus",
+        "moon",
+        "more",
+        "phone",
+        "play",
+        "plus",
+        "refresh",
+        "search",
+        "send",
+        "settings",
+        "share",
+        "star",
+        "sun",
+        "trash",
+        "user",
+        "users",
+        "video",
+        "wifi",
+        "zap",
     ];
 
     pub const ICON_SIZE: &[&str] = &["hero", "row", "tile"];
@@ -3201,7 +3281,14 @@ pub mod catalog {
         ("Panel", &[("dock", Token(DOCK))]),
         // Content a swipe reveals. See the catalog.
         ("Reveal", &[]),
-        ("Card", &[("on_tap", Event), ("value", Any), ("tint", Token(CARD_TINT))]),
+        (
+            "Card",
+            &[
+                ("on_tap", Event),
+                ("value", Any),
+                ("tint", Token(CARD_TINT)),
+            ],
+        ),
         // A column may say how WIDE, because a row of columns has to divide the
         // line somehow and only the card knows which column is the one that
         // should absorb what is left. A mover row is ticker-and-name beside a
@@ -3239,7 +3326,14 @@ pub mod catalog {
         ("Fab", &[("name", Token(ICON))]),
         // The bottom tab bar and its tabs — pinned to the page floor.
         ("TabBar", &[]),
-        ("Tab", &[("icon", Token(ICON)), ("label", Text), ("active", Token(ONOFF))]),
+        (
+            "Tab",
+            &[
+                ("icon", Token(ICON)),
+                ("label", Text),
+                ("active", Token(ONOFF)),
+            ],
+        ),
         // A full-bleed inverse section band — a month strip, a dark app-bar
         // stripe. Takes the strip's own title; it is chrome, not a container.
         ("Band", &[("text", Text)]),
@@ -5533,6 +5627,8 @@ pub struct RealizeLimits {
     pub max_nodes: usize,
     pub max_depth: usize,
     pub max_collection: usize,
+    /// Aggregate element visits and loop iterations, including false guards.
+    pub max_work: usize,
 }
 
 impl Default for RealizeLimits {
@@ -5541,6 +5637,7 @@ impl Default for RealizeLimits {
             max_nodes: 8_192,
             max_depth: 64,
             max_collection: 512,
+            max_work: 65_536,
         }
     }
 }
@@ -5638,6 +5735,7 @@ fn realize_inner(
 
     let mut ctx = Realizer {
         depth: 0,
+        work: 0,
         card: &card,
         limits,
         nodes: 0,
@@ -5783,29 +5881,30 @@ impl ValueScope<'_> {
         }
 
         let mut current = match self.frames.iter().rev().find(|(n, _, _)| n == root) {
-            Some((_, v, _)) => v.clone(),
-            None => self.data.get(root)?.clone(),
+            Some((_, v, _)) => v,
+            None => self.data.get(root)?,
         };
         for segment in segments {
             // `[inner]` — resolve the inner path, then index by its value.
             if let Some(inner) = segment.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
                 let key = self.lookup(inner)?;
                 current = match &key {
-                    serde_json::Value::String(k) => current.get(k.as_str())?.clone(),
-                    v => current.get(v.as_u64()? as usize)?.clone(),
+                    serde_json::Value::String(k) => current.get(k.as_str())?,
+                    v => current.get(v.as_u64()? as usize)?,
                 };
                 continue;
             }
             current = match segment.parse::<usize>() {
-                Ok(index) => current.get(index)?.clone(),
-                Err(_) => current.get(segment)?.clone(),
+                Ok(index) => current.get(index)?,
+                Err(_) => current.get(segment)?,
             };
         }
-        Some(current)
+        Some(current.clone())
     }
 }
 
 struct Realizer<'a> {
+    work: usize,
     card: &'a Card,
     limits: RealizeLimits,
     nodes: usize,
@@ -5826,6 +5925,15 @@ struct Realizer<'a> {
 }
 
 impl Realizer<'_> {
+    fn charge_work(&mut self) -> bool {
+        if self.work >= self.limits.max_work || self.nodes >= self.limits.max_nodes {
+            self.truncated = true;
+            return false;
+        }
+        self.work += 1;
+        true
+    }
+
     fn element(
         &mut self,
         element: &Element,
@@ -5833,7 +5941,7 @@ impl Realizer<'_> {
         key: &str,
         out: &mut Vec<UiNode>,
     ) {
-        if self.nodes >= self.limits.max_nodes || self.depth >= self.limits.max_depth {
+        if !self.charge_work() || self.depth >= self.limits.max_depth {
             self.truncated = true;
             return;
         }
@@ -6099,6 +6207,9 @@ impl Realizer<'_> {
         let mut seen_keys: Vec<String> = Vec::new();
 
         for (index, item) in items.iter().enumerate() {
+            if !self.charge_work() {
+                break;
+            }
             if index >= self.limits.max_collection {
                 self.truncated = true;
                 break;
@@ -6111,11 +6222,11 @@ impl Realizer<'_> {
                 .and_then(|k| {
                     let mut segments = k.split('.');
                     segments.next()?;
-                    let mut current = item.clone();
+                    let mut current = item;
                     for segment in segments {
-                        current = current.get(segment)?.clone();
+                        current = current.get(segment)?;
                     }
-                    Some(json_to_key(&current))
+                    Some(json_to_key(current))
                 })
                 .unwrap_or_else(|| index.to_string());
 
@@ -8510,9 +8621,11 @@ pub mod makepad {
                     Some(NodeValue::Token(t)) => crate::icon_glyph(t),
                     _ => crate::icon_glyph("home"),
                 };
-                let _ = writeln!(out,
+                let _ = writeln!(
+                    out,
                     "{p}TextCaption{{ text: {} draw_text.color: {DIM} }}",
-                    text_of(arg(node, "label")).replace('"', &format!("{g} ")));
+                    text_of(arg(node, "label")).replace('"', &format!("{g} "))
+                );
                 let _ = g;
             }
             "TabBar" => {
@@ -8535,9 +8648,11 @@ pub mod makepad {
                          draw_text.text_style: TextStyle{{ font_family: FontFamily{{ latin := \
                          FontMember{{ res: crate_resource(\"makepad_widgets:resources/fa-solid-900.ttf\") \
                          asc: 0.0 desc: 0.0 }} }} font_size: 9 }} }}");
-                    let _ = writeln!(out,
+                    let _ = writeln!(
+                        out,
                         "{p}    TextCaption{{ text: {} draw_text.color: {ink} }}",
-                        text_of(arg(tab, "label")));
+                        text_of(arg(tab, "label"))
+                    );
                     let _ = writeln!(out, "{p}  }}");
                 }
                 let _ = writeln!(out, "{p}}}");
@@ -9444,26 +9559,6 @@ pub fn state_initials(source: &str) -> std::collections::BTreeMap<String, serde_
         .collect()
 }
 
-/// The theme this card declares, or `None` for the default.
-///
-/// The card names a MOOD; resolving it into colours is the component kit's job
-/// (§1.1's middle layer), so this hands the host a catalogued name and nothing
-/// else. A name absent from [`catalog::THEMES`] never reaches here — the parser
-/// refuses it — so a host may treat whatever it gets as answerable, and treat
-/// `None` as "the kit's default".
-///
-/// Read before realize, like [`state_initials`]: the palette has to be chosen to
-/// build the source the kit is concatenated into, which is earlier than a tree.
-/// The theme axes a card declares beside its mood, in source order.
-///
-/// Read before realize for the same reason [`card_theme`] is: a host choosing
-/// a palette needs the card's stated intent, and that is a fact about the
-/// source rather than about a realized tree.
-
-/// The theme's default answer for each semantic icon name — Font Awesome
-/// solid codepoints, resolved AT LOWER TIME so the kit never carries a string
-/// table and the card never carries a glyph.
-
 /// The pastel pair a card tint token resolves to — first stop, second stop.
 /// One table, lower-time, the same shape as `icon_glyph`: the card names a
 /// closed HUE ROLE, this is where the numbers live.
@@ -9482,6 +9577,9 @@ pub fn card_tint(t: &str) -> (u32, u32) {
     }
 }
 
+/// The theme's default answer for each semantic icon name — Font Awesome
+/// solid codepoints, resolved AT LOWER TIME so the kit never carries a string
+/// table and the card never carries a glyph.
 pub fn icon_glyph(name: &str) -> &'static str {
     match name {
         "activity" => "\u{f201}",
@@ -9538,6 +9636,11 @@ pub fn icon_glyph(name: &str) -> &'static str {
     }
 }
 
+/// The theme axes a card declares beside its mood, in source order.
+///
+/// Read before realize for the same reason [`card_theme`] is: a host choosing
+/// a palette needs the card's stated intent, and that is a fact about the
+/// source rather than about a realized tree.
 pub fn card_theme_axes(source: &str) -> Vec<(String, String)> {
     let mut sink = Diagnostics::default();
     let Some(tokens) = lex(source, &mut sink) else {
@@ -9546,6 +9649,16 @@ pub fn card_theme_axes(source: &str) -> Vec<(String, String)> {
     Parser::new(&tokens, &mut sink).parse_card().theme_axes
 }
 
+/// The theme this card declares, or `None` for the default.
+///
+/// The card names a MOOD; resolving it into colours is the component kit's job
+/// (§1.1's middle layer), so this hands the host a catalogued name and nothing
+/// else. A name absent from [`catalog::THEMES`] never reaches here — the parser
+/// refuses it — so a host may treat whatever it gets as answerable, and treat
+/// `None` as "the kit's default".
+///
+/// Read before realize, like [`state_initials`]: the palette has to be chosen to
+/// build the source the kit is concatenated into, which is earlier than a tree.
 pub fn card_theme(source: &str) -> Option<String> {
     let mut sink = Diagnostics::default();
     let tokens = lex(source, &mut sink)?;
@@ -9807,6 +9920,7 @@ fn resolved_bindings(
     };
     let ctx = Realizer {
         depth: 0,
+        work: 0,
         card: &card,
         limits: RealizeLimits::default(),
         nodes: 0,
@@ -11032,7 +11146,11 @@ pub mod kit {
                             segs.last_mut().expect("seeded non-empty").push(c);
                         }
                     }
-                    let fname = if segs.len() == 2 { "l0_surface_pin2" } else { "l0_surface_pin3" };
+                    let fname = if segs.len() == 2 {
+                        "l0_surface_pin2"
+                    } else {
+                        "l0_surface_pin3"
+                    };
                     let _ = write!(out, "{fname}(");
                     for (i, seg) in segs.iter().enumerate() {
                         if i > 0 {
@@ -11172,9 +11290,15 @@ pub mod kit {
                     Some(NodeValue::Token(t)) => t.clone(),
                     _ => "home".to_owned(),
                 };
-                let on = i32::from(matches!(arg(node, "active"), Some(NodeValue::Token(t)) if t == "on"));
-                let _ = write!(out, "l0_tab({:?}, {}, {on})",
-                    crate::icon_glyph(&g), makepad::expr_of(node, "label"));
+                let on = i32::from(
+                    matches!(arg(node, "active"), Some(NodeValue::Token(t)) if t == "on"),
+                );
+                let _ = write!(
+                    out,
+                    "l0_tab({:?}, {}, {on})",
+                    crate::icon_glyph(&g),
+                    makepad::expr_of(node, "label")
+                );
             }
             "Rule" | "Space" => {
                 let _ = write!(out, "{f}()");

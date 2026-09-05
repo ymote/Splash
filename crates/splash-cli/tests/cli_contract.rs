@@ -29,6 +29,27 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
+fn evaluation_stops_before_a_granted_effect_after_an_uncaught_error() {
+    let output = run_splash(vec![
+        "eval".into(),
+        "--allow-echo".into(),
+        "use mod.std;use mod.tool;std.assert(false);tool.call(\"text.echo\",\"must not run\")"
+            .into(),
+    ]);
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must not run"));
+    assert!(stderr(&output).contains("assertion failed"));
+}
+
+#[test]
+fn direct_debug_logging_cannot_write_to_cli_stdout() {
+    let output = run_splash(vec!["eval".into(), "~\"private marker\"".into()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(!stderr(&output).contains("private marker"));
+}
+
+#[test]
 fn profile_contract_discloses_no_ambient_authority() {
     let output = run_splash(vec!["profile".to_owned()]);
 

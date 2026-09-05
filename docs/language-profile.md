@@ -9,16 +9,12 @@ regression. Parser features outside the grammar and fixtures remain inherited
 compatibility features until separately specified.
 
 **Scope.** This is the *workflow* profile: it is shaped for bounded dataflow and
-tool calls, and it deliberately rejects UI constructs. A second profile for
-generated UI is proposed but unimplemented — see
-[UI Profile Level 0](ui-profile-l0.md). The two are siblings rather than nested:
-a card is not a workflow with widgets bolted on, and neither profile is a subset
-of the other. Where they agree is the property that matters — a producer must be
-unable to write anything that reaches a capability it was not granted.
-
-Until L0 exists, `splash profile` reports only this profile, and a host with
-generated UI source has no canonical entry point (see
-[Generated UI source](grammar.md#generated-ui-source)).
+tool calls, and it deliberately rejects UI constructs. Generated UI uses the
+implemented sibling [UI Profile](ui-profile-l0.md), including its separately
+specified L1 expressions. Hosts check cards through
+`splash_core::ui_l0::check_ui_l0` and realize them through the UI API.
+`splash profile` describes this workflow profile; see
+[Generated UI source](grammar.md#generated-ui-source) for the card entry point.
 
 ## Source contract
 
@@ -628,12 +624,16 @@ used at the Rust data boundary. The frozen `mod.std.json` module exposes that
 same boundary through `json.parse(document)` and `json.stringify(value)`.
 `string.to_bytes()` creates the bounded UTF-8 byte-array form accepted by
 `parse_json()` and `json.parse()`. Those parsing APIs accept only strict JSON
-from a string or UTF-8 byte array, then reconstruct a Splash value from bounded
-canonical JSON; they do not accept Makepad's nonstandard JSON extensions.
+from a string or UTF-8 byte array, then copy validated decoded values into the
+VM; they do not use the compatibility script tokenizer as a JSON reader.
 `to_json()` and
 `json.stringify()` return a JSON string only for JSON-safe values. Cycles,
 unsupported values, non-finite numbers, and duplicate object keys are rejected
 on serialization; malformed or non-UTF-8 input is rejected on parsing. Either
+direction rejects integer values outside +/-9007199254740991 before they can
+be silently rounded; represent larger identifiers as strings. This also applies
+to host-injected VM globals and canonical integer literals. Host-only JSON
+used for schemas and telemetry retains its full integer range. Either
 direction rejects excessive container depth and excessive input or output as
 ordinary native errors that canonical `try/catch` can recover from. With
 default execution limits, direct conversion is capped at 64 KiB and 64

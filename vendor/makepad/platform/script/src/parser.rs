@@ -466,6 +466,7 @@ enum State {
     // Short-circuit evaluation - patches TEST opcode jump after second operand
     ShortCircuitEnd {
         test_slot: u32,
+        what_op: LiveId,
     },
     // Short-circuit ?= - emits ASSIGN after RHS, then patches jump
     ShortCircuitAssignEnd {
@@ -527,7 +528,8 @@ impl State {
             id!(|) => 13,
             id!(-:) => 14,
             id!(++) => 14,
-            id!(===) | id!(!==) | id!(==) | id!(!=) | id!(<) | id!(>) | id!(<=) | id!(>=) => 15,
+            id!(<) | id!(>) | id!(<=) | id!(>=) => 14,
+            id!(===) | id!(!==) | id!(==) | id!(!=) => 15,
             id!(is) => 15,
             id!(&&) => 16,
             id!(||) | id!(|?) => 17,
@@ -777,6 +779,8 @@ pub struct ParserCheckpoint {
     /// The last opcode before the checkpoint, saved because auto-close's
     /// set_pop_to_me() mutates it in place. Must be restored on continuation.
     last_opcode: Option<ScriptValue>,
+    /// Auto-close patches pending logical jumps in place, not just the tail.
+    short_circuit_opcodes: Vec<(u32, ScriptValue)>,
 }
 
 impl ScriptParser {
@@ -2711,7 +2715,7 @@ impl ScriptParser {
                 self.push_code(Opcode::ME_SPLAT.into(), index);
                 return 0;
             }
-            State::ShortCircuitEnd { test_slot } => {
+            State::ShortCircuitEnd { test_slot, .. } => {
                 // Patch the TEST opcode's jump to skip to current position (after second operand)
                 self.set_opcode_args(test_slot, OpcodeArgs::from_u32(self.code_len() - test_slot));
                 return 0;
@@ -3631,8 +3635,13 @@ impl ScriptParser {
                             } else {
                                 break;
                             }
-                        } else if let State::ShortCircuitEnd { test_slot } = last {
-                            // Patch any higher-precedence short-circuit ops
+                        } else if let State::ShortCircuitEnd { test_slot, what_op } = last {
+                            // Keep a lower-precedence left operator open until
+                            // its entire right-hand expression has been emitted.
+                            if State::operator_order(*what_op) > op_order {
+                                break;
+                            }
+                            // Patch higher or equal precedence short-circuit ops
                             let test_slot = *test_slot;
                             self.state.pop();
                             self.set_opcode_args(
@@ -3649,7 +3658,10 @@ impl ScriptParser {
                     self.push_code(State::short_circuit_opcode(op).into(), self.index);
 
                     // Push state to patch the jump after second operand is parsed
-                    self.state.push(State::ShortCircuitEnd { test_slot });
+                    self.state.push(State::ShortCircuitEnd {
+                        test_slot,
+                        what_op: op,
+                    });
                     self.state.push(State::BeginExpr { required: true });
                     return 1;
                 }
@@ -3767,8 +3779,7 @@ impl ScriptParser {
                                     let Some(proto_field_index) = chain_start.checked_add(2) else {
                                         error!(
                                             self,
-                                            tokenizer,
-                                            "Malformed prototype field assignment"
+                                            tokenizer, "Malformed prototype field assignment"
                                         );
                                         self.state.push(State::BeginExpr { required: true });
                                         return 1;
@@ -3782,8 +3793,7 @@ impl ScriptParser {
                                     if !chain_starts_with_id || !proto_field_slot_is_valid {
                                         error!(
                                             self,
-                                            tokenizer,
-                                            "Malformed prototype field assignment"
+                                            tokenizer, "Malformed prototype field assignment"
                                         );
                                         self.state.push(State::BeginExpr { required: true });
                                         return 1;
@@ -4259,6 +4269,17 @@ impl ScriptParser {
             destruct_defaults_len: self.destruct_defaults.len(),
             nested_patterns_len: self.nested_patterns.len(),
             last_opcode: self.opcodes.last().copied(),
+            short_circuit_opcodes: self
+                .state
+                .iter()
+                .filter_map(|state| {
+                    if let State::ShortCircuitEnd { test_slot, .. } = state {
+                        Some((*test_slot, self.opcodes[*test_slot as usize]))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -4272,6 +4293,9 @@ impl ScriptParser {
             if let Some(last) = self.opcodes.last_mut() {
                 *last = saved;
             }
+        }
+        for (slot, opcode) in cp.short_circuit_opcodes {
+            self.opcodes[slot as usize] = opcode;
         }
         self.index = cp.token_index;
         self.state = cp.state;
@@ -4405,6 +4429,12 @@ impl ScriptParser {
                 }
                 State::EmitUnary { what_op, index } => {
                     self.push_code(State::operator_to_unary(what_op), index);
+                }
+                State::ShortCircuitEnd { test_slot, .. } => {
+                    self.set_opcode_args(
+                        test_slot,
+                        OpcodeArgs::from_u32(self.code_len() - test_slot),
+                    );
                 }
                 _ => {}
             }

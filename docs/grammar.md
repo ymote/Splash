@@ -114,7 +114,7 @@ equality           = comparison, { ( "==" | "!=" ), comparison } ;
 comparison         = additive, { ( "<" | "<=" | ">" | ">=" ), additive } ;
 additive           = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative     = unary, { ( "*" | "/" | "%" ), unary } ;
-unary              = [ "!" | "-" | "+" | "~" ], postfix ;
+unary              = [ "!" | "-" | "+" ], postfix ;
 postfix            = primary,
                      { call | field-access | index-access | ".await()" } ;
 call               = "(", [ expression, { ",", expression } ], ")" ;
@@ -146,6 +146,37 @@ a record literal as the whole branch, parenthesize it, for example
 `try ({value: 1}) catch ({value: 0})`. A value block's final statement must be
 a value-producing expression. `for`, `loop`, and `while` do not produce a
 value; place an explicit `nil` or another result expression after them.
+
+An `if`/`elif`/`else` block produces its final expression value, including
+when that expression ends in a newline or semicolon. An empty branch or a
+branch ending in a declaration or loop produces `nil`. Function blocks still
+use explicit `return`. Statement separators do not discard conditional results.
+
+`!` always produces a Boolean by negating truth conversion. Comparisons bind
+more tightly than equality, `&&` more tightly than `||`; logical operators
+short-circuit their entire right-hand expression. `~` is an inherited logging
+operator, not a canonical unary operator, and the standalone runtime denies
+its output even through its trusted compatibility entry point.
+
+Array indexing accepts only finite, non-negative integral numbers. A negative,
+fractional, string, Boolean, or `nil` index raises a catchable error before any
+read or write. Numeric string conversion is independent of inline versus heap
+storage: valid numeric text converts to a number; invalid text produces NaN.
+NaN is unequal to itself and cannot cross the JSON boundary.
+
+Canonical numeric literals must be finite. Integer literals and VM JSON input
+and output are restricted to -9007199254740991 through 9007199254740991.
+Larger integer identifiers must be strings. An unsafe literal is a syntax
+error; unsafe JSON conversion is a catchable error. Arithmetic uses binary64
+and may produce values outside that range, but integer results outside it
+cannot be serialized as JSON. Fractional numbers retain binary64 rounding.
+
+Structural equality visits each distinct container pair once, including
+cycles and shared subgraphs. Comparison consumes VM instruction fuel and
+checks the hard deadline, with an independent ceiling of 65,536 work units
+per comparison. Exhaustion terminates evaluation and cannot be caught.
+An uncaught ordinary script error also terminates evaluation before any later
+instruction or host effect; `try/catch` is the explicit recovery mechanism.
 
 The grammar makes the portable operator precedence explicit rather than making
 every inherited VM operator part of the language contract. Use parentheses

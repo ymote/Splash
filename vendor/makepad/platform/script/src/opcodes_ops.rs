@@ -7,26 +7,19 @@ use crate::numeric::NumericValue;
 use crate::opcode::*;
 use crate::value::*;
 use crate::vm::ScriptVm;
+use crate::*;
 
 impl<'a> ScriptVm<'a> {
     // ARITHMETIC handlers
 
     pub(crate) fn handle_not(&mut self) {
         let value = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
-        if let Some(v) = value.as_f64() {
-            self.bx
-                .threads
-                .cur()
-                .push_stack_unchecked(ScriptValue::from_f64(!(v as u64) as f64));
-            self.bx.threads.cur().trap.goto_next();
-        } else {
-            let v = self.bx.heap.cast_to_bool(value);
-            self.bx
-                .threads
-                .cur()
-                .push_stack_unchecked(ScriptValue::from_bool(!v));
-            self.bx.threads.cur().trap.goto_next();
-        }
+        let v = self.bx.heap.cast_to_bool(value);
+        self.bx
+            .threads
+            .cur()
+            .push_stack_unchecked(ScriptValue::from_bool(!v));
+        self.bx.threads.cur().trap.goto_next();
     }
 
     pub(crate) fn handle_neg(&mut self) {
@@ -104,23 +97,53 @@ impl<'a> ScriptVm<'a> {
     // EQUALITY handlers
 
     pub(crate) fn handle_eq(&mut self) {
-        let b = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
-        let a = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
-        self.bx
-            .threads
-            .cur()
-            .push_stack_unchecked(self.bx.heap.deep_eq(a, b).into());
-        self.bx.threads.cur().trap.goto_next();
+        self.handle_structural_equality(false);
     }
 
     pub(crate) fn handle_neq(&mut self) {
+        self.handle_structural_equality(true);
+    }
+
+    fn handle_structural_equality(&mut self, negate: bool) {
         let b = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         let a = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
-        self.bx
-            .threads
-            .cur()
-            .push_stack_unchecked((!self.bx.heap.deep_eq(a, b)).into());
-        self.bx.threads.cur().trap.goto_next();
+        let deadline = self.bx.run_budget.as_ref().map(|b| b.hard_deadline);
+        let thread = self.bx.threads.cur();
+        let result = self
+            .bx
+            .heap
+            .deep_eq_bounded(a, b, crate::equality::MAX_EQUALITY_WORK, || {
+                if let Some(remaining) = thread.instruction_limit_remaining.as_mut() {
+                    if *remaining == 0 {
+                        return false;
+                    }
+                    *remaining -= 1;
+                }
+                deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
+            });
+        match result {
+            Some(equal) => {
+                self.bx
+                    .threads
+                    .cur()
+                    .push_stack_unchecked((equal != negate).into());
+                self.bx.threads.cur().trap.goto_next();
+            }
+            None => {
+                let error = script_err_limit!(
+                    self.bx.threads.cur_ref().trap,
+                    "script equality work, instruction, or time limit exceeded"
+                );
+                // Native work exhaustion is uncatchable just like VM fuel.
+                self.drain_errors();
+                self.bx
+                    .threads
+                    .cur()
+                    .trap
+                    .on
+                    .set(Some(crate::trap::ScriptTrapOn::Bail(error)));
+            }
+        }
     }
 
     pub(crate) fn handle_shallow_eq(&mut self) {

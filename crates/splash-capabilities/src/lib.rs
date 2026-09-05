@@ -7632,13 +7632,37 @@ mod tests {
             )
             .unwrap();
 
-        assert!(report.completed(), "{:?}", report.diagnostics);
+        assert!(!report.completed(), "{:?}", report.diagnostics);
         assert!(report
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.contains("assertion failed")));
         assert_eq!(observed_handler_calls.get(), 0);
         assert!(runtime.audit().is_empty());
+    }
+
+    #[test]
+    fn guards_and_logical_precedence_skip_granted_effects() {
+        for (source, completed) in [
+            (
+                "use mod.std;use mod.tool;std.assert(false);tool.call(\"text.echo\",\"secret\")",
+                false,
+            ),
+            (
+                "use mod.tool;true || false && tool.call(\"text.echo\",\"secret\")",
+                true,
+            ),
+        ] {
+            let mut runtime = CapabilityRuntime::default();
+            runtime
+                .register_tool(ToolPolicy::new("text.echo"), |_| {
+                    panic!("a skipped effect must never execute")
+                })
+                .unwrap();
+            let result = runtime.eval(source).unwrap();
+            assert_eq!(result.completed(), completed, "{:?}", result.diagnostics);
+            assert!(runtime.audit().is_empty());
+        }
     }
 
     #[test]

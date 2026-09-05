@@ -92,6 +92,9 @@ pub const DEFAULT_BUDGET_SAMPLE_INTERVAL: u32 = 1_024;
 pub const DEFAULT_MAX_JSON_DATA_BYTES: usize = 64 * 1024;
 /// Default maximum JSON container nesting accepted at a host-data boundary.
 pub const DEFAULT_MAX_JSON_DATA_DEPTH: usize = 64;
+/// JSON integers crossing the VM boundary must fit the contiguous exact
+/// binary64 integer range. Larger identifiers should be encoded as strings.
+pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 /// Maximum source array items processed by one transforming standard
 /// collection helper.
 ///
@@ -395,6 +398,7 @@ pub enum RuntimeJsonError {
     TooDeep { maximum: usize },
     InvalidEncoding,
     NonFiniteNumber,
+    UnsafeInteger,
     UnsupportedScriptValue,
     NonStringObjectKey,
     UnknownObjectKey,
@@ -427,6 +431,8 @@ impl Display for RuntimeJsonError {
             Self::NonFiniteNumber => {
                 formatter.write_str("a Splash non-finite number cannot cross a JSON boundary")
             }
+            Self::UnsafeInteger => formatter
+                .write_str("JSON integers outside +/-9007199254740991 must be encoded as strings"),
             Self::UnsupportedScriptValue => {
                 formatter.write_str("a Splash value cannot be represented as JSON")
             }
@@ -779,7 +785,7 @@ pub struct ImportedModuleCallHintReport {
 
 impl Evaluation {
     pub fn succeeded(&self) -> bool {
-        !self.value.is_err()
+        !self.value.is_err() && self.diagnostics.is_empty()
     }
 
     pub fn completed(&self) -> bool {
@@ -819,6 +825,7 @@ impl<H: Any, S: Any> Runtime<H, S> {
             json_method_limits,
         };
         runtime.with_vm(|vm| {
+            vm.bx.allow_debug_output = false;
             vm.bx
                 .heap
                 .set_max_string_bytes(Some(limits.max_string_bytes));
@@ -924,16 +931,15 @@ impl<H: Any, S: Any> Runtime<H, S> {
         if !is_valid_json_global_name(name) {
             return Err(RuntimeError::JsonData(RuntimeJsonError::InvalidGlobalName));
         }
-        let encoded =
-            serialize_bounded_json(value, max_bytes, max_depth).map_err(RuntimeError::JsonData)?;
+        serialize_bounded_json(value, max_bytes, max_depth).map_err(RuntimeError::JsonData)?;
+        validate_script_json_numbers(value).map_err(RuntimeError::JsonData)?;
         let max_string_bytes = self.limits.max_string_bytes;
         let max_heap_bytes = self.limits.max_heap_bytes;
         self.with_vm(|vm| {
             if has_paused_thread(vm) {
                 return Err(RuntimeError::EvaluationInProgress);
             }
-            let mut parser = vm::json::JsonParserThread::default();
-            let value = parser.read_json(&encoded, &mut vm.bx.heap);
+            let value = materialize_script_json(&mut vm.bx.heap, value);
             vm.bx.heap.reconcile_heap_bytes();
             let actual = vm.bx.heap.accounted_heap_bytes();
             let heap_limit_exceeded = vm.bx.heap.take_heap_limit_exceeded();
@@ -2017,8 +2023,8 @@ pub fn encode_bounded_script_json(
 
 /// Decodes bounded JSON into a Splash value for a trusted native binding.
 ///
-/// The JSON is parsed and re-encoded through Splash's bounded host-data
-/// boundary before the vendored VM materializes it. This prevents a native
+/// The JSON is validated through Splash's bounded host-data boundary before
+/// its decoded values are copied into the VM. This prevents a native
 /// binding from bypassing the runtime's JSON byte or nesting limits. Decoding
 /// data does not load a module or grant a capability.
 pub fn decode_bounded_script_json(
@@ -2028,9 +2034,72 @@ pub fn decode_bounded_script_json(
     max_depth: usize,
 ) -> Result<vm::ScriptValue, RuntimeJsonError> {
     let value = parse_bounded_json(document, max_bytes, max_depth)?;
-    let encoded = serialize_bounded_json(&value, max_bytes, max_depth)?;
-    let mut parser = vm::json::JsonParserThread::default();
-    Ok(parser.read_json(&encoded, &mut vm.bx.heap))
+    validate_script_json_numbers(&value)?;
+    serialize_bounded_json(&value, max_bytes, max_depth)?;
+    Ok(materialize_script_json(&mut vm.bx.heap, &value))
+}
+
+// Inputs have already passed byte, depth, and numeric checks. Copy decoded
+// values directly: the compatibility script tokenizer is not a JSON decoder
+// and loses signs on negative JSON numbers.
+fn materialize_script_json(heap: &mut vm::heap::ScriptHeap, value: &JsonValue) -> vm::ScriptValue {
+    match value {
+        JsonValue::Null => vm::ScriptValue::NIL,
+        JsonValue::Bool(value) => (*value).into(),
+        JsonValue::Number(value) => value.as_f64().expect("validated JSON number").into(),
+        JsonValue::String(value) => heap.new_string_from_str(value),
+        JsonValue::Array(values) => {
+            let array = heap.new_array();
+            for value in values {
+                let value = materialize_script_json(heap, value);
+                heap.array_push_unchecked(array, value);
+            }
+            array.into()
+        }
+        JsonValue::Object(values) => {
+            let object = heap.new_object();
+            heap.set_string_keys(object);
+            for (key, value) in values {
+                let key = heap.new_string_from_str(key);
+                let value = materialize_script_json(heap, value);
+                heap.set_value_def(object, key, value);
+            }
+            object.into()
+        }
+    }
+}
+
+// Call only after the ordinary JSON depth/byte checks. Host-only JSON and
+// schema/telemetry serialization retain their exact serde integer domain.
+fn validate_script_json_numbers(value: &JsonValue) -> Result<(), RuntimeJsonError> {
+    match value {
+        JsonValue::Number(number) => {
+            let safe = if let Some(integer) = number.as_u64() {
+                integer <= MAX_SAFE_JSON_INTEGER
+            } else if let Some(integer) = number.as_i64() {
+                integer.unsigned_abs() <= MAX_SAFE_JSON_INTEGER
+            } else {
+                number.as_f64().is_some_and(|n| {
+                    n.is_finite() && (n.fract() != 0.0 || n.abs() <= MAX_SAFE_JSON_INTEGER as f64)
+                })
+            };
+            if !safe {
+                return Err(RuntimeJsonError::UnsafeInteger);
+            }
+        }
+        JsonValue::Array(values) => {
+            for value in values {
+                validate_script_json_numbers(value)?;
+            }
+        }
+        JsonValue::Object(values) => {
+            for value in values.values() {
+                validate_script_json_numbers(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_json_depth(
@@ -2142,6 +2211,9 @@ fn write_script_json(
             return Err(RuntimeJsonError::NonFiniteNumber);
         }
         if value.fract() == 0.0 {
+            if value.abs() > MAX_SAFE_JSON_INTEGER as f64 {
+                return Err(RuntimeJsonError::UnsafeInteger);
+            }
             return writer.append(&value.to_string());
         }
         let Some(number) = serde_json::Number::from_f64(value) else {
@@ -5377,8 +5449,8 @@ mod tests {
             let evaluation = runtime.eval(source).unwrap();
 
             assert!(
-                evaluation.completed(),
-                "{name} did not complete: {:?}",
+                !evaluation.completed(),
+                "{name} must stop at the uncaught assertion: {:?}",
                 evaluation.diagnostics
             );
             assert!(
@@ -5388,17 +5460,6 @@ mod tests {
                     .any(|diagnostic| diagnostic.contains("assertion failed")),
                 "{name}: {:?}",
                 evaluation.diagnostics
-            );
-            assert_eq!(
-                runtime
-                    .script_value_as_json(
-                        evaluation.value,
-                        DEFAULT_MAX_JSON_DATA_BYTES,
-                        DEFAULT_MAX_JSON_DATA_DEPTH,
-                    )
-                    .unwrap(),
-                serde_json::json!(0),
-                "{name} re-entered an abandoned fallback"
             );
         }
     }
@@ -8446,7 +8507,7 @@ compute(outer, 2)
                      array.push(squares, index * index)\n\
                  }\n\
                  assert(squares == [0, 1, 4])\n\
-                 assert(array.range(9007199254740991, 9007199254740992) == [9007199254740991])\n\
+                 assert(array.range(9007199254740990, 9007199254740991) == [9007199254740990])\n\
                  assert(array.concat([1, 2], [3, 4]) == [1, 2, 3, 4])\n\
                  let optional_nested = {answer: 1}\n\
                  let optional = [nil, false, 0, \"\", optional_nested, nil]\n\
@@ -8609,7 +8670,7 @@ compute(outer, 2)
         );
 
         let invalid_range_precision = runtime
-            .eval("use mod.std.array\ntry array.range(0, 9007199254740994) catch \"invalid\"")
+            .eval("use mod.std.array\ntry array.range(0, 9007199254740991+3) catch \"invalid\"")
             .unwrap();
         assert!(
             invalid_range_precision.completed(),
@@ -8701,7 +8762,7 @@ compute(outer, 2)
 
         let oversized_len = Runtime::default()
             .eval(&format!(
-                "use mod.std.array\n\
+                "use mod.std.assert\nuse mod.std.array\n\
                  let values = []\n\
                  values[{MAX_STANDARD_ARRAY_ITEMS}] = 0\n\
                  assert(array.len(values) == {})\n\

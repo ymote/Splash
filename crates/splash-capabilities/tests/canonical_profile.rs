@@ -47,7 +47,7 @@ fn executes_shipped_canonical_fixtures_through_real_capability_bindings() {
             "../../splash-core/tests/fixtures/canonical_constructs.splash"
         ))
         .unwrap();
-    assert!(initial.suspended);
+    assert!(initial.suspended, "{:?}", initial.diagnostics);
 
     let pump = runtime.pump().unwrap();
     assert_eq!(pump.completed, 1);

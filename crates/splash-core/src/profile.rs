@@ -1341,6 +1341,15 @@ impl<'source> ProfileLexer<'source> {
             );
         }
 
+        let spelling: String = self.chars[start..self.index].iter().collect();
+        if let Ok(value) = spelling.parse::<f64>() {
+            if !value.is_finite()
+                || (value.fract() == 0.0 && value.abs() > crate::MAX_SAFE_JSON_INTEGER as f64)
+            {
+                self.report(line, column,
+                    "numeric literals must be finite; integers outside +/-9007199254740991 must be strings");
+            }
+        }
         self.emit(TokenKind::Number, line, column, start, self.index);
     }
 
@@ -1566,7 +1575,13 @@ impl<'source> ProfileLexer<'source> {
             self.advance();
         }
         let operator: String = self.chars[start..self.index].iter().collect();
-        if is_canonical_operator(&operator) {
+        if operator == "~" {
+            self.report(
+                line,
+                column,
+                "direct logging (`~`) is not part of the canonical Splash profile",
+            );
+        } else if is_canonical_operator(&operator) {
             self.emit(
                 TokenKind::Operator(operator),
                 line,
@@ -2103,6 +2118,7 @@ struct CanonicalParser {
     imports: Option<ModuleImportCollector>,
     static_record_shapes: Option<StaticRecordShapeCollector>,
     vm_statement_separator_offsets: Option<Vec<usize>>,
+    vm_block_tail_edits: Vec<(usize, usize, &'static str)>,
 }
 
 impl CanonicalParser {
@@ -2119,6 +2135,7 @@ impl CanonicalParser {
             imports: None,
             static_record_shapes: None,
             vm_statement_separator_offsets: None,
+            vm_block_tail_edits: Vec::new(),
         }
     }
 
@@ -2150,16 +2167,27 @@ impl CanonicalParser {
             .vm_statement_separator_offsets
             .take()
             .expect("VM statement-separator collection was enabled");
-        let inserted_statement_separators = offsets.len();
-        let mut lowered = String::with_capacity(source.len() + inserted_statement_separators);
+        // Also budget synthesized nil tails. Removed source semicolons only
+        // reduce the VM token count and retain their source width as spaces.
+        let inserted_statement_separators = offsets.len()
+            + self
+                .vm_block_tail_edits
+                .iter()
+                .filter(|(_, _, text)| *text == " nil ")
+                .count();
+        let mut edits: Vec<_> = offsets
+            .into_iter()
+            .map(|offset| (offset, offset, ";"))
+            .collect();
+        edits.extend(self.vm_block_tail_edits);
+        edits.sort_by_key(|(start, _, _)| *start);
+        let mut lowered = String::with_capacity(source.len() + inserted_statement_separators * 5);
         let mut source_offset = 0_usize;
-
-        for offset in offsets {
-            debug_assert!(source_offset <= offset && offset <= source.len());
-            debug_assert!(source.is_char_boundary(offset));
-            lowered.push_str(&source[source_offset..offset]);
-            lowered.push(';');
-            source_offset = offset;
+        for (start, end, replacement) in edits {
+            debug_assert!(source_offset <= start && end <= source.len());
+            lowered.push_str(&source[source_offset..start]);
+            lowered.push_str(replacement);
+            source_offset = end;
         }
         lowered.push_str(&source[source_offset..]);
 
@@ -2217,6 +2245,10 @@ impl CanonicalParser {
     }
 
     fn parse_block(&mut self) {
+        self.parse_block_with_value(false);
+    }
+
+    fn parse_block_with_value(&mut self, produces_value: bool) {
         if !self.enter_nesting() {
             return;
         }
@@ -2226,12 +2258,34 @@ impl CanonicalParser {
             return;
         }
         self.consume_statement_ends();
+        let mut tail_is_value = false;
+        let mut tail_boundary = self.index;
         while !self.at_end() && !self.at_kind(&TokenKind::CloseCurly) {
             let start = self.index;
+            tail_is_value = !self.starts_non_value_try_tail();
             self.parse_statement();
+            tail_boundary = self.index;
             self.require_statement_end();
             if self.index == start {
                 self.advance();
+            }
+        }
+        if produces_value && self.at_kind(&TokenKind::CloseCurly) {
+            let close = self.current().start_byte;
+            if let Some(offsets) = self.vm_statement_separator_offsets.as_mut() {
+                if tail_is_value {
+                    if offsets.last() == Some(&close) {
+                        offsets.pop();
+                    }
+                    for token in &self.tokens[tail_boundary..self.index] {
+                        if matches!(token.kind, TokenKind::Semicolon) {
+                            self.vm_block_tail_edits
+                                .push((token.start_byte, token.end_byte, " "));
+                        }
+                    }
+                } else {
+                    self.vm_block_tail_edits.push((close, close, " nil "));
+                }
             }
         }
         if !self.take_kind(&TokenKind::CloseCurly) {
@@ -2524,7 +2578,7 @@ impl CanonicalParser {
 
     fn parse_conditional_branch(&mut self) {
         if self.at_kind(&TokenKind::OpenCurly) {
-            self.parse_block();
+            self.parse_block_with_value(true);
         } else if self.starts_lambda_expression() {
             self.report_current("a lambda used as a conditional branch must be written in a block");
         } else if self.at_expression_boundary() {
@@ -2640,7 +2694,7 @@ impl CanonicalParser {
     }
 
     fn parse_unary(&mut self) {
-        self.take_any_operator(&["!", "-", "+", "~"]);
+        self.take_any_operator(&["!", "-", "+"]);
         self.parse_postfix();
     }
 

@@ -650,7 +650,11 @@ impl ScriptObjectData {
         self.map
             .capacity()
             .saturating_mul(Self::map_entry_bytes())
-            .saturating_add(self.vec.capacity().saturating_mul(size_of::<ScriptVecValue>()))
+            .saturating_add(
+                self.vec
+                    .capacity()
+                    .saturating_mul(size_of::<ScriptVecValue>()),
+            )
     }
 
     /// Conservative retained capacity needed before inserting a new map key.
@@ -675,7 +679,10 @@ impl ScriptObjectData {
                 .max(Self::MAP_GROWTH_CAPACITY_FLOOR)
         };
         let map_bytes = map_capacity.checked_mul(Self::map_entry_bytes())?;
-        let vec_bytes = self.vec.capacity().checked_mul(size_of::<ScriptVecValue>())?;
+        let vec_bytes = self
+            .vec
+            .capacity()
+            .checked_mul(size_of::<ScriptVecValue>())?;
         map_bytes.checked_add(vec_bytes)
     }
 
@@ -1009,6 +1016,10 @@ impl ScriptObjectData {
                 }
             }
         } else {
+            if let Some(existing) = self.map.get_mut(&key) {
+                existing.value = value;
+                return;
+            }
             let order = self.map.len() as u32;
             self.map.insert(
                 key,

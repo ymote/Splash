@@ -684,7 +684,26 @@ impl<'a> ScriptVm<'a> {
                 .trap
                 .goto(try_frame.start_ip + try_frame.jump);
         } else {
+            // An uncaught error terminates this evaluation before another
+            // instruction (and therefore another host effect) can execute.
+            let error = self
+                .bx
+                .threads
+                .cur_ref()
+                .trap
+                .err
+                .borrow()
+                .front()
+                .map(|e| e.value);
             self.drain_errors();
+            if let Some(error) = error {
+                self.bx
+                    .threads
+                    .cur()
+                    .trap
+                    .on
+                    .set(Some(ScriptTrapOn::Bail(error)));
+            }
         }
     }
 
@@ -888,10 +907,8 @@ impl<'a> ScriptVm<'a> {
                 // If there's a value on the stack, return it (for expression-style scripts)
                 let stack_len = self.bx.threads.cur().stack.len();
                 if stack_len > 0 {
-                    log!("run_core: returning stack value, stack_len={}", stack_len);
                     return self.bx.threads.cur().pop_stack_value();
                 }
-                log!("run_core: stack empty, returning NIL");
                 return NIL;
             };
 
@@ -1494,6 +1511,9 @@ pub struct ScriptVmBase {
     pub is_reload: bool,
     pub debug_trace: bool,
     pub silence_errors: bool,
+    /// Trusted raw Makepad hosts may log; standalone Splash disables this
+    /// before either canonical or compatibility source can execute.
+    pub allow_debug_output: bool,
     /// When Some, drained errors are pushed here (formatted) instead of being
     /// logged or dropped — even under `silence_errors`. Install before an
     /// eval/call, take after, to feed diagnostics back to a host (e.g. an AI
@@ -1513,6 +1533,7 @@ impl ScriptVmBase {
             is_reload: false,
             debug_trace: false,
             silence_errors: false,
+            allow_debug_output: true,
             captured_errors: None,
             run_budget: None,
         }
@@ -1546,6 +1567,7 @@ impl ScriptVmBase {
             is_reload: false,
             debug_trace: false,
             silence_errors: false,
+            allow_debug_output: true,
             captured_errors: None,
             run_budget: None,
         }
@@ -1618,6 +1640,42 @@ mod tests {
         );
 
         assert_eq!(result.as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn streaming_logical_precedence_repatches_pending_short_circuits() {
+        for (prefix, suffix, expected) in [
+            ("true || false ", "&& false", true),
+            ("false && true ", "|| true", true),
+            ("true == 2 ", "> 1", true),
+        ] {
+            let mut host = ();
+            let mut std = ();
+            let mut vm = ScriptVm {
+                host: &mut host,
+                std: &mut std,
+                bx: Box::new(ScriptVmBase::new()),
+            };
+            let module = || ScriptMod {
+                file: "streaming-precedence.splash".into(),
+                ..Default::default()
+            };
+            let partial = vm.with_instruction_limit(1000, |vm| {
+                vm.eval_with_append_source(module(), prefix, ScriptObject::ZERO)
+            });
+            assert!(
+                !partial.is_err(),
+                "unfinished logical expression must terminate: {prefix}"
+            );
+            let result = vm.with_instruction_limit(1000, |vm| {
+                vm.eval_with_append_source(
+                    module(),
+                    &format!("{prefix}{suffix}\n;"),
+                    ScriptObject::ZERO,
+                )
+            });
+            assert_eq!(result.as_bool(), Some(expected), "{prefix}{suffix}");
+        }
     }
 
     #[test]
@@ -1697,7 +1755,7 @@ mod tests {
                    }\n\
                    try { payload + payload } { \"ok\" }\n\
                    ;"
-                .to_owned(),
+            .to_owned(),
             ..Default::default()
         });
 
@@ -1728,7 +1786,7 @@ mod tests {
             code: "let values = []\n\
                    try { values[268435456] = 1 } { \"ok\" }\n\
                    ;"
-                .to_owned(),
+            .to_owned(),
             ..Default::default()
         });
 
@@ -1823,10 +1881,7 @@ mod tests {
             bx: Box::new(ScriptVmBase::new()),
         };
 
-        let bytes = vm
-            .bx
-            .heap
-            .new_array_from_vec_u8(vec![b'a', 0xFF, b'b']);
+        let bytes = vm.bx.heap.new_array_from_vec_u8(vec![b'a', 0xFF, b'b']);
         vm.set_injected_global(id!(bytes), bytes.into());
 
         let result = vm.eval(ScriptMod {

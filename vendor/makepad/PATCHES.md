@@ -1,5 +1,42 @@
 # Local Vendor Patches
 
+## `platform/script`: language review fixes (#9–#18)
+
+The September 2026 review fixes implement the contracts published in
+`docs/grammar.md`. `equality.rs` replaces recursive structural comparison with
+a cycle-aware worklist, meters edges, pairs, typed-array elements and string
+chunks, and bounds temporary storage. Equality opcodes charge instruction fuel,
+check the hard deadline, and bail on native-work exhaustion. NaN remains unequal
+to itself. Raw host comparison is iterative but does not consume VM fuel.
+
+Uncaught VM errors now drain diagnostics and bail before another instruction
+can run. Active `try` handlers still recover normally. A host-controlled
+`allow_debug_output` flag preserves raw Makepad debugging by default; Splash's
+standalone runtime disables it, including compatibility evaluation. LOG is
+rejected and incidental VM error prints are removed.
+
+The parser retains the logical operator in streaming checkpoint state, closes
+short-circuit jumps according to precedence, and gives comparisons higher
+precedence than equality. `!` consistently negates truth conversion. Numeric
+string conversion handles inline and heap strings alike and produces NaN for
+invalid text. Array opcode reads and writes validate index type, sign,
+integrality and representable range before touching storage. Existing limits
+still govern sparse growth. Updating an untracked object field now preserves
+its original insertion order, matching the tracked-object path; the stricter
+uncaught-error behavior exposed this existing contract violation.
+
+Conditional block-tail lowering, strict JSON materialization, numeric boundary
+checks, and aggregate UI realization work limits live in Splash-owned crates.
+Regressions cover cycles and shared DAGs in a timed child process, fuel,
+precedence and effects, streaming appends, error recovery, invalid writes,
+numeric storage variants, JSON boundaries, and empty nested UI expansion.
+
+**Upstream sync:** reapply or retire the VM changes as a unit when importing
+Makepad. Preserve the published Splash contracts and run both Splash's regression
+suite and the explicit `makepad-script` tests, especially streaming precedence
+and `try/catch` recovery. Keep the standalone logging opt-out host-controlled;
+do not add capabilities to compensate for removed output paths.
+
 ## `regex/src/utf8.rs`: Clippy-compatible iterator entry
 
 The upstream iterator wrapped an inner non-terminating loop in `while let`.

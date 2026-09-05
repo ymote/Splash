@@ -33,7 +33,7 @@ for index, value in flags {
     break
 }
 
-for first, second, third in flags {
+for first, second, third in record {
     break
 }
 

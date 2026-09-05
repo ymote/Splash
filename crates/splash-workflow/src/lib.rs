@@ -10166,6 +10166,30 @@ mod tests {
     }
 
     #[test]
+    fn an_uncaught_guard_error_prevents_later_granted_steps() {
+        let mut runtime = CapabilityRuntime::default();
+        runtime
+            .register_tool(ToolPolicy::new("text.echo"), |_| {
+                panic!("the effect following a failed guard must never execute")
+            })
+            .unwrap();
+        let mut engine = WorkflowEngine::new(runtime);
+        let plan = engine
+            .plan(vec![
+                WorkflowStep::new("guard", "use mod.std;std.assert(false);42"),
+                WorkflowStep::new("effect", "use mod.tool;tool.call(\"text.echo\",\"secret\")"),
+            ])
+            .unwrap();
+        let approval = engine.approve(&plan).unwrap();
+        assert!(
+            matches!(engine.execute(&plan, approval), Err(WorkflowError::StepFailed {
+            step_id, completed_steps: 0, ..
+        }) if step_id == "guard")
+        );
+        assert!(engine.runtime().audit().is_empty());
+    }
+
+    #[test]
     fn rejects_noncanonical_source_with_step_context_before_a_workflow_tool_runs() {
         let mut runtime = CapabilityRuntime::default();
         runtime
