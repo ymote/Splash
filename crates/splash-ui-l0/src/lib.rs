@@ -7794,6 +7794,32 @@ pub mod makepad {
         format: Option<String>,
     }
 
+    /// The literal `text:` of a node that ALSO carries a value, or `None`.
+    ///
+    /// Only a literal: a live `text:` and a live `value:` would each be a call
+    /// this side never resolves, and joining two of them is a decision for
+    /// whoever writes such a card, not for the lowering to guess at.
+    fn label_beside_value(node: &UiNode) -> Option<&str> {
+        // Not a HERO. A hero is one large number and its label belongs above
+        // it, not inside it: prepended, "card balance" turned $235.00 into a
+        // two-line "card balance $235.00" at 43pt and shrank the figure the
+        // screen exists to show. The small roles are the ones that read as
+        // "label value" on one line.
+        if node.kind == "TextHero" {
+            return None;
+        }
+        let has_value = arg(node, "value").is_some()
+            || node.bindings.iter().any(|(n, _)| n == "value")
+            || node.exprs.iter().any(|(n, _)| n == "value");
+        if !has_value {
+            return None;
+        }
+        match arg(node, "text") {
+            Some(NodeValue::Text(t)) if !t.is_empty() => Some(t),
+            _ => None,
+        }
+    }
+
     fn decoration_of(node: &UiNode) -> Decoration {
         Decoration {
             unit: match token_arg(node, "unit") {
@@ -7817,9 +7843,23 @@ pub mod makepad {
                 Some("pressure") => " hPa",
                 _ => "",
             },
-            glyph: match arg(node, "glyph") {
-                Some(NodeValue::Text(g)) => g.clone(),
-                _ => String::new(),
+            // A `text:` beside a `value:` is that value's LABEL, and it goes in
+            // front of the number for the same reason `glyph` does.
+            //
+            // `valued` prefers `value:` and only falls back to `text:`, so a
+            // node carrying both dropped the label silently: the weather card's
+            // `TextCaption(text: "最高", value: now.hi)` trio rendered as three
+            // bare temperatures with nothing to tell them apart, on every rail.
+            // A card that states a label wants it drawn.
+            glyph: {
+                let mark = match arg(node, "glyph") {
+                    Some(NodeValue::Text(g)) => g.clone(),
+                    _ => String::new(),
+                };
+                match label_beside_value(node) {
+                    Some(label) => format!("{label} {mark}"),
+                    None => mark,
+                }
             },
             // `suffix` is a declared unit word — "412 pts", not "412". It was in
             // the catalog and ignored here, so every score and comment count on
