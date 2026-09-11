@@ -1,15 +1,15 @@
-# Splash Grammar v0.2
+# Octoscript Grammar v0.2
 
-This document specifies the portable source subset for Splash producers,
+This document specifies the portable source subset for Octoscript producers,
 formatters, editors, and LLMs. It is intentionally narrower than the
 vendored Makepad parser: compatibility syntax outside this document is not a
-stable Splash language promise. `splash check` and
-`splash_core::check_syntax` enforce this profile and lower canonical statement
+stable Octoscript language promise. `octoscript check` and
+`octoscript_core::check_syntax` enforce this profile and lower canonical statement
 boundaries before reporting VM parser compatibility.
 
 The parser accepts a few legacy separator and declaration forms for Makepad
 compatibility. Generated workflow source must use the canonical forms below.
-Use [`splash check`](#syntax-preflight) before executing generated code.
+Use [`octoscript check`](#syntax-preflight) before executing generated code.
 
 Version 0.2 adds the canonical `try ... catch ...` expression. Every v0.1
 program remains valid v0.2 source; the new form does not enable an error value,
@@ -82,7 +82,7 @@ argument, array, record-member, and parameter separation. `let` bindings may
 be reassigned with an assignment operator such as `=`, `+=`, or `-=`.
 Multiline records may include leading, separating, and closing newlines, but
 not a trailing comma. Before canonical preflight or execution reaches the
-inherited VM, Splash lowers each validated newline statement boundary to an
+inherited VM, Octoscript lowers each validated newline statement boundary to an
 explicit VM semicolon. This preserves portable newline semantics even though
 the inherited streaming tokenizer otherwise treats newlines as whitespace.
 
@@ -193,7 +193,7 @@ standalone keyword or scheduler.
 
 `try protected catch fallback` evaluates to the protected branch's value when
 that branch succeeds. An ordinary script or native-binding error unwinds
-Splash function calls to the nearest active `try`, discards the error, and
+Octoscript function calls to the nearest active `try`, discards the error, and
 evaluates the fallback branch. A fallback error can be caught only by an
 enclosing `try` or otherwise reaches the host. Generated source should normally
 use blocks for both branches when either branch has more than one expression.
@@ -217,7 +217,7 @@ caught failure as proof that an external effect did not happen.
 
 ## Compatibility Boundary
 
-`splash check` rejects Makepad-only compatibility forms even when the vendored
+`octoscript check` rejects Makepad-only compatibility forms even when the vendored
 VM parser would accept them. This includes `var`, `match`, the legacy
 catch-less `try protected fallback [ok success]` form, standalone `ok`, typed
 or destructuring declarations, numeric suffixes, single-quoted strings, range
@@ -241,7 +241,7 @@ evaluation.
 These compatibility APIs must not receive LLM-generated or otherwise untrusted
 source, and they do not resolve imports, install modules, or grant authority.
 They also reject Makepad
-`@(index)` host-value tokens because standalone Splash has no host value table;
+`@(index)` host-value tokens because standalone Octoscript has no host value table;
 reviewed capability adapters are the Rust integration boundary. A canonical
 profile rejection returns before the inherited tokenizer or parser sees the
 source. The development CLI performs canonical preflight automatically for
@@ -252,19 +252,19 @@ masks inherited Makepad UI, debug, shader, pod, GC, math, regex, HTML, and
 direct-output entry points and clears inherited primitive type methods. In
 particular, generated source cannot reach the vendored `std.log`, `std.print`,
 `std.println`, `std.regex`, `String.parse_html()`, raw `array.push()`, or
-record-prototype APIs. The only direct primitive boundary restored by Splash is
+record-prototype APIs. The only direct primitive boundary restored by Octoscript is
 bounded `value.to_json()`, `document.parse_json()`, and `string.to_bytes()`;
 local array mutation uses `array.push(value, item)`. `mod.std.assert`, normal
-language operations, the frozen Splash-owned `mod.std.math` scalar helpers,
+language operations, the frozen Octoscript-owned `mod.std.math` scalar helpers,
 and the bounded `mod.std.json` data, `mod.std.text`, `mod.std.array`, and
 `mod.std.object` helpers remain available, along with reviewed host-installed
 `mod.tool` or direct capability modules. A trusted host that needs the broader
 Makepad surface must embed the raw Makepad VM itself; the compatibility APIs do
 not restore those bindings.
 
-The tracked [`makepad_ui_counter.splash`](../examples/makepad_ui_counter.splash)
+The tracked [`makepad_ui_counter.octoscript`](../examples/makepad_ui_counter.octoscript)
 fixture passes the bounded compatibility preflight to catch parser drift, but
-it remains outside this grammar and cannot run through `splash-cli`. It
+it remains outside this grammar and cannot run through `octoscript-cli`. It
 requires a Makepad UI host that supplies widget modules and `ui`; see
 [Makepad UI compatibility](makepad-ui-compatibility.md).
 
@@ -280,7 +280,7 @@ profile that admits UI constructs while admitting nothing which can reach a
 capability. Sources are queries the runtime resolves before realization and
 injects as data.
 
-It is **implemented** — `splash_core::ui_l0::check_ui_l0` accepts or rejects,
+It is **implemented** — `octoscript_core::ui_l0::check_ui_l0` accepts or rejects,
 and `realize` produces a renderer-neutral node tree. Note what that entry point
 does *not* do: L0 has no expression form, so there is nothing to evaluate and
 realization never enters the VM. Authority confinement is therefore structural
@@ -290,7 +290,7 @@ at all.
 
 ## Canonical Workflow Source
 
-```splash
+```octoscript
 use mod.tool
 use mod.std.assert
 
@@ -315,7 +315,7 @@ grammar checker deliberately does not resolve them.
 Use the CLI before evaluating a generated file:
 
 ```sh
-cargo run -p splash-cli -- check workflow.splash
+cargo run -p octoscript-cli -- check workflow.octoscript
 ```
 
 The command prints one JSON object containing `valid`, a bounded
@@ -330,32 +330,32 @@ structural delimiters before the vendored parser runs. Canonical source uses
 that same bounded VM preflight after grammar admission, so it does not bypass
 the VM tokenizer limits.
 
-Rust hosts can call `splash_core::check_syntax` or
-`splash_core::check_syntax_named`. These functions apply the normal source-size
+Rust hosts can call `octoscript_core::check_syntax` or
+`octoscript_core::check_syntax_named`. These functions apply the normal source-size
 syntax-token, and nesting limits but not instruction or deadline execution
 limits because they do not execute source. Embedded hosts can lower any of
 those bounds with `ExecutionLimits`.
 
 Editor and generator tooling that needs an outline can call
-`splash_core::top_level_declarations` or
-`splash_core::top_level_declarations_named`. They apply the same bounded
+`octoscript_core::top_level_declarations` or
+`octoscript_core::top_level_declarations_named`. They apply the same bounded
 canonical and VM-compatibility checks, then return only top-level `fn` and
 `let` declarations with UTF-8 byte spans for the declaration and identifier.
 Invalid source returns an empty outline; call `check_syntax` for diagnostics.
 The API never evaluates source, resolves imports, or creates a capability host.
 
-The development CLI exposes the same operation as `splash outline <file>`. It
+The development CLI exposes the same operation as `octoscript outline <file>`. It
 prints JSON with `valid`, bounded diagnostics, and a `declarations` array. A
 declaration has `kind` (`function` or `let`), `name`, and `declaration` and
 `selection` UTF-8 byte spans. Invalid source prints its diagnostics with an
-empty declaration list and exits nonzero, just as `splash check` does.
+empty declaration list and exits nonzero, just as `octoscript check` does.
 
 ## Formatting
 
 Format canonical source through the same profile and VM-compatibility checks:
 
 ```sh
-cargo run -p splash-cli -- format workflow.splash
+cargo run -p octoscript-cli -- format workflow.octoscript
 ```
 
 The formatter writes to standard output and never modifies the input file. It
@@ -369,15 +369,15 @@ Canonical source accepts LF and CRLF line endings. A bare carriage return is
 rejected because the vendored VM does not treat it as a statement separator;
 formatted output uses LF.
 
-Use `splash format --check workflow.splash` to exit nonzero when formatting
-would change the source. Rust hosts can call `splash_core::format_source` or
-`splash_core::format_source_named`; both use the supplied `ExecutionLimits`
+Use `octoscript format --check workflow.octoscript` to exit nonzero when formatting
+would change the source. Rust hosts can call `octoscript_core::format_source` or
+`octoscript_core::format_source_named`; both use the supplied `ExecutionLimits`
 source, syntax-token, and nesting bounds, cap output at four times the source
 budget, and never evaluate code.
 
 ## Editor protocol
 
-`splash-lsp` exposes the same effect-free validation and formatting operations
+`octoscript-lsp` exposes the same effect-free validation and formatting operations
 over stdio LSP. It uses UTF-16 positions, requests full-document sync, and
 supports `textDocument/didOpen`, `textDocument/didChange`,
 `textDocument/didClose`, `textDocument/formatting`,
@@ -460,8 +460,8 @@ keeps fixed `mod.tool` suggestions limited to a direct visible import binding.
 The server separately recognizes an exact visible `use mod.tool` binding. At a
 direct `tool.` member site it offers the fixed `call`, `call_json`, `start`, and
 `start_json` methods. An editor integration may also provide a bounded advisory
-tool-catalog projection at `initializationOptions.splash.toolCatalog` or a
-later `settings.splash.toolCatalog` configuration update. The LSP retains only
+tool-catalog projection at `initializationOptions.octoscript.toolCatalog` or a
+later `settings.octoscript.toolCatalog` configuration update. The LSP retains only
 bounded `name`, `format`, and `description` metadata and uses it only for the
 first literal argument of direct visible `tool.call`/`tool.start`
 (matching `text`) or `tool.call_json`/`tool.start_json` (matching `json`). It
@@ -573,7 +573,7 @@ over-limit field projection, fail closed with the rest of the advisory module
 metadata.
 
 For host-managed dataflow authoring, an editor may separately provide the
-bounded `initializationOptions.splash.workflowDataCatalog` projection. The LSP
+bounded `initializationOptions.octoscript.workflowDataCatalog` projection. The LSP
 uses it only for direct unshadowed `workflow.input.*` and
 `workflow.outputs.<stepId>.*` completion and field hover. It is static advisory
 metadata, not a JSON Schema loader or a runtime snapshot: it cannot establish
@@ -582,7 +582,7 @@ or make an adapter callable. A visible local or imported `workflow` binding
 shadows it, absent metadata creates no namespace, and malformed input fails
 closed. The optional `workflowDataStepContext` admits only an exact prefix of
 the catalog's projected outputs and its next projected step, then filters output
-completion and hover to that prefix. A host using `splash-workflow` can generate
+completion and hover to that prefix. A host using `octoscript-workflow` can generate
 that pair from an exact suspended continuation or validated checkpoint, but the
 LSP remains unable to inspect or authorize runtime state. A host can replace the
 complete pair through `workspace/didChangeConfiguration`; partial or malformed
@@ -610,7 +610,7 @@ initialization-time or configuration-refresh catalog projection is advisory
 client metadata, not a catalog lookup. Tool and module keys refresh
 independently; neither affects the atomic workflow-data pair. The server does
 not open the URI supplied by the client or run source. A malformed `settings`
-value or non-object `settings.splash` clears all advisory catalogs. All
+value or non-object `settings.octoscript` clears all advisory catalogs. All
 diagnostics, edits, symbols, definitions, references, hovers, highlights,
 completions, and rename validation derive from client-provided document text
 and optional advisory metadata.

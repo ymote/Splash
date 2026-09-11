@@ -277,7 +277,7 @@ impl<'a> ScriptVm<'a> {
 
     /// Clears resource-limit signals that did not belong to an active VM
     /// instruction. Hosts normally do not need this: `run_core` consumes its
-    /// own failures, and Splash clears stale signals before a fresh eval.
+    /// own failures, and Octoscript clears stale signals before a fresh eval.
     pub fn clear_execution_limit_failures(&mut self) {
         self.bx.threads.cur().take_stack_limit_exceeded();
         self.bx.threads.cur().take_call_frame_limit_exceeded();
@@ -1511,7 +1511,7 @@ pub struct ScriptVmBase {
     pub is_reload: bool,
     pub debug_trace: bool,
     pub silence_errors: bool,
-    /// Trusted raw Makepad hosts may log; standalone Splash disables this
+    /// Trusted raw Makepad hosts may log; standalone Octoscript disables this
     /// before either canonical or compatibility source can execute.
     pub allow_debug_output: bool,
     /// When Some, drained errors are pushed here (formatted) instead of being
@@ -1623,7 +1623,7 @@ mod tests {
             bx: Box::new(ScriptVmBase::new()),
         };
         let script_mod = || ScriptMod {
-            file: "streaming-try-catch.splash".to_owned(),
+            file: "streaming-try-catch.octoscript".to_owned(),
             ..Default::default()
         };
         let prefix = "use mod.std.assert\n\
@@ -1657,7 +1657,7 @@ mod tests {
                 bx: Box::new(ScriptVmBase::new()),
             };
             let module = || ScriptMod {
-                file: "streaming-precedence.splash".into(),
+                file: "streaming-precedence.octoscript".into(),
                 ..Default::default()
             };
             let partial = vm.with_instruction_limit(1000, |vm| {
@@ -1688,7 +1688,7 @@ mod tests {
             bx: Box::new(ScriptVmBase::new()),
         };
         let script_mod = || ScriptMod {
-            file: "streaming-try-ok.splash".to_owned(),
+            file: "streaming-try-ok.octoscript".to_owned(),
             ..Default::default()
         };
         let prefix = "let marker = 0\ntry { 7 } { marker = 1 }";
@@ -1720,7 +1720,7 @@ mod tests {
         ));
 
         let result = vm.eval(ScriptMod {
-            file: "hard-time-budget.splash".to_owned(),
+            file: "hard-time-budget.octoscript".to_owned(),
             code: "loop {}\n;".to_owned(),
             ..Default::default()
         });
@@ -1746,7 +1746,7 @@ mod tests {
         vm.bx.captured_errors = Some(Vec::new());
 
         let result = vm.eval(ScriptMod {
-            file: "string-limit.splash".to_owned(),
+            file: "string-limit.octoscript".to_owned(),
             code: "let payload = \"x\"\n\
                    let index = 0\n\
                    while (index < 3) {\n\
@@ -1782,7 +1782,7 @@ mod tests {
         vm.bx.captured_errors = Some(Vec::new());
 
         let result = vm.eval(ScriptMod {
-            file: "heap-limit.splash".to_owned(),
+            file: "heap-limit.octoscript".to_owned(),
             code: "let values = []\n\
                    try { values[268435456] = 1 } { \"ok\" }\n\
                    ;"
@@ -1859,7 +1859,7 @@ mod tests {
         vm.set_injected_global(id!(bytes), bytes.into());
 
         let result = vm.eval(ScriptMod {
-            file: "byte-array-string-limit.splash".to_owned(),
+            file: "byte-array-string-limit.octoscript".to_owned(),
             code: "try { bytes.to_string() } { \"ok\" }\n;".to_owned(),
             ..Default::default()
         });
@@ -1885,7 +1885,7 @@ mod tests {
         vm.set_injected_global(id!(bytes), bytes.into());
 
         let result = vm.eval(ScriptMod {
-            file: "byte-array-lossy-utf8.splash".to_owned(),
+            file: "byte-array-lossy-utf8.octoscript".to_owned(),
             code: "bytes.to_string()\n;".to_owned(),
             ..Default::default()
         });
@@ -1908,17 +1908,17 @@ mod tests {
 
         for (file, code, expected) in [
             (
-                "string-replace.splash",
+                "string-replace.octoscript",
                 "\"abcd\".replace(\"b\", \"XX\")\n;",
                 "aXXcd",
             ),
             (
-                "string-url-encode.splash",
+                "string-url-encode.octoscript",
                 "\"a b!\".url_encode()\n;",
                 "a%20b%21",
             ),
             (
-                "string-url-decode.splash",
+                "string-url-decode.octoscript",
                 "\"a%20b%21\".url_decode()\n;",
                 "a b!",
             ),
@@ -1954,7 +1954,7 @@ mod tests {
         vm.set_injected_global(id!(bytes), bytes.into());
 
         let result = vm.eval(ScriptMod {
-            file: "byte-array-json-limit.splash".to_owned(),
+            file: "byte-array-json-limit.octoscript".to_owned(),
             code: "try { bytes.parse_json() } { \"ok\" }\n;".to_owned(),
             ..Default::default()
         });
@@ -1997,14 +1997,14 @@ mod tests {
         let reentrant = vm.bx.heap.new_module(id!(reentrant));
         vm.add_method(reentrant, id!(reload), &[], |vm, _| {
             vm.eval(ScriptMod {
-                file: "reentrant-reload.splash".to_owned(),
+                file: "reentrant-reload.octoscript".to_owned(),
                 code: "41\n;".to_owned(),
                 ..Default::default()
             })
         });
 
         let _ = vm.eval(ScriptMod {
-            file: "reentrant-reload.splash".to_owned(),
+            file: "reentrant-reload.octoscript".to_owned(),
             code: "use mod.reentrant\nreentrant.reload()\n;".to_owned(),
             ..Default::default()
         });

@@ -1,6 +1,6 @@
 # Workflow Drafts
 
-`WorkflowDraft` is Splash's bounded, data-only interchange format for an LLM
+`WorkflowDraft` is Octoscript's bounded, data-only interchange format for an LLM
 or an operator to propose an ordered workflow. It is intentionally earlier in
 the lifecycle than a `WorkflowPlan`: decoding a draft cannot create a runtime,
 inspect a tool catalog, issue a lease, approve a plan, invoke an adapter, or
@@ -36,9 +36,9 @@ retaining an unbounded vector before rejecting the draft.
 
 ## Producer Schema
 
-`splash workflow-schema` emits the machine-readable JSON Schema producer
+`octoscript workflow-schema` emits the machine-readable JSON Schema producer
 contract for this envelope without reading a draft, creating a runtime, or
-registering a capability. Its `x-splash` extension states bounds that ordinary
+registering a capability. Its `x-octoscript` extension states bounds that ordinary
 JSON Schema cannot express: aggregate decoded source bytes, total wire bytes,
 unique IDs across object items, ordered-step semantics, the canonical source
 profile, and the fact that the document carries no authority. The schema is
@@ -47,13 +47,13 @@ intended to help an LLM or editor construct the proposal;
 `from_json_with_max_bytes` to impose a lower ingress limit.
 
 The schema's `source` field is only a string at the draft boundary. Canonical
-Splash syntax is checked separately during `review`; a valid JSON envelope is
+Octoscript syntax is checked separately during `review`; a valid JSON envelope is
 not a valid, approved, or executable workflow.
 
 ## Host Lifecycle
 
 ```rust
-use splash_workflow::{WorkflowDraft, WorkflowEngine};
+use octoscript_workflow::{WorkflowDraft, WorkflowEngine};
 
 let draft = WorkflowDraft::from_json(untrusted_llm_json)?;
 let review = draft.review()?;
@@ -87,7 +87,7 @@ It is not part of the draft wire format and it is not a capability. A fresh
 context has one input value; each successful step contributes one JSON result.
 Scripts see a host-injected `workflow` value with this fixed shape:
 
-```splash
+```octoscript
 let request = workflow.input
 let prepared = workflow.outputs.prepare
 ```
@@ -111,7 +111,7 @@ authorized: the active lease still checks the registered name and call budget
 when the call is reserved.
 
 ```rust
-use splash_workflow::{WorkflowData, WorkflowEngine};
+use octoscript_workflow::{WorkflowData, WorkflowEngine};
 
 let data = WorkflowData::from_input_json(r#"{"left":20,"right":22}"#)?;
 let approval = engine.approve_dataflow_with_step_capability_policies(
@@ -137,12 +137,12 @@ and where to persist or display it.
 When a later authorized tool must receive only a particular data shape, bind a
 `WorkflowDataContract` to the dataflow approval. It has one compiled input
 schema and one compiled output schema for every trusted plan step, in the
-exact trusted-plan order. The host builds it from `splash_schema::JsonSchema`;
-it is neither draft JSON nor Splash-visible configuration.
+exact trusted-plan order. The host builds it from `octoscript_schema::JsonSchema`;
+it is neither draft JSON nor Octoscript-visible configuration.
 
 ```rust
-use splash_schema::JsonSchema;
-use splash_workflow::{WorkflowDataContract, WorkflowStepOutputContract};
+use octoscript_schema::JsonSchema;
+use octoscript_workflow::{WorkflowDataContract, WorkflowStepOutputContract};
 
 let contract = WorkflowDataContract::new(
     JsonSchema::compile(serde_json::json!({
@@ -199,7 +199,7 @@ mutable runtime escape.
 Review a draft without creating a capability runtime:
 
 ```sh
-cargo run -p splash-cli -- workflow-review examples/release_workflow_draft.json
+cargo run -p octoscript-cli -- workflow-review examples/release_workflow_draft.json
 ```
 
 The command prints JSON with each step's ID, canonical syntax diagnostics,
@@ -227,7 +227,7 @@ and other possible alias escapes remain absent from this review projection.
 The development CLI also exposes a deliberately narrow local execution path:
 
 ```sh
-cargo run -p splash-cli -- workflow-run --allow-echo --allow-json-add \
+cargo run -p octoscript-cli -- workflow-run --allow-echo --allow-json-add \
   --grant prepare:text.echo:1 --grant calculate:math.add:1 \
   examples/local_workflow_draft.json
 ```
@@ -235,7 +235,7 @@ cargo run -p splash-cli -- workflow-run --allow-echo --allow-json-add \
 Pass `--input` to use the dataflow path with an explicit JSON input file:
 
 ```sh
-cargo run -p splash-cli -- workflow-run --allow-json-add \
+cargo run -p octoscript-cli -- workflow-run --allow-json-add \
   --input examples/dataflow_input.json \
   --grant prepare:math.add:1 \
   examples/dataflow_workflow_draft.json

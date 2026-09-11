@@ -1,7 +1,7 @@
 # Editor workflow-data projection
 
-`splash-lsp` receives a bounded authoring projection through
-`initializationOptions.splash.workflowDataCatalog`. A host can later replace a
+`octoscript-lsp` receives a bounded authoring projection through
+`initializationOptions.octoscript.workflowDataCatalog`. A host can later replace a
 complete workflow projection and current-step context through the standard LSP
 configuration notification described below. The server never connects to an
 engine itself.
@@ -12,7 +12,7 @@ application configuration before it starts the LSP session. The LSP never
 loads a schema, follows a reference, reads a workflow checkpoint, or connects
 to a workflow engine.
 
-For a host using `splash-workflow`, `WorkflowDataLspProjection` builds this
+For a host using `octoscript-workflow`, `WorkflowDataLspProjection` builds this
 exact wire shape from a contract-bound `WorkflowData` prefix. It validates the
 plan/contract binding, the data contract, the completed prefix, and the stored
 contract digest before it emits metadata. The preferred live path is
@@ -23,7 +23,7 @@ from host-reconstructed counters. A durable host can use
 its separately retained dataflow context.
 
 ```rust
-let splash = if let Some(projection) = engine.suspended_dataflow_lsp_projection(&plan)? {
+let octoscript = if let Some(projection) = engine.suspended_dataflow_lsp_projection(&plan)? {
     serde_json::to_value(projection)?
 } else {
     serde_json::json!({
@@ -33,7 +33,7 @@ let splash = if let Some(projection) = engine.suspended_dataflow_lsp_projection(
 };
 let settings = serde_json::json!({
     "settings": {
-        "splash": splash
+        "octoscript": octoscript
     }
 });
 ```
@@ -46,7 +46,7 @@ only validate their structure and remains non-authoritative.
 
 ```json
 {
-  "splash": {
+  "octoscript": {
     "workflowDataCatalog": {
       "inputFields": [
         {
@@ -90,16 +90,16 @@ only validate their structure and remains non-authoritative.
 ```
 
 `inputFields` and `outputs` are required arrays. Every output has a required
-canonical Splash `stepId` and a required `fields` array. Each field has a
-canonical Splash identifier `name`, one of `any`, `null`, `boolean`, `number`,
+canonical Octoscript `stepId` and a required `fields` array. Each field has a
+canonical Octoscript identifier `name`, one of `any`, `null`, `boolean`, `number`,
 `integer`, `string`, `array`, or `object` as `type`, and an optional plain-text
 `description`. Unknown descriptor properties are ignored.
 
 This is deliberately the direct-member-addressable subset of a workflow
 contract. Runtime workflow step IDs and JSON property keys may be broader than
-Splash identifiers, but a value such as `release-publish` cannot be represented
+Octoscript identifiers, but a value such as `release-publish` cannot be represented
 by `workflow.outputs.release-publish`. A host must send only projected names
-that have a valid direct Splash spelling; the LSP rejects the complete supplied
+that have a valid direct Octoscript spelling; the LSP rejects the complete supplied
 projection rather than inventing aliases or silently presenting a partial map.
 
 ## Per-step completed prefix
@@ -127,7 +127,7 @@ outputs and the current addressable step, never future workflow outputs. At the
 first step, the catalog therefore contains that current step but completion
 shows no output yet. After a later suspension, a new projection adds the
 completed output and the new current step. If the actual current step cannot be
-spelled as a direct Splash member, or if the projected prefix exceeds the LSP
+spelled as a direct Octoscript member, or if the projected prefix exceeds the LSP
 bounds, construction fails so an integration does not send stale metadata.
 
 The LSP cannot independently verify that an arbitrary client-provided position
@@ -138,7 +138,7 @@ editor process itself has authority over workflow state.
 ## Configuration refresh
 
 After an authoritative host workflow transition, an editor integration can
-send `workspace/didChangeConfiguration` with a `settings.splash` object that
+send `workspace/didChangeConfiguration` with a `settings.octoscript` object that
 contains both `workflowDataCatalog` and `workflowDataStepContext` in exactly
 the shapes above. This is a complete replacement, not a patch: the server
 validates the new catalog and context together before making either visible.
@@ -146,7 +146,7 @@ validates the new catalog and context together before making either visible.
 ```json
 {
   "settings": {
-    "splash": {
+    "octoscript": {
       "workflowDataCatalog": {
         "inputFields": [],
         "outputs": [
@@ -164,7 +164,7 @@ validates the new catalog and context together before making either visible.
 ```
 
 An update that mentions either workflow key must contain both. A malformed
-`settings` value, malformed `splash` object, invalid catalog, invalid context,
+`settings` value, malformed `octoscript` object, invalid catalog, invalid context,
 or partial pair discards the full workflow projection and returns incomplete
 empty workflow matches rather than retaining stale fields. A well-formed
 configuration update with neither workflow key is ignored, so unrelated editor
@@ -177,7 +177,7 @@ non-dataflow suspension, or a failed projection build, send both keys with JSON
 ```json
 {
   "settings": {
-    "splash": {
+    "octoscript": {
       "workflowDataCatalog": null,
       "workflowDataStepContext": null
     }

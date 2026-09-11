@@ -1,8 +1,8 @@
 # Worker Protocol v5
 
-`splash-protocol` is the portable data contract between a trusted Splash host
+`octoscript-protocol` is the portable data contract between a trusted Octoscript host
 and a platform-contained worker. It defines capability attenuation, bounded
-JSON frames, and keyed message authentication. `splash-worker` implements the
+JSON frames, and keyed message authentication. `octoscript-worker` implements the
 worker-side dispatch and journal sequencing atop this contract. Neither crate
 creates a process, generates a session key, establishes trust in a worker,
 applies an OS sandbox, or supplies rollback-resistant persistence. A host must
@@ -79,7 +79,7 @@ only inside its chosen worker backend.
 ```
 
 JSON payloads must be objects or arrays. The protocol rejects scalar JSON at
-both input and result boundaries, matching Splash's portable JSON tool
+both input and result boundaries, matching Octoscript's portable JSON tool
 contract. It also bounds JSON nesting to 32 levels, including the root object
 or array, before authorization, canonicalization, or adapter dispatch.
 
@@ -108,7 +108,7 @@ and any non-next sequence number before it returns the message. Incoming and
 outgoing sequences are independent. `SessionKey` is intentionally neither
 serializable nor displayable, and each owned copy is zeroized on drop. This
 reduces residual key lifetime but is not a memory-locking or crash-dump
-guarantee. The key must never appear in a Splash script, manifest, audit event,
+guarantee. The key must never appear in a Octoscript script, manifest, audit event,
 or worker command line.
 
 The key is a 32-byte symmetric secret. Generate and transfer it through an
@@ -130,7 +130,7 @@ session ID, invalid UTF-8, weak key, and truncation.
 It is not key generation, key exchange, encrypted transport, worker
 attestation, or secret storage. Use it only on a one-way private pipe before
 the JSON-line channel begins; do not put it in a socket, ordinary JSON frame,
-Splash value, log, manifest, command line, environment variable, or capability
+Octoscript value, log, manifest, command line, environment variable, or capability
 selector. When using a `BufReader`, retain that same reader for JSON frames so
 any bytes it prefetched are not lost. A bootstrap failure means the host and
 worker must discard the session rather than reuse the stream.
@@ -154,7 +154,7 @@ frame at 1 MiB. Decoding only validates wire syntax. Call
 4. The worker resolves opaque selectors through its backend policy and runs
    the adapter.
 5. The host opens the authenticated matching `result` frame and validates it
-   against the authorized invocation before exposing it to Splash. A
+   against the authorized invocation before exposing it to Octoscript. A
    successful result is accepted once; replayed results are rejected.
 
 Transport framing, worker lifecycle, durable replay, and OS policy remain
@@ -193,7 +193,7 @@ An acknowledgement after a result, a result after an acknowledgement,
 and any identity mismatch are rejected. A process exit, pipe EOF, transport
 error, watchdog deadline, or host kill is not an acknowledgement.
 
-`splash-worker::cancellable::CancellableWorkerSessionDriver` keeps the
+`octoscript-worker::cancellable::CancellableWorkerSessionDriver` keeps the
 authenticated frame loop responsive while one explicitly registered
 `CancellableWorkerAdapter` executes on an owned thread. Its cancellation token
 is set only after the request frame authenticates and reauthorizes. The adapter
@@ -217,7 +217,7 @@ acknowledgement to `confirm_external_tool_cancellation`.
 resolves the watchdog race before exposing a terminal worker event. The Linux
 `BubblewrapWorkerWatchdog` implements this contract. If lifecycle control wins,
 the session is poisoned and the external operation remains pending for
-reconciliation. `splash-workflow/multiplexed-worker` applies successful events
+reconciliation. `octoscript-workflow/multiplexed-worker` applies successful events
 through `WorkflowEngine`, preserving suspended-step bookkeeping instead of
 mutating its underlying runtime directly.
 
@@ -228,7 +228,7 @@ durable effect must use the existing fresh-session reconciliation path.
 
 ## Rust Adapter Runtime
 
-`splash-worker::WorkerSession` is the baseline implementation for a trusted
+`octoscript-worker::WorkerSession` is the baseline implementation for a trusted
 Rust adapter catalog. It opens only a host-authenticated `open_session` frame,
 requires `WorkerSessionAdmission` to bind the session ID and journal scope to
 the intended tenant and replay policy, issue a current single-writer fencing
@@ -246,7 +246,7 @@ bounded durable-recovery declaration; dispatch recovery is by `operation_key`,
 while compensation recovery remains adapter-specific. A provider-idempotency
 declaration means the adapter must pass the exact `operation_key` to the
 external provider as its idempotency key. These are trusted Rust adapter
-contracts, not properties a Splash script can claim.
+contracts, not properties a Octoscript script can claim.
 
 The runtime enforces worker journal ordering but runs with the privileges of
 its embedding process. A production host must place it in the selected
@@ -285,7 +285,7 @@ an authenticated request through a fresh `SessionAuthorizer`; journal scope,
 operation identity, canonical input, and active-grant checks provide that
 cross-session recovery binding instead.
 
-`splash-worker` returns `PendingOperation` for an existing `pending` record;
+`octoscript-worker` returns `PendingOperation` for an existing `pending` record;
 it never turns an unconfirmed effect into success. A `running` or terminal
 state can be returned only after it is revalidated against the active grant.
 
@@ -293,7 +293,7 @@ The ordinary `invoke` message has no durable journal identity. Its adapter
 handler is for read-only or independently idempotent work; use
 `dispatch_operation` for a crash-sensitive external effect.
 
-The baseline `splash-worker` runtime restores its in-memory journal to the
+The baseline `octoscript-worker` runtime restores its in-memory journal to the
 last successfully persisted state if recording an adapter observation fails.
 It poisons that session and returns an indeterminate operation error rather
 than a terminal response; the host must reopen from a fresh atomically loaded
@@ -316,7 +316,7 @@ complete state machine and restart sequence.
 ## Explicit Compensation
 
 `compensate_operation` is the narrow v5 path for one inverse effect of a
-previously succeeded durable operation. It is not exposed to Splash source and
+previously succeeded durable operation. It is not exposed to Octoscript source and
 it is not a generic retry or rollback command. The trusted host must first
 persist a compensation intent in its workflow ledger, then issue a one-use,
 session-bound approval before it seals an authenticated request. The host must
@@ -380,7 +380,7 @@ For a live `CapabilityRuntime`,
 `prepare_authenticated_external_reconciliation` creates the keyed request
 frame from a claimed operation and
 `reconcile_authenticated_external_tool` opens and applies the response. A
-`running` observation leaves the Splash promise pending. A terminal state is
+`running` observation leaves the Octoscript promise pending. A terminal state is
 resolved through the same audit and output-validation boundary as a direct
 external completion.
 
@@ -390,26 +390,26 @@ does not make an `ExternalToolId`, promise, or VM state durable. Hosts that
 need restart recovery must persist a durable operation identity and policy,
 authenticate the storage and worker response, then decide whether to retry,
 reconcile, compensate, or fail the workflow before creating a fresh runtime.
-`splash-workflow` can create a plan-bound durable operation key and ledger for
+`octoscript-workflow` can create a plan-bound durable operation key and ledger for
 that host policy; see [durable operation ledgers](workflow-operations.md).
 
-## Splash integration
+## Octoscript integration
 
-`splash-capabilities::ProtocolWorkerClient` owns a `SessionAuthorizer` and a
+`octoscript-capabilities::ProtocolWorkerClient` owns a `SessionAuthorizer` and a
 host-provided `WorkerTransport`. Register it with
 `CapabilityRuntime::register_protocol_json_tool`; registration rejects a local
-`ToolPolicy` that exceeds the matching worker grant. Each Splash JSON tool
+`ToolPolicy` that exceeds the matching worker grant. Each Octoscript JSON tool
 call then passes through both the local capability policy and the worker
 manifest before the transport is invoked.
 
 `ProtocolWorkerClient` is an in-process adapter boundary, not a containment
 implementation. Production local-tool adapters still need a separately
 contained worker and authenticated transport. It maps a transport failure to a
-generic Splash error, so transport, adapter, persistence, or authentication
+generic Octoscript error, so transport, adapter, persistence, or authentication
 details stay on the trusted host side.
 
 For a fixed, app-provided mobile or embedded adapter catalog, the optional
-`splash-capabilities/in-process-worker` feature supplies
+`octoscript-capabilities/in-process-worker` feature supplies
 `InProcessAuthenticatedWorkerTransport`. It exercises the authenticated
 ordinary `invoke`/`result` host-to-worker-to-host frames in one process,
 including session ID, role, sequence, and key-tag verification. It supplies no
@@ -417,7 +417,7 @@ process, memory, syscall, or resource isolation and must not be described as a
 sandbox. See [worker adapter runtime](worker-runtime.md#authenticated-in-process-transport).
 
 For a separately started worker, the optional
-`splash-capabilities/json-line-worker` feature provides
+`octoscript-capabilities/json-line-worker` feature provides
 `JsonLineWorkerChannel` over host-supplied buffered input/output handles and
 `AuthenticatedFrameWorkerTransport` for ordinary calls and
 `OneShotAuthenticatedOperationWorkerTransport` for one durable dispatch,

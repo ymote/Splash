@@ -82,7 +82,7 @@ impl ScriptHeap {
     /// which would otherwise never be released.
     const MAX_STRINGS_REUSE: usize = 1024;
 
-    /// Applies an aggregate cap to the Splash-owned heap data structures.
+    /// Applies an aggregate cap to the Octoscript-owned heap data structures.
     ///
     /// `None` preserves the inherited Makepad VM behavior. The accounting
     /// tracks retained capacity of script strings, arrays, objects, slots, and
@@ -101,7 +101,7 @@ impl ScriptHeap {
         self.reconcile_heap_bytes();
     }
 
-    /// Returns the configured aggregate Splash heap cap, if any.
+    /// Returns the configured aggregate Octoscript heap cap, if any.
     pub fn max_heap_bytes(&self) -> Option<usize> {
         self.max_heap_bytes
     }

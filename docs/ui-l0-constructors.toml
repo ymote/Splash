@@ -216,14 +216,14 @@ width  = { kind = "token", tokens = ["fill", "fit", "day", "rank", "temp", "labe
 # into shipped cards.
 #
 # These six cannot be theme compositions (profile §1.1): a gradient bar or a sun
-# arc is a fragment shader parameterised by data, and `splash-render` notes that
+# arc is a fragment shader parameterised by data, and `octoscript-render` notes that
 # a DSL node cannot carry shader source, because MPSL compiles at build time.
 #
 # HOW they reach a backend is unsettled. An earlier version of this comment said
 # each backend implements them "exactly as it already does for Map", which
 # asserted a contract that does not exist: five of the six are absent from
-# splash-render's tag table, and its fallback drops the node. Six of six are
-# implemented in octos-one today and one in Splash-Makepad, so the pipeline
+# octoscript-render's tag table, and its fallback drops the node. Six of six are
+# implemented in octos-one today and one in Octoscript-Makepad, so the pipeline
 # should be proven there before the vocabulary is fixed.
 #
 # The card still names only a role and its data. Colour, thickness and cap shape

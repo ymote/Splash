@@ -1,9 +1,9 @@
 # Worker Adapter Runtime
 
-`splash-worker` is the worker-side Rust runtime for one authenticated Splash
+`octoscript-worker` is the worker-side Rust runtime for one authenticated Octoscript
 capability session. It is intended for mobile, embedded, and desktop hosts
-that want dynamic Splash workflows to invoke a small, explicit catalog of
-trusted Rust adapters without giving Splash source access to the Rust crate
+that want dynamic Octoscript workflows to invoke a small, explicit catalog of
+trusted Rust adapters without giving Octoscript source access to the Rust crate
 graph or ambient OS APIs.
 
 It is a protocol and sequencing layer, not a sandbox. An in-process use has
@@ -29,7 +29,7 @@ host-authenticated `open_session` frame. It supplies four trusted inputs:
   and after every worker observation while enforcing that lease.
 
 ```rust
-use splash_worker::{
+use octoscript_worker::{
     AuthenticatedWorkerJournalStore, WorkerAdapter, WorkerAdapterRegistry,
     WorkerSession, WorkerSessionAdmission,
     WorkerSessionLimits,
@@ -74,7 +74,7 @@ The adapter registry is intentionally explicit. An adapter receives the
 attenuated `CapabilityGrant` with each request and may resolve only the grant's
 opaque resource selectors through its embedding policy. It must not interpret
 script input as a file path, executable, network origin, credential, or crate
-name. This is how Splash uses the Rust ecosystem: a host compiles narrow,
+name. This is how Octoscript uses the Rust ecosystem: a host compiles narrow,
 reviewed adapters against its chosen crates and exposes only their bounded data
 contracts to scripts. JSON payloads are object/array envelopes with a 32-level
 maximum nesting depth in addition to their grant byte limits.
@@ -96,7 +96,7 @@ crate integration, not dynamic crate loading or a sandbox:
 
 ```rust
 use serde::{Deserialize, Serialize};
-use splash_worker::{
+use octoscript_worker::{
     TypedJsonWorkerAdapter, WorkerAdapterRegistry, WorkerInvocationSafety,
 };
 
@@ -192,11 +192,11 @@ identity.
 Compensation recovery is deliberately narrower. After an indeterminate
 compensation, the host reuses the exact existing compensation intent under a
 fresh approval and invokes an adapter-specific status or manual-recovery
-policy. Splash does not define a universal inverse-status API.
+policy. Octoscript does not define a universal inverse-status API.
 
 ## Authenticated In-Process Transport
 
-The optional `splash-capabilities` feature `in-process-worker` provides
+The optional `octoscript-capabilities` feature `in-process-worker` provides
 `InProcessAuthenticatedWorkerTransport` for an application that embeds a
 fixed worker adapter catalog in the same process. It dispatches every ordinary
 tool invocation through the real authenticated-frame lifecycle:
@@ -211,7 +211,7 @@ that worker's `open_session` frame; the first dispatch verifies the shared
 secret key through the normal frame tag.
 
 ```rust
-use splash_capabilities::in_process_worker::InProcessAuthenticatedWorkerTransport;
+use octoscript_capabilities::in_process_worker::InProcessAuthenticatedWorkerTransport;
 
 let transport = InProcessAuthenticatedWorkerTransport::new(
     host_authenticator,
@@ -236,7 +236,7 @@ adapter does not weaken either requirement.
 
 ## Bounded JSON-Line Transport
 
-The optional `splash-capabilities` feature `json-line-worker` provides a
+The optional `octoscript-capabilities` feature `json-line-worker` provides a
 `JsonLineWorkerChannel<R, W>` for a host-owned buffered reader and writer,
 plus `AuthenticatedFrameWorkerTransport<C>` for ordinary `invoke`/`result`
 calls and `OneShotAuthenticatedOperationWorkerTransport<C>` for exactly one
@@ -252,10 +252,10 @@ into the authenticated call transport:
 ```rust
 use std::io::BufReader;
 
-use splash_capabilities::json_line_worker::{
+use octoscript_capabilities::json_line_worker::{
     AuthenticatedFrameWorkerTransport, JsonLineWorkerChannel, WorkerFrameChannel,
 };
-use splash_capabilities::WorkerMessage;
+use octoscript_capabilities::WorkerMessage;
 
 let mut channel = JsonLineWorkerChannel::new(BufReader::new(child_stdout), child_stdin);
 let opening = host_authenticator.seal(WorkerMessage::OpenSession { manifest })?;
@@ -290,10 +290,10 @@ the frame sealing, so use `operation_reconcile_request` rather than
 ```rust
 use std::io::BufReader;
 
-use splash_capabilities::json_line_worker::{
+use octoscript_capabilities::json_line_worker::{
     JsonLineWorkerChannel, OneShotAuthenticatedOperationWorkerTransport, WorkerFrameChannel,
 };
-use splash_capabilities::WorkerMessage;
+use octoscript_capabilities::WorkerMessage;
 
 let mut channel = JsonLineWorkerChannel::new(BufReader::new(child_stdout), child_stdin);
 let opening = host_authenticator.seal(WorkerMessage::OpenSession {
@@ -330,7 +330,7 @@ transport failure remains a host recovery decision. The transport does not
 restart a VM, resolve a promise, select compensation, or make a terminal
 observation sufficient to run a workflow suffix.
 
-On Linux, `splash-workflow/bubblewrap-recovery` provides the higher-level,
+On Linux, `octoscript-workflow/bubblewrap-recovery` provides the higher-level,
 reconciliation-only composition for this sequence. It requires a reaping proof
 from the stopped worker, reserves a fenced authenticated host-ledger writer,
 starts a differently keyed Bubblewrap session under an optional preserved
@@ -382,12 +382,12 @@ long as the host enforces frame-size limits, adapter I/O timeouts, storage
 semantics, and containment appropriate to the target.
 
 For direct mobile and embedded scripting, use
-`splash_capabilities::mobile::MobileRuntimeBuilder`. It accepts reviewed local
+`octoscript_capabilities::mobile::MobileRuntimeBuilder`. It accepts reviewed local
 adapters during setup, and `build()` consumes it to yield a `MobileRuntime`
 with canonical evaluation, bounded host-owned JSON input and output conversion,
 bounded host pumping, catalog inspection, audit inspection, and explicit garbage
 collection only. JSON input and output use the smaller of the builder's source
-and syntax-nesting limits and Splash's 64 KiB / 64-level data limits. The
+and syntax-nesting limits and Octoscript's 64 KiB / 64-level data limits. The
 resulting profile has no API to register more tools, claim or complete external
 work, or attach a worker transport. Structured adapters require an executable
 `JsonToolContract`.
@@ -411,7 +411,7 @@ Treat a rejected export as an observability gap rather than silently skipping
 history. See [capability audit export](capability-audits.md).
 
 ```rust
-use splash_capabilities::{
+use octoscript_capabilities::{
     json, JsonToolContract, ToolMetadata, ToolPolicy,
     mobile::MobileRuntimeBuilder,
 };
@@ -458,7 +458,7 @@ idle point to reclaim settled promise records. `set_json_global` and
 the resumed continuation observes the same host data it started with.
 
 For an ordered mobile or embedded workflow, use
-`splash_workflow::mobile::MobileWorkflowBuilder` instead. It repeats the
+`octoscript_workflow::mobile::MobileWorkflowBuilder` instead. It repeats the
 setup-only local adapter boundary, then returns a facade that can plan a
 bounded `WorkflowDraft`, issue only named `WorkflowStepCapabilityPolicy`
 grants, checkpoint, and execute. It has no mutable `CapabilityRuntime`,
@@ -477,16 +477,16 @@ bounded exact local root alias to its underlying named tool during app-owned
 review. That report cannot approve or grant a workflow capability.
 
 The script-visible `{ input, outputs }` context is capped by the smaller of
-the builder's source-byte and syntax-nesting limits and Splash's 64 KiB and
+the builder's source-byte and syntax-nesting limits and Octoscript's 64 KiB and
 64-level workflow-data limits. The facade rejects an oversized or too-deep
 initial or resumed context before approval, and rejects a step result that
 would make the retained aggregate context exceed those same bounds. Persistence
-metadata such as a contract digest is never injected into Splash source and
+metadata such as a contract digest is never injected into Octoscript source and
 does not consume this script-visible data budget.
 
 ```rust
-use splash_capabilities::{CapabilityLeaseGrant, ToolMetadata, ToolPolicy};
-use splash_workflow::{
+use octoscript_capabilities::{CapabilityLeaseGrant, ToolMetadata, ToolPolicy};
+use octoscript_workflow::{
     mobile::MobileWorkflowBuilder, WorkflowDraft, WorkflowStep,
     WorkflowStepCapabilityPolicy,
 };

@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use libfuzzer_sys::fuzz_target;
-use splash_capabilities::{
+use octoscript_capabilities::{
     durable_audits::CapabilityAuditJournal, MAX_DURABLE_CAPABILITY_AUDIT_EVENTS,
     MAX_DURABLE_CAPABILITY_AUDIT_JOURNAL_BYTES,
 };

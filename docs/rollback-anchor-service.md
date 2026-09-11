@@ -1,11 +1,11 @@
 # Transactional Rollback-Anchor Service
 
-`splash_storage::rollback_anchor_service` defines a bounded host-only protocol
+`octoscript_storage::rollback_anchor_service` defines a bounded host-only protocol
 for a separately trusted transactional service. It is intended for deployments
 where the service retains rollback-resistant per-record state outside the
 rollback domain of a local SQLite payload file.
 
-The protocol is not a Splash capability, tool, or general HTTP API. Storage
+The protocol is not a Octoscript capability, tool, or general HTTP API. Storage
 record keys, service URLs, and authentication values remain host configuration.
 No generated source can select an endpoint, issue a request, inspect anchor
 state, or obtain a token.
@@ -19,11 +19,11 @@ expose its endpoint or token through `Debug`.
 
 ```toml
 [dependencies]
-splash-storage = { path = "../splash-storage", features = ["sqlite", "https-rollback-anchor"] }
+octoscript-storage = { path = "../octoscript-storage", features = ["sqlite", "https-rollback-anchor"] }
 ```
 
 ```rust
-use splash_storage::{
+use octoscript_storage::{
     https_rollback_anchor::{
         HttpsRollbackAnchorAuthorization, HttpsRollbackAnchorTransport,
     },
@@ -33,18 +33,18 @@ use splash_storage::{
 
 let authorization = HttpsRollbackAnchorAuthorization::bearer(host_provisioned_bearer_token)?;
 let transport = HttpsRollbackAnchorTransport::new(
-    "https://anchor.example.invalid/v1/splash-anchor",
+    "https://anchor.example.invalid/v1/octoscript-anchor",
     Some(authorization),
 )?;
 let anchor = TrustedServiceRollbackAnchor::new(transport);
-let backend = AnchoredSqliteStore::open("/host-owned/splash.sqlite", anchor)?;
+let backend = AnchoredSqliteStore::open("/host-owned/octoscript.sqlite", anchor)?;
 # let _ = backend;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The bearer token must come from trusted host provisioning, such as an app
 enrollment flow or a native credential backend. It is not stored in an
-authenticated record and is not a Splash secret API. A host can omit bearer
+authenticated record and is not a Octoscript secret API. A host can omit bearer
 authentication when its independently configured transport authentication is
 sufficient.
 
@@ -193,4 +193,4 @@ retry an older expectation.
 
 The client redacts service transport errors and response bytes. Hosts should
 retain service diagnostics in their own protected observability system rather
-than exposing them to worker or Splash diagnostics.
+than exposing them to worker or Octoscript diagnostics.

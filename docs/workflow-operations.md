@@ -1,6 +1,6 @@
 # Durable Operation Ledgers
 
-`splash-workflow` provides `WorkflowOperationLedger` for the host-owned
+`octoscript-workflow` provides `WorkflowOperationLedger` for the host-owned
 durable intent of an external effect. It is complementary to a workflow
 checkpoint: a checkpoint describes a completed step prefix, while a ledger
 describes an operation that may still be uncertain around a crash or worker
@@ -25,9 +25,9 @@ operation key from the plan fingerprint, step ID, tool, complete input bytes,
 and a host-supplied durable nonce.
 
 ~~~rust
-use splash_capabilities::CapabilityRuntime;
-use splash_protocol::{canonical_operation_input_bytes, ToolPayload};
-use splash_workflow::{WorkflowEngine, WorkflowStep};
+use octoscript_capabilities::CapabilityRuntime;
+use octoscript_protocol::{canonical_operation_input_bytes, ToolPayload};
+use octoscript_workflow::{WorkflowEngine, WorkflowStep};
 
 let mut engine = WorkflowEngine::new(CapabilityRuntime::default());
 let plan = engine.plan(vec![WorkflowStep::new(
@@ -101,7 +101,7 @@ the two-stage bridge below instead of manually combining
 5. When the worker responds, call
    `apply_authenticated_operation_dispatch_result`. It authenticates the
    frame and updates only the ledger state while returning the verified result.
-   Persist that updated ledger before resolving the Splash promise with
+   Persist that updated ledger before resolving the Octoscript promise with
    `complete_external_tool` or recording the authenticated terminal
    `cancelled` observation with `cancel_external_tool`. A host-originated
    cooperative stop instead uses the separate request/confirm cancellation
@@ -158,7 +158,7 @@ match result.status {
 ~~~
 
 The nonce is host-owned and durable. Use a persisted workflow-run identifier
-and a host-defined operation ordinal; do not derive it from Splash source,
+and a host-defined operation ordinal; do not derive it from Octoscript source,
 the runtime-local `call_index`, or the external runtime's idempotency key.
 Those values can change when a process or resumed suffix is recreated.
 
@@ -166,17 +166,17 @@ The bridge does not serialize a VM continuation, `ExternalToolId`, payload,
 approval, or worker session. After a process restart, rebuild the trusted plan
 and capability policy, restore and validate the ledger, reconcile the durable
 operation, then choose an explicit policy for a new workflow execution. A
-terminal ledger state alone is not permission to skip or resume a Splash step.
+terminal ledger state alone is not permission to skip or resume a Octoscript step.
 
 ## Live Ordinary Cancellation
 
 Protocol v5 also has a non-durable cooperative path for an external workflow
 step dispatched as an ordinary `invoke`. Enable
-`splash-workflow/multiplexed-worker`, start the claimed invocation through a
+`octoscript-workflow/multiplexed-worker`, start the claimed invocation through a
 `SupervisedMultiplexedWorkerSession`, and use the workflow module's helpers:
 
 ~~~rust
-use splash_workflow::multiplexed_worker::{
+use octoscript_workflow::multiplexed_worker::{
     poll_external_tool, request_external_tool_cancellation,
 };
 
@@ -216,7 +216,7 @@ plan. If the storage system has a compare-and-swap version or authenticated
 watermark, use the revision-aware validation method to reject an older record.
 
 ~~~rust
-use splash_workflow::WorkflowOperationLedger;
+use octoscript_workflow::WorkflowOperationLedger;
 
 let restored = WorkflowOperationLedger::from_json(&stored_ledger)?;
 engine.validate_operation_ledger_at_or_after(
@@ -232,7 +232,7 @@ authenticate the ledger and retain its watermark atomically or through a
 compare-and-swap policy. Key rotation, storage encryption, retention, and
 rollback protection are platform responsibilities.
 
-[`splash-storage`](durable-storage.md) supplies the host-only authenticated
+[`octoscript-storage`](durable-storage.md) supplies the host-only authenticated
 envelope and backend contract for this persistence boundary. Its included
 memory backend is development-only; choose a platform backend that meets the
 documented atomic revision-floor contract before treating a workflow ledger as
@@ -257,7 +257,7 @@ same terminal state is idempotent, but a contradictory later state is
 rejected.
 
 An authenticated `succeeded` observation is still not workflow approval and
-does not restore a Splash promise or VM. The host must separately validate any
+does not restore a Octoscript promise or VM. The host must separately validate any
 terminal payload against the current tool contract, decide whether the effect
 is sufficient to advance the plan, and issue fresh workflow approval before it
 runs a suffix. The ledger intentionally retains no worker output with which to
@@ -303,7 +303,7 @@ or workflow resumption. The host must choose how to handle `running`, an
 indeterminate transport failure, or a policy/input mismatch before it creates a
 fresh runtime or invokes compensation.
 
-On Linux, the optional `splash-workflow/bubblewrap-recovery` feature provides a
+On Linux, the optional `octoscript-workflow/bubblewrap-recovery` feature provides a
 reconciliation-only host composition around this transport. It requires an old
 worker reaping proof, a differently keyed exact-tool Bubblewrap manifest, a
 watchdog deadline, and `FencedRollbackProtectedStore`, then persists the

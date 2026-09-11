@@ -1,6 +1,6 @@
 # Bubblewrap Post-Stop Recovery
 
-The optional `splash-workflow/bubblewrap-recovery` feature automates one narrow
+The optional `octoscript-workflow/bubblewrap-recovery` feature automates one narrow
 recovery path for an ambiguous durable operation after a Linux Bubblewrap
 worker stops. It composes the existing containment, authenticated worker
 protocol, durable operation ledger, watchdog, and fenced storage boundaries.
@@ -38,7 +38,7 @@ new `FreshBubblewrapRecoverySession`, and a fresh contained worker.
 Enable the integration on the trusted Linux host:
 
 ```toml
-splash-workflow = { version = "0.1.0", features = ["bubblewrap-recovery"] }
+octoscript-workflow = { version = "0.1.0", features = ["bubblewrap-recovery"] }
 ```
 
 First convert the stopped lifecycle into a proof. Reaping proves only that the
@@ -60,9 +60,9 @@ authority under the same ID.
 ```rust
 use std::time::Duration;
 
-use splash_protocol::{CapabilityGrant, CapabilityManifest};
-use splash_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
-use splash_workflow::bubblewrap_recovery::{
+use octoscript_protocol::{CapabilityGrant, CapabilityManifest};
+use octoscript_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
+use octoscript_workflow::bubblewrap_recovery::{
     recover_bubblewrap_operation, BubblewrapPostStopRecoveryRequest,
     FreshBubblewrapRecoverySession,
 };
@@ -131,7 +131,7 @@ and product policy checks before use.
 
 The old `BubblewrapWorkerReaped` proof is cloneable and reusable because
 reaping is a permanent fact and a failed fresh launch must be recoverable. It
-cannot be constructed without consuming a Splash-owned worker lifecycle.
+cannot be constructed without consuming a Octoscript-owned worker lifecycle.
 
 ## Explicit Non-Guarantees
 

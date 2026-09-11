@@ -11,7 +11,7 @@ attempt, and byte limits, description, optional JSON input/output schemas, and
 at the Rust tool boundary before handler invocation and before output returns.
 `false` means any schemas are prompt metadata only; text tools always report
 `false`. `max_attempts` is the host-only bound for an external operation; it
-does not give Splash source a retry API. The runtime does not install catalog
+does not give Octoscript source a retry API. The runtime does not install catalog
 access into `mod.tool`: a script cannot discover or mint capabilities by
 inspecting descriptions.
 
@@ -26,7 +26,7 @@ runtime uses only a process-local session counter, so its labels can repeat
 after restart and are not a confidentiality boundary.
 
 For a UI or LLM review step, a host may pair the catalog with
-`splash_core::tool_call_hint_report` or `splash tool-calls <file>`. That
+`octoscript_core::tool_call_hint_report` or `octoscript tool-calls <file>`. That
 outline retains at most 1,024 direct sites and exposes truncation explicitly;
 it is deliberately limited to direct source spelling and does not resolve
 aliases, shadowing, flow, or computed names. It is never sufficient to approve
@@ -44,8 +44,8 @@ reviewed catalog, or a tighter embedded allocation budget, select their limits
 when they create the runtime:
 
 ```rust
-use splash_capabilities::{CapabilityCatalogLimits, CapabilityRuntime};
-use splash_core::ExecutionLimits;
+use octoscript_capabilities::{CapabilityCatalogLimits, CapabilityRuntime};
+use octoscript_core::ExecutionLimits;
 
 let runtime = CapabilityRuntime::with_limits_pending_and_catalog(
     ExecutionLimits::default(),
@@ -73,7 +73,7 @@ stream readable from `mod.tool`; it tells a worker adapter how much bounded
 progress output it may send through the host lifecycle.
 
 ```rust
-use splash_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
+use octoscript_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
 
 let contract = JsonToolContract::new(
     json!({
@@ -98,7 +98,7 @@ runtime.register_validated_json_tool(
 )?;
 ```
 
-Contracts use Splash's bounded executable schema subset, so the catalog schema
+Contracts use Octoscript's bounded executable schema subset, so the catalog schema
 shown here is enforced at the tool boundary. See [JSON tool contracts](schema-contracts.md)
 for the supported keywords and limits. `ToolMetadata::with_input_schema` and
 `with_output_schema` remain available when a host needs non-enforcing prompt
@@ -110,7 +110,7 @@ For static, LLM-friendly dataflow, a host can expose a reviewed JSON tool as a
 flat direct module method. This removes the JSON-string round trip from source:
 
 ```rust
-use splash_capabilities::CapabilityModule;
+use octoscript_capabilities::CapabilityModule;
 
 runtime.register_capability_module(
     CapabilityModule::new("arithmetic", "Reviewed arithmetic adapters.")
@@ -118,7 +118,7 @@ runtime.register_capability_module(
 )?;
 ```
 
-```splash
+```octoscript
 use mod.arithmetic
 
 let math = arithmetic
@@ -138,12 +138,12 @@ underlying target tool. In both modes the target retains its call limit,
 metadata, audit entry, JSON validation, and active capability-lease check.
 Prompt-only schemas, text tools, duplicate target aliases, existing VM module
 names, dynamic libraries, and script-selected crates remain unavailable.
-After the host has installed the fixed methods, Splash freezes both the direct
+After the host has installed the fixed methods, Octoscript freezes both the direct
 module object and `mod.tool`; a script cannot rewrite a reviewed method through
 the import or any local alias, either during the current evaluation or for a
 later evaluation on the same runtime.
 
-```splash
+```octoscript
 use mod.remote_math
 
 let result = remote_math.add({left: 20, right: 22}).await()
@@ -185,7 +185,7 @@ entries carry their host-selected `synchronous` or `deferred` mode and
 `single_json` call shape, so the editor can label a deferred call as returning
 a promise and offer a bounded one-value signature without guessing its argument
 contract. When an executable input or output schema is an explicit object whose
-entire property set uses canonical Splash identifiers and defines a `properties`
+entire property set uses canonical Octoscript identifiers and defines a `properties`
 map, the projection also carries the corresponding bounded
 field/type/required view with optional plain-text property descriptions. An
 input or output property explicitly typed as an object with a complete direct
@@ -203,9 +203,9 @@ form. It also follows exact local `let alias = result` chains of at most 16
 hops. It never inserts `await()`, completes input or result paths below that
 child level, follows computed/deeper aliases or arbitrary result chains,
 evaluates a schema, or gives an editor authority. Neither API is
-installed into Splash source. The sealed
+installed into Octoscript source. The sealed
 `mobile::MobileRuntimeBuilder` and
-`splash_workflow::mobile::MobileWorkflowBuilder` expose the same registration
+`octoscript_workflow::mobile::MobileWorkflowBuilder` expose the same registration
 path before `build`; the workflow facade retains only its immutable mapping,
 metadata projections, and named step-policy approval surface.
 
@@ -226,15 +226,15 @@ local alias as a grant. It never evaluates source, seals the catalog, issues a l
 reachability. An incomplete source-level lexical/import/alias index reports
 `truncated` and publishes no partial scope-resolved mapping. The development
 CLI exposes the same optional projection as `direct_module_calls` from
-`splash tool-calls --allow-json-add` and
-`splash workflow-review --allow-json-add`; it is only the reviewed demo host
+`octoscript tool-calls --allow-json-add` and
+`octoscript workflow-review --allow-json-add`; it is only the reviewed demo host
 catalog.
 
 For an approval flow, a host can issue a `CapabilityLease` from a selected
 subset of this catalog and call `eval_with_capability_lease`, or pass that lease
 to `WorkflowEngine::approve_with_capability_lease`. A lease is local to one
 runtime and records a catalog fingerprint, including direct module mappings,
-allowed names, and narrower per-tool call limits. A dynamic Splash value used
+allowed names, and narrower per-tool call limits. A dynamic Octoscript value used
 as a tool name is checked when the call is reserved, not inferred from source
 text. Changing the catalog after issuing a lease invalidates it before
 execution; an active suspended evaluation also prevents catalog registration
@@ -278,25 +278,25 @@ described in [External tools](external-tools.md).
 The development CLI exposes the same host catalog as JSON:
 
 ```sh
-cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
+cargo run -p octoscript-cli -- catalog --allow-echo --allow-json-add
 ```
 
 ## Editor projection
 
 An editor integration may pass that JSON array through
-`initializationOptions.splash.toolCatalog` when it starts `splash-lsp`, or
+`initializationOptions.octoscript.toolCatalog` when it starts `octoscript-lsp`, or
 replace it later through `workspace/didChangeConfiguration`. The LSP consumes
 only each descriptor's `name`, `format`, and `description`; it ignores dispatch,
 limits, schemas, and every other field. This lets the editor complete a direct
 visible tool-name literal with the correct text or JSON call form without
 making the LSP a capability client.
 
-For a refresh, send a complete replacement under `settings.splash.toolCatalog`:
+For a refresh, send a complete replacement under `settings.octoscript.toolCatalog`:
 
 ```json
 {
   "settings": {
-    "splash": {
+    "octoscript": {
       "toolCatalog": [
         {
           "name": "text.echo",
@@ -317,13 +317,13 @@ replacement discards only the tool projection and makes matching completion
 incomplete rather than presenting a partial catalog. A valid empty array is a
 complete empty catalog. Tool refreshes do not alter `moduleCatalog` or the
 atomic workflow-data pair. A malformed `settings` value or non-object
-`settings.splash` clears all advisory catalogs. The LSP retains at most 128
+`settings.octoscript` clears all advisory catalogs. The LSP retains at most 128
 entries and 512 KiB of names/descriptions. Runtime policy still checks the
 actual dynamic name against the active catalog and capability lease at
 reservation time.
 
 Refreshable authoring metadata for host-defined `mod.*` interfaces is
 intentionally separate from this tool catalog. It uses
-`initializationOptions.splash.moduleCatalog` or a configuration refresh, cannot
+`initializationOptions.octoscript.moduleCatalog` or a configuration refresh, cannot
 discover or approve a tool, and is documented in [Editor module interface
 projection](module-catalog.md).

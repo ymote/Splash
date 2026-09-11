@@ -569,7 +569,7 @@ name = "smallvec"
 version = "1.15.1"
 
 [[package]]
-name = "splash-capabilities"
+name = "octoscript-capabilities"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -577,43 +577,43 @@ dependencies = [
  "makepad-script",
  "serde",
  "serde_json",
- "splash-core",
- "splash-protocol",
- "splash-schema",
- "splash-storage",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-schema",
+ "octoscript-storage",
  "ureq",
  "zeroize",
 ]
 
 [[package]]
-name = "splash-core"
+name = "octoscript-core"
 version = "0.1.0"
 dependencies = [
  "makepad-script",
  "serde_json",
- "splash-ui-l0",
+ "octoscript-ui-l0",
 ]
 
 [[package]]
-name = "splash-fuzz"
+name = "octoscript-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "lsp-server",
  "lsp-types",
  "serde_json",
- "splash-capabilities",
- "splash-core",
- "splash-protocol",
- "splash-sandbox",
- "splash-schema",
- "splash-storage",
- "splash-worker",
- "splash-workflow",
+ "octoscript-capabilities",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-sandbox",
+ "octoscript-schema",
+ "octoscript-storage",
+ "octoscript-worker",
+ "octoscript-workflow",
 ]
 
 [[package]]
-name = "splash-linux-project-quota"
+name = "octoscript-linux-project-quota"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -621,7 +621,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-linux-seccomp"
+name = "octoscript-linux-seccomp"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -629,7 +629,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-protocol"
+name = "octoscript-protocol"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -640,27 +640,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-sandbox"
+name = "octoscript-sandbox"
 version = "0.1.0"
 dependencies = [
  "close_fds",
  "landlock",
  "linux-raw-sys",
  "rustix",
- "splash-linux-project-quota",
- "splash-linux-seccomp",
- "splash-protocol",
+ "octoscript-linux-project-quota",
+ "octoscript-linux-seccomp",
+ "octoscript-protocol",
 ]
 
 [[package]]
-name = "splash-schema"
+name = "octoscript-schema"
 version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
-name = "splash-storage"
+name = "octoscript-storage"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -672,35 +672,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-ui-l0"
+name = "octoscript-ui-l0"
 version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
-name = "splash-worker"
+name = "octoscript-worker"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "splash-protocol",
- "splash-storage",
+ "octoscript-protocol",
+ "octoscript-storage",
  "zeroize",
 ]
 
 [[package]]
-name = "splash-workflow"
+name = "octoscript-workflow"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "serde",
  "serde_json",
- "splash-capabilities",
- "splash-core",
- "splash-protocol",
- "splash-schema",
- "splash-storage",
+ "octoscript-capabilities",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-schema",
+ "octoscript-storage",
 ]
 
 [[package]]

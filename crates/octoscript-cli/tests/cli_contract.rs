@@ -1,0 +1,229 @@
+#![forbid(unsafe_code)]
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+use serde_json::Value;
+
+fn example_path(name: &str) -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn run_octoscript(arguments: Vec<String>) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_octoscript"))
+        .args(arguments)
+        .output()
+        .expect("the Octoscript CLI binary should run")
+}
+
+fn json_stdout(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).expect("the Octoscript CLI should emit JSON stdout")
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("the Octoscript CLI should emit UTF-8 stderr")
+}
+
+#[test]
+fn evaluation_stops_before_a_granted_effect_after_an_uncaught_error() {
+    let output = run_octoscript(vec![
+        "eval".into(),
+        "--allow-echo".into(),
+        "use mod.std;use mod.tool;std.assert(false);tool.call(\"text.echo\",\"must not run\")"
+            .into(),
+    ]);
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must not run"));
+    assert!(stderr(&output).contains("assertion failed"));
+}
+
+#[test]
+fn direct_debug_logging_cannot_write_to_cli_stdout() {
+    let output = run_octoscript(vec!["eval".into(), "~\"private marker\"".into()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    assert!(!stderr(&output).contains("private marker"));
+}
+
+#[test]
+fn profile_contract_discloses_no_ambient_authority() {
+    let output = run_octoscript(vec!["profile".to_owned()]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let output = json_stdout(&output);
+    assert_eq!(output["language"], "Octoscript");
+    assert_eq!(output["profile"]["canonical_only"], true);
+    assert_eq!(output["authority"]["ambient_os_apis"], false);
+    assert_eq!(output["authority"]["ambient_rust_crate_access"], false);
+    assert_eq!(
+        output["authority"]["workflow_drafts_grant_authority"],
+        false
+    );
+}
+
+#[test]
+fn reviewed_dataflow_executes_only_with_an_explicit_step_grant() {
+    let draft = example_path("dataflow_workflow_draft.json");
+    let input = example_path("dataflow_input.json");
+
+    let review = run_octoscript(vec!["workflow-review".to_owned(), draft.clone()]);
+    assert!(review.status.success(), "stderr: {}", stderr(&review));
+    let review = json_stdout(&review);
+    assert_eq!(review["valid"], true);
+    assert_eq!(
+        review["steps"][0]["tool_calls"][0]["name"]["value"],
+        "math.add"
+    );
+
+    let allowed = run_octoscript(vec![
+        "workflow-run".to_owned(),
+        "--allow-json-add".to_owned(),
+        "--input".to_owned(),
+        input.clone(),
+        "--grant".to_owned(),
+        "prepare:math.add:1".to_owned(),
+        draft.clone(),
+    ]);
+    assert!(allowed.status.success(), "stderr: {}", stderr(&allowed));
+    let allowed = json_stdout(&allowed);
+    assert_eq!(allowed["status"], "completed");
+    assert_eq!(allowed["audit"][0]["outcome"], "allowed");
+    assert_eq!(allowed["dataflow"]["outputs"]["prepare"]["total"], 42);
+    assert_eq!(allowed["dataflow"]["outputs"]["summarize"]["total"], 42);
+
+    let denied = run_octoscript(vec![
+        "workflow-run".to_owned(),
+        "--allow-json-add".to_owned(),
+        "--input".to_owned(),
+        input,
+        draft,
+    ]);
+    assert!(!denied.status.success());
+    let denied_stdout = json_stdout(&denied);
+    assert_eq!(denied_stdout["status"], "failed");
+    assert_eq!(denied_stdout["audit"][0]["outcome"], "denied");
+    assert_eq!(denied_stdout["dataflow"]["outputs"], serde_json::json!({}));
+    assert!(stderr(&denied).contains("workflow execution failed"));
+}
+
+#[test]
+fn direct_module_catalog_is_explicit_and_the_demo_source_runs() {
+    let unavailable = run_octoscript(vec!["module-catalog".to_owned()]);
+    assert!(
+        unavailable.status.success(),
+        "stderr: {}",
+        stderr(&unavailable)
+    );
+    assert_eq!(json_stdout(&unavailable), serde_json::json!([]));
+
+    let catalog = run_octoscript(vec![
+        "module-catalog".to_owned(),
+        "--allow-json-add".to_owned(),
+    ]);
+    assert!(catalog.status.success(), "stderr: {}", stderr(&catalog));
+    let catalog = json_stdout(&catalog);
+    assert_eq!(catalog.as_array().map(Vec::len), Some(1));
+    assert_eq!(catalog[0]["name"], "arithmetic");
+    assert_eq!(catalog[0]["methods"][0]["name"], "add");
+    assert_eq!(catalog[0]["methods"][0]["tool"], "math.add");
+
+    let source = example_path("direct_module_workflow.octoscript");
+    let source_only_review = run_octoscript(vec!["tool-calls".to_owned(), source.clone()]);
+    assert!(
+        source_only_review.status.success(),
+        "stderr: {}",
+        stderr(&source_only_review)
+    );
+    assert_eq!(
+        json_stdout(&source_only_review)["direct_module_calls"],
+        serde_json::json!([])
+    );
+
+    let configured_review = run_octoscript(vec![
+        "tool-calls".to_owned(),
+        "--allow-json-add".to_owned(),
+        source.clone(),
+    ]);
+    assert!(
+        configured_review.status.success(),
+        "stderr: {}",
+        stderr(&configured_review)
+    );
+    let configured_review = json_stdout(&configured_review);
+    assert_eq!(configured_review["tool_calls"], serde_json::json!([]));
+    assert_eq!(
+        configured_review["direct_module_calls"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["module"],
+        "arithmetic"
+    );
+    assert_eq!(configured_review["direct_module_calls"][0]["method"], "add");
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["tool"],
+        "math.add"
+    );
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["mode"],
+        "synchronous"
+    );
+    assert_eq!(
+        configured_review["direct_module_calls"][0]["callee"]["line"],
+        5
+    );
+
+    let execution = run_octoscript(vec![
+        "run".to_owned(),
+        "--allow-json-add".to_owned(),
+        source,
+    ]);
+    assert!(execution.status.success(), "stderr: {}", stderr(&execution));
+
+    let draft = example_path("direct_module_workflow_draft.json");
+    let workflow_review = run_octoscript(vec![
+        "workflow-review".to_owned(),
+        "--allow-json-add".to_owned(),
+        draft.clone(),
+    ]);
+    assert!(
+        workflow_review.status.success(),
+        "stderr: {}",
+        stderr(&workflow_review)
+    );
+    let workflow_review = json_stdout(&workflow_review);
+    assert_eq!(
+        workflow_review["steps"][0]["direct_module_calls"][0]["tool"],
+        "math.add"
+    );
+    assert_eq!(
+        workflow_review["steps"][0]["direct_module_calls"][0]["mode"],
+        "synchronous"
+    );
+    assert_eq!(
+        workflow_review["steps"][0]["direct_module_calls"][0]["callee"]["line"],
+        4
+    );
+
+    let workflow_execution = run_octoscript(vec![
+        "workflow-run".to_owned(),
+        "--allow-json-add".to_owned(),
+        "--grant".to_owned(),
+        "calculate:math.add:1".to_owned(),
+        draft,
+    ]);
+    assert!(
+        workflow_execution.status.success(),
+        "stderr: {}",
+        stderr(&workflow_execution)
+    );
+    let workflow_execution = json_stdout(&workflow_execution);
+    assert_eq!(workflow_execution["status"], "completed");
+    assert_eq!(workflow_execution["audit"][0]["tool"], "math.add");
+}

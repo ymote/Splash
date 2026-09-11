@@ -1,9 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use splash_capabilities::{CapabilityLeaseGrant, CapabilityRuntime, JsonSchema};
-use splash_core::ExecutionLimits;
-use splash_workflow::{
+use octoscript_capabilities::{CapabilityLeaseGrant, CapabilityRuntime, JsonSchema};
+use octoscript_core::ExecutionLimits;
+use octoscript_workflow::{
     WorkflowData, WorkflowDataContract, WorkflowDraft, WorkflowEngine, WorkflowStep,
     WorkflowStepCapabilityPolicy, WorkflowStepOutputContract, MAX_WORKFLOW_DATA_BYTES,
     MAX_WORKFLOW_DRAFT_BYTES, MAX_WORKFLOW_REVIEW_TOOL_CALL_HINTS,

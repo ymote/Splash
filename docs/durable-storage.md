@@ -1,6 +1,6 @@
 # Authenticated Durable Storage
 
-`splash-storage` is a host-only record boundary for checkpoints, workflow
+`octoscript-storage` is a host-only record boundary for checkpoints, workflow
 operation ledgers, and other non-script state. It protects a serialized record
 against tampering and transplant to a different logical record key. It does
 not grant a script storage access, expose a storage key, encrypt data, create a
@@ -53,23 +53,23 @@ so it is never a production rollback defense.
 ## Anchored SQLite
 
 The optional `sqlite` feature provides
-`splash_storage::sqlite::AnchoredSqliteStore`. It uses SQLite for local
+`octoscript_storage::sqlite::AnchoredSqliteStore`. It uses SQLite for local
 transactional payload storage and a host-provided `RollbackAnchor` for the
 separate durable, rollback-resistant commitment. SQLite alone remains an
 ordinary local database and is not a trust anchor.
 
 ```toml
-splash-storage = { version = "0.1", features = ["sqlite"] }
+octoscript-storage = { version = "0.1", features = ["sqlite"] }
 ```
 
 ```rust
-use splash_storage::{
+use octoscript_storage::{
     sqlite::AnchoredSqliteStore, AuthenticatedStore, StorageKeyring,
 };
 
 // `platform_anchor` must implement RollbackAnchor through a real platform
 // monotonic authority or transactional trusted service.
-let backend = AnchoredSqliteStore::open("/host-owned/splash.sqlite", platform_anchor)?;
+let backend = AnchoredSqliteStore::open("/host-owned/octoscript.sqlite", platform_anchor)?;
 let store = AuthenticatedStore::new(backend, storage_keyring);
 ```
 
@@ -158,7 +158,7 @@ time-of-use gap. The fence backend and its failover behavior are therefore a
 security trust anchor. Once a record has a nonzero fence, a plain
 compare-and-swap must fail rather than bypass the fenced write path.
 
-`splash-worker::WorkerJournalStore` has the same production requirement for a
+`octoscript-worker::WorkerJournalStore` has the same production requirement for a
 worker operation journal: `persist` must atomically compare the loaded
 `WorkerJournalRevision`, commit the new journal, and advance that revision
 through an authenticated rollback-resistant durable store, while rejecting an
@@ -208,22 +208,22 @@ on Linux and embedded targets rather than falling back to an in-process mock
 credential store.
 
 ```toml
-splash-storage = { version = "0.1", features = ["keyring"] }
+octoscript-storage = { version = "0.1", features = ["keyring"] }
 ```
 
 ```rust
-use splash_storage::{
+use octoscript_storage::{
     platform_keyring::{PlatformKeyringEntry, PlatformKeyringKeyring}, StorageKeyId,
 };
 
 let active = PlatformKeyringEntry::new(
     StorageKeyId::new("storage-v2")?,
-    "com.ymote.splash",
+    "com.ymote.octoscript",
     "workflow-storage-v2",
 )?;
 let previous = PlatformKeyringEntry::new(
     StorageKeyId::new("storage-v1")?,
-    "com.ymote.splash",
+    "com.ymote.octoscript",
     "workflow-storage-v1",
 )?;
 let storage_keyring = PlatformKeyringKeyring::new(active, vec![previous])?.load()?;
@@ -254,8 +254,8 @@ record first, parse the ledger, recreate the trusted plan, and validate both
 the plan binding and the ledger's own revision policy.
 
 ~~~rust
-use splash_storage::StorageRecordKey;
-use splash_workflow::WorkflowOperationLedger;
+use octoscript_storage::StorageRecordKey;
+use octoscript_workflow::WorkflowOperationLedger;
 
 let record_key = StorageRecordKey::new("workflow-ledger", "release-42")?;
 let stored = store.load(&record_key)?.expect("host-created ledger record");

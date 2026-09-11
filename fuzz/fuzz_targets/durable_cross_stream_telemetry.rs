@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use libfuzzer_sys::fuzz_target;
-use splash_workflow::{
+use octoscript_workflow::{
     telemetry::{
         durable::{
             CrossStreamTelemetryJournal, MAX_DURABLE_CROSS_STREAM_TELEMETRY_EVENTS,

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use splash_core::{
+use octoscript_core::{
     check_syntax_named, check_vm_compatibility_named, format_source_named, fuzzing,
     imported_module_call_hint_report_named, is_canonical_identifier,
     lexical_completion_report_named, lexical_symbol_report_named, module_import_report_named,
@@ -31,23 +31,23 @@ fuzz_target!(|data: &[u8]| {
     let source = bounded_prefix(unbounded_source, limits.max_source_bytes);
     let profile = fuzzing::check_canonical_profile(source, limits)
         .expect("the fuzz limits are always valid for canonical preflight");
-    let full = check_syntax_named("fuzz.splash", source, limits)
+    let full = check_syntax_named("fuzz.octoscript", source, limits)
         .expect("the fuzz limits are always valid for full syntax checking");
-    let compatibility = check_vm_compatibility_named("fuzz.splash", source, limits)
+    let compatibility = check_vm_compatibility_named("fuzz.octoscript", source, limits)
         .expect("the fuzz limits are always valid for VM compatibility checking");
     assert!(compatibility.diagnostics.len() <= MAX_SYNTAX_DIAGNOSTICS);
-    let completion_report = lexical_completion_report_named("fuzz.splash", source, limits)
+    let completion_report = lexical_completion_report_named("fuzz.octoscript", source, limits)
         .expect("the fuzz limits are always valid for bounded completion metadata");
     assert_completion_invariants(source, &completion_report);
-    let import_report = module_import_report_named("fuzz.splash", source, limits)
+    let import_report = module_import_report_named("fuzz.octoscript", source, limits)
         .expect("the fuzz limits are always valid for bounded import metadata");
     assert_module_import_invariants(source, &import_report);
     let static_record_shape_report =
-        static_record_shape_report_named("fuzz.splash", source, limits)
+        static_record_shape_report_named("fuzz.octoscript", source, limits)
             .expect("the fuzz limits are always valid for bounded static record metadata");
     assert_static_record_shape_invariants(source, &static_record_shape_report);
     let imported_module_call_report =
-        imported_module_call_hint_report_named("fuzz.splash", source, limits)
+        imported_module_call_hint_report_named("fuzz.octoscript", source, limits)
             .expect("the fuzz limits are always valid for bounded imported-module review");
     assert_imported_module_call_hint_invariants(source, &imported_module_call_report);
 
@@ -58,11 +58,11 @@ fuzz_target!(|data: &[u8]| {
             full.diagnostics
         );
 
-        let declarations = top_level_declarations_named("fuzz.splash", source, limits)
+        let declarations = top_level_declarations_named("fuzz.octoscript", source, limits)
             .expect("the fuzz limits are always valid for bounded outlining");
         assert_outline_invariants(source, &declarations);
 
-        let tool_call_report = tool_call_hint_report_named("fuzz.splash", source, limits)
+        let tool_call_report = tool_call_hint_report_named("fuzz.octoscript", source, limits)
             .expect("the fuzz limits are always valid for bounded tool-call outlining");
         assert!(tool_call_report.hints.len() <= MAX_TOOL_CALL_HINTS);
         if tool_call_report.truncated {
@@ -70,7 +70,7 @@ fuzz_target!(|data: &[u8]| {
         }
         assert_tool_call_hint_invariants(source, &tool_call_report.hints);
 
-        let lexical_report = lexical_symbol_report_named("fuzz.splash", source, limits)
+        let lexical_report = lexical_symbol_report_named("fuzz.octoscript", source, limits)
             .expect("the fuzz limits are always valid for bounded lexical indexing");
         let lexical_occurrences = lexical_report.symbols.len()
             + lexical_report
@@ -95,14 +95,14 @@ fuzz_target!(|data: &[u8]| {
             source.len()
         );
 
-        match format_source_named("fuzz.splash", source, limits) {
+        match format_source_named("fuzz.octoscript", source, limits) {
             Ok(formatted) => {
                 let formatted_limits = ExecutionLimits {
                     max_source_bytes: formatted.len().max(1),
                     ..limits
                 };
                 let formatted_report =
-                    check_syntax_named("formatted-fuzz.splash", &formatted, formatted_limits)
+                    check_syntax_named("formatted-fuzz.octoscript", &formatted, formatted_limits)
                         .expect("formatted source uses valid fuzz limits");
                 assert!(
                     formatted_report.valid,
@@ -110,7 +110,7 @@ fuzz_target!(|data: &[u8]| {
                     formatted_report.diagnostics
                 );
                 assert_eq!(
-                    format_source_named("formatted-fuzz.splash", &formatted, formatted_limits)
+                    format_source_named("formatted-fuzz.octoscript", &formatted, formatted_limits)
                         .expect("valid formatted source must remain formatable"),
                     formatted,
                     "formatter output is not idempotent"
@@ -705,7 +705,7 @@ fn assert_completion_invariants(source: &str, report: &LexicalCompletionReport) 
     }
 }
 
-fn assert_symbol_span(source: &str, symbol: &LexicalSymbol, span: splash_core::SourceSpan) {
+fn assert_symbol_span(source: &str, symbol: &LexicalSymbol, span: octoscript_core::SourceSpan) {
     assert!(
         source.is_char_boundary(span.start_byte) && source.is_char_boundary(span.end_byte),
         "lexical symbol span is not a UTF-8 boundary: {symbol:?}"

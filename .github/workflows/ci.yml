@@ -21,18 +21,18 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
-      - run: cargo check --locked -p splash-sandbox --tests --target aarch64-unknown-linux-gnu
-      - run: cargo check --locked -p splash-sandbox --tests --target riscv64gc-unknown-linux-gnu
-      - run: cargo check --locked -p splash-sandbox --tests --target x86_64-pc-windows-gnu
+      - run: cargo check --locked -p octoscript-sandbox --tests --target aarch64-unknown-linux-gnu
+      - run: cargo check --locked -p octoscript-sandbox --tests --target riscv64gc-unknown-linux-gnu
+      - run: cargo check --locked -p octoscript-sandbox --tests --target x86_64-pc-windows-gnu
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-script
       - run: cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
       # The project-quota positive-path test requires an explicitly provisioned host fixture.
       - run: >
           sudo -E env RUSTUP_HOME="$HOME/.rustup"
-          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox --lib -- --ignored
+          "$CARGO_HOME/bin/cargo" test --locked -p octoscript-sandbox --lib -- --ignored
       - run: >
           sudo -E env RUSTUP_HOME="$HOME/.rustup"
-          "$CARGO_HOME/bin/cargo" test --locked -p splash-sandbox --test cgroup_v2 -- --ignored
+          "$CARGO_HOME/bin/cargo" test --locked -p octoscript-sandbox --test cgroup_v2 -- --ignored
 
   fuzz-target:
     runs-on: ubuntu-latest

@@ -1,7 +1,7 @@
 # HTTP endpoint and origin catalogs
 
 The optional
-`splash_capabilities::http_endpoint_catalog` module provides two narrow
+`octoscript_capabilities::http_endpoint_catalog` module provides two narrow
 outbound JSON capabilities selected during trusted Rust setup:
 
 - `HttpEndpointCatalog` fixes each complete URL, method, and optional
@@ -17,11 +17,11 @@ Enable the feature explicitly because it links an HTTP/TLS client:
 
 ~~~toml
 [dependencies]
-splash-capabilities = { path = "../splash-capabilities", features = ["http-endpoint-catalog"] }
+octoscript-capabilities = { path = "../octoscript-capabilities", features = ["http-endpoint-catalog"] }
 ~~~
 
 For the sealed workflow facade, enable the matching
-splash-workflow/http-endpoint-catalog feature.
+octoscript-workflow/http-endpoint-catalog feature.
 
 To resolve endpoint-bound secrets at invocation time from a native credential
 store on macOS, iOS, or Windows, enable
@@ -30,7 +30,7 @@ store on macOS, iOS, or Windows, enable
 
 ~~~toml
 [dependencies]
-splash-capabilities = { path = "../splash-capabilities", features = ["platform-keyring-secret-resolver"] }
+octoscript-capabilities = { path = "../octoscript-capabilities", features = ["platform-keyring-secret-resolver"] }
 ~~~
 
 ## Authority model
@@ -39,7 +39,7 @@ During trusted Rust setup, the host fixes each complete URL, method, and
 opaque identifier:
 
 ~~~rust
-use splash_capabilities::{
+use octoscript_capabilities::{
     http_endpoint_catalog::{
         HttpEndpoint, HttpEndpointCatalog, HttpEndpointCatalogLimits, HttpEndpointMethod,
         HttpEndpointSecret, HttpEndpointSecretStore,
@@ -63,7 +63,7 @@ fn register_release_status(
     )?.with_bearer_secret("release.status.token")?)?;
 
     // This value comes from trusted host setup, such as an OS credential store.
-    // It is never supplied to or returned from Splash source.
+    // It is never supplied to or returned from Octoscript source.
     let mut secrets = HttpEndpointSecretStore::new();
     secrets.insert(
         "release.status.token",
@@ -84,10 +84,10 @@ fn register_release_status(
 }
 ~~~
 
-Splash can supply only an opaque ID and, for a host-configured POST, one JSON
+Octoscript can supply only an opaque ID and, for a host-configured POST, one JSON
 object or array body:
 
-~~~splash
+~~~octoscript
 use mod.tool
 
 let raw = tool.call_json("service.request", {endpoint: "release.status"})
@@ -101,10 +101,10 @@ publishes the URL. The runtime also independently checks the request, so direct
 adapter use cannot widen the accepted shape.
 
 The caller supplies `release_status_token` during trusted host setup, such as
-from an OS credential store; it is not a Splash function or generated-script
+from an OS credential store; it is not a Octoscript function or generated-script
 input. Hosts can instead implement `HttpEndpointSecretResolver` to resolve from
 a platform credential store for every invocation. The resolver is called only
-for a credential binding selected during trusted endpoint setup; Splash cannot
+for a credential binding selected during trusted endpoint setup; Octoscript cannot
 name a secret or invoke a secret resolver directly.
 
 `platform_keyring_secret_resolver::PlatformKeyringSecretResolver` is a
@@ -121,14 +121,14 @@ For a host that provisions the credential separately, replace the in-memory
 store in the setup example with this resolver:
 
 ~~~rust
-use splash_capabilities::platform_keyring_secret_resolver::{
+use octoscript_capabilities::platform_keyring_secret_resolver::{
     PlatformKeyringSecretEntry, PlatformKeyringSecretResolver,
 };
 
 let secrets = PlatformKeyringSecretResolver::new(vec![
     PlatformKeyringSecretEntry::new(
         "release.status.token",
-        "com.example.splash",
+        "com.example.octoscript",
         "release-status",
     )?,
 ])?;
@@ -151,7 +151,7 @@ schema-checked Rust adapter when a remote endpoint needs tighter payload rules.
 One catalog tool can invoke every entry in its catalog. Use separate tools or a
 trusted authorizer when different endpoints need different workflow grants.
 The host decides whether to share its host-side catalog descriptor with an LLM;
-Splash source has no catalog-discovery API.
+Octoscript source has no catalog-discovery API.
 
 ## Exact-origin policy requests
 
@@ -160,7 +160,7 @@ dynamic paths or queries below one complete origin. The host still fixes the
 method and every transport decision:
 
 ~~~rust
-use splash_capabilities::{
+use octoscript_capabilities::{
     http_endpoint_catalog::{
         HttpEndpointMethod, HttpEndpointSecret, HttpEndpointSecretStore, HttpOrigin,
         HttpOriginCatalog,
@@ -192,10 +192,10 @@ runtime.register_http_origin_catalog_tool_with_secret_resolver(
 )?;
 ~~~
 
-Splash supplies an opaque origin ID, a complete bounded URL, and a JSON body
+Octoscript supplies an opaque origin ID, a complete bounded URL, and a JSON body
 for a host-configured `POST`:
 
-~~~splash
+~~~octoscript
 use mod.tool
 
 let raw = tool.call_json("release.request", {
@@ -241,7 +241,7 @@ value, and `with_secret_header` injects a value into one fixed reviewed header.
 Both require an HTTPS endpoint. The latter refuses transport-managed,
 cookie, and response-shaping header names, so it cannot change the request
 method, target, body encoding, proxy behavior, or response format. The secret
-identifier and value are host configuration; neither becomes a Splash input.
+identifier and value are host configuration; neither becomes a Octoscript input.
 
 At execution, the catalog:
 
@@ -268,7 +268,7 @@ its TLS dependency.
 
 ## Failure and disclosure behavior
 
-Trusted setup receives detailed HttpEndpointCatalogError values. Splash
+Trusted setup receives detailed HttpEndpointCatalogError values. Octoscript
 receives only either HTTP endpoint access was denied for an invalid request or
 HTTP endpoint request failed for configuration, transport, status, size, or
 response-format failures. URLs, remote status codes, response bodies, headers,
@@ -296,14 +296,14 @@ result as other resolver failures.
 
 The `linux-network-broker` feature adds an optional Linux-only execution
 boundary for these catalogs when a worker is launched through
-`splash-sandbox::bubblewrap`. It is separate from ordinary catalog registration:
+`octoscript-sandbox::bubblewrap`. It is separate from ordinary catalog registration:
 the catalog remains host-owned, and the contained worker gets one read-only
 mounted Unix-socket directory while retaining an isolated network namespace and
 no direct HTTP client.
 
 ```toml
 [dependencies]
-splash-capabilities = { path = "../splash-capabilities", features = ["linux-network-broker"] }
+octoscript-capabilities = { path = "../octoscript-capabilities", features = ["linux-network-broker"] }
 ```
 
 At setup, `LinuxNetworkBroker::bind_endpoint` or `bind_origin` takes one
@@ -339,7 +339,7 @@ for the mount and containment requirements.
 
 ## Security boundary
 
-This is API-level mediation only. It stops a generated Splash program from
+This is API-level mediation only. It stops a generated Octoscript program from
 changing a fixed endpoint or escaping an exact reviewed origin; it does not
 prevent the embedding process or another trusted Rust adapter from opening a
 network connection. It also does not pin DNS results, enforce a firewall rule,
@@ -363,7 +363,7 @@ are not bounded by the catalog's HTTP deadline.
 
 For mobile and embedded applications, pass the catalog to
 mobile::MobileRuntimeBuilder::register_http_endpoint_catalog_tool or
-splash_workflow::mobile::MobileWorkflowBuilder::register_http_endpoint_catalog_tool
+octoscript_workflow::mobile::MobileWorkflowBuilder::register_http_endpoint_catalog_tool
 before build(). Use each matching
 `register_http_endpoint_catalog_tool_with_secret_resolver` method when the
 catalog has a credential binding. Each builder consumes both catalog and

@@ -1,7 +1,7 @@
 # External Tools
 
 An external tool is a deferred-only capability with no Rust handler inside the
-Splash interpreter process. It is registered with
+Octoscript interpreter process. It is registered with
 CapabilityRuntime::register_external_tool or one of the JSON variants.
 
 External tools are intentionally unavailable to tool.call and tool.call_json.
@@ -27,7 +27,7 @@ completion uses the same output byte limit, JSON envelope validation, optional
 JSON contract validation, and audit path as a host-pumped tool handler.
 
 ~~~rust
-use splash_capabilities::{CapabilityRuntime, ToolMetadata, ToolPolicy};
+use octoscript_capabilities::{CapabilityRuntime, ToolMetadata, ToolPolicy};
 
 let mut runtime = CapabilityRuntime::default();
 runtime.register_external_tool_with_metadata(
@@ -65,7 +65,7 @@ workers, prefer the authenticated reconciliation bridge below instead of
 manually trusting a returned request ID. When present,
 remaining_deadline_millis should also be applied by the worker adapter.
 
-When an external invocation belongs to a suspended `splash-workflow` step and
+When an external invocation belongs to a suspended `octoscript-workflow` step and
 must be durable, do not call `claim_next_external_tool` first and add a ledger
 record later. Use `WorkflowEngine::prepare_next_external_operation`, persist
 the ledger, then call `claim_prepared_external_operation`. That flow converts
@@ -83,7 +83,7 @@ operation remains claimed, so it is not returned again by
 `claim_next_external_tool`.
 
 ~~~rust
-use splash_capabilities::RetryClass;
+use octoscript_capabilities::RetryClass;
 
 let first = runtime.claim_next_external_tool().expect("pending worker call");
 let retry = runtime.retry_external_tool(first.id, RetryClass::Transient)?;
@@ -93,7 +93,7 @@ assert_eq!(retry.attempt, 2);
 ~~~
 
 The retry preserves its input, call index, opaque host ID, and idempotency key.
-It does not create another Splash call or consume another tool call budget.
+It does not create another Octoscript call or consume another tool call budget.
 The runtime records an `AuditOutcome::RetryScheduled` event with the host's
 retry class. Reaching the attempt bound returns `RetryLimitReached`; the host
 must then complete or cancel the claimed operation. A retry after the deferred
@@ -103,7 +103,7 @@ deadline returns `DeadlineElapsed`; the event loop should resolve it through
 `idempotency_key` is safe to pass to an authenticated worker as a downstream
 deduplication key. It is stable for all attempts of one operation and includes
 a runtime session nonce sourced from operating-system entropy. When that source
-is unavailable, Splash refuses to register an externally dispatched tool rather
+is unavailable, Octoscript refuses to register an externally dispatched tool rather
 than emitting a time- or PID-derived fallback. A host that has a separately
 trusted unique source can construct `CapabilitySessionNonce` and pass it to
 `CapabilityRuntime::with_limits_pending_catalog_and_session_nonce`; that nonce
@@ -113,7 +113,7 @@ durable operation identity. Retain the opaque `ExternalToolId` locally. Durable
 workflows should use a persisted workflow or operation identity in addition to
 this per-runtime key. Do not retry a non-idempotent worker unless the worker
 deduplicates requests using that key or another durable operation identity.
-`splash-workflow` provides a plan-bound
+`octoscript-workflow` provides a plan-bound
 [durable operation ledger](workflow-operations.md) for that host-owned
 identity and restart policy. A contained worker can accept that identity in an
 authenticated [durable operation dispatch](worker-operations.md), then persist
@@ -129,12 +129,12 @@ keeps that ID locally and the worker returns an authenticated status bound to
 the exact request.
 
 ~~~rust
-use splash_capabilities::{
+use octoscript_capabilities::{
     CapabilityRuntime, ExternalReconciliation, OperationReconcileResult,
     OperationStatus, SessionAuthenticator, SessionKey, SessionRole,
     ToolPolicy, WorkerMessage, WorkerPayload,
 };
-use splash_protocol::AUTH_TAG_BYTES;
+use octoscript_protocol::AUTH_TAG_BYTES;
 
 let mut runtime = CapabilityRuntime::default();
 runtime.register_external_tool(ToolPolicy::new("text.remote"))?;
@@ -210,7 +210,7 @@ the runtime rejects later changes so an operation cannot change redaction
 behavior mid-lifecycle.
 
 ~~~rust
-use splash_capabilities::{ToolPolicy, ToolStreamPolicy};
+use octoscript_capabilities::{ToolPolicy, ToolStreamPolicy};
 
 let policy = ToolPolicy::new("text.remote").with_stream(
     ToolStreamPolicy::new(
@@ -244,7 +244,7 @@ Chunks are separate from the terminal result passed to `complete_external_tool`:
 the terminal result still obeys the regular output-size, JSON-envelope, and
 optional executable-schema checks. A JSON tool may therefore stream text
 progress while its final result must remain a valid JSON envelope matching its
-contract. Splash source cannot read, await, or subscribe to chunks; it sees
+contract. Octoscript source cannot read, await, or subscribe to chunks; it sees
 only the terminal promise result.
 
 The redactor is trusted, synchronous Rust code. Keep it deterministic and
@@ -283,7 +283,7 @@ call index, attempt, and idempotency key, but not the input. It is correlation
 metadata, not adapter authority or proof that work stopped. Repeating the
 request is idempotent.
 
-While cancellation is requested, the runtime keeps the Splash promise pending
+While cancellation is requested, the runtime keeps the Octoscript promise pending
 and rejects retries, pre-dispatch validation, and further stream chunks. A
 terminal success or failure can still win the race and resolve normally. Only
 after the owning adapter acknowledges cancellation should the host call
@@ -325,7 +325,7 @@ For a contained process, wrap the transport in
 `SupervisedMultiplexedWorkerSession`. Its supervisor must report the exact same
 session ID. It arms the host deadline before writing `invoke`, disarms it before
 exposing a terminal event, and poisons the session when a deadline or lifecycle
-stop wins. `splash-workflow/multiplexed-worker` consumes those events through
+stop wins. `octoscript-workflow/multiplexed-worker` consumes those events through
 `WorkflowEngine`, so completion advances the retained step and acknowledged
 cancellation follows the engine's normal step-failure path. Do not use
 `runtime_mut()` for this integration.

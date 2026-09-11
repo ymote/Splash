@@ -4496,7 +4496,7 @@ mod tests {
         let mut parser = ScriptParser::default();
         parser.set_emit_errors(false);
 
-        parser.parse(&tokenizer, "fuzz.splash", (0, 0), &[]);
+        parser.parse(&tokenizer, "fuzz.octoscript", (0, 0), &[]);
 
         assert!(parser.had_error);
         assert_eq!(parser.opcodes.len(), parser.source_map.len());
@@ -4512,7 +4512,7 @@ mod tests {
         let mut parser = ScriptParser::default();
         parser.set_emit_errors(false);
 
-        parser.parse(&tokenizer, "valid.splash", (0, 0), &[]);
+        parser.parse(&tokenizer, "valid.octoscript", (0, 0), &[]);
 
         assert!(!parser.had_error, "{:?}", parser.diagnostics);
         assert_eq!(parser.opcodes.len(), parser.source_map.len());

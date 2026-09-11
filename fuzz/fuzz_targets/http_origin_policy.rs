@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use splash_capabilities::http_endpoint_catalog::{
+use octoscript_capabilities::http_endpoint_catalog::{
     HttpEndpointCatalogLimits, HttpEndpointMethod, HttpOrigin, HttpOriginCatalog,
 };
 

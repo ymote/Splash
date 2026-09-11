@@ -7,7 +7,7 @@ turning the event stream into workflow authority.
 
 The journal contains only bounded lifecycle metadata: plan IDs, validated step
 and tool identifiers, operation or compensation keys, state enums, completed
-step counts, and diagnostic counts. It never contains Splash source, tool
+step counts, and diagnostic counts. It never contains Octoscript source, tool
 input/output, schema data, approvals, grants, worker session keys, VM promises,
 or secrets.
 

@@ -1,8 +1,8 @@
 # Fixed-file catalogs
 
-`splash_capabilities::fixed_file_catalog::FixedFileCatalog` is a narrow local
+`octoscript_capabilities::fixed_file_catalog::FixedFileCatalog` is a narrow local
 text-file capability for hosts that need to expose a reviewed static data set
-to dynamic Splash workflows. It is not a general filesystem API.
+to dynamic Octoscript workflows. It is not a general filesystem API.
 
 ## Authority model
 
@@ -10,7 +10,7 @@ During trusted Rust setup, the host adds each file under a canonical opaque
 identifier:
 
 ```rust
-use splash_capabilities::{
+use octoscript_capabilities::{
     fixed_file_catalog::{FixedFileCatalog, FixedFileCatalogLimits},
     CapabilityRuntime, ToolMetadata, ToolPolicy,
 };
@@ -38,9 +38,9 @@ fn register_release_notes(
 }
 ```
 
-Splash can then use only the registered tool and opaque identifier:
+Octoscript can then use only the registered tool and opaque identifier:
 
-```splash
+```octoscript
 use mod.tool
 
 let notes = tool.call("file.read", "release.notes")
@@ -51,7 +51,7 @@ Identifiers match `^[a-z0-9_-][a-z0-9_.-]{0,127}$`. They are labels, never
 paths. The adapter does not expose directory listing, globbing, metadata,
 handles, write access, symlink traversal from source, or a way to add entries
 after registration. The host must decide which identifiers, if any, are given
-to an LLM outside the Splash language boundary. One granted catalog tool can
+to an LLM outside the Octoscript language boundary. One granted catalog tool can
 read every entry in that catalog. Use separate tools/catalogs or a trusted
 input-aware capability authorizer when different files need different grants.
 
@@ -70,7 +70,7 @@ identifier input bytes and call count.
 ## Failure and disclosure behavior
 
 The host-side `FixedFileCatalog::read` API returns detailed configuration and
-I/O errors for trusted logs. The Splash tool converts them to generic denied or
+I/O errors for trusted logs. The Octoscript tool converts them to generic denied or
 failed messages. It does not return a local path, an operating-system error,
 or explicit catalog-membership detail to script source. A successful call does
 of course reveal that its identifier was granted; use unguessable identifiers
@@ -99,6 +99,6 @@ platform-specific contained worker and a reviewed capability design.
 
 For mobile and embedded applications, pass the catalog to either
 `mobile::MobileRuntimeBuilder::register_fixed_file_catalog_tool` or
-`splash_workflow::mobile::MobileWorkflowBuilder::register_fixed_file_catalog_tool`
+`octoscript_workflow::mobile::MobileWorkflowBuilder::register_fixed_file_catalog_tool`
 before `build()`. Each builder consumes it during setup, so dynamic source or
 workflow steps cannot change the catalog afterward.

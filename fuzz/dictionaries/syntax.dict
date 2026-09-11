@@ -60,7 +60,7 @@
 "workflow.input["
 "assert("
 ".await()"
-"splash"
+"octoscript"
 "toolCatalog"
 "moduleCatalog"
 "workflowDataCatalog"

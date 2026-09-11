@@ -1,6 +1,6 @@
 # Workflow Checkpoints
 
-`splash-workflow` provides a bounded JSON checkpoint for a host-attested
+`octoscript-workflow` provides a bounded JSON checkpoint for a host-attested
 completed prefix of a workflow plan. It is intended for host-owned durable
 storage and restart orchestration, not as a VM snapshot.
 
@@ -29,7 +29,7 @@ prefix completed. On restart, it recreates the trusted plan and tool policy,
 then asks for a new checkpoint-bound approval before it runs the suffix.
 
 ~~~rust
-use splash_workflow::{WorkflowCheckpoint, WorkflowEngine, WorkflowStep};
+use octoscript_workflow::{WorkflowCheckpoint, WorkflowEngine, WorkflowStep};
 
 let plan = engine.plan(vec![
     WorkflowStep::new("prepare", "let release = 1"),
@@ -84,11 +84,11 @@ the engine. Every policy must name the corresponding trusted plan step; both
 the count and ordered IDs are checked before any lease is issued. The resume
 counterpart accepts policies only for the unexecuted suffix. A policy is
 non-serializable host configuration, not a lease or credential, and must not
-be assembled from Splash source or review hints. Use the explicit lease APIs
+be assembled from Octoscript source or review hints. Use the explicit lease APIs
 when a step needs a custom `ToolCallAuthorizer`.
 
 For a static mobile or embedded adapter catalog,
-`splash_workflow::mobile::MobileWorkflowBuilder` exposes this named-policy
+`octoscript_workflow::mobile::MobileWorkflowBuilder` exposes this named-policy
 approval path without exposing `WorkflowEngine::runtime_mut`, manual leases,
 full-catalog approval, or external-operation APIs. Its local adapters are
 still trusted app code, not contained workers; see [worker runtime](worker-runtime.md).
@@ -114,7 +114,7 @@ therefore binds a digest of the exact context to the completed prefix without
 serializing raw input, tool results, or schema source into checkpoint JSON.
 
 ```rust
-use splash_workflow::WorkflowData;
+use octoscript_workflow::WorkflowData;
 
 let data = engine.take_dataflow_snapshot().expect("terminal dataflow state");
 let checkpoint = engine.dataflow_checkpoint_after(&plan, &data, 1)?;
@@ -197,7 +197,7 @@ When `execute` or `resume` returns `WorkflowError::StepRejected`,
 `WorkflowError::StepFailed`, or `WorkflowError::StepSuspended`, its
 `completed_steps` value identifies the completed prefix before the unfinished
 step. `WorkflowError::StepRejected` carries the bounded, structured
-canonical-Splash syntax report and records no tool call; its corresponding
+canonical-Octoscript syntax report and records no tool call; its corresponding
 in-memory event retains only diagnostic count and truncation metadata. A host
 may use the count with
 `checkpoint_after` only after it has applied its own durable-success policy;

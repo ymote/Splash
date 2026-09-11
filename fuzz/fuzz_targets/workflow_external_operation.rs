@@ -1,18 +1,18 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use splash_capabilities::{
+use octoscript_capabilities::{
     CapabilityRuntime, OperationReconcileResult, OperationStatus, SessionAuthenticator, SessionKey,
     SessionRole, ToolPolicy, WorkerMessage, WorkerPayload,
 };
-use splash_workflow::{
+use octoscript_workflow::{
     WorkflowEngine, WorkflowError, WorkflowOperationLedger, WorkflowStep,
     MAX_WORKFLOW_OPERATION_LEDGER_BYTES, MAX_WORKFLOW_OPERATION_NONCE_BYTES,
 };
 
 const MAX_FUZZ_INPUT_BYTES: usize = MAX_WORKFLOW_OPERATION_LEDGER_BYTES;
 const MAX_FUZZ_PAYLOAD_BYTES: usize = 4 * 1024;
-const SENSITIVE_MARKER: &str = "splash-fuzz-secret:";
+const SENSITIVE_MARKER: &str = "octoscript-fuzz-secret:";
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_FUZZ_INPUT_BYTES {
@@ -56,7 +56,7 @@ fn fuzz_external_operation_bridge(data: &[u8]) {
     policy.max_calls = 2;
 
     let secret_literal = serde_json::to_string(&secret)
-        .expect("a Rust string always encodes as a Splash-compatible literal");
+        .expect("a Rust string always encodes as a Octoscript-compatible literal");
     let source = if use_json {
         format!(
             "use mod.tool\n\

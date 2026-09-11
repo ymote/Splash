@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use splash_storage::{
+use octoscript_storage::{
     rollback_anchor_service::{
         RollbackAnchorService, RollbackAnchorServiceTransport, TrustedServiceRollbackAnchor,
         MAX_ROLLBACK_ANCHOR_SERVICE_REQUEST_BYTES, MAX_ROLLBACK_ANCHOR_SERVICE_RESPONSE_BYTES,

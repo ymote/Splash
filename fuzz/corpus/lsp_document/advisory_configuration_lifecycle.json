@@ -1,6 +1,6 @@
 [
   {
-    "splash": {
+    "octoscript": {
       "toolCatalog": [
         {"name": "text.echo", "format": "text", "description": "Reviewed text adapter."}
       ],
@@ -30,15 +30,15 @@
     }
   },
   {
-    "splash": {
+    "octoscript": {
       "toolCatalog": [
         {"name": "json.echo", "format": "json", "description": "Replacement JSON adapter."}
       ]
     }
   },
-  {"splash": {"moduleCatalog": null}},
+  {"octoscript": {"moduleCatalog": null}},
   {
-    "splash": {
+    "octoscript": {
       "workflowDataCatalog": null,
       "workflowDataStepContext": {
         "currentStepId": "prepare",
@@ -46,9 +46,9 @@
       }
     }
   },
-  {"splash": []},
+  {"octoscript": []},
   {
-    "splash": {
+    "octoscript": {
       "toolCatalog": [],
       "moduleCatalog": [],
       "workflowDataCatalog": {
@@ -62,7 +62,7 @@
     }
   },
   {
-    "splash": {
+    "octoscript": {
       "toolCatalog": null,
       "moduleCatalog": null,
       "workflowDataCatalog": null,

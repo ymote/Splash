@@ -35,20 +35,20 @@ if !batch.is_empty() {
 
 An exact retry by the host can safely export the same batch again when its own
 sink supports idempotency. The opt-in
-`splash-capabilities/durable-audit-journal` feature supplies
+`octoscript-capabilities/durable-audit-journal` feature supplies
 `durable_audits::CapabilityAuditStore` for one authenticated, host-owned
 stream. The host still selects the rollback-protected storage backend, record
 key, stream identity, and retention capacity. A host enabling this feature
-also declares a direct `splash-storage` dependency; the storage backend and
+also declares a direct `octoscript-storage` dependency; the storage backend and
 keys are intentionally not re-exported through the scripting crate.
 
 ```rust
 use std::num::NonZeroUsize;
 
-use splash_capabilities::durable_audits::{
+use octoscript_capabilities::durable_audits::{
     CapabilityAuditStore, CapabilityAuditStreamId,
 };
-use splash_storage::StorageRecordKey;
+use octoscript_storage::StorageRecordKey;
 
 let stream_id = CapabilityAuditStreamId::new("release-42-attempt-1")?;
 let mut audits = CapabilityAuditStore::new(
@@ -112,7 +112,7 @@ live runtime session when operating-system entropy or a host-supplied capability
 session nonce is available. In a no-entropy local-only runtime it uses only a
 process-local session counter, so it can repeat after restart and must not be
 treated as confidential or cross-restart unlinkable. Audit records do not retain
-Splash source, tool input/output, external stream chunks, credentials, approval
+Octoscript source, tool input/output, external stream chunks, credentials, approval
 objects, leases, worker keys, or VM promise state.
 
 An `allowed` audit outcome is not proof that a remote effect completed or can
@@ -124,7 +124,7 @@ or compensation action.
 ## Sealed Profiles
 
 `mobile::MobileRuntime::audit_since` and
-`splash_workflow::mobile::MobileWorkflowRuntime::audit_since` forward the
+`octoscript_workflow::mobile::MobileWorkflowRuntime::audit_since` forward the
 same read-only export after setup. They do not expose mutable catalog
 registration, external operation control, or an adapter escape hatch. The
 embedding application may persist the exported batch through the optional

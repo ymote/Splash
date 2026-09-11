@@ -1,6 +1,6 @@
 # Cross-Stream Telemetry
 
-`splash_workflow::telemetry::CrossStreamTelemetryAggregator` is a bounded,
+`octoscript_workflow::telemetry::CrossStreamTelemetryAggregator` is a bounded,
 in-memory host helper that combines retained capability-audit and workflow-event
 batches into one local timeline. `telemetry::durable::CrossStreamTelemetryStore`
 persists the same kind of source batches through a host-owned authenticated
@@ -20,7 +20,7 @@ when a host needs independently retained source telemetry.
 
 Each `CrossStreamTelemetrySource` has a telemetry family and a bounded
 lowercase token identity (`[a-z0-9._-]`, at most 128 UTF-8 bytes). The host,
-not Splash source, chooses it. Treat it as non-secret metadata.
+not Octoscript source, chooses it. Treat it as non-secret metadata.
 
 Assign a fresh identity to every capability-runtime or workflow-engine history
 segment. Both source families begin their own sequence at one, so two recreated
@@ -48,7 +48,7 @@ aggregate timeline after its aggregate cursor and advance that cursor only after
 the host sink accepts it:
 
 ```rust
-use splash_workflow::telemetry::{
+use octoscript_workflow::telemetry::{
     CrossStreamTelemetryAggregator, CrossStreamTelemetryKind,
     CrossStreamTelemetrySource,
 };
@@ -113,8 +113,8 @@ retries.
 ```rust
 use std::num::NonZeroUsize;
 
-use splash_storage::StorageRecordKey;
-use splash_workflow::telemetry::{
+use octoscript_storage::StorageRecordKey;
+use octoscript_workflow::telemetry::{
     durable::{CrossStreamTelemetryStore, CrossStreamTelemetryStreamId},
     CrossStreamTelemetryKind, CrossStreamTelemetrySource,
 };
@@ -160,7 +160,7 @@ timeline.
 Use an `AuthenticatedStore<B>` whose `B` genuinely satisfies the
 rollback-protected storage contract. `VolatileMemoryStore` is for tests and
 local development only. Authentication does not provide confidentiality, and
-the journal does not contain raw Splash source, tool input/output, credentials,
+the journal does not contain raw Octoscript source, tool input/output, credentials,
 approvals, leases, worker keys, promises, or dataflow values. Encrypt retained
 metadata separately when it needs confidentiality.
 

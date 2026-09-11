@@ -3,7 +3,7 @@
 use std::io::{BufReader, Cursor};
 
 use libfuzzer_sys::fuzz_target;
-use splash_capabilities::json_line_worker::{
+use octoscript_capabilities::json_line_worker::{
     JsonLineWorkerChannel, WorkerFrameChannel, MAX_WIRE_FRAME_BYTES,
 };
 

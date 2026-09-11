@@ -1,7 +1,7 @@
 # Capability-Bound Worker Secrets
 
-`splash_worker::secret_broker` provides a narrow host-side secret-delivery
-contract for reviewed Rust worker adapters. It is not a Splash API: generated
+`octoscript_worker::secret_broker` provides a narrow host-side secret-delivery
+contract for reviewed Rust worker adapters. It is not a Octoscript API: generated
 source cannot name a secret, enumerate bindings, retrieve bytes, or invoke a
 provider.
 
@@ -31,8 +31,8 @@ bytes are available only inside a callback, although trusted adapter code must
 still avoid copying, logging, or serializing them.
 
 ```rust
-use splash_protocol::{CapabilityGrant, ResourceKind, ResourceSelector};
-use splash_worker::secret_broker::{
+use octoscript_protocol::{CapabilityGrant, ResourceKind, ResourceSelector};
+use octoscript_worker::secret_broker::{
     CapabilitySecretBroker, SecretAccessBinding, SecretProvider, SecretValue,
 };
 
@@ -51,7 +51,7 @@ impl SecretProvider for HostProvider {
 let binding = SecretAccessBinding::new("release.publish", "release.token")?;
 let mut broker = CapabilitySecretBroker::new(HostProvider, [binding.clone()])?;
 
-// The host-created worker session supplies this grant. Splash source never
+// The host-created worker session supplies this grant. Octoscript source never
 // constructs a CapabilityGrant or chooses its resource selectors.
 let mut grant = CapabilityGrant::json("release.publish");
 grant.resources.insert(ResourceSelector::new(
@@ -68,19 +68,19 @@ broker.with_secret(&grant, &binding, |token| {
 ```
 
 An adapter normally maps broker failure to its finite `WorkerAdapterError` and
-does not expose provider details to the worker protocol or Splash diagnostics.
+does not expose provider details to the worker protocol or Octoscript diagnostics.
 The adapter must retain its binding in trusted Rust configuration; it must not
 derive the binding from a JSON request, a tool payload, a file, or another
 generated value.
 
 ## Native credential provider
 
-On macOS, iOS, and Windows, `splash-capabilities` can provide the broker's
+On macOS, iOS, and Windows, `octoscript-capabilities` can provide the broker's
 `SecretProvider` using a fixed mapping to pre-provisioned native credentials:
 
 ```toml
 [dependencies]
-splash-capabilities = { path = "../splash-capabilities", features = ["platform-keyring-worker-secret-provider"] }
+octoscript-capabilities = { path = "../octoscript-capabilities", features = ["platform-keyring-worker-secret-provider"] }
 ```
 
 `PlatformKeyringSecretResolver` reuses the fixed opaque secret-ID to
@@ -93,16 +93,16 @@ The broker still has to receive the exact binding and current grant before this
 provider is asked to load a value.
 
 ```rust
-use splash_capabilities::platform_keyring_secret_resolver::{
+use octoscript_capabilities::platform_keyring_secret_resolver::{
     PlatformKeyringSecretEntry, PlatformKeyringSecretResolver,
 };
-use splash_worker::secret_broker::{CapabilitySecretBroker, SecretAccessBinding};
+use octoscript_worker::secret_broker::{CapabilitySecretBroker, SecretAccessBinding};
 
 let binding = SecretAccessBinding::new("release.publish", "release.token")?;
 let provider = PlatformKeyringSecretResolver::new(vec![
     PlatformKeyringSecretEntry::new(
         "release.token",
-        "com.example.splash",
+        "com.example.octoscript",
         "release-publish",
     )?,
 ])?;

@@ -12,16 +12,16 @@ Only the language VM, parser, derive crate, and their direct leaf
 dependencies are imported. Makepad widgets, platform scripting, filesystem,
 process, timer, and network modules are intentionally excluded.
 
-The vendor tree is intentionally excluded from the Splash Cargo workspace.
-It remains a path dependency of `splash-core`, but its upstream lint backlog
-does not dilute the lint gate for Splash-owned crates. Run its test suite
+The vendor tree is intentionally excluded from the Octoscript Cargo workspace.
+It remains a path dependency of `octoscript-core`, but its upstream lint backlog
+does not dilute the lint gate for Octoscript-owned crates. Run its test suite
 explicitly with `cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-script`.
 
 Upstream changes are reviewed and imported as explicit commits. New host
-capabilities belong in `crates/splash-capabilities`, never in the vendored VM.
+capabilities belong in `crates/octoscript-capabilities`, never in the vendored VM.
 
 Every local vendor patch is documented in `vendor/makepad/PATCHES.md` and must
 be reapplied or retired during each upstream update. Behavioral changes are
-allowed only when they implement a published Splash language contract, carry
+allowed only when they implement a published Octoscript language contract, carry
 focused compatibility and streaming regressions, and do not add ambient host
 authority to the VM.

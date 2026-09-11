@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use libfuzzer_sys::fuzz_target;
-use splash_protocol::{CapabilityGrant, CapabilityManifest, ResourceKind, ResourceSelector};
-use splash_sandbox::bubblewrap::{
+use octoscript_protocol::{CapabilityGrant, CapabilityManifest, ResourceKind, ResourceSelector};
+use octoscript_sandbox::bubblewrap::{
     BubblewrapPolicyError, BubblewrapWorkerPolicy, EphemeralFileRoot, FileRootAccess,
     FileRootBinding, ReadOnlyMount, DEFAULT_MAX_BUBBLEWRAP_ACTIVE_FILE_ROOTS,
 };

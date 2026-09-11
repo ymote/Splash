@@ -3,8 +3,8 @@
 use std::num::NonZeroUsize;
 
 use libfuzzer_sys::fuzz_target;
-use splash_capabilities::{CapabilityRuntime, ToolPolicy};
-use splash_workflow::{
+use octoscript_capabilities::{CapabilityRuntime, ToolPolicy};
+use octoscript_workflow::{
     telemetry::{
         CrossStreamTelemetryAggregator, CrossStreamTelemetryCursorError, CrossStreamTelemetryError,
         CrossStreamTelemetryKind, CrossStreamTelemetrySource,
@@ -195,7 +195,7 @@ fn make_workflow_batch(first_sequence: u64, count: usize) -> WorkflowEventBatch 
     .expect("fixed workflow batch is contiguous")
 }
 
-fn audit_batch(event_count: usize) -> splash_capabilities::AuditEventBatch {
+fn audit_batch(event_count: usize) -> octoscript_capabilities::AuditEventBatch {
     let mut runtime = CapabilityRuntime::default();
     let mut policy = ToolPolicy::new("text.echo");
     policy.max_calls = MAX_FUZZ_AUDIT_EVENTS;

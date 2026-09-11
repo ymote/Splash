@@ -2,7 +2,7 @@
 
 Worker protocol v5 retains a narrow, host-controlled path for one compensating
 effect of a previously succeeded durable operation. It is deliberately not a
-Splash language feature: generated source cannot create a compensation key,
+Octoscript language feature: generated source cannot create a compensation key,
 approve one, select a tenant, change a grant, or call a worker compensation
 handler directly.
 
@@ -45,8 +45,8 @@ The host must persist the intent before it can approve or send the inverse
 effect. A typical flow is:
 
 ```rust
-use splash_protocol::{canonical_operation_input_bytes, CapabilityGrant, ToolPayload};
-use splash_workflow::{
+use octoscript_protocol::{canonical_operation_input_bytes, CapabilityGrant, ToolPayload};
+use octoscript_workflow::{
     CompensationActionVerifier, CompensationGrantVerifier, WorkflowCompensationDispatch,
     WorkflowCompensationPolicy, WorkflowCompensationTarget,
 };
@@ -139,7 +139,7 @@ execution order is non-negotiable:
 5. Persist `running`, `succeeded`, `failed`, or `cancelled` after the adapter
    reports it, then send `CompensationResult`.
 
-`splash-worker::WorkerSession` restores its in-memory journal to the last
+`octoscript-worker::WorkerSession` restores its in-memory journal to the last
 successful persistence point and poisons its session when the adapter may have
 acted but the observed state cannot be made durable. It returns an
 indeterminate-compensation error; reopen from an atomic journal-and-revision

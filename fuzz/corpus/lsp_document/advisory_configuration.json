@@ -1,5 +1,5 @@
 {
-  "splash": {
+  "octoscript": {
     "toolCatalog": [
       {"name": "text.echo", "format": "text", "description": "Reviewed text adapter."}
     ],

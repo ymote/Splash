@@ -1,0 +1,197 @@
+# ledger stock@1.0.0
+# level:   L0
+# profile: ui/l0
+# model:   glm-5.2
+#
+# Reference card for Octoscript/docs/ui-profile-l0.md. Expresses everything
+# app/app/src/app/plan/stock.rs lowers: MoversList, QuoteHeader, PriceChart,
+# StatGrid. The hardest of the three: it is the only one with a genuine
+# list↔detail switch, and the only one whose chart depends on a second piece
+# of state.
+
+source movers      sys.movers(count: 10, fields: [ticker, name, last, change, pct])
+source quote       sys.quote(ticker: state.selected,
+                             fields: [name, last, change, pct, open, high, low,
+                                      volume, mktcap, pe])
+source env.locale  sys.locale()
+# The user's own layer (§5.12): saved tickers, and the chart range they prefer.
+# The store holds IDENTITIES — a ticker is a name the quote endpoint resolves
+# fresh every render; a price is never written down.
+source watch       sys.watchlist(fields: [ticker, last, pct])
+source range_pref  sys.prefs(fields: [range])
+# The membership probe: is the stock this page looks at in the user's list?
+# Names a ticker, so `has` answers "1"/"0" from the store — which is what
+# flips the page between Add and Remove.
+source kept        sys.watchlist(ticker: state.selected, fields: [has])
+# Free-text ticker lookup for the add flow — weather's editor pattern, the
+# stock way: results carry real listings, never a guessed symbol.
+source found       sys.symbol_search(query: state.query, count: 5, fields: [ticker, name])
+
+state selected { shape: text, initial: "" }                    # "" ⇒ movers list
+state query    { shape: text, initial: "" }
+state editing  { shape: enum[none, add], initial: .none }
+# What the LAST keep/forget on this page did, for the moment after a remove
+# when the probe already says "not kept" but the user deserves the word.
+state last_act { shape: enum[none, added, removed], initial: .none }
+# CAPTURED from the stored preference (§5.13); the host guarantees "m1" until
+# the user ever picks a range, so the capture is always a member of the enum.
+state range    { shape: enum[d1, w1, m1, m6, y1], initial: range_pref.range }
+
+event open_quote { selected: set($value), last_act: set(.none) }
+event back       { selected: clear, range: clear, last_act: set(.none) }
+event set_range  { range: set($value), range_pref: set($value) }
+# Keep/forget carry the word the page shows after: the probe flips the
+# button the moment the store changes, and `last_act` says what just happened.
+event keep       { watch: append($value), last_act: set(.added) }
+event forget     { watch: remove($value), last_act: set(.removed) }
+# The add flow. Looking is not keeping: tapping a result only OPENS its quote;
+# Add is the one event that stores, and the × closes with nothing stored.
+event add_sym     { editing: set(.add), query: clear }
+event typing      { query: set($value) }
+event preview     { selected: set($value), last_act: set(.none) }
+event confirm_add { watch: append($value), selected: set($value), editing: set(.none), query: clear }
+event close_add   { editing: set(.none), query: clear }
+
+copy movers  { class: vocabulary, en: "Top Movers", zh: "涨跌榜" }
+copy back_lbl { class: vocabulary, en: "‹ Back", zh: "‹ 返回" }
+copy watch_hd { class: vocabulary, en: "WATCHLIST", zh: "自选" }
+copy unstar   { class: vocabulary, en: "Remove", zh: "删除" }
+copy plus     { class: vocabulary, en: "+" }
+copy add_lbl  { class: vocabulary, en: "Add", zh: "添加" }
+copy added_lbl   { class: vocabulary, en: "✓ Added",   zh: "已添加" }
+copy removed_lbl { class: vocabulary, en: "Removed",   zh: "已删除" }
+copy loading { class: vocabulary, en: "Fetching the quote…", zh: "正在获取行情…" }
+copy offline { class: vocabulary, en: "Can't reach the market feed", zh: "无法获取行情" }
+copy open   { class: vocabulary, en: "Open",       zh: "开盘" }
+copy high   { class: vocabulary, en: "High",       zh: "最高" }
+copy low    { class: vocabulary, en: "Low",        zh: "最低" }
+copy volume { class: vocabulary, en: "Volume",     zh: "成交量" }
+copy mktcap { class: vocabulary, en: "Mkt Cap",    zh: "市值" }
+copy pe     { class: vocabulary, en: "P/E",        zh: "市盈率" }
+
+view root  Surface(pad: .page) {
+             when selected == "" { list }
+             when selected != "" { detail }
+           }
+
+view list  Col {
+             # The header bar is always there: it names the saved list and
+             # hosts the add affordance in the top-right corner.
+             Row(align: .center, gap: 8) {
+               TextCaption(text: copy.watch_hd, width: .fill)
+               Chip(text: copy.plus, on_tap: add_sym, value: "1")
+             }
+             when editing == .add {
+               Panel {
+                 Row(align: .center, gap: 10) {
+                   Field(text: query, placeholder: copy.watch_hd, on_commit: preview,
+                         on_change: typing, width: .fill)
+                   Chip(text: "×", on_tap: close_add)
+                 }
+                 when query != "" {
+                   # Row taps PREVIEW the quote; only the Add chip beside a
+                   # result stores it (chip as sibling — a row's hit target
+                   # covers its children, measured).
+                   for f, i in found key f.ticker {
+                     Row(align: .center, gap: 10) {
+                       Row(align: .center, gap: 10, width: .fill, on_tap: preview, value: f.ticker) {
+                         TextRow(text: f.ticker, width: .label)
+                         TextCaption(text: f.name, width: .fill)
+                       }
+                       Chip(text: copy.add_lbl, on_tap: confirm_add, value: f.ticker)
+                     }
+                   }
+                 }
+               }
+             }
+             for w, i in watch key w.ticker {
+               # Swipe THIS row left and ITS red Remove appears beside it;
+               # swipe right puts it away. `Reveal` is widget visibility, not
+               # card state — no other row moves, nothing re-realizes, and
+               # the swipe fires instead of the tap so a drag cannot also
+               # open the quote.
+               Row(align: .center, gap: 8) {
+                 Row(align: .center, gap: 8, width: .fill, on_tap: open_quote, value: w.ticker) {
+                   TextRow(text: w.ticker, width: .fill)
+                   TextValue(value: w.last, format: .money)
+                   TextValue(value: w.pct, format: .signed_pct)
+                 }
+                 Reveal {
+                   Chip(text: copy.unstar, on_tap: forget, value: w.ticker, tone: .danger, width: .fit)
+                 }
+               }
+             }
+             TextTitle(text: copy.movers)
+             Panel {
+               # Movers are the market's recommendations, not the user's list:
+               # no swipe menu here — a mover row is the tap that opens its
+               # quote, and the quote page is where Add lives.
+               for m in movers key m.ticker {
+                 Row(align: .center, gap: 8, on_tap: open_quote, value: m.ticker) {
+                   Col(gap: 2, width: .fill) {
+                     TextRow(text: m.ticker)
+                     TextCaption(text: m.name, width: .fill)
+                   }
+                   TextValue(value: m.last, format: .money)
+                   TextValue(value: m.pct, format: .signed_pct, tint: m.change)
+                 }
+                 Rule()
+               }
+             }
+           }
+
+# §5.9: the quote's lifecycle is a state to branch on — a tapped ticker says
+# "fetching" or "can't reach", never a silent grid of em dashes.
+view detail  Col {
+               # The page knows whether this stock is kept and says so: a
+               # kept one shows ✓ Added beside a red Remove, an unkept one
+               # shows Add — and for the beat after a remove, the word
+               # Removed, so the tap is answered in place.
+               Row(align: .center, gap: 8) {
+                 Row(align: .center, width: .fill, on_tap: back) { TextRow(text: copy.back_lbl) }
+                 when kept.has == "1" {
+                   TextCaption(text: copy.added_lbl)
+                   Chip(text: copy.unstar, on_tap: forget, value: selected, tone: .danger, width: .fit)
+                 }
+                 when kept.has != "1" {
+                   when last_act == .removed { TextCaption(text: copy.removed_lbl) }
+                   Chip(text: copy.add_lbl, on_tap: keep, value: selected)
+                 }
+               }
+               when quote.$state == .pending { TextBody(text: copy.loading) }
+               when quote.$state == .failed  { TextBody(text: copy.offline) }
+               header
+               chart
+               ranges
+               stats
+             }
+
+view header  Col {
+               TextCaption(text: quote.name)
+               TextHero(value: quote.last, format: .money)
+               Row(gap: 8) {
+                 TextStat(value: quote.change, format: .signed_money, tint: quote.change)
+                 TextStat(value: quote.pct,    format: .signed_pct,   tint: quote.change)
+               }
+             }
+
+view chart  StockPlot(symbol: selected, range: range)
+
+# Range switching is a set() over a declared enum — no expression, and the
+# selected range is a guard rather than a computed style.
+view ranges  Row(gap: 6) {
+               Chip(text: "1D", on_tap: set_range, value: .d1, active: range == .d1)
+               Chip(text: "1W", on_tap: set_range, value: .w1, active: range == .w1)
+               Chip(text: "1M", on_tap: set_range, value: .m1, active: range == .m1)
+               Chip(text: "6M", on_tap: set_range, value: .m6, active: range == .m6)
+               Chip(text: "1Y", on_tap: set_range, value: .y1, active: range == .y1)
+             }
+
+view stats  Grid(cols: 2) {
+              Tile(label: copy.open,   value: quote.open,   format: .money)
+              Tile(label: copy.high,   value: quote.high,   format: .money)
+              Tile(label: copy.low,    value: quote.low,    format: .money)
+              Tile(label: copy.volume, value: quote.volume, format: .compact)
+              Tile(label: copy.mktcap, value: quote.mktcap, format: .compact)
+              Tile(label: copy.pe,     value: quote.pe,     format: .ratio)
+            }

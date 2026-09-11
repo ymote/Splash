@@ -1,5 +1,5 @@
 [package]
-name = "splash-fuzz"
+name = "octoscript-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -15,14 +15,14 @@ libfuzzer-sys = "0.4"
 lsp-server = "0.9.0"
 lsp-types = "0.97.0"
 serde_json = "1.0.150"
-splash-capabilities = { version = "0.1.0", path = "../crates/splash-capabilities", features = ["durable-audit-journal", "http-endpoint-catalog", "json-line-worker"] }
-splash-core = { path = "../crates/splash-core" }
-splash-protocol = { version = "0.1.0", path = "../crates/splash-protocol" }
-splash-sandbox = { version = "0.1.0", path = "../crates/splash-sandbox" }
-splash-schema = { version = "0.1.0", path = "../crates/splash-schema" }
-splash-storage = { version = "0.1.0", path = "../crates/splash-storage" }
-splash-worker = { version = "0.1.0", path = "../crates/splash-worker" }
-splash-workflow = { version = "0.1.0", path = "../crates/splash-workflow" }
+octoscript-capabilities = { version = "0.1.0", path = "../crates/octoscript-capabilities", features = ["durable-audit-journal", "http-endpoint-catalog", "json-line-worker"] }
+octoscript-core = { path = "../crates/octoscript-core" }
+octoscript-protocol = { version = "0.1.0", path = "../crates/octoscript-protocol" }
+octoscript-sandbox = { version = "0.1.0", path = "../crates/octoscript-sandbox" }
+octoscript-schema = { version = "0.1.0", path = "../crates/octoscript-schema" }
+octoscript-storage = { version = "0.1.0", path = "../crates/octoscript-storage" }
+octoscript-worker = { version = "0.1.0", path = "../crates/octoscript-worker" }
+octoscript-workflow = { version = "0.1.0", path = "../crates/octoscript-workflow" }
 
 [workspace]
 members = ["."]

@@ -5,8 +5,8 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use libfuzzer_sys::fuzz_target;
-use splash_protocol::{CapabilityGrant, ResourceKind, ResourceSelector};
-use splash_worker::secret_broker::{CapabilitySecretBroker, SecretAccessBinding, SecretValue};
+use octoscript_protocol::{CapabilityGrant, ResourceKind, ResourceSelector};
+use octoscript_worker::secret_broker::{CapabilitySecretBroker, SecretAccessBinding, SecretValue};
 
 const MAX_FUZZ_INPUT_BYTES: usize = 1024;
 

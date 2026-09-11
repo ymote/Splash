@@ -8,7 +8,7 @@ contract through `register_typed_json_tool`.
 
 The runtime validates the ordinary JSON object/array envelope first, then the
 input contract before reserving a call or invoking the handler. It validates
-the output envelope and output contract before returning a result to Splash.
+the output envelope and output contract before returning a result to Octoscript.
 Rejected input is recorded as denied and does not consume the tool's call
 budget. The same path is used by synchronous calls and deferred calls, whether
 they are host-pumped or externally completed.
@@ -36,7 +36,7 @@ levels, properties per object to 128, and enum values to 128.
 ## Registration
 
 ```rust
-use splash_capabilities::{json, JsonToolContract, ToolError, ToolMetadata, ToolPolicy};
+use octoscript_capabilities::{json, JsonToolContract, ToolError, ToolMetadata, ToolPolicy};
 
 let contract = JsonToolContract::new(
     json!({
@@ -85,7 +85,7 @@ output type. There is intentionally no uncontracted typed registration API.
 
 ```rust
 use serde::{Deserialize, Serialize};
-use splash_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
+use octoscript_capabilities::{json, JsonToolContract, ToolMetadata, ToolPolicy};
 
 #[derive(Deserialize)]
 struct AddInput {
@@ -124,7 +124,7 @@ runtime.register_typed_json_tool_with_metadata(
 )?;
 ```
 
-The schema is still the wire authority: Splash validates it before Serde
+The schema is still the wire authority: Octoscript validates it before Serde
 deserializes input and after Serde serializes output. This catches drift such
 as a Rust default for an omitted required field, Serde's default acceptance of
 unknown fields, incompatible enum encodings, and numeric-range differences.

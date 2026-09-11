@@ -11,7 +11,7 @@ to itself. Raw host comparison is iterative but does not consume VM fuel.
 
 Uncaught VM errors now drain diagnostics and bail before another instruction
 can run. Active `try` handlers still recover normally. A host-controlled
-`allow_debug_output` flag preserves raw Makepad debugging by default; Splash's
+`allow_debug_output` flag preserves raw Makepad debugging by default; Octoscript's
 standalone runtime disables it, including compatibility evaluation. LOG is
 rejected and incidental VM error prints are removed.
 
@@ -26,13 +26,13 @@ its original insertion order, matching the tracked-object path; the stricter
 uncaught-error behavior exposed this existing contract violation.
 
 Conditional block-tail lowering, strict JSON materialization, numeric boundary
-checks, and aggregate UI realization work limits live in Splash-owned crates.
+checks, and aggregate UI realization work limits live in Octoscript-owned crates.
 Regressions cover cycles and shared DAGs in a timed child process, fuel,
 precedence and effects, streaming appends, error recovery, invalid writes,
 numeric storage variants, JSON boundaries, and empty nested UI expansion.
 
 **Upstream sync:** reapply or retire the VM changes as a unit when importing
-Makepad. Preserve the published Splash contracts and run both Splash's regression
+Makepad. Preserve the published Octoscript contracts and run both Octoscript's regression
 suite and the explicit `makepad-script` tests, especially streaming precedence
 and `try/catch` recovery. Keep the standalone logging opt-out host-controlled;
 do not add capabilities to compensate for removed output paths.
@@ -41,15 +41,15 @@ do not add capabilities to compensate for removed output paths.
 
 The upstream iterator wrapped an inner non-terminating loop in `while let`.
 Every inner path either returned an item or continued the inner loop, so the
-outer loop could never advance to a second iteration. Splash replaces that
+outer loop could never advance to a second iteration. Octoscript replaces that
 outer loop with `self.range_stack.pop()?`, preserving the single-pop behavior
 while satisfying Clippy's `never_loop` denial on Rust 1.95.
 
 ## `platform/script`: canonical `try/catch` and cross-call unwinding
 
-Splash Grammar v0.2 publishes `try protected catch fallback`. The upstream
+Octoscript Grammar v0.2 publishes `try protected catch fallback`. The upstream
 parser already emits `TRY_*` opcodes for the compatibility form
-`try protected fallback [ok success]`, so Splash keeps those opcodes and makes
+`try protected fallback [ok success]`, so Octoscript keeps those opcodes and makes
 `catch` a one-shot contextual separator before the fallback. It is not a
 global keyword: an identifier named `catch` remains valid, including as the
 first fallback token. Parser checkpoint state retains whether the separator
@@ -70,7 +70,7 @@ fallback values participate safely in larger expressions without changing the
 legacy `ok` control paths.
 
 Upstream error handling checks only the current call frame for a try frame.
-Splash searches active call frames, unwinds failed script calls to the nearest
+Octoscript searches active call frames, unwinds failed script calls to the nearest
 try-owning frame, restores that frame's instruction body, and then applies the
 existing try-frame cleanup and jump. Hard VM bails remain outside this path.
 
@@ -95,7 +95,7 @@ audit, refund a call, widen a lease, or bypass a dataflow output contract.
 The inherited interpreter cached a raw pointer into a body's opcode vector
 across native calls. Native handlers receive `&mut ScriptVm` and can re-enter
 evaluation, including replacing the current body's parser, which invalidates
-that pointer. Splash copies each opcode through a scoped `RefCell` borrow
+that pointer. Octoscript copies each opcode through a scoped `RefCell` borrow
 instead; the borrow ends before dispatch, so re-entrant host code remains
 supported without retaining a dangling pointer.
 
@@ -110,7 +110,7 @@ implementation cannot forge a type match by overriding a trait method.
 
 The inherited assignment rewrite walks the emitted opcode stream in reverse
 pairs. A malformed partial field assignment can leave a trailing one-opcode
-chunk, but the loop indexed both pair elements unconditionally. Splash stops
+chunk, but the loop indexed both pair elements unconditionally. Octoscript stops
 at that incomplete chunk so the normal parser error path rejects the source
 instead of panicking during compatibility preflight.
 
@@ -123,7 +123,7 @@ is next synchronized.
 The `:` prototype-field rewrite inserted paired opcodes directly into the
 opcode stream and its source-map sidecar. Malformed field chains can reach that
 rewrite with a missing synthetic source-map entry, making the second sidecar
-insert out of bounds. Splash validates that the chain begins with an identifier
+insert out of bounds. Octoscript validates that the chain begins with an identifier
 and inserts through one helper that restores missing entries as synthetic
 metadata before mutating both vectors. The parser now returns its normal syntax
 diagnostic and retains opcode/source-map lockstep for the minimized fuzz input.
@@ -136,8 +136,8 @@ is next synchronized.
 
 The inherited tokenizer ignores underscores inside numeric literals, but it
 moved to whitespace while retaining the buffered number. A following
-separator, including Splash's terminal preflight marker, then reached
-`emit_separator` with stale text and panicked. Splash retains the numeric state
+separator, including Octoscript's terminal preflight marker, then reached
+`emit_separator` with stale text and panicked. Octoscript retains the numeric state
 across the separator so later digits remain part of the same literal and a
 separator flushes it through the normal number path. Focused tokenizer and
 compatibility-preflight regressions cover integer, fractional, exponent, and
@@ -151,7 +151,7 @@ is next synchronized.
 
 The inherited suggestion formatter truncated inline and heap strings with a
 fixed byte slice. A valid multibyte character crossing that byte offset caused
-a panic while formatting an otherwise recoverable script error. Splash now
+a panic while formatting an otherwise recoverable script error. Octoscript now
 truncates previews at character boundaries and covers the exact boundary case
 with a regression test.
 

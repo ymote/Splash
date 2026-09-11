@@ -5,12 +5,12 @@
 - Standalone VM workspace with upstream provenance.
 - Standalone source surface that masks inherited Makepad UI/debug, direct-output,
   regex, HTML, GC, pod, shader, and math entry points before evaluation while
-  preserving the documented core, frozen Splash-owned `mod.std.math` scalar
+  preserving the documented core, frozen Octoscript-owned `mod.std.math` scalar
   helpers, `mod.std.json` bounded data helpers, `mod.std.text` bounded text
   helpers, `mod.std.array` bounded shallow-array helpers, `mod.std.object`
   bounded own-field record helpers, and trusted host-installed modules.
 - Bounded evaluation and canonical grammar diagnostics, including
-  host-configurable per-string, tracked Splash-owned aggregate-heap,
+  host-configurable per-string, tracked Octoscript-owned aggregate-heap,
   operand-stack, and active-call-frame ceilings.
 - Canonical source formatting that preserves comments and literal spellings.
 - Host-only LSP diagnostics and full-document canonical formatting for the
@@ -55,7 +55,7 @@
   workflow-data projection for direct, unshadowed `workflow.input.*` and
   `workflow.outputs.<stepId>.*` completion and hover. Its ordered step context
   filters outputs to a projected completed prefix and next projected step. The
-  `splash-workflow` API can derive that complete pair from contract-bound data,
+  `octoscript-workflow` API can derive that complete pair from contract-bound data,
   a validated checkpoint, or exact suspended engine state without serializing
   values, source, approvals, leases, or schema source. The LSP itself remains
   advisory: it does not load schemas/checkpoints, validate values, approve a
@@ -157,9 +157,9 @@
 - Host-only bounded external retries with stable idempotency keys.
 - External deferred-tool registration fails closed when operating-system
   entropy is unavailable. A host may explicitly provide a bounded session
-  nonce with a documented cross-restart uniqueness scope; Splash never falls
+  nonce with a documented cross-restart uniqueness scope; Octoscript never falls
   back to time/PID-derived downstream idempotency keys.
-- Bounded, redactor-hooked external output streaming outside Splash source.
+- Bounded, redactor-hooked external output streaming outside Octoscript source.
 - Keyed, replay-checked worker frames and authenticated live-operation
   reconciliation.
 - Bounded data-only workflow checkpoints with fresh host approval on resume.
@@ -287,14 +287,14 @@
   persistent host-backed writable roots fail closed by default. On Linux, a
   host can attach a verified generic filesystem project quota to a
   descriptor-pinned root and set an aggregate hard byte and inode maximum;
-  Splash validates the project ID, inheritance flag, nonzero hard limits,
+  Octoscript validates the project ID, inheritance flag, nonzero hard limits,
   current usage, configured ceilings, and distinct `(filesystem, project ID)`
   aggregate before Bubblewrap receives the same retained root descriptor. A
   selected verified quota root also requires mandatory further-user-namespace
   lockdown so an owning worker cannot retag its directory in the initial user
   namespace. The host provisions and retains control of the quota. The old explicit
   unbounded-write acknowledgement remains only as a visible weaker escape
-  hatch for an external boundary Splash cannot inspect. An opt-in stricter
+  hatch for an external boundary Octoscript cannot inspect. An opt-in stricter
   policy rejects unverified persistent roots and an unbounded private `/tmp`,
   requires further-user-namespace lockdown, and remounts the namespace root,
   `/proc`, and `/dev` read-only; it accepts verified project-quota roots. Each
@@ -366,14 +366,14 @@
   Windows, mobile, and embedded implementations. Target-specific
   credential-provider and secret-delivery backends, plus a complete audited
   code-execution policy beyond Landlock's filesystem-execute action, also
-  remain. The exact-origin catalog alone still mediates only Splash-initiated
+  remain. The exact-origin catalog alone still mediates only Octoscript-initiated
   HTTP requests, and the worker secret broker deliberately mediates only a
   reviewed adapter's host-owned resolver; broader selectors must remain denied
   until each is enforced.
 
 ## Complete: a canonical profile for generated UI
 
-Splash has no supported path for LLM-authored UI. The canonical grammar rejects
+Octoscript has no supported path for LLM-authored UI. The canonical grammar rejects
 UI constructs; the compatibility APIs accept them but must not receive generated
 source. A host that needs one must embed the raw Makepad VM, which restores the
 inherited UI, debug, shader, GC and direct-output bindings the standalone
@@ -386,7 +386,7 @@ constructors, bindings, keyed loops, guarded branches and components with
 declared local state, with no expression form and no module access, evaluated
 against an empty host surface. Three reference cards exercise it.
 
-**Implemented** in `splash-core::ui_l0`: parser, validator, per-instance state store,
+**Implemented** in `octoscript-core::ui_l0`: parser, validator, per-instance state store,
 event dispatch, a renderer-neutral realizer, a source plan, and static dependency tracking for
 reconciliation. 224 tests; the three reference cards are accepted and the shipping nav card is
 rejected as L2; four cases render on a OnePlus 6T through an unmodified downstream host, checked
@@ -452,7 +452,7 @@ Remaining:
   defects in `dirty_records` and in the checker regardless of whether patching ever
   ships. Revisit if a card ever gets large enough to move the number.
 - **`makepad::lower` is in the wrong crate.** It belongs in a backend crate, not
-  in `splash-core`, which otherwise names no renderer.
+  in `octoscript-core`, which otherwise names no renderer.
 - **L1 is implemented ahead of its specification.** A card declaring `level: L1`
   is admitted and gets an expression form — arithmetic over already-declared
   values, where an expression must read something so a literal-only formula

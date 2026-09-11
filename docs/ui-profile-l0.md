@@ -1,7 +1,7 @@
-# Splash UI Profile — Level 0
+# Octoscript UI Profile — Level 0
 
 **Status:** **implemented.** Normative producer contract for generated UI source at Level 0.
-Parser, validator, realizer and instance store live in `splash-core::ui_l0`; 317 tests, three
+Parser, validator, realizer and instance store live in `octoscript-core::ui_l0`; 317 tests, three
 reference cards, and a card rendered on a OnePlus 6T through an unmodified host.
 **Relationship to [Grammar v0.2](grammar.md):** a *sibling* canonical profile, not a subset of
 the workflow language. `check_syntax` rejects UI source and `eval_vm_compatibility` must not
@@ -194,11 +194,11 @@ Three layers, each knowing one thing:
 ```
 L0 card        names roles              TextHero, Panel, Chip, TempBar
    ↓
-theme kit      role → presentation      components/<theme>/*.splash, authored as Splash DSL
+theme kit      role → presentation      components/<theme>/*.octoscript, authored as Octoscript DSL
    ↓
-splash-render  DSL → UiNode             evaluated in the VM, renderer-free
+octoscript-render  DSL → UiNode             evaluated in the VM, renderer-free
    ↓
-backend        UiNode → native          splash-makepad · Splash-OH · Splash-Android
+backend        UiNode → native          octoscript-makepad · Octoscript-OH · Octoscript-Android
 ```
 
 A card therefore lowers to **semantic invocations of the active theme's component kit**, never
@@ -219,13 +219,13 @@ past it reaches one platform and silently abandons the other two.
 
 **Some roles cannot be a theme composition.** Six of the catalogue —
 `WeatherIcon`, `TempBar`, `SunArc`, `MoonPhase`, `AqiContour`, `StockPlot` — are small data
-visualisations. `splash-render` states why they cannot be authored in the DSL: *a DSL node
+visualisations. `octoscript-render` states why they cannot be authored in the DSL: *a DSL node
 cannot carry shader source — MPSL compiles at build time — but it can select a shader that was
 compiled.* A gradient bar is a fragment shader parameterised by data, not a composition of
 boxes and text.
 
 **How they reach a backend is unsettled, and a previous version of this section settled it
-wrongly.** It declared six new node kinds and asserted that `splash-render` would route them.
+wrongly.** It declared six new node kinds and asserted that `octoscript-render` would route them.
 Five of the six are not in that consumer's tag table, and its fallback is to return `None` —
 so a card's temperature bars, sun arc, moon phase and air-quality field would have been
 dropped without a diagnostic. The section asserted a cross-repository contract that nobody had
@@ -243,7 +243,7 @@ What is true and what is not:
 
 **The order this implies.** Prove the pipeline end to end on the backend that already
 implements these widgets — six of six exist and ship in octos-one today, against one in
-`Splash-Makepad` — and let the vocabulary be whatever that requires. Then port to the others
+`Octoscript-Makepad` — and let the vocabulary be whatever that requires. Then port to the others
 against a contract that has shipped once. Defining the contract first is defining it for three
 implementations, two of which do not exist, which is how the previous attempt went wrong.
 
@@ -252,7 +252,7 @@ makepad's widget dialect directly, with ten hardcoded colours and a font-size ra
 the DSL, the VM, `UiNode` and two backends, and putting a theme inside the crate whose job is
 deciding whether a card is safe. It is still a defect measured against this section. What
 changed is that **nothing in production calls it**: octos-one's device path is
-`kit::lower` → `_kit.splash` → the VM → `UiNode` → widgets, end to end, and `makepad::lower`
+`kit::lower` → `_kit.octoscript` → the VM → `UiNode` → widgets, end to end, and `makepad::lower`
 survives only in this crate's own tests.
 
 All six data visualisations reach a backend through it. The warning below — that five of the
@@ -905,7 +905,7 @@ currently share the name:
 |---|---|
 | `UiNode.key` | L0's declaration-and-loop path, used for realization and patch reuse |
 | emitted `l0_key` | that same path, written as a backend attribute for tap routing |
-| `Attrs.key` in `splash-render` | a kit-selected name for a slot in a process-global `BTreeMap<String, f64>` — no instance scoping, no pruning |
+| `Attrs.key` in `octoscript-render` | a kit-selected name for a slot in a process-global `BTreeMap<String, f64>` — no instance scoping, no pruning |
 
 The third is not the first. Reusing its name for instance identity would put per-instance cells
 into a global map keyed by whatever the kit chose, which is the collision §5.7 exists to
@@ -1281,11 +1281,11 @@ the language.
 once: it lowers to a *backend dialect* rather than to the theme's component kit, it decides
 *presentation* (ten hardcoded colours, a font-size ramp) which belongs to a theme, and it
 therefore reaches one backend of three. It also defines a second `UiNode`, duplicating the one
-`splash-render` already produces.
+`octoscript-render` already produces.
 
 **The replacement now exists, and does not yet replace anything.** `kit::lower` emits role calls
-against `Splash-Makepad`'s `components/l0/_kit.splash` — 21 roles, each verified by building it
-through `splash_render::build` in the repository where that consumer lives. The three reference
+against `Octoscript-Makepad`'s `components/l0/_kit.octoscript` — 21 roles, each verified by building it
+through `octoscript_render::build` in the repository where that consumer lives. The three reference
 cards build (news 25 nodes, stock 11, weather 62), the emitted source carries no presentation,
 and live backend calls survive, because both lowerings share one value formatter.
 

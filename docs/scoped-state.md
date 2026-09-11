@@ -1,4 +1,4 @@
-# Splash Language Contract: Scoped State
+# Octoscript Language Contract: Scoped State
 
 **Status:** proposed. Nothing here is implemented.
 
@@ -16,11 +16,11 @@ carry: whoever owns the cells must be handed instance identity, because L0 rebui
 data changes and a cell that cannot be re-found is a cell that is lost.
 
 `UPSTREAM.md` permits a behavioural change to the vendored VM "only when [it]
-implements a published Splash language contract". This is that contract. It is
+implements a published Octoscript language contract". This is that contract. It is
 deliberately narrow: it publishes the smallest state mechanism that lets an
 interaction be handled locally, and defers everything that can be deferred.
 
-**This contract has more than one implementer.** Splash's vendored VM
+**This contract has more than one implementer.** Octoscript's vendored VM
 (`vendor/makepad/platform/script`, pinned to upstream `4f9ce7a8`) and the VM that
 ships on device in octos-one (`makepad/platform/script`) are independent
 lineages — neither contains the other's history. That is a deliberate position,
@@ -34,9 +34,9 @@ be satisfied by one implementation, that sentence is a defect.
 
 ---
 
-## 1. What Splash has today, and why it is not enough
+## 1. What Octoscript has today, and why it is not enough
 
-Splash has no state in the VM. What looks like state is two separate mechanisms
+Octoscript has no state in the VM. What looks like state is two separate mechanisms
 that never meet:
 
 | | mechanism | where it lives |
@@ -60,8 +60,8 @@ needing an `expanded` flag must synthesise seven distinct names — the manual
 keying that component models exist to remove. A card author who gets the keying
 wrong gets two rows sharing one flag, silently.
 
-**Every render backend must re-solve it.** Splash lowers to three backends
-(`splash-oh`, `splash-android`, `splash-makepad`). State handled above the DSL is
+**Every render backend must re-solve it.** Octoscript lowers to three backends
+(`octoscript-oh`, `octoscript-android`, `octoscript-makepad`). State handled above the DSL is
 handled three times; state handled in the DSL is handled once.
 
 ---
@@ -118,7 +118,7 @@ displayed as though it had always been a number.
 
 ## 3. Scope, and what identifies a cell
 
-**A cell belongs to the innermost enclosing instance.** Splash's existing flat
+**A cell belongs to the innermost enclosing instance.** Octoscript's existing flat
 `state.` namespace is global by construction; this one is not, and the difference
 is the point of the contract.
 
@@ -189,7 +189,7 @@ while that field's shape is unchanged. That needs declared shapes, an initial,
 and a schema id — none of which the DSL carries. The VM holds cells and compares
 keys; the layer that knows what a component *is* decides when to discard them.
 
-**Expressions are unaffected.** Splash already has them. This contract adds no
+**Expressions are unaffected.** Octoscript already has them. This contract adds no
 evaluation, no operators, and no new call forms.
 
 **`{{state.q}}` is untouched.** It keeps working exactly as it does, including

@@ -1,6 +1,6 @@
 # Positioning and Feasibility
 
-Splash is a capability-first scripting runtime for generated workflows,
+Octoscript is a capability-first scripting runtime for generated workflows,
 tool orchestration, and bounded data transformation. It is intentionally not a
 general-purpose replacement for Python or JavaScript in every environment.
 
@@ -9,9 +9,9 @@ that an LLM can generate, a host can review and authorize, and a Rust
 application can execute without importing ambient process authority into the
 script.
 
-## Difference From Makepad Splash
+## Difference From Makepad Octoscript
 
-Makepad's Splash implementation is a VM and language substrate used by the
+Makepad's Octoscript implementation is a VM and language substrate used by the
 Makepad UI ecosystem. It accepts compatibility syntax and is designed to be
 embedded by a trusted application. Upstream modules and host bindings can be
 appropriate for a UI runtime, but they are not a stable capability boundary for
@@ -20,7 +20,7 @@ untrusted generated programs.
 This repository vendors that substrate with provenance, then defines a
 separate portable language contract and host model:
 
-| Area | Makepad-oriented substrate | Splash runtime profile |
+| Area | Makepad-oriented substrate | Octoscript runtime profile |
 | --- | --- | --- |
 | Source contract | Broad compatibility parser | Published canonical v0.2 grammar, preflighted before execution |
 | Primary use | UI/runtime embedding | Dynamic workflows, dataflow, and reviewed tool calls |
@@ -39,7 +39,7 @@ migration, but generated code must never receive it.
 
 ## What Is Feasible Now
 
-Splash is suitable today when an application owns a small, reviewed capability
+Octoscript is suitable today when an application owns a small, reviewed capability
 catalog and needs dynamic behavior without shipping a full Python or
 JavaScript runtime:
 
@@ -71,7 +71,7 @@ mobile and embedded applications, but it is not OS containment.
 
 ## What It Does Not Replace
 
-Do not position Splash as a universal Python or JavaScript replacement. It
+Do not position Octoscript as a universal Python or JavaScript replacement. It
 does not currently provide a package manager, direct crate imports, browser or
 Node compatibility, a standard filesystem/network/process API, a mature async
 runtime, a broad numerical ecosystem, or a stable language specification beyond
@@ -88,7 +88,7 @@ file path, URL, or secret.
 
 For an application that needs arbitrary packages, browser APIs, extensive data
 science libraries, dynamic module loading, or developer-facing REPL
-ergonomics, Python or JavaScript remains the appropriate choice. Splash should
+ergonomics, Python or JavaScript remains the appropriate choice. Octoscript should
 compete in the constrained orchestration niche: smaller deployment surface,
 deterministic language profile, host-controlled effects, and integration with
 the Rust application that already owns the device or service.
@@ -98,7 +98,7 @@ the Rust application that already owns the device or service.
 There are three distinct boundaries. They must not be conflated.
 
 1. The canonical grammar and evaluator bound source, syntax work, individual
-   string construction, tracked retained Splash VM storage, live operand-stack
+   string construction, tracked retained Octoscript VM storage, live operand-stack
    values, active call frames, instructions, and evaluation time. They reduce
    interpreter resource risk; these VM bounds are not a process-wide allocator
    quota and they do not authorize effects.
@@ -112,16 +112,16 @@ There are three distinct boundaries. They must not be conflated.
    effects. This is the containment boundary. The current Linux Bubblewrap
    backend is one optional implementation; mobile, Windows, macOS, embedded
    Linux, and bare-metal environments require their own enforceable backend or
-   must restrict Splash to safe in-process adapters.
+   must restrict Octoscript to safe in-process adapters.
 
-An adapter is trusted native code. A lease can prevent an unapproved Splash
+An adapter is trusted native code. A lease can prevent an unapproved Octoscript
 call, but it cannot make a permitted Rust handler less privileged than the
 process that runs it. Hosts must keep capability names narrow, schemas
 bounded, and adapter implementations independently reviewed.
 
 ## Delivery Gates
 
-Before calling Splash a production replacement for a scripting layer in a
+Before calling Octoscript a production replacement for a scripting layer in a
 specific product, demonstrate all of the following for that product and
 target:
 

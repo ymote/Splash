@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use libfuzzer_sys::fuzz_target;
-use splash_workflow::{
+use octoscript_workflow::{
     durable_events::WorkflowEventJournal, WorkflowEvent, WorkflowEventBatch, WorkflowEventRecord,
     MAX_DURABLE_WORKFLOW_EVENTS, MAX_DURABLE_WORKFLOW_EVENT_JOURNAL_BYTES,
 };

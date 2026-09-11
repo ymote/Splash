@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value};
-use splash_capabilities::CapabilityLeaseGrant;
-use splash_core::{ExecutionLimits, DEFAULT_MAX_SCRIPT_HEAP_BYTES};
-use splash_workflow::{
+use octoscript_capabilities::CapabilityLeaseGrant;
+use octoscript_core::{ExecutionLimits, DEFAULT_MAX_SCRIPT_HEAP_BYTES};
+use octoscript_workflow::{
     mobile::MobileWorkflowBuilder, WorkflowData, WorkflowStep, WorkflowStepCapabilityPolicy,
 };
 

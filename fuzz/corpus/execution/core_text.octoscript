@@ -1,0 +1,11 @@
+use mod.std.assert
+use mod.std.text
+let value = text.trim("  Octoscript  ")
+assert(text.lower(value) == "octoscript")
+assert(text.slice("a🙂b", 1, 2) == "🙂")
+assert(text.index_of("a🙂b", "b") == 2)
+assert(text.last_index_of("a🙂b🙂", "🙂") == 3)
+assert(text.index_of(value, "z") == -1)
+assert(text.split("a,,b,", ",") == ["a", "", "b", ""])
+assert(text.join(["a", "", "b", ""], ",") == "a,,b,")
+text.replace_all(value, "S", "s")

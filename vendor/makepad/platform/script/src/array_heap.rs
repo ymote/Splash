@@ -237,7 +237,7 @@ impl ScriptHeap {
     /// This cannot observe capacity changes after the borrow escapes. A host
     /// that uses it while a heap cap is active must call
     /// [`Self::reconcile_heap_bytes`] before it re-enters untrusted script.
-    /// Splash's normal VM paths use accounting-aware helpers instead.
+    /// Octoscript's normal VM paths use accounting-aware helpers instead.
     pub fn array_mut(
         &mut self,
         array: ScriptArray,

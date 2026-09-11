@@ -1,14 +1,14 @@
 # Editor Module Interface Projection
 
-`splash-lsp` can receive a small description of host-defined `mod.*` paths
+`octoscript-lsp` can receive a small description of host-defined `mod.*` paths
 when an editor starts it or through a later configuration refresh. This is
-authoring metadata only. It does not make Splash a package loader, create a
+authoring metadata only. It does not make Octoscript a package loader, create a
 Rust adapter, or prove that a module exists in the runtime selected for a
 document.
 
 ## Initialization and refresh format
 
-Pass `initializationOptions.splash.moduleCatalog` as an array of full module
+Pass `initializationOptions.octoscript.moduleCatalog` as an array of full module
 paths. Each descriptor accepts `path`, an optional `description`, and an
 optional `callMode` of `"synchronous"` or `"deferred"`, plus an optional
 `callShape` of `"single_json"`, plus optional `inputFields` and `outputFields`;
@@ -27,7 +27,7 @@ cannot also be a parent of another catalog path.
 
 ```json
 {
-  "splash": {
+  "octoscript": {
     "moduleCatalog": [
       {
         "path": "mod.app.weather",
@@ -77,14 +77,14 @@ cannot also be a parent of another catalog path.
 }
 ```
 
-Every path must start with `mod`, have at least one following canonical Splash
+Every path must start with `mod`, have at least one following canonical Octoscript
 identifier, contain at most 16 segments, and fit in 256 bytes. The LSP keeps at
 most 256 descriptors, 1,024 aggregate input fields (including retained input
 children), 1,024 aggregate output fields (including retained output children),
 and 512 KiB of retained path,
 description, call-mode, call-shape, and field bytes. A descriptor description
 and a field description each cap at 4 KiB. Every input or output field requires
-a canonical Splash identifier up to
+a canonical Octoscript identifier up to
 128 bytes, one of the fixed
 `any`, `null`, `boolean`, `number`, `integer`, `string`, `array`, or `object`
 types, and an explicit Boolean `required` value. `fields` is valid only on a
@@ -106,7 +106,7 @@ For example, a reviewed runtime binding for `use mod.arithmetic` and
 entries; a direct method includes its host-selected `callMode` and
 `callShape: "single_json"`. When its executable input or output schema is an
 explicit object with a `properties` map whose declared property and required
-names use canonical Splash identifiers, it also projects `inputFields` or
+names use canonical Octoscript identifiers, it also projects `inputFields` or
 `outputFields` with the schema field type, required bit, and optional plain-text
 description. For an input or output property explicitly typed as `object` with
 its own complete `properties` map, the runtime also projects that one direct
@@ -119,12 +119,12 @@ signature metadata, not runtime discovery or authority.
 
 A host can replace the complete projection later through
 `workspace/didChangeConfiguration` using the same array under
-`settings.splash.moduleCatalog`:
+`settings.octoscript.moduleCatalog`:
 
 ```json
 {
   "settings": {
-    "splash": {
+    "octoscript": {
       "moduleCatalog": [
         {
           "path": "mod.app.weather",
@@ -141,7 +141,7 @@ explicitly clears it. A malformed, duplicate, or over-limit replacement makes
 only module completion unavailable rather than retaining stale paths. A valid
 empty array is a complete empty projection. Module refreshes do not alter
 `toolCatalog` or the atomic workflow-data pair. A malformed `settings` value or
-non-object `settings.splash` clears all advisory catalogs.
+non-object `settings.octoscript` clears all advisory catalogs.
 
 ## Completion and hover behavior
 
@@ -150,7 +150,7 @@ such as `use mod.` or `use mod.app.`. It also completes immediate static
 children after a direct, visible imported module binding or a stable exact
 local root alias, including a bounded chain of catalog paths below that binding:
 
-```splash
+```octoscript
 use mod.app.weather
 let weather_api = weather
 weather_api.

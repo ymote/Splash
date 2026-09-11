@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
-use splash_core::{
+use octoscript_core::{
     check_syntax_named, ExecutionLimits, Runtime, RuntimeError, DEFAULT_MAX_SCRIPT_HEAP_BYTES,
 };
 
@@ -22,7 +22,7 @@ fuzz_target!(|data: &[u8]| {
 
     let limits = fuzz_limits(data);
     let source = bounded_prefix(unbounded_source, limits.max_source_bytes);
-    let syntax = check_syntax_named("fuzz-execution-limits.splash", source, limits)
+    let syntax = check_syntax_named("fuzz-execution-limits.octoscript", source, limits)
         .expect("the fuzz limits are always valid for syntax checking");
     if !syntax.valid {
         return;

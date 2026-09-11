@@ -1,14 +1,14 @@
 # Development Checks
 
-Run the Splash-owned quality gate:
+Run the Octoscript-owned quality gate:
 
 ```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo check --locked -p splash-sandbox --tests --target aarch64-unknown-linux-gnu
-cargo check --locked -p splash-sandbox --tests --target riscv64gc-unknown-linux-gnu
-cargo check --locked -p splash-sandbox --tests --target x86_64-pc-windows-gnu
+cargo check --locked -p octoscript-sandbox --tests --target aarch64-unknown-linux-gnu
+cargo check --locked -p octoscript-sandbox --tests --target riscv64gc-unknown-linux-gnu
+cargo check --locked -p octoscript-sandbox --tests --target x86_64-pc-windows-gnu
 ```
 
 The Linux target checks compile the real Bubblewrap and cgroup paths on the two
@@ -16,7 +16,7 @@ architectures supported by CI, including the Landlock pre-exec runner. On a
 Linux host with a Landlock-enabled kernel, also run:
 
 ```sh
-cargo test --locked -p splash-sandbox --test landlock_runner
+cargo test --locked -p octoscript-sandbox --test landlock_runner
 ```
 
 That integration test verifies that an allowlisted fixed runner cannot execute
@@ -33,11 +33,11 @@ the inheritance bit, and configure nonzero hard byte and inode limits. Then run
 the ignored integration test with that root and its installed hard limits:
 
 ```sh
-SPLASH_PROJECT_QUOTA_TEST_ROOT=/srv/splash/quota-test \
-SPLASH_PROJECT_QUOTA_TEST_ID=42 \
-SPLASH_PROJECT_QUOTA_TEST_MAXIMUM_BYTES=268435456 \
-SPLASH_PROJECT_QUOTA_TEST_MAXIMUM_INODES=16384 \
-cargo test --locked -p splash-sandbox --test linux_project_quota -- --ignored
+OCTOSCRIPT_PROJECT_QUOTA_TEST_ROOT=/srv/octoscript/quota-test \
+OCTOSCRIPT_PROJECT_QUOTA_TEST_ID=42 \
+OCTOSCRIPT_PROJECT_QUOTA_TEST_MAXIMUM_BYTES=268435456 \
+OCTOSCRIPT_PROJECT_QUOTA_TEST_MAXIMUM_INODES=16384 \
+cargo test --locked -p octoscript-sandbox --test linux_project_quota -- --ignored
 ```
 
 The test only reads and validates quota state; it never enables, changes, or
@@ -52,7 +52,7 @@ cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-script
 cargo test --manifest-path vendor/makepad/Cargo.toml -p makepad-regex
 ```
 
-This keeps failures in source owned by Splash actionable while preserving
+This keeps failures in source owned by Octoscript actionable while preserving
 separate behavioral coverage for the imported VM.
 
 ## Sustained fuzzing
@@ -91,7 +91,7 @@ documented in `vendor/makepad/PATCHES.md`.
 
 ## Language server
 
-`splash-lsp` is a host-only stdio server for editor clients. It advertises
+`octoscript-lsp` is a host-only stdio server for editor clients. It advertises
 UTF-16 positions, full document synchronization, syntax diagnostics,
 whole-document canonical formatting, top-level `fn`/`let` document symbols,
 same-document lexical definition/reference requests, binding-kind and bounded
@@ -99,11 +99,11 @@ named-function-signature hover, symbol highlights, lexical completion, and
 guarded rename:
 
 ```sh
-cargo run -p splash-lsp
+cargo run -p octoscript-lsp
 ```
 
 It receives document text through LSP notifications plus optional bounded
-initialization metadata. It does not read the document URI, evaluate Splash
+initialization metadata. It does not read the document URI, evaluate Octoscript
 code, construct a capability host, resolve arbitrary imported modules, or load
 a Rust adapter. The grammar-aware lexical index covers the final binding
 introduced by `use`, named functions, `let`, function and lambda parameters,
@@ -165,13 +165,13 @@ implies a capability grant.
 An editor integration may provide an advisory projection of the host's current
 tool catalog during LSP initialization or later through
 `workspace/didChangeConfiguration`. The server reads only
-`initializationOptions.splash.toolCatalog` or `settings.splash.toolCatalog`;
+`initializationOptions.octoscript.toolCatalog` or `settings.octoscript.toolCatalog`;
 this is an array compatible with the `name`, `format`, and `description` fields
-emitted by `CapabilityRuntime::tool_catalog()` or `splash catalog`:
+emitted by `CapabilityRuntime::tool_catalog()` or `octoscript catalog`:
 
 ```json
 {
-  "splash": {
+  "octoscript": {
     "toolCatalog": [
       {
         "name": "text.echo",
@@ -209,12 +209,12 @@ matching envelope format never grants a lease: runtime reservation and an
 active capability lease remain the authority boundary.
 
 An editor integration may separately provide an advisory module-interface
-projection through `initializationOptions.splash.moduleCatalog` or a later
-`settings.splash.moduleCatalog` configuration update:
+projection through `initializationOptions.octoscript.moduleCatalog` or a later
+`settings.octoscript.moduleCatalog` configuration update:
 
 ```json
 {
-  "splash": {
+  "octoscript": {
     "moduleCatalog": [
       {
         "path": "mod.app.weather",
@@ -247,7 +247,7 @@ runtime exports or infer general fields. An omitted `moduleCatalog` key retains
 its prior projection, JSON `null` explicitly clears it, and a malformed update
 makes only module completion unavailable. Tool and module updates are
 independent of each other and of the atomic workflow-data pair. A malformed
-`settings` value or non-object `settings.splash` invalidates all advisory
+`settings` value or non-object `settings.octoscript` invalidates all advisory
 catalogs so the server cannot retain stale metadata.
 
 An advisory module alias is only an exact `let alias = binding` chain of at
@@ -324,14 +324,14 @@ value, evaluate JSON Schema, or validate a contract.
 
 For an approved dataflow authoring session, an editor integration may also
 provide a bounded projection through
-`initializationOptions.splash.workflowDataCatalog`. It is a normalized list of
+`initializationOptions.octoscript.workflowDataCatalog`. It is a normalized list of
 input fields and named step-output fields, derived by the host from its own
 `WorkflowDataContract` or approved plan. The LSP completes only direct,
 unshadowed `workflow.input.*` and `workflow.outputs.<stepId>.*` paths, and
 hovers known projected fields with plain-text documentation. It neither
 introduces `workflow` when the projection is absent nor independently claims
 that a planned output is in the runtime completed prefix. A host linked with
-`splash-workflow` can generate a validated projection from a bound dataflow
+`octoscript-workflow` can generate a validated projection from a bound dataflow
 prefix, checkpoint, or the exact retained state of a suspended continuation.
 When the host also provides
 `workflowDataStepContext`, the LSP accepts only an exact ordered prefix of the
@@ -361,7 +361,7 @@ the exact open-document version.
 Lexical navigation and completion reports are lazily cached per document
 version and discarded on a full change or close. The server retains at most 128
 open documents and refuses to retain document text above the normal 256 KiB
-Splash source cap.
+Octoscript source cap.
 
 ## Syntax fuzzing
 
@@ -403,7 +403,7 @@ stdio. It requests formatting, outlining, completion, hover, definition,
 references, highlights, and guarded rename across at most 33 UTF-8-boundary
 positions plus an invalid UTF-16 position on arbitrary accepted source
 snapshots, then issues fixed catalog-specific requests and closes the document.
-It accepts at most 16 KiB of fuzz input and has reviewed source `.splash` and
+It accepts at most 16 KiB of fuzz input and has reviewed source `.octoscript` and
 advisory-configuration `.json` seeds. A parsed JSON value exercises advisory
 initialization and refresh around a fixed document. A nonempty root JSON array
 is a fuzz-only lifecycle envelope: the first value initializes the server and
@@ -414,7 +414,7 @@ recovery behavior without defining an LSP wire format. The server uses a fixed
 bounded advisory module catalog, including shaped direct-method input field
 metadata, only to exercise catalog completion, root/direct-child input-key
 completion/hover, and signature help: the target never starts stdio, reads the
-URI, resolves modules, evaluates Splash, creates a capability host, or invokes
+URI, resolves modules, evaluates Octoscript, creates a capability host, or invokes
 an adapter.
 `mobile_dataflow` decodes one bounded JSON case with a host-global identifier,
 input value, canonical source, and optional source/nesting limits. It installs
@@ -443,7 +443,7 @@ terminal execution deadline. Script-level errors from
 unavailable modules are expected. It creates `Runtime<(), ()>`, so no
 capability or Rust adapter can run; a panic or hang is a fuzz failure.
 `execution` explicitly collects its fresh VM after evaluation so retained heap
-state cannot mask resource behavior. Their tracked `.splash` seeds cover
+state cannot mask resource behavior. Their tracked `.octoscript` seeds cover
 canonical dataflow, deferred tools, loops, lambdas, recoverable error control
 flow, intentional instruction-limit behavior, and exponential string growth.
 `execution_replay` runs each accepted source in two independent fresh
@@ -465,7 +465,7 @@ yield, but it must then refuse a later `set_limits` request so the continuation
 keeps its original resource contract. A completed evaluation must accept the
 replacement profile.
 The target collects the VM after each case and never installs an adapter or
-capability. Its reviewed `.splash` seeds cover a cooperative budget yield and a
+capability. Its reviewed `.octoscript` seeds cover a cooperative budget yield and a
 tight instruction limit. `bubblewrap_policy` maps at most 64 fuzz bytes onto
 only host-derived Bubblewrap and runtime paths, host-authored file-root
 registrations, private tmpfs modes, aggregate tmpfs limits, aggregate Linux
@@ -494,7 +494,7 @@ catalog; the target never opens a network connection. `secret_broker` builds a
 fixed configured binding plus byte-selected grants and resource selectors. It
 asserts that the in-memory provider runs only after an exact tool and `Secret`
 resource match, and that rejected diagnostics do not echo the generated marker;
-it never reads a platform credential store or exposes a secret to Splash.
+it never reads a platform credential store or exposes a secret to Octoscript.
 `workflow_draft` feeds
 bounded UTF-8 JSON into the data-only `WorkflowDraft` decoder, then checks that
 every accepted draft
@@ -545,7 +545,7 @@ batches under byte-derived source cursors and aggregate capacities. It checks
 source-family isolation, explicit non-one segment registration, exact replay
 and gap rejection, aggregate eviction cursors, and source continuity after an
 aggregate clear. It runs only a fixed local `text.echo` adapter to construct
-audit telemetry; fuzz input never becomes Splash source, a tool name, or a
+audit telemetry; fuzz input never becomes Octoscript source, a tool name, or a
 tool payload.
 `durable_cross_stream_telemetry` feeds bounded UTF-8 documents through the
 authenticated aggregate-journal decoder. Every accepted journal must re-encode

@@ -1,7 +1,7 @@
-# Splash
+# Octoscript
 
-Splash is a capability-first scripting runtime for dynamic workflows, tool
-orchestration, and data transformation. It starts from the Makepad Splash VM
+Octoscript is a capability-first scripting runtime for dynamic workflows, tool
+orchestration, and data transformation. It starts from the Makepad Octoscript VM
 and keeps UI support optional rather than making UI the language boundary.
 
 ## Current baseline
@@ -11,7 +11,7 @@ and keeps UI support optional rather than making UI the language boundary.
   diagnostics for generated source and editor tooling, plus token-aware
   lowering of canonical newline statement boundaries for the inherited VM.
 - An effect-free canonical formatter that preserves comments and literal
-  spellings while normalizing valid Splash source for LLM and editor workflows.
+  spellings while normalizing valid Octoscript source for LLM and editor workflows.
 - A bounded, grammar-aware lexical symbol index for imports, functions, local
   bindings, parameters, and loop bindings without evaluating source.
 - Bounded same-document lexical completion at expression identifiers, with
@@ -43,13 +43,13 @@ and keeps UI support optional rather than making UI the language boundary.
   Makepad compatibility syntax before a tool can run.
 - Standalone runtime initialization that masks inherited Makepad UI/debug and
   unbounded native entry points before source evaluation, leaving only the
-  documented core plus trusted host-installed modules reachable from Splash.
+  documented core plus trusted host-installed modules reachable from Octoscript.
 - Frozen no-authority `mod.std.math` scalar helpers, `mod.std.json` bounded
   JSON helpers, `mod.std.text` bounded text helpers, and `mod.std.array`
   bounded shallow-array helpers, plus `mod.std.object` bounded own-field record
   helpers for common dataflow without restoring Makepad's broader
   shader-oriented `mod.math` surface or granting host authority.
-- A bounded evaluator with source, individual-string, tracked Splash-owned
+- A bounded evaluator with source, individual-string, tracked Octoscript-owned
   retained-heap, VM operand-stack, active-call-frame, instruction, and deadline
   limits. These VM ceilings are not an OS process-memory quota and exclude
   opaque trusted Rust adapter allocations.
@@ -58,7 +58,7 @@ and keeps UI support optional rather than making UI the language boundary.
   byte- and depth-bounded input plus
   cycle-aware, byte- and depth-bounded output, with ordinary script errors
   rather than unbounded VM work.
-- Recoverable `try ... catch ...` control flow across Splash function calls,
+- Recoverable `try ... catch ...` control flow across Octoscript function calls,
   with hard resource stops kept uncatchable and no implicit effect rollback.
 - A deny-by-default tool host: scripts can call only explicitly registered
   tools through `mod.tool`.
@@ -104,7 +104,7 @@ and keeps UI support optional rather than making UI the language boundary.
 - A bounded worker-side capability secret-broker contract for reviewed Rust
   adapters: a host-owned provider can release a zeroizing binary secret only
   to one exact preconfigured `(tool, secret-id)` binding whose active worker
-  grant carries that same opaque `Secret` resource. It has no Splash lookup or
+  grant carries that same opaque `Secret` resource. It has no Octoscript lookup or
   enumeration API and is not itself a platform credential store or OS secret
   boundary.
 - A sealed mobile and embedded workflow profile that exposes data-only drafts,
@@ -121,7 +121,7 @@ and keeps UI support optional rather than making UI the language boundary.
   closed when OS entropy is unavailable unless the host supplies a bounded
   session nonce with a documented uniqueness scope.
 - Bounded, optionally redacted external output chunks released only to the
-  trusted host, never directly to Splash source.
+  trusted host, never directly to Octoscript source.
 - Keyed, directional, replay-checked worker protocol frames and authenticated
   reconciliation for live external operations.
 - Authenticated durable-operation dispatch frames and a bounded worker journal
@@ -232,7 +232,7 @@ and keeps UI support optional rather than making UI the language boundary.
 - Optional Bubblewrap watchdog and generic bounded worker transport with
   host-selected per-invocation and total-session wall-clock deadlines; expiry
   or host termination poisons the session and remains indeterminate.
-- A small `splash` CLI for local evaluation and the workflow example.
+- A small `octoscript` CLI for local evaluation and the workflow example.
 
 No ambient filesystem, subprocess, raw socket, HTTP client/server, or Makepad
 platform/debug module is source-reachable by default. The vendored VM bootstrap
@@ -245,7 +245,7 @@ behind an appropriate target-specific containment boundary before they are
 suitable for untrusted workloads.
 
 For ordinary numeric dataflow, `use mod.std.math` provides a small frozen
-Splash-owned scalar library. It is separate from the masked Makepad
+Octoscript-owned scalar library. It is separate from the masked Makepad
 `mod.math` shader module and cannot access files, processes, networking,
 clocks, entropy, or Rust crates.
 
@@ -266,7 +266,7 @@ scalar position of a literal match or `-1`; an empty needle returns `0`.
 matches a non-empty delimiter literally, preserves empty fields, and returns at
 most 4,096 segments. `join` accepts an array of at most 4,096 strings,
 preserves their order, and permits an empty string separator. Results use
-Splash's configured string bound; the module does not expose regexes, host
+Octoscript's configured string bound; the module does not expose regexes, host
 state, filesystem, process, network, clock, entropy, or crate access.
 
 For local collection shaping, `use mod.std.array` provides `array.len(value)`,
@@ -283,8 +283,8 @@ scalar values compare by value, while arrays and records match only by
 reference; `index_of` returns the first match or `-1`. `slice` uses a half-open
 range with non-negative integer indexes. `range` builds a fresh half-open
 `[start, end)` array for indexed loops; its non-negative endpoints must be
-exact Splash scalar integers through `2^53`, `start` cannot exceed `end`, and
-it returns at most 4,096 items. Canonical Splash deliberately has no range
+exact Octoscript scalar integers through `2^53`, `start` cannot exceed `end`, and
+it returns at most 4,096 items. Canonical Octoscript deliberately has no range
 operator.
 `compact` returns a fresh shallow array without `nil` items while preserving
 `false`, zero, empty strings, and order. `unique` returns a fresh shallow
@@ -326,7 +326,7 @@ process, network, clock, entropy, or crate access.
 
 ## Example
 
-```splash
+```octoscript
 use mod.tool
 
 let summary = tool.call("text.echo", "plan the release")
@@ -340,7 +340,7 @@ For work that should yield back to the host event loop, use an explicit
 promise. The host runs at most one granted tool when it calls `pump()` (or a
 bounded batch with `pump_up_to`).
 
-```splash
+```octoscript
 use mod.tool
 
 let summary = tool.start("text.echo", "plan the release").await()
@@ -350,7 +350,7 @@ summary
 For a recovery-safe fallback, use canonical `try/catch`. Recovery does not
 refund the call or imply that an adapter effect was rolled back.
 
-```splash
+```octoscript
 use mod.tool
 
 let summary = try {
@@ -362,15 +362,15 @@ summary
 ```
 
 Rust applications integrate their existing crate ecosystem by registering a
-narrow, policy-bound adapter for each effect. Splash does not import crates or
+narrow, policy-bound adapter for each effect. Octoscript does not import crates or
 ambient OS APIs directly.
 
 JSON capabilities use object or array envelopes. Rust adapters can receive and
 return `serde_json::Value`, or use the schema-required typed Serde bridge for
-reviewed structs; Splash turns records and arrays into JSON with
+reviewed structs; Octoscript turns records and arrays into JSON with
 `tool.call_json` or `tool.start_json`.
 
-```splash
+```octoscript
 use mod.tool
 use mod.std.assert
 
@@ -382,7 +382,7 @@ assert(response.total == 42)
 For a fixed reviewed adapter, a Rust host can instead register a bounded direct
 capability module and generated source can use decoded data directly:
 
-```splash
+```octoscript
 use mod.arithmetic
 use mod.std.assert
 
@@ -399,11 +399,11 @@ The development CLI registers this reviewed facade together with its `math.add`
 demo capability:
 
 ```sh
-cargo run -p splash-cli -- run --allow-json-add examples/direct_module_workflow.splash
-cargo run -p splash-cli -- module-catalog --allow-json-add
-cargo run -p splash-cli -- tool-calls --allow-json-add examples/direct_module_workflow.splash
-cargo run -p splash-cli -- workflow-review --allow-json-add examples/direct_module_workflow_draft.json
-cargo run -p splash-cli -- workflow-run --allow-json-add --grant calculate:math.add:1 examples/direct_module_workflow_draft.json
+cargo run -p octoscript-cli -- run --allow-json-add examples/direct_module_workflow.octoscript
+cargo run -p octoscript-cli -- module-catalog --allow-json-add
+cargo run -p octoscript-cli -- tool-calls --allow-json-add examples/direct_module_workflow.octoscript
+cargo run -p octoscript-cli -- workflow-review --allow-json-add examples/direct_module_workflow_draft.json
+cargo run -p octoscript-cli -- workflow-run --allow-json-add --grant calculate:math.add:1 examples/direct_module_workflow_draft.json
 ```
 
 The catalog maps the `arithmetic.add` facade to `math.add`; workflow policies
@@ -420,29 +420,29 @@ mapping for LLM and operator review. Those entries do not grant a tool or
 replace the explicit `calculate:math.add:1` workflow policy above.
 
 ```sh
-cargo run -p splash-cli -- run --allow-echo examples/tool_workflow.splash
+cargo run -p octoscript-cli -- run --allow-echo examples/tool_workflow.octoscript
 ```
 
 The deferred example is runnable with:
 
 ```sh
-cargo run -p splash-cli -- run --allow-echo examples/deferred_tool_workflow.splash
+cargo run -p octoscript-cli -- run --allow-echo examples/deferred_tool_workflow.octoscript
 ```
 
 The JSON dataflow example is runnable with:
 
 ```sh
-cargo run -p splash-cli -- run --allow-json-add examples/json_tool_workflow.splash
+cargo run -p octoscript-cli -- run --allow-json-add examples/json_tool_workflow.octoscript
 ```
 
 ## Makepad UI compatibility
 
-[`examples/makepad_ui_counter.splash`](examples/makepad_ui_counter.splash) is a
+[`examples/makepad_ui_counter.octoscript`](examples/makepad_ui_counter.octoscript) is a
 small current-style Makepad UI body retained as a parser compatibility fixture.
-It is deliberately not runnable through `splash-cli`: the standalone runtime
+It is deliberately not runnable through `octoscript-cli`: the standalone runtime
 does not install Makepad widget modules, an event loop, or the `ui` handle.
 The canonical workflow profile continues to reject it; trusted UI hosts can
-use `splash_core::check_vm_compatibility_named`, which enforces source, token,
+use `octoscript_core::check_vm_compatibility_named`, which enforces source, token,
 and delimiter-nesting bounds, before they install their own bindings. See
 [Makepad UI compatibility](docs/makepad-ui-compatibility.md) for the current
 upstream example distinction and the exact boundary.
@@ -450,51 +450,51 @@ upstream example distinction and the exact boundary.
 Inspect the exact demo-tool catalog supplied to an LLM host with:
 
 ```sh
-cargo run -p splash-cli -- catalog --allow-echo --allow-json-add
+cargo run -p octoscript-cli -- catalog --allow-echo --allow-json-add
 ```
 
 Before generating source, an LLM host can query the versioned canonical
 language contract without creating a runtime or registering a tool:
 
 ```sh
-cargo run -p splash-cli -- profile
+cargo run -p octoscript-cli -- profile
 ```
 
 The JSON response identifies the profile and grammar path, reports the active
 default bounds, and states the tool and workflow authority boundary. It is not
 a tool catalog, capability grant, or substitute for the normative
-[Splash Grammar v0.2](docs/grammar.md). Query the host's separate catalog
+[Octoscript Grammar v0.2](docs/grammar.md). Query the host's separate catalog
 before proposing effectful calls.
 
 For an LLM-generated ordered workflow, query the bounded draft producer schema
 before writing its JSON envelope:
 
 ```sh
-cargo run -p splash-cli -- workflow-schema
+cargo run -p octoscript-cli -- workflow-schema
 ```
 
 The schema describes only `format_version` and ordered `id`/`source` steps,
 including the decoder's limits. It deliberately has no fields for capabilities,
 approvals, contracts, checkpoints, results, or external-operation handles;
-review the resulting file with `splash workflow-review` before the host plans
+review the resulting file with `octoscript workflow-review` before the host plans
 or approves anything.
 
-Validate generated source against the canonical Splash v0.2 profile without
+Validate generated source against the canonical Octoscript v0.2 profile without
 creating a capability host or running any bytecode:
 
 ```sh
-cargo run -p splash-cli -- check examples/deferred_tool_workflow.splash
+cargo run -p octoscript-cli -- check examples/deferred_tool_workflow.octoscript
 ```
 
 The command emits JSON diagnostics and exits nonzero for invalid source,
 including Makepad compatibility syntax outside the portable contract. The
-portable source contract is [Splash Grammar v0.2](docs/grammar.md).
+portable source contract is [Octoscript Grammar v0.2](docs/grammar.md).
 
 Inspect valid top-level declarations without evaluating source or constructing
 a capability host:
 
 ```sh
-cargo run -p splash-cli -- outline examples/json_tool_workflow.splash
+cargo run -p octoscript-cli -- outline examples/json_tool_workflow.octoscript
 ```
 
 The command emits JSON with `function` and `let` declarations plus UTF-8 byte
@@ -505,7 +505,7 @@ Inspect direct source-level `tool.call`, `tool.start`, `tool.call_json`, and
 `tool.start_json` sites before requesting approval:
 
 ```sh
-cargo run -p splash-cli -- tool-calls examples/json_tool_workflow.splash
+cargo run -p octoscript-cli -- tool-calls examples/json_tool_workflow.octoscript
 ```
 
 The command emits JSON locations plus a literal tool name when the first
@@ -523,7 +523,7 @@ receivers, member aliases, or source-derived authority.
 Review an LLM-generated multi-step draft before it becomes a host-owned plan:
 
 ```sh
-cargo run -p splash-cli -- workflow-review examples/release_workflow_draft.json
+cargo run -p octoscript-cli -- workflow-review examples/release_workflow_draft.json
 ```
 
 The versioned JSON draft contains only step IDs and source. Review output
@@ -540,7 +540,7 @@ Run the bounded local demonstration catalog only with explicit host-selected
 per-step grants:
 
 ```sh
-cargo run -p splash-cli -- workflow-run --allow-echo --allow-json-add \
+cargo run -p octoscript-cli -- workflow-run --allow-echo --allow-json-add \
   --grant prepare:text.echo:1 --grant calculate:math.add:1 \
   examples/local_workflow_draft.json
 ```
@@ -548,7 +548,7 @@ cargo run -p splash-cli -- workflow-run --allow-echo --allow-json-add \
 Run the bounded dataflow example with explicit input and one reviewed grant:
 
 ```sh
-cargo run -p splash-cli -- workflow-run --allow-json-add \
+cargo run -p octoscript-cli -- workflow-run --allow-json-add \
   --input examples/dataflow_input.json \
   --grant prepare:math.add:1 \
   examples/dataflow_workflow_draft.json
@@ -582,20 +582,20 @@ Format valid canonical source without creating a capability host or rewriting
 the input file:
 
 ```sh
-cargo run -p splash-cli -- format examples/deferred_tool_workflow.splash
+cargo run -p octoscript-cli -- format examples/deferred_tool_workflow.octoscript
 ```
 
 Use `--check` in an editor or CI workflow to require the canonical formatting
 result without printing it:
 
 ```sh
-cargo run -p splash-cli -- format --check examples/deferred_tool_workflow.splash
+cargo run -p octoscript-cli -- format --check examples/deferred_tool_workflow.octoscript
 ```
 
 Run the language server from an LSP-compatible editor with:
 
 ```sh
-cargo run -p splash-lsp
+cargo run -p octoscript-lsp
 ```
 
 It accepts client-provided open-document text plus optional bounded advisory
@@ -648,7 +648,7 @@ and `text`.
 The frozen `mod.std` subtree cannot be extended by advisory catalog metadata. An
 integration may additionally supply a
 advisory tool-catalog projection through
-`initializationOptions.splash.toolCatalog` or a later
+`initializationOptions.octoscript.toolCatalog` or a later
 `workspace/didChangeConfiguration` update; it accepts the `name`, `format`,
 and `description` fields from the host catalog JSON. For an exact visible
 `mod.tool` binding, the LSP completes the first string literal in direct
@@ -680,7 +680,7 @@ general types, arbitrary record fields, builtins, arbitrary catalog data, or
 runtime-derived imported-module exports.
 
 An editor may also supply a separate advisory module-interface projection
-through `initializationOptions.splash.moduleCatalog` or a later
+through `initializationOptions.octoscript.moduleCatalog` or a later
 `workspace/didChangeConfiguration` update. It completes the current segment in
 a direct statement-position `use mod.*` path and bounded catalog paths after a
 direct, visible imported module binding or a stable exact local root-alias
@@ -692,7 +692,7 @@ file, resolve a module, inspect a runtime export, or override the fixed
 `mod.tool` API. Tool and module catalog keys refresh independently: an omitted
 key keeps its prior value, JSON `null` explicitly clears it, and a malformed or
 over-limit key value makes only that catalog unavailable. A malformed `settings`
-value or non-object `settings.splash` clears all advisory catalogs. Neither
+value or non-object `settings.octoscript` clears all advisory catalogs. Neither
 projection authorizes source. Module aliases must be exact `let alias = binding`
 chains of at most 16 hops with complete source metadata and no write, member
 extraction, parenthesized/computed edge, or other value escape in their resolved
@@ -704,10 +704,10 @@ but exhaustive reference, highlight, and rename requests fail instead of
 returning a partial set.
 
 For a host-managed dataflow authoring session, an editor can also supply a
-separate `initializationOptions.splash.workflowDataCatalog` projection. It
+separate `initializationOptions.octoscript.workflowDataCatalog` projection. It
 completes direct unshadowed `workflow.input.*` and
 `workflow.outputs.<stepId>.*` paths and hovers known field metadata. A host
-using `splash-workflow` can generate a validated current-prefix update from a
+using `octoscript-workflow` can generate a validated current-prefix update from a
 suspended contract-bound continuation or checkpoint; the LSP itself still does
 not load schemas or runtime state. It does not validate data, approve a
 workflow, issue a lease, or make an adapter callable;
@@ -722,38 +722,38 @@ both keys with JSON `null`. See [editor workflow-data projection](docs/workflow-
 
 ## Workspace
 
-- `splash-core`: bounded VM wrapper and diagnostics.
-- `splash-capabilities`: explicit tool policy, cursor-safe bounded audit export
+- `octoscript-core`: bounded VM wrapper and diagnostics.
+- `octoscript-capabilities`: explicit tool policy, cursor-safe bounded audit export
   with a feature-gated authenticated durable journal, deferred promises,
   LLM-facing host catalog, approval-bound capability leases, JSON contracts,
   fixed-file and feature-gated HTTP endpoint/origin catalogs, aggregate catalog
   limits, safe host bridge, and a sealed static-catalog mobile/embedded profile.
-- `splash-schema`: bounded executable JSON-schema subset for tool contracts.
-- `splash-storage`: host-only authenticated records, rollback protection, and
+- `octoscript-schema`: bounded executable JSON-schema subset for tool contracts.
+- `octoscript-storage`: host-only authenticated records, rollback protection, and
   fenced compare-and-swap backend boundary, plus an optional anchored SQLite
   payload adapter that requires a platform trust anchor and a bounded
   transactional-service anchor client; neither substitutes for the deployed
   trust authority.
-- `splash-protocol`: portable worker messages, capability attenuation, fixed
+- `octoscript-protocol`: portable worker messages, capability attenuation, fixed
   128-grant manifest and 1,024 retained-request-identity session bounds, keyed
   session framing, instance-bound in-process authorization tokens, strict
   ordinary-call cancellation, and host-side invocation/result validation.
-- `splash-worker`: worker-side session runtime, explicit Rust adapter registry,
+- `octoscript-worker`: worker-side session runtime, explicit Rust adapter registry,
   cancellable ordinary-invocation driver, capability-bound secret-broker
   contract, and authenticated journal-store bridge; it is not an OS sandbox
   or platform storage backend.
-- `splash-sandbox`: target-specific worker containment policy; its initial
+- `octoscript-sandbox`: target-specific worker containment policy; its initial
   Bubblewrap backend is Linux-only and deliberately narrow, with bounded
   manifest-selected ephemeral file roots for scratch data.
-- `splash-workflow`: host-owned planning, lease-bound approval, bounded JSON
+- `octoscript-workflow`: host-owned planning, lease-bound approval, bounded JSON
   dataflow, bounded in-memory and authenticated durable event and cross-stream
   telemetry journals, host-receipt-order aggregation,
   checkpointing, durable operation records, optional fenced Bubblewrap
   post-stop reconciliation, a multiplexed-worker completion sink, sequential
   execution, and a sealed mobile/embedded workflow facade for static local
   adapters and direct capability modules.
-- `splash-cli`: local development CLI.
-- `splash-lsp`: host-only stdio diagnostics, canonical formatting, top-level
+- `octoscript-cli`: local development CLI.
+- `octoscript-lsp`: host-only stdio diagnostics, canonical formatting, top-level
   declaration symbols, and bounded same-document lexical navigation, hover, and
   highlights plus lexical completion and version-bound guarded rename for open
   editor documents.
@@ -797,7 +797,7 @@ telemetry without creating recovery or capability authority.
 [Workflow drafts](docs/workflow-drafts.md) define the untrusted LLM-plan
 interchange and review boundary before a host-owned approval.
 
-[Positioning and feasibility](docs/positioning.md) compares Splash with its
+[Positioning and feasibility](docs/positioning.md) compares Octoscript with its
 Makepad substrate and defines the realistic boundary for Python/JavaScript
 replacement claims.
 

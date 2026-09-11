@@ -1,6 +1,6 @@
 # Security Model
 
-Splash treats generated scripts, tool descriptions, and tool inputs as
+Octoscript treats generated scripts, tool descriptions, and tool inputs as
 untrusted. The runtime has two separate security boundaries:
 
 1. The language boundary exposes no ambient filesystem, process, network, or
@@ -44,7 +44,7 @@ a credential binding. The adapter disables environment proxies and redirect
 following, exposes no cookie API, bounds script request input, response headers,
 bodies, and total request time, and requires a 2xx JSON object or array response.
 An explicit trusted `HttpEndpointSecretResolver` can inject a bounded sensitive
-header into one configured HTTPS endpoint only after input checks. Splash cannot
+header into one configured HTTPS endpoint only after input checks. Octoscript cannot
 name, read, enumerate, serialize, or receive a secret. Script-facing failures
 are generic and do not disclose endpoint membership, URLs, credential references,
 secret values, status codes, headers, response bodies, or transport details.
@@ -69,7 +69,7 @@ restrict another trusted adapter. A fixed URL is still trusted host policy.
 Effects requiring real network isolation need a target-specific containment or
 network backend.
 
-The canonical Splash profile is an effect-free preflight in front of the
+The canonical Octoscript profile is an effect-free preflight in front of the
 vendored Makepad parser. A profile rejection never reaches that parser or a
 host binding; a profile acceptance is then independently parsed by the VM
 before evaluation. The runtime carries executable canonical-fixture regression
@@ -84,13 +84,13 @@ are specifically unavailable. `mod.std.assert`, the frozen no-authority
 `mod.std.math`, `mod.std.json`, `mod.std.text`, `mod.std.array`, and
 `mod.std.object` modules, ordinary bounded language operations, and explicitly
 installed host modules remain available.
-This avoids unreviewed native output and native allocations outside Splash's
+This avoids unreviewed native output and native allocations outside Octoscript's
 tracked heap from becoming generated-source behavior. It does not alter a host
 that embeds the raw Makepad VM, and a trusted host can still install a reviewed
 capability under any otherwise-masked module name through the normal policy
 boundary.
 
-The only built-in numeric module added by Splash itself is frozen,
+The only built-in numeric module added by Octoscript itself is frozen,
 effect-free `mod.std.math`. It provides bounded-arity scalar `f64` operations
 and constants, not the vendored shader-oriented `mod.math` module. It cannot
 perform I/O, access host state, read time or entropy, or load a Rust crate.
@@ -140,7 +140,7 @@ Cycles, unsupported values, non-finite numbers, and duplicate object keys are
 rejected on serialization; malformed or non-UTF-8 input is rejected on parsing.
 Either direction rejects depth exhaustion and input or output exhaustion as
 ordinary native errors rather than unbounded parser or serializer work. This
-protects Splash `Runtime` evaluation, including the explicit
+protects Octoscript `Runtime` evaluation, including the explicit
 compatibility-evaluation entry point; it does not alter a host that directly
 embeds the raw Makepad VM.
 
@@ -151,7 +151,7 @@ as an uncatchable hard resource failure, including during compatibility
 evaluation and bounded JSON reconstruction.
 
 `ExecutionLimits::max_heap_bytes` additionally caps tracked retained capacity
-in the Splash-owned VM heap. Its default is 8 MiB and it accounts for script
+in the Octoscript-owned VM heap. Its default is 8 MiB and it accounts for script
 strings, arrays, object storage, slot tables, and intern tables. Sparse array
 and object writes, plus conservative object-map rehashes, are rejected before
 they request their backing allocation; other normal script allocations raise
@@ -170,7 +170,7 @@ Targets that need process-wide memory or effect containment must layer an
 operating-system boundary around the worker.
 
 Canonical `try/catch` handles ordinary script and native-binding errors and
-unwinds Splash function calls, but it is not a sandbox or transaction. It
+unwinds Octoscript function calls, but it is not a sandbox or transaction. It
 cannot catch string-allocation, heap-allocation, operand-stack, call-frame,
 instruction-limit, or hard-deadline termination, inspect an error object, widen a
 capability lease, refund a call,
@@ -180,7 +180,7 @@ diagnostics. An uncaught native error is host-facing and may contain
 adapter-provided text, so adapters must return disclosure-safe messages and
 keep private detail in trusted logs.
 
-`splash-lsp` is a host-only helper for a trusted local editor client. It never
+`octoscript-lsp` is a host-only helper for a trusted local editor client. It never
 reads a document URI, evaluates source, creates a capability host, resolves an
 imported module, or loads an adapter. Its top-level `fn`/`let` outline and
 same-document lexical definition/reference index are derived only from valid
@@ -240,7 +240,7 @@ first. Do not expose its stdio
 transport to a hostile peer or describe it as an IPC resource sandbox; place a
 separate bounded transport or operating-system boundary in front of such a peer.
 
-`splash-protocol` defines the portable, attenuated handoff from a policy host
+`octoscript-protocol` defines the portable, attenuated handoff from a policy host
 to a contained worker. It validates manifests, request uniqueness, formats,
 byte limits, and call budgets. Its `SessionAuthenticator` can also bind each
 worker frame to a host-provisioned BLAKE3 session key, directional role, and
@@ -252,7 +252,7 @@ enforce an operating-system policy itself. The host must provide a trusted
 bootstrap channel and containment backend before an effectful adapter is
 considered contained.
 
-`splash-worker` is the worker-side implementation of that protocol boundary.
+`octoscript-worker` is the worker-side implementation of that protocol boundary.
 It accepts only an explicitly registered Rust adapter for a granted capability,
 requires host admission to bind a fresh authenticated session to its tenant
 journal scope, and persists durable intent before an adapter effect through a
@@ -309,7 +309,7 @@ durability. A network service must enforce those boundaries outside the handler
 and return generic failures without backend details. A volatile or rollbackable
 backend remains unsuitable after being wrapped by either dispatcher.
 
-The optional `splash-storage` `keyring` feature retrieves a host-provisioned
+The optional `octoscript-storage` `keyring` feature retrieves a host-provisioned
 32-byte storage key from native credential stores on macOS, iOS, and Windows.
 It reads an existing binary credential only, rejects unsupported targets rather
 than using an in-process mock, and never creates, rotates, or deletes platform
@@ -356,7 +356,7 @@ mediation, not mobile or embedded operating-system containment. A `FixedFileCata
 through the builder is consumed before sealing and has the same opaque-ID,
 descriptor-pinning, and mutable-content limitations described above.
 
-`splash_workflow::mobile::MobileWorkflowBuilder` applies the same static local
+`octoscript_workflow::mobile::MobileWorkflowBuilder` applies the same static local
 adapter rule to host-owned workflow execution. Its sealed result can create
 plans from trusted steps or data-only drafts, approve only named per-step
 policies, checkpoint, and execute. It intentionally does not expose the
@@ -388,7 +388,7 @@ adapter thread and sets a cancellation token only after request authentication
 and reauthorization. A positive acknowledgement is valid only when the adapter
 has stopped its effect and guarantees no result follows. `too_late` requires a
 validated ordinary result first, while `unsupported` keeps the call active.
-These are trusted Rust adapter contracts, not properties asserted by Splash
+These are trusted Rust adapter contracts, not properties asserted by Octoscript
 source or inferred from a process exit.
 
 `SupervisedMultiplexedWorkerSession` additionally requires its transport and
@@ -401,7 +401,7 @@ two-phase cancellation confirmation. The workflow integration applies events
 through `WorkflowEngine`, not `runtime_mut()`, so retained-step state cannot be
 bypassed accidentally.
 
-`splash-sandbox::bubblewrap` is the first such platform sandbox integration.
+`octoscript-sandbox::bubblewrap` is the first such platform sandbox integration.
 It accepts only a fixed host-selected worker executable and fixed arguments,
 constructs a fresh Bubblewrap mount namespace, clears the worker environment,
 creates a new session, binds the worker to its parent lifecycle, and mounts
@@ -422,7 +422,7 @@ creating further user namespaces. That mode has no compatibility fallback and
 will fail on unsupported, setuid, or user-namespace-restricted hosts; it does
 not mean Bubblewrap never created an internal nested namespace.
 
-With the Linux-only `splash-capabilities/linux-network-broker` feature, the
+With the Linux-only `octoscript-capabilities/linux-network-broker` feature, the
 host can derive one exact `NetworkOriginAccess` set from the compiled manifest,
 bind a reviewed fixed-endpoint or exact-origin HTTP catalog to it, and install
 the returned `LinuxNetworkBrokerMount` into that same policy. The broker creates
@@ -464,14 +464,14 @@ For Linux deployments with a host-owned delegated cgroup-v2 parent,
 `spawn_with_bootstrap_in_cgroup`. The policy creates a fresh child, applies
 selected `cpu.max`, `memory.max`, `memory.swap.max`, `pids.max`, and per-device
 `io.max` controls, and starts a fixed host-side runner. The runner moves itself
-into that child before it executes Bubblewrap. Splash observes the direct child
+into that child before it executes Bubblewrap. Octoscript observes the direct child
 in `cgroup.procs` before it returns a managed worker handle, so lifecycle
 teardown cannot race a runner that has not yet joined the cgroup. The cgroup
-path and I/O device identifiers are never Splash values, worker protocol
+path and I/O device identifiers are never Octoscript values, worker protocol
 fields, or Bubblewrap arguments.
 
 The host must enable and delegate the required controllers under a dedicated
-parent before launch. Splash verifies the parent is mounted from cgroup v2 and
+parent before launch. Octoscript verifies the parent is mounted from cgroup v2 and
 deliberately does not modify
 `cgroup.subtree_control`, because changing a shared parent can affect unrelated
 workloads. The policy fails before launch when a selected controller or
@@ -483,7 +483,7 @@ bootstrap failure call `cgroup.kill` before reaping the direct Bubblewrap
 process. This covers the worker cgroup subtree, including descendant forks,
 where `Child::kill` alone would not. A cgroup cleanup or kill failure is a
 containment failure, not a successful cancellation result. `memory.max` is a
-memory-cgroup boundary rather than an RSS-only metric; Splash additionally sets
+memory-cgroup boundary rather than an RSS-only metric; Octoscript additionally sets
 `memory.oom.group=1` when it selects that control. `memory.swap.max=0` prevents
 anonymous memory in the worker cgroup from being swapped out. `io.max` bounds
 selected BPS and IOPS classes for one trusted block-device `major:minor`
@@ -493,7 +493,7 @@ bandwidth rather than a wall-clock deadline. The [Linux cgroup v2 documentation]
 defines the kernel semantics.
 
 Hosts may additionally select the typed
-`WorkerSeccompProfile::DenyKnownEscapeSurface`. Splash generates a fixed cBPF
+`WorkerSeccompProfile::DenyKnownEscapeSurface`. Octoscript generates a fixed cBPF
 program and transfers it over an anonymous launch-only descriptor to
 Bubblewrap, which consumes and closes that descriptor before it attaches the
 filter immediately before worker execution. The profile verifies the syscall
@@ -512,18 +512,18 @@ for the exact supported architectures, denied operations, and limitations.
 For a fixed worker whose target ABI and runtime have been independently
 reviewed, a host can instead provide a bounded `WorkerSeccompAllowlist` through
 `set_seccomp_allowlist`. This selects `WorkerSeccompProfile::StrictAllowlist`:
-Splash keeps the ABI/x32 and fixed escape-surface guards, returns `ALLOW` only
+Octoscript keeps the ABI/x32 and fixed escape-surface guards, returns `ALLOW` only
 for listed syscall numbers, and kills every other syscall. An empty, duplicate,
 oversized, or missing list is rejected rather than falling back to default-allow
-filtering. The list is trusted host configuration, never Splash source, worker
+filtering. The list is trusted host configuration, never Octoscript source, worker
 input, LLM output, or caller-provided cBPF. Policy compilation rejects a list
 without the required `execve`; the host must additionally cover any fixed
 resource-limit runner and the exact worker runtime. With
-`LandlockExecutableRunner`, Splash does not give the strict program to
+`LandlockExecutableRunner`, Octoscript does not give the strict program to
 Bubblewrap: it gives the fixed runner a bounded compiler-generated encoding,
 which the runner installs only after its fully enforced Landlock ruleset and
 descriptor cleanup, immediately before the fixed inner exec. This internal
-handoff is not Splash source, worker input, manifest data, or caller-provided
+handoff is not Octoscript source, worker input, manifest data, or caller-provided
 cBPF in the Bubblewrap policy API, and launch has no direct-worker or
 unfiltered fallback. It is still a
 syscall boundary only: because execution must normally remain available, it
@@ -532,15 +532,15 @@ or capability grants.
 
 `LandlockExecutableRunner` is an optional Linux-only defense-in-depth boundary
 for exact filesystem-backed executable targets. The host configures a distinct
-read-only runtime runner path; Splash adds the fixed worker, an optional limit
+read-only runtime runner path; Octoscript adds the fixed worker, an optional limit
 runner, and bounded explicit additional paths, then the bundled
-`splash-landlock-runner` installs `LANDLOCK_ACCESS_FS_EXECUTE` rules with a
+`octoscript-landlock-runner` installs `LANDLOCK_ACCESS_FS_EXECUTE` rules with a
 hard Landlock compatibility requirement before it starts the inner command. It
 rejects unsupported platforms at compilation and unsupported or incomplete
 kernel enforcement at startup rather than falling back to direct worker
 execution. A dynamically linked inner worker or resource-limit runner also
 needs its resolved regular ELF loader listed as an explicit target. Its rules
-are inherited by worker descendants. In descriptor-pinned mode Splash also overlays the Landlock runner
+are inherited by worker descendants. In descriptor-pinned mode Octoscript also overlays the Landlock runner
 and every explicit allowed target from retained descriptors, preventing path
 replacement after compilation from changing those selected files.
 
@@ -552,10 +552,10 @@ it reads. Treat the [Linux Landlock documentation](https://docs.kernel.org/users
 as the source of kernel semantics and layer immutable runtime ownership,
 mount/descriptor isolation, cgroups, and a suitable syscall policy around it.
 
-An optional host-configured `splash-limit-runner` can execute the fixed worker
+An optional host-configured `octoscript-limit-runner` can execute the fixed worker
 only after applying selected Linux rlimits and disabling core dumps. The runner,
 limits, worker target, and worker arguments are all compiled from trusted Rust
-policy; Splash source and tool data cannot control any of them. It must be a
+policy; Octoscript source and tool data cannot control any of them. It must be a
 distinct executable in a read-only runtime mount, and a setup or `exec` failure
 does not fall back to direct worker execution. The host still must reject a
 failed authenticated worker startup because Bubblewrap spawn alone does not
@@ -609,14 +609,14 @@ with the mount namespace, and may consume memory or swap; they must not hold a
 durable journal or effect record. Multiple roots have independent ceilings,
 not a shared session budget. None of these limits is a process-memory, CPU,
 process-count, or persistent-filesystem quota.
-The tmpfs mounts are `nosuid,nodev`, but Splash does not claim they are
+The tmpfs mounts are `nosuid,nodev`, but Octoscript does not claim they are
 `noexec`: a compromised worker can write executable content into an ephemeral
 root and invoke it when the runtime and syscall policy allow. Denying an
 `executable` capability selector prevents generated source from selecting a
 host command; it does not mediate native `execve` calls inside the worker.
 Active host-backed read-write roots are rejected by default. Host code can
 explicitly allow one only when it already enforces an independent persistent
-storage quota; Splash cannot validate that quota.
+storage quota; Octoscript cannot validate that quota.
 `require_bounded_file_root_writes` adds rejection of an enabled unbounded
 private `/tmp`, non-recursive read-only remounts of the empty namespace root,
 `/proc`, and `/dev` after all selected submounts are created, and mandatory
@@ -639,11 +639,11 @@ are an opt-in exception only for a descriptor-pinned directory on a supporting
 filesystem and Linux 5.14-or-later kernel. A selected quota root requires the
 mandatory further-user-namespace lockdown, which prevents a worker that owns
 the root from changing the project ID or inheritance state through Linux
-filesystem-attribute ioctls in the initial user namespace. Splash checks the
+filesystem-attribute ioctls in the initial user namespace. Octoscript checks the
 provisioned project ID, inheritance bit, nonzero hard block and inode limits,
 current usage, configured per-root ceilings, and aggregate distinct
 `(filesystem, project ID)` hard limits before launch. The filesystem, not
-Splash, enforces those limits after launch. The host must prevent a privileged
+Octoscript, enforces those limits after launch. The host must prevent a privileged
 quota administrator from raising, disabling, or retagging the project while
 the worker is active.
 Project quotas do not constrain process memory, device access, network,
@@ -653,7 +653,7 @@ worker-secret delivery mechanism. Protocol v5 can
 layer an exact ordinary-call request over its private pipes only for reviewed
 cancellable adapters. Its optional strict allowlist is a target-specific
 syscall boundary, not a replacement for those missing controls. The optional
-`splash-workflow/bubblewrap-recovery` coordinator adds a narrow post-exit path:
+`octoscript-workflow/bubblewrap-recovery` coordinator adds a narrow post-exit path:
 it requires a session-bound reaping proof, reloads a fenced authenticated host
 ledger, uses a differently keyed least-privilege contained session for one
 bounded reconciliation, reaps that session, and compare-and-swap persists the
@@ -700,7 +700,7 @@ history. The older `sequence` field correlates one invocation and can repeat
 across retries, cancellation, or streaming, so it is not an export cursor.
 Hosts that need complete retention must surface an export gap and use a
 separate authenticated durable sink. The optional
-`splash_capabilities::durable_audits::CapabilityAuditStore` supplies one
+`octoscript_capabilities::durable_audits::CapabilityAuditStore` supplies one
 bounded sink for runtime-exported batches: it validates the data-only audit
 shape, requires contiguous source sequences, deduplicates exact retained
 overlap, rejects retention gaps and conflicts, and writes through the supplied
@@ -712,7 +712,7 @@ and a successful export are not an authorization decision, durable record,
 effect proof, or permission to resume a workflow. See [capability audit
 export](docs/capability-audits.md).
 
-`splash_workflow::durable_events::WorkflowEventStore` provides one bounded
+`octoscript_workflow::durable_events::WorkflowEventStore` provides one bounded
 authenticated workflow-telemetry journal for host-owned operator/audit replay.
 It accepts only contiguous engine-exported sequences, rejects source gaps and
 contradictory retained overlaps, records retention eviction explicitly, and
@@ -724,7 +724,7 @@ still use fresh approval, idempotency, and authenticated reconciliation for an
 external effect.
 
 Registered tool names are restricted to 128-byte lowercase ASCII capability
-identifiers. A denied call can still carry an arbitrary dynamic Splash string,
+identifiers. A denied call can still carry an arbitrary dynamic Octoscript string,
 so the audit view preserves only a fixed-length, session-scoped BLAKE3 label
 for invalid or oversized unrecognized names. It does not retain that raw
 script value. The label is a correlation aid, not a credential or a secrecy
@@ -738,10 +738,10 @@ idempotency, reconciliation, and compensation policy.
 
 JSON capabilities are an explicit policy type. They accept only JSON object or
 array envelopes: envelope validation happens before the Rust handler is called,
-and before a result is returned to Splash. `JsonToolContract` adds an
+and before a result is returned to Octoscript. `JsonToolContract` adds an
 executable, bounded schema subset at the same boundary. Input contract failure
 does not invoke a handler or consume a call; output contract failure does not
-reach Splash. This is a data contract, not a way to deserialize arbitrary Rust
+reach Octoscript. This is a data contract, not a way to deserialize arbitrary Rust
 types or grant a script access to a crate. The typed Serde bridge requires a
 `JsonToolContract` and validates that contract before input deserialization and
 after output serialization; a Rust struct is never the authoritative policy.
@@ -815,7 +815,7 @@ workflow. The host must restore and authenticate both its ledger and the
 worker journal, choose recovery policy, persist the verified observation, and
 issue fresh approval before it can run any later workflow work.
 
-The optional `splash-workflow/bubblewrap-recovery` integration owns the narrow
+The optional `octoscript-workflow/bubblewrap-recovery` integration owns the narrow
 Linux composition of those steps for reconciliation only. It accepts a proof
 that the old Bubblewrap session was reaped, generates a new session key without
 fallback, requires one exact-tool manifest, reserves a durable writer fence,
@@ -829,7 +829,7 @@ discards the observation.
 An external tool may opt into bounded host-visible output chunks. The runtime
 accepts chunks only for a claimed operation, applies source-byte, aggregate,
 and post-redaction limits, and returns only the redacted text to the host.
-Chunks are not installed as a Splash API or buffered as script-visible state.
+Chunks are not installed as a Octoscript API or buffered as script-visible state.
 A redactor is trusted host Rust code, not generated script code; it must remain
 small and non-blocking, and it cannot substitute for a contained worker or
 output validation by the receiving UI, log, or LLM adapter. Stream limits span
@@ -947,7 +947,7 @@ and again before frame sealing, so a production host must connect it to current
 tenant policy, revocation, and any grant-lease state rather than treating a
 stored fingerprint as a still-valid capability.
 
-`splash-storage` authenticates host-owned record bytes with a provisioned
+`octoscript-storage` authenticates host-owned record bytes with a provisioned
 BLAKE3 key and binds them to an opaque record namespace, name, revision, and
 key ID. It supports verification-key rotation, but it does not encrypt payloads
 or generate, transfer, or protect storage keys. Its `RollbackProtectedStore`
@@ -957,7 +957,7 @@ a successful compare-and-swap. The included `VolatileMemoryStore` is only a
 process-local test/development implementation, not a durable backend. A file,
 database, or mobile key-value adapter must not claim rollback protection unless
 it has a separate platform trust anchor and the required atomic semantics.
-Generated Splash source receives neither a store nor a key.
+Generated Octoscript source receives neither a store nor a key.
 
 Worker protocol v5 provides authenticated ordinary-call cancellation,
 operation-dispatch, and explicit compensation frames. Cancellation is an
@@ -972,7 +972,7 @@ tool, key, input, grant, scope, or contradictory terminal result is rejected.
 The host should reconcile an ambiguous response rather than blindly
 re-dispatching or creating another inverse effect. This remains a worker
 idempotency primitive, not semantic rollback, key exchange, process
-containment, or authorization granted to Splash source. The journal retains
+containment, or authorization granted to Octoscript source. The journal retains
 terminal result data for idempotent replies, so its storage may need encryption
 in addition to authentication. The canonical-input digest is an unkeyed
 correlation value, so operation payloads must contain opaque secret selectors
@@ -994,7 +994,7 @@ The catalog publishes this distinction as `contract_enforced`, so a host or
 LLM prompt builder does not need to infer enforcement from the presence of a
 schema field.
 
-`splash_core::tool_call_hints` and the `splash tool-calls` CLI command are
+`octoscript_core::tool_call_hints` and the `octoscript tool-calls` CLI command are
 effect-free source-review aids, not static authorization. They recognize only
 direct `tool` method syntax and deliberately do not resolve aliases,
 shadowing, runtime string values, reachability, or imports. A host must never

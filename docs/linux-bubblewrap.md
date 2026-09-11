@@ -1,22 +1,22 @@
 # Linux Bubblewrap Workers
 
-`splash-sandbox::bubblewrap` builds and launches a Linux Bubblewrap worker from
+`octoscript-sandbox::bubblewrap` builds and launches a Linux Bubblewrap worker from
 trusted host Rust configuration. It is the first execution-boundary backend for
-Splash. The policy accepts a fixed worker program, fixed worker arguments,
+Octoscript. The policy accepts a fixed worker program, fixed worker arguments,
 read-only runtime mounts, and opaque host-backed or bounded ephemeral
 `file_root` entries selected by an active `CapabilityManifest`.
 
 An active host-backed read-write root is denied by default. On Linux, a host
 can instead attach a verified `LinuxProjectQuota` to a descriptor-pinned root
-and configure an aggregate hard byte and inode limit. Splash then checks the
+and configure an aggregate hard byte and inode limit. Octoscript then checks the
 same directory descriptor that Bubblewrap will mount before launch. For a
-legacy deployment with a separately managed quota that Splash cannot inspect,
+legacy deployment with a separately managed quota that Octoscript cannot inspect,
 host code may still call `allow_unbounded_host_file_root_writes`; that is an
 explicit weaker escape hatch, not quota enforcement. This default does not
 bound an explicitly enabled private `/tmp`, which remains an ephemeral mount
 with its own selected policy.
 
-It is deliberately not a general command runner. Splash source, tool payloads,
+It is deliberately not a general command runner. Octoscript source, tool payloads,
 and resource selector IDs never become a host path, command line, origin, or
 session key.
 
@@ -27,28 +27,28 @@ program must live in a read-only runtime mount; a file-root binding cannot
 provide it.
 
 ```rust
-use splash_sandbox::bubblewrap::{
+use octoscript_sandbox::bubblewrap::{
     BubblewrapWorkerPolicy, EphemeralFileRoot, ExecutableSourceBinding,
     FileRootAccess, FileRootBinding, LandlockExecutableRunner, LinuxProjectQuota,
     MountSourceBinding, ReadOnlyMount, ResourceLimitRunner, WorkerResourceLimits,
     WorkerSeccompProfile,
 };
-use splash_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
+use octoscript_protocol::{PrivatePipeWorkerBootstrap, SessionAuthenticator, SessionRole};
 
 let mut policy = BubblewrapWorkerPolicy::new(
     "/usr/bin/bwrap",
-    "/opt/splash/bin/worker",
+    "/opt/octoscript/bin/worker",
 )?
 .with_worker_arguments(["--json-lines"]);
 
 policy.add_runtime_mount(ReadOnlyMount::new(
-    "/opt/splash/runtime",
-    "/opt/splash",
+    "/opt/octoscript/runtime",
+    "/opt/octoscript",
 )?);
 policy.add_file_root(
     "project-read",
     FileRootBinding::new(
-        "/srv/splash/project",
+        "/srv/octoscript/project",
         "/workspace/project",
         FileRootAccess::ReadOnly,
     )?,
@@ -70,19 +70,19 @@ limits.set_address_space_bytes(512 * 1024 * 1024)?;
 limits.set_open_files(64)?;
 limits.set_file_size_bytes(16 * 1024 * 1024)?;
 policy.set_resource_limit_runner(ResourceLimitRunner::new(
-    "/opt/splash/bin/splash-limit-runner",
+    "/opt/octoscript/bin/octoscript-limit-runner",
     limits,
 )?);
 policy.require_resource_limit_runner();
 
 let mut executable_runner =
-    LandlockExecutableRunner::new("/opt/splash/bin/splash-landlock-runner")?;
+    LandlockExecutableRunner::new("/opt/octoscript/bin/octoscript-landlock-runner")?;
 // The actual resolved regular ELF loader is deployment and ABI specific. Add
 // it for any dynamically linked inner worker or resource-limit runner, plus
 // any fixed intermediary that will itself call execve.
-let deployed_elf_loader = "/opt/splash/lib/ld-linux-aarch64.so.1";
+let deployed_elf_loader = "/opt/octoscript/lib/ld-linux-aarch64.so.1";
 executable_runner.add_allowed_executable(deployed_elf_loader)?;
-executable_runner.add_allowed_executable("/opt/splash/bin/reviewed-interpreter")?;
+executable_runner.add_allowed_executable("/opt/octoscript/bin/reviewed-interpreter")?;
 policy.set_landlock_executable_runner(executable_runner);
 
 let command = policy.compile(&attenuated_manifest)?;
@@ -107,12 +107,12 @@ choice. It does not turn those per-process limits into a cgroup, disk quota, or
 wall-clock deadline.
 
 `MountSourceBinding::DescriptorPinned` is optional Linux hardening for host
-paths selected by this policy. At `compile`, Splash opens each selected runtime
+paths selected by this policy. At `compile`, Octoscript opens each selected runtime
 and host-backed file-root source, retains that root descriptor in the immutable
 command, and passes a fresh launch-only duplicate to Bubblewrap through
 `--ro-bind-fd` or `--bind-fd`. After compilation, replacing the configured
 source path cannot substitute a different mount root. A Bubblewrap build that
-lacks those options fails the worker launch; Splash never retries with a
+lacks those options fails the worker launch; Octoscript never retries with a
 path-based bind. This mode alone does not freeze mutable descendants of a
 pinned directory, the contents of a runtime tree, the Bubblewrap executable
 selected by the host, or an already-open writable file. Those still require
@@ -125,7 +125,7 @@ filesystem that implements generic project quotas and runs a kernel with
 `quotactl_fd` (Linux 5.14 or later). The host provisions that filesystem before
 it compiles a worker policy: assign a nonzero project ID to the exact root,
 enable its project-inheritance flag, and set nonzero hard block and inode
-limits. Splash does not create, resize, or repair the quota.
+limits. Octoscript does not create, resize, or repair the quota.
 
 ```rust
 let durable_output = LinuxProjectQuota::new(
@@ -143,7 +143,7 @@ policy.set_maximum_aggregate_linux_project_quota(
 policy.add_file_root(
     "durable-output",
     FileRootBinding::new(
-        "/srv/splash/worker-output",
+        "/srv/octoscript/worker-output",
         "/workspace/output",
         FileRootAccess::ReadWrite,
     )?
@@ -151,7 +151,7 @@ policy.add_file_root(
 )?;
 ```
 
-At `compile`, Splash opens a read-only directory descriptor relative to the
+At `compile`, Octoscript opens a read-only directory descriptor relative to the
 retained `O_PATH` mount descriptor, reads `FS_IOC_FSGETXATTR`, and calls
 `quotactl_fd(Q_GETQUOTA, PRJQUOTA)` on that same filesystem. It fails closed
 when the kernel or filesystem does not support either interface, permission is
@@ -164,7 +164,7 @@ Every active quota root needs `MountSourceBinding::DescriptorPinned`,
 `require_no_further_user_namespaces`, and an aggregate maximum. The mandatory
 user namespace prevents a worker that owns a mounted directory from changing
 the project ID or inheritance state through the Linux filesystem-attribute
-ioctls. Splash sums the hard limits of distinct `(filesystem, project ID)`
+ioctls. Octoscript sums the hard limits of distinct `(filesystem, project ID)`
 pairs exactly once, so several worker-visible directories under one project
 consume one shared quota budget. A raw read-write host root is rejected while
 this aggregate policy is enabled, even when
@@ -181,13 +181,13 @@ downstream tool effects, or data written outside the selected project.
 
 `ExecutableSourceBinding::DescriptorPinned` is a separate Linux opt-in for
 the fixed launch chain. It requires `MountSourceBinding::DescriptorPinned`.
-At `compile`, Splash retains the host Bubblewrap executable descriptor and
+At `compile`, Octoscript retains the host Bubblewrap executable descriptor and
 launches it through a fresh private `/proc/self/fd/N` path rather than the
 configured pathname. It also retains each fixed worker and optional
-`splash-limit-runner`, `splash-landlock-runner`, and each explicit Landlock
+`octoscript-limit-runner`, `octoscript-landlock-runner`, and each explicit Landlock
 allowlist target file descriptor, then inserts a read-only `--ro-bind-fd` file
 overlay at each exact worker-visible path after the runtime root mount. In
-cgroup-v2 mode, Splash additionally opens and pins the selected cgroup runner
+cgroup-v2 mode, Octoscript additionally opens and pins the selected cgroup runner
 immediately after preparing the fresh child cgroup, and the runner preserves
 the retained Bubblewrap descriptor while it `exec`s it. Replacing those selected
 executable paths after their descriptors are retained cannot substitute a
@@ -207,7 +207,7 @@ minimal and immutable when that stronger property matters.
 `compile` before it launches Bubblewrap. It then writes and flushes a versioned,
 non-JSON preamble to the private worker stdin pipe. A mismatch fails before
 launch; a write failure kills and reaps the child. The session key never appears
-in command-line arguments, environment variables, mount paths, Splash values,
+in command-line arguments, environment variables, mount paths, Octoscript values,
 capability selectors, or ordinary JSON frames.
 
 The worker must read that preamble exactly once before it creates its JSON-line
@@ -223,10 +223,10 @@ attestation, or key storage.
 For a Linux deployment that has a host-owned delegated cgroup-v2 parent, the
 host can add controller limits to the complete Bubblewrap worker tree. The
 parent and the runner are host paths: neither is a worker-visible runtime mount
-or a Splash value.
+or a Octoscript value.
 
 ```rust
-use splash_sandbox::cgroup_v2::{
+use octoscript_sandbox::cgroup_v2::{
     CgroupV2IoDevice, CgroupV2IoMax, CgroupV2Limits, CgroupV2Policy,
 };
 
@@ -241,8 +241,8 @@ io.set_write_operations_per_second(120)?;
 cgroup_limits.add_io_max(io)?;
 
 let cgroup_policy = CgroupV2Policy::new(
-    "/sys/fs/cgroup/splash-workers",
-    "/opt/splash/host-bin/splash-cgroup-runner",
+    "/sys/fs/cgroup/octoscript-workers",
+    "/opt/octoscript/host-bin/octoscript-cgroup-runner",
     cgroup_limits,
 )?;
 let worker = command.spawn_with_bootstrap_in_cgroup(&cgroup_policy, &bootstrap)?;
@@ -259,13 +259,13 @@ must still contain at least one finite controller limit.
 Build the bundled host-side runner on the target Linux platform with:
 
 ```sh
-cargo build --locked -p splash-sandbox --bin splash-cgroup-runner --release
+cargo build --locked -p octoscript-sandbox --bin octoscript-cgroup-runner --release
 ```
 
 `CgroupV2Policy` verifies that its parent is mounted from cgroup v2 and exposes
 the required core controls. It requires an existing cgroup-v2 parent owned by
 the host. The host must delegate and enable every selected controller for its
-children before launch. Splash intentionally does not write the parent's
+children before launch. Octoscript intentionally does not write the parent's
 `cgroup.subtree_control`, because changing that parent could alter resource
 policy for unrelated workloads. Preparation creates a fresh child, writes the
 selected controller values, and fails before launch if a control file or
@@ -278,10 +278,10 @@ the cgroup without a post-spawn migration race. Before it executes Bubblewrap,
 the runner marks every inherited descriptor from 3 onward close-on-exec,
 preserving only selected launch-only seccomp and descriptor-pinned mount
 descriptors. The cgroup path is not present in the Bubblewrap command line,
-environment, Splash source, or worker protocol.
+environment, Octoscript source, or worker protocol.
 
 Before `spawn_in_cgroup` or `spawn_with_bootstrap_in_cgroup` returns a worker
-handle, Splash observes the direct child PID in the fresh `cgroup.procs`. The
+handle, Octoscript observes the direct child PID in the fresh `cgroup.procs`. The
 default bounded wait is five seconds and can be changed with
 `CgroupV2Policy::set_join_timeout`; a runner that exits or does not join in time
 is killed along with the prepared cgroup and the launch fails. This confirmation
@@ -294,7 +294,7 @@ The current controller profile provides:
   permits up to half of one fair-scheduler CPU worth of bandwidth in each
   period; it is not a wall-clock deadline.
 - `memory.max`, a memory-cgroup limit rather than an RSS-only metric. When this
-  limit is selected Splash also writes `memory.oom.group=1`, so a cgroup OOM is
+  limit is selected Octoscript also writes `memory.oom.group=1`, so a cgroup OOM is
   handled as one worker-tree failure rather than leaving a partial tree.
 - `memory.swap.max`, an independent swap hard limit. A value of zero prevents
   worker anonymous memory from being swapped out. Selecting it fails before
@@ -326,8 +326,8 @@ for the kernel controller semantics.
 ## Host Wall-Clock Watchdog
 
 For a synchronous JSON-line worker, enable both
-`splash-capabilities/json-line-worker` and
-`splash-capabilities/bubblewrap-watchdog`. Move the spawned worker directly
+`octoscript-capabilities/json-line-worker` and
+`octoscript-capabilities/bubblewrap-watchdog`. Move the spawned worker directly
 into the watchdog before sending effectful work, then wrap the authenticated
 transport:
 
@@ -335,14 +335,14 @@ transport:
 use std::io::BufReader;
 use std::time::Duration;
 
-use splash_capabilities::bounded_worker::{
+use octoscript_capabilities::bounded_worker::{
     BoundedWorkerTransport, WorkerInvocationDeadline,
 };
-use splash_capabilities::json_line_worker::{
+use octoscript_capabilities::json_line_worker::{
     AuthenticatedFrameWorkerTransport, JsonLineWorkerChannel, WorkerFrameChannel,
 };
-use splash_capabilities::WorkerMessage;
-use splash_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
+use octoscript_capabilities::WorkerMessage;
+use octoscript_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
 
 let session_deadline = BubblewrapWorkerSessionDeadline::new(Duration::from_secs(300))?;
 let (watchdog, worker_stdin, worker_stdout) =
@@ -375,13 +375,13 @@ compensation path before deciding how to recover an effect.
 The watchdog bounds host wall-clock time, not the worker's aggregate disk or
 device use or an adapter's downstream I/O. Keep cgroup-backed workers in their
 managed lifecycle when process-tree teardown is required. Both deadlines are
-trusted host configuration and are never Splash values.
+trusted host configuration and are never Octoscript values.
 
 ## Authenticated Cooperative Cancellation
 
 For one explicitly cancellable ordinary invocation, enable
-`splash-capabilities/json-line-worker` and
-`splash-capabilities/bubblewrap-watchdog`. The worker must read the private
+`octoscript-capabilities/json-line-worker` and
+`octoscript-capabilities/bubblewrap-watchdog`. The worker must read the private
 bootstrap, authenticate `open_session`, and run
 `CancellableWorkerSessionDriver` with a manifest whose adapters were all
 registered through `register_cancellable`.
@@ -395,10 +395,10 @@ the event loop can send `cancel` while the adapter thread runs:
 use std::io::BufReader;
 use std::time::Duration;
 
-use splash_capabilities::bounded_worker::WorkerInvocationDeadline;
-use splash_capabilities::bubblewrap_watchdog::BubblewrapMultiplexedWorkerSession;
-use splash_capabilities::multiplexed_worker::MultiplexedAuthenticatedWorkerTransport;
-use splash_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
+use octoscript_capabilities::bounded_worker::WorkerInvocationDeadline;
+use octoscript_capabilities::bubblewrap_watchdog::BubblewrapMultiplexedWorkerSession;
+use octoscript_capabilities::multiplexed_worker::MultiplexedAuthenticatedWorkerTransport;
+use octoscript_sandbox::bubblewrap::BubblewrapWorkerSessionDeadline;
 
 let session_deadline =
     BubblewrapWorkerSessionDeadline::new(Duration::from_secs(300))?;
@@ -420,7 +420,7 @@ session.request_external_tool_cancellation(&request, "cancel-1")?;
 // Poll `session.poll_external_tool(&mut runtime)` from the trusted event loop.
 ```
 
-For an external workflow step, enable `splash-workflow/multiplexed-worker` and
+For an external workflow step, enable `octoscript-workflow/multiplexed-worker` and
 use its `request_external_tool_cancellation` and `poll_external_tool` helpers.
 They apply terminal events through `WorkflowEngine`; calling
 `engine.runtime_mut()` would bypass retained-step bookkeeping.
@@ -442,7 +442,7 @@ fresh-session recovery path.
 
 ## Durable Post-Stop Reconciliation
 
-The optional `splash-workflow/bubblewrap-recovery` feature composes the
+The optional `octoscript-workflow/bubblewrap-recovery` feature composes the
 launcher, private bootstrap, watchdog, one-shot durable transport, workflow
 ledger, and fenced authenticated store for one recovery attempt. It requires a
 `BubblewrapWorkerReaped` proof from the old lifecycle, refuses the old session
@@ -524,7 +524,7 @@ that the worker is never inside one. It is not a seccomp, resource-limit, or
 general containment policy.
 
 `WorkerSeccompProfile::DenyKnownEscapeSurface` is a second, independent,
-opt-in hardening mode. Splash generates its fixed cBPF program itself and sends
+opt-in hardening mode. Octoscript generates its fixed cBPF program itself and sends
 it through an anonymous launch-only descriptor to Bubblewrap's `--seccomp`
 option. The descriptor is never part of `BubblewrapCommand::arguments`, is not
 caller-supplied, and Bubblewrap consumes and closes it before applying the
@@ -569,20 +569,20 @@ program; a worker may still add a stricter filter of its own.
 fixed worker launch chain. Build the bundled runner on the target platform:
 
 ```sh
-cargo build --locked -p splash-sandbox --bin splash-landlock-runner --release
+cargo build --locked -p octoscript-sandbox --bin octoscript-landlock-runner --release
 ```
 
 Deploy it in a read-only runtime mount at a path distinct from the worker and
-any `splash-limit-runner`. At compilation, Splash requires the runner and every
+any `octoscript-limit-runner`. At compilation, Octoscript requires the runner and every
 explicit additional target to be a regular executable through that same
-read-only mount. The final command starts `splash-landlock-runner` with a
+read-only mount. The final command starts `octoscript-landlock-runner` with a
 deterministic list containing the fixed worker, an optional resource-limit
 runner, and any host-configured additions. For each dynamically linked inner
 worker or resource-limit runner, the host must also add its resolved regular
 ELF loader path from the deployed runtime; the loader itself is executed during
 that inner kernel launch chain.
 Do not add a symlink path: use the resolved regular file that the read-only
-runtime mount exposes. Splash source, tool payloads, selectors, manifests, and
+runtime mount exposes. Octoscript source, tool payloads, selectors, manifests, and
 worker input cannot add a path or choose the inner command. The runner repeats
 the final-component regular-file and executable checks through an
 `O_PATH | O_NOFOLLOW` descriptor before it creates rules.
@@ -597,7 +597,7 @@ stops worker startup; there is no direct-worker fallback. Landlock rules are
 inherited by descendants. The [Linux Landlock API documentation](https://docs.kernel.org/userspace-api/landlock.html)
 defines this filesystem `EXECUTE` action and its kernel limitations.
 
-With `ExecutableSourceBinding::DescriptorPinned`, Splash also overlays the
+With `ExecutableSourceBinding::DescriptorPinned`, Octoscript also overlays the
 Landlock runner and every explicit allowed target from retained descriptors,
 not merely the fixed worker. This prevents a host-path replacement after policy
 compilation from changing the selected object. It does not freeze libraries or
@@ -618,12 +618,12 @@ This is deliberately narrower than a complete code-execution policy:
 - It must not be treated as complete mediation for special filesystems,
   pre-opened descriptors, or future execution mechanisms; layer mount,
   descriptor, cgroup, and syscall controls appropriate to the deployment.
-- With `WorkerSeccompProfile::StrictAllowlist`, Splash stages the already
+- With `WorkerSeccompProfile::StrictAllowlist`, Octoscript stages the already
   compiler-generated filter through this fixed runner. The runner validates the
   bounded internal encoding, installs Landlock and verifies full enforcement,
   marks nonstandard descriptors close-on-exec, attaches the strict filter, and
-  only then replaces itself with the fixed inner command. No public Splash
-  policy API accepts cBPF for this handoff, and Splash source, a manifest, and
+  only then replaces itself with the fixed inner command. No public Octoscript
+  policy API accepts cBPF for this handoff, and Octoscript source, a manifest, and
   worker input cannot select it. A malformed encoding, failed filter install,
   failed Landlock setup, or failed exec stops worker startup without a
   direct-worker or unfiltered fallback.
@@ -635,7 +635,7 @@ This is deliberately narrower than a complete code-execution policy:
 `WorkerSeccompAllowlist` is the independent strict profile for a particular
 trusted worker runtime. A host constructs it from a bounded set of raw syscall
 numbers for the current Linux ABI, then installs it atomically with
-`BubblewrapWorkerPolicy::set_seccomp_allowlist`. It is not serializable Splash
+`BubblewrapWorkerPolicy::set_seccomp_allowlist`. It is not serializable Octoscript
 configuration, LLM output, worker input, or caller-provided cBPF. Empty,
 duplicate, and more-than-512-entry lists are rejected; selecting
 `WorkerSeccompProfile::StrictAllowlist` without using that setter fails policy
@@ -652,13 +652,13 @@ namespace-creating legacy `clone` calls and `TIOCSTI` return `EPERM` even when
 the host lists ordinary `clone` or `ioctl`.
 
 A strict list must cover the entire post-filter execution path: the fixed
-`execve`, any selected `splash-limit-runner`, the dynamic loader, and the exact
+`execve`, any selected `octoscript-limit-runner`, the dynamic loader, and the exact
 fixed worker and libraries. Without a Landlock runner, Bubblewrap attaches the
 filter before its final exec. With a Landlock runner, the runner attaches the
 same compiler-generated program after Landlock setup and descriptor cleanup,
 before its final fixed exec; its setup syscalls therefore do not need to appear
 in the strict list. Build and test the exact list per target ABI with the same
-immutable runtime mounts deployed to production. Splash does not infer a list
+immutable runtime mounts deployed to production. Octoscript does not infer a list
 from source, profile a worker at runtime, or widen a list after launch. Policy
 compilation explicitly rejects a list without `execve`; any other incomplete
 list stops the worker rather than weakening containment.
@@ -670,11 +670,11 @@ Mount layout and a separately designed executable policy remain responsible for
 that authority. The strict profile likewise does not mediate a network origin,
 D-Bus, device access, secrets, or capability grants.
 
-`splash-limit-runner` is an optional Linux-only, fixed pre-exec runner. Build
+`octoscript-limit-runner` is an optional Linux-only, fixed pre-exec runner. Build
 the bundled binary on the target Linux platform with:
 
 ```sh
-cargo build --locked -p splash-sandbox --bin splash-limit-runner --release
+cargo build --locked -p octoscript-sandbox --bin octoscript-limit-runner --release
 ```
 
 Deploy that binary and every runtime dependency it needs in a read-only runtime
@@ -682,7 +682,7 @@ mount, then configure its worker-visible path with `ResourceLimitRunner`. The
 compiler requires distinct worker-visible runner and worker paths, each
 resolving to an executable through a read-only runtime mount. It emits the
 runner, policy-generated limit flags,
-`--`, and then the fixed worker and fixed arguments. Splash source, tool
+`--`, and then the fixed worker and fixed arguments. Octoscript source, tool
 payloads, selectors, and manifest data cannot select the runner, alter a limit,
 or add target arguments.
 
@@ -754,7 +754,7 @@ The resulting command uses:
   instead uses `--ro-bind-fd` or `--bind-fd` with a host-held descriptor; and
 - optional descriptor-pinned Bubblewrap execution through a launch-only
   `/proc/self/fd/N` path. When selected together with descriptor-pinned mount
-  roots, Splash also adds final read-only `--ro-bind-fd` overlays for the
+  roots, Octoscript also adds final read-only `--ro-bind-fd` overlays for the
   fixed worker and optional limit runner files; and
 - optional `--size BYTES` immediately before a private `--tmpfs /tmp`, limiting
   only allocations in that mount; and
@@ -763,7 +763,7 @@ The resulting command uses:
 - optional final `--remount-ro /proc`, `--remount-ro /dev`, and
   `--remount-ro /` operations in bounded-write mode, leaving selected
   submounts under their independently compiled access policies; and
-- optional `splash-limit-runner` invocation before the fixed worker, with only
+- optional `octoscript-limit-runner` invocation before the fixed worker, with only
   host-selected rlimit flags and no script-controlled target or arguments; and
 - private stdin/stdout pipes, with stderr sent to `/dev/null` to prevent an
   undrained diagnostic pipe from blocking the worker.
@@ -776,7 +776,7 @@ for the underlying constraints.
 
 ## Brokered Network-Origin Access
 
-The optional `splash-capabilities/linux-network-broker` feature is the one
+The optional `octoscript-capabilities/linux-network-broker` feature is the one
 Linux exception to the default `network_origin` rejection. It is a narrow,
 host-owned HTTP broker, not a general network proxy. The host builds one
 `LinuxNetworkBroker` around one reviewed `HttpEndpointCatalog` or
@@ -784,13 +784,13 @@ host-owned HTTP broker, not a general network proxy. The host builds one
 same Bubblewrap policy:
 
 ```rust
-use splash_capabilities::{
+use octoscript_capabilities::{
     http_endpoint_catalog::{HttpEndpointCatalog, HttpEndpointSecretStore},
     linux_network_broker::{
         LinuxNetworkBroker, DEFAULT_LINUX_NETWORK_BROKER_DESTINATION,
     },
 };
-use splash_protocol::NetworkOriginAccess;
+use octoscript_protocol::NetworkOriginAccess;
 
 let access = NetworkOriginAccess::from_manifest(&attenuated_manifest)?;
 // `catalog` must contain exactly the opaque IDs in `access`, no more or less.
@@ -927,7 +927,7 @@ It does not yet provide:
   dynamic loader, shared-library tree, runtime configuration, or the behavior
   of a writable host-backed root. `MountSourceBinding::DescriptorPinned`
   prevents replacement of selected mount roots. Combined with
-  `ExecutableSourceBinding::DescriptorPinned`, Splash also pins the selected
+  `ExecutableSourceBinding::DescriptorPinned`, Octoscript also pins the selected
   Bubblewrap, worker, optional limit-runner, and freshly prepared cgroup-runner
   executable files. Policy sources and runtime contents still need immutable
   host ownership when that is part of the product security model.

@@ -699,7 +699,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
-name = "splash-capabilities"
+name = "octoscript-capabilities"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -708,37 +708,37 @@ dependencies = [
  "makepad-script",
  "serde",
  "serde_json",
- "splash-core",
- "splash-protocol",
- "splash-sandbox",
- "splash-schema",
- "splash-storage",
- "splash-worker",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-sandbox",
+ "octoscript-schema",
+ "octoscript-storage",
+ "octoscript-worker",
  "ureq",
  "zeroize",
 ]
 
 [[package]]
-name = "splash-cli"
+name = "octoscript-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "splash-capabilities",
- "splash-core",
- "splash-workflow",
+ "octoscript-capabilities",
+ "octoscript-core",
+ "octoscript-workflow",
 ]
 
 [[package]]
-name = "splash-core"
+name = "octoscript-core"
 version = "0.1.0"
 dependencies = [
  "makepad-script",
  "serde_json",
- "splash-ui-l0",
+ "octoscript-ui-l0",
 ]
 
 [[package]]
-name = "splash-linux-project-quota"
+name = "octoscript-linux-project-quota"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -746,7 +746,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-linux-seccomp"
+name = "octoscript-linux-seccomp"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -754,52 +754,52 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-lsp"
+name = "octoscript-lsp"
 version = "0.1.0"
 dependencies = [
  "lsp-server",
  "lsp-types",
  "serde_json",
- "splash-capabilities",
- "splash-core",
- "splash-schema",
- "splash-workflow",
+ "octoscript-capabilities",
+ "octoscript-core",
+ "octoscript-schema",
+ "octoscript-workflow",
 ]
 
 [[package]]
-name = "splash-protocol"
+name = "octoscript-protocol"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "constant_time_eq",
  "serde",
  "serde_json",
- "splash-storage",
+ "octoscript-storage",
  "zeroize",
 ]
 
 [[package]]
-name = "splash-sandbox"
+name = "octoscript-sandbox"
 version = "0.1.0"
 dependencies = [
  "close_fds",
  "landlock",
  "linux-raw-sys",
  "rustix",
- "splash-linux-project-quota",
- "splash-linux-seccomp",
- "splash-protocol",
+ "octoscript-linux-project-quota",
+ "octoscript-linux-seccomp",
+ "octoscript-protocol",
 ]
 
 [[package]]
-name = "splash-schema"
+name = "octoscript-schema"
 version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
-name = "splash-storage"
+name = "octoscript-storage"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -814,37 +814,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "splash-ui-l0"
+name = "octoscript-ui-l0"
 version = "0.1.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
-name = "splash-worker"
+name = "octoscript-worker"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "splash-protocol",
- "splash-storage",
+ "octoscript-protocol",
+ "octoscript-storage",
  "zeroize",
 ]
 
 [[package]]
-name = "splash-workflow"
+name = "octoscript-workflow"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
- "splash-capabilities",
- "splash-core",
- "splash-protocol",
- "splash-sandbox",
- "splash-schema",
- "splash-storage",
+ "octoscript-capabilities",
+ "octoscript-core",
+ "octoscript-protocol",
+ "octoscript-sandbox",
+ "octoscript-schema",
+ "octoscript-storage",
 ]
 
 [[package]]

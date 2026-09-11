@@ -1,32 +1,32 @@
 [workspace]
 members = [
-    "crates/splash-core",
-    "crates/splash-ui-l0",
-    "crates/splash-linux-seccomp",
-    "crates/splash-linux-project-quota",
-    "crates/splash-capabilities",
-    "crates/splash-protocol",
-    "crates/splash-schema",
-    "crates/splash-sandbox",
-    "crates/splash-storage",
-    "crates/splash-worker",
-    "crates/splash-workflow",
-    "crates/splash-cli",
-    "crates/splash-lsp",
+    "crates/octoscript-core",
+    "crates/octoscript-ui-l0",
+    "crates/octoscript-linux-seccomp",
+    "crates/octoscript-linux-project-quota",
+    "crates/octoscript-capabilities",
+    "crates/octoscript-protocol",
+    "crates/octoscript-schema",
+    "crates/octoscript-sandbox",
+    "crates/octoscript-storage",
+    "crates/octoscript-worker",
+    "crates/octoscript-workflow",
+    "crates/octoscript-cli",
+    "crates/octoscript-lsp",
 ]
 default-members = [
-    "crates/splash-core",
-    "crates/splash-linux-seccomp",
-    "crates/splash-linux-project-quota",
-    "crates/splash-capabilities",
-    "crates/splash-protocol",
-    "crates/splash-schema",
-    "crates/splash-sandbox",
-    "crates/splash-storage",
-    "crates/splash-worker",
-    "crates/splash-workflow",
-    "crates/splash-cli",
-    "crates/splash-lsp",
+    "crates/octoscript-core",
+    "crates/octoscript-linux-seccomp",
+    "crates/octoscript-linux-project-quota",
+    "crates/octoscript-capabilities",
+    "crates/octoscript-protocol",
+    "crates/octoscript-schema",
+    "crates/octoscript-sandbox",
+    "crates/octoscript-storage",
+    "crates/octoscript-worker",
+    "crates/octoscript-workflow",
+    "crates/octoscript-cli",
+    "crates/octoscript-lsp",
 ]
 exclude = ["vendor/makepad"]
 resolver = "2"
@@ -34,7 +34,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ymote/Splash"
+repository = "https://github.com/OctoSense-org/Octoscript"
 rust-version = "1.85"
 
 [workspace.lints.rust]
