@@ -26,6 +26,23 @@
 
 # ─── containers ───────────────────────────────────────────────────────────────
 
+# A registered theme-kit component. The host supplies its checked definition;
+# an instance names a source-linked placement, not a widget implementation.
+[Kit]
+component = { kind = "text" }
+instance = { kind = "text" }
+part = { kind = "text" }
+text = { kind = "text" }
+placeholder = { kind = "text" }
+enabled = { kind = "bool" }
+checked = { kind = "bool" }
+selected = { kind = "bool" }
+index = { kind = "number" }
+value = { kind = "number" }
+value2 = { kind = "number" }
+focused = { kind = "bool" }
+password = { kind = "bool" }
+
 [Surface]
 pad = { kind = "token", tokens = ["page", "tight", "none"] }
 
@@ -480,7 +497,7 @@ answers = ["duration", "distance", "steps"]
 # Progress here is measured: the position is projected onto the route, so an
 # instruction only advances because the device did.
 [sources."sys.step"]
-args = ["from_lat", "from_lon", "to_lat", "to_lon", "at_lat", "at_lon", "fields"]
+args = ["from_lat", "from_lon", "to_lat", "to_lon", "at_lat", "at_lon", "via", "fields"]
 answers = ["instruction", "remaining", "progress", "eta"]
 
 [sources."sys.places"]
@@ -614,6 +631,12 @@ answers = ["ticker", "name", "exchange", "kind"]
 # produce that: L0 has no way to build a composite value, which is exactly the
 # point of it having no expression form. The language was right.
 [sources."sys.cities"]
-args = ["fields"]
-answers = ["name", "lat", "lon", "temp", "feels", "hi", "lo", "cond", "humidity", "wind"]
+args = ["fields", "unit"]
+answers = ["name", "lat", "lon", "temp", "feels", "feels_delta", "hi", "lo", "cond", "humidity", "wind"]
 writes = ["append", "remove"]
+
+# Pure conversion; supported pairs and coefficients are owned by the runtime.
+# direction is fwd (default) or rev. Unsupported pairs have no value.
+[sources."sys.convert"]
+args = ["amount", "from", "to", "direction", "fields"]
+answers = ["amount", "value"]

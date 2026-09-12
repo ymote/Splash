@@ -827,6 +827,7 @@ dependencies = [
 name = "splash-ui-l0"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde_json",
 ]
 

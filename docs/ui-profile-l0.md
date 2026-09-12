@@ -505,12 +505,11 @@ source now    sys.weather(lat: place.lat, lon: place.lon, fields: [temp, hi, lo,
 The evaluator never sees `sys.geocode`. The runtime resolves it, injects the result as data,
 and the view reads `place.name`.
 
-**A literal in a data position must be `vocabulary` or `source-derived`.** This is decidable
-at L0 precisely because `view` is a typed tree — a `model-copy` literal bound to a data
-argument is a structural violation, not a judgement call. It is the property that makes
-`"34 mph"` concatenated onto a live value unrepresentable rather than merely discouraged.
+**Selected data arguments must be bound rather than supplied as direct literals.** The
+checker enforces this syntactic rule, declared names and declared copy classes. It does
+not establish the provenance or truth of every value reachable through a binding.
 
-**What is actually enforced, and what is not.** Both halves matter, and only one is complete:
+**What is actually enforced, and what is not:**
 
 | Position | Rule |
 |---|---|
@@ -527,13 +526,31 @@ real ergonomic cost and buys less than it appears to: of the eleven literals in 
 cards, six are `glyph` symbols (`‹ ↑ ↓ ≈`) that are closed presentation vocabulary rather than
 language, and translating them is meaningless.
 
-So the guarantee this section provides is narrower than its first paragraph implies. **A
-fabricated number cannot reach a numeric position — by any route, including laundered through
-a chain of component props — and fabricated prose can reach a text position, but only as a raw
-literal.** Text that is *declared* model-authored is refused wherever it tries to surface. The first is the failure mode that produced the six shipped bugs this rule exists
-for — an invented `condition`, an invented `wmin`/`wmax` — and it is closed. The second is open
-by choice, and would need retained provenance on every string, not a broader argument category,
-to close.
+State values now retain a runtime origin: `Authored`, `Vocabulary`, `Source`,
+`UserInput`, `Host`, `Derived` or `Unknown`. The realizer carries this through loops,
+component parameters, local state, source captures, schema retention and transitions.
+Authored defaults remain legal in controls. In `Data` catalog arguments and numeric
+`text` arguments they resolve to `Missing`; their live bindings and expressions are
+suppressed too. Thus `state n { shape: number, initial: 1547 }` with
+`TextHero(value: n)` checks successfully but displays an em dash until an accepted
+host or user value arrives. Passing that state through components does not change
+its origin. Path arguments used as query selectors (for example a stock symbol)
+keep their existing binding contract.
+
+The native host derives event origins from the realized control and its declared
+event: Field commits/changes are user input; a Row carrying an authored value
+retains `Authored`. JSON payloads cannot declare an origin. Legacy dispatch APIs
+conservatively treat unattributed payloads as authored; trusted hosts use
+`dispatch_reporting_with_origin`. A reset or literal assignment restores the
+initial/authored origin. Changing only the eligibility of an origin still triggers
+a redraw, even when the value is identical. Empty native text is a payload, not an
+absent event. `set_cell` is a trusted host write; source captures use
+`set_cell_with_origin(..., Source)`.
+
+L1 expressions propagate origins and permit authored coefficients combined with
+source/host/user values. This traces inputs, not the truth of the formula. Authored
+copy classes remain declarations, and inline labels remain accepted. Neither L0
+acceptance nor L1 expression validation is a proof of factual correctness.
 
 Implicit dependencies are declared like any other source:
 
@@ -1266,28 +1283,35 @@ rejected until the level is explicitly raised; escalation is never silent. **Com
 versions must be pinned**, or an L0 card can be moved to L2 by a definition it references
 being replaced.
 
-The check therefore returns a **closure digest**: every component the card declares, paired
-with a hash of its definition — param names, state (path, shape, initial, keep), events and
-view body — sorted by name. A host stores this beside the approved level. A digest that moved
-means the level was derived from a definition that no longer exists and must be re-derived
-before the card is accepted, rather than inherited from the record it no longer matches.
+The check returns a **closure digest** per declared component, sorted by name. Each digest
+covers its parameters, state (including shape and initial capture path), events, and view
+body, plus the transitive component and view definitions it references. Loop key paths and
+whether an element is a view reference are included. Definition order at file scope and
+source locations are excluded; order within a definition remains significant. A component
+edit that affects a dependency therefore also changes its callers' digests.
 
-The digest sorts **components**, so reordering declarations at the top level is not a version
-change — a digest that moved on a cosmetic edit would make pinning useless in the way that
-matters, since hosts would see it move constantly and learn to ignore it. Order *within* a
-component is hashed, so moving a param, state or event does register as a change.
+The closure digests are versioned 64-bit FNV-1a change detectors. Every declared
+component receives an entry, even unused ones. They are diagnostic/cache metadata.
 
-**Known limits, stated so the digest is not trusted past them.** It hashes every declared
-component rather than the closure reachable from the root view, so an unused definition causes
-a false repin. And it is 64-bit FNV-1a, which is a change *detector* and not an adversarial
-boundary: it is fit for noticing that a definition moved, and unfit for resisting a chosen
-collision. Pinning is also report material — nothing in the runtime yet stores or compares it.
+`approval::ArtifactApproval` separately pins the complete source, admitted level,
+policy version, profile implementation, assembled kit, and a host runtime bundle
+using length-delimited BLAKE3 hashes. The Octos native host builds that bundle from
+its local source/resources, patched Makepad tree (including the VM, widget layer and
+capability bindings), dependency lockfile, compiler version and build configuration.
+It stores each policy approval under `l0-approvals/<source digest>.json`, beneath its
+configuration directory. New L0/L1 artifacts may be admitted by the installed host
+policy; this is not a claim that a person manually reviewed each card.
 
-It also omits a loop's `key` expression, whether an element is a view reference, and the bodies
-of views a component references — so a card can change what it renders
-without the digest moving. Parameter and state *shapes* are covered as of the change that made
-prop shapes survive parsing; before that `x: number` → `x: text` was invisible to both the digest and §5.8's
-schema id, so a live string could survive into number-shaped state.
+Existing approvals are verified before source resolution or mounting, and live
+session approvals are verified before dispatch or durable effects. A source,
+level, kit or runtime change cannot inherit a mismatching approval. Invalid records
+and I/O failures fail closed; the host never silently overwrites a mismatching pin.
+Reapproval is a host operation after reviewing the changed artifact. The native app
+locks compiled script sources before widget registration, so file watching or Studio
+live edits cannot change the approved runtime in a running process. Layout refreshes
+remain available. Runtime source data is intentionally outside the code approval:
+it changes without changing the card's authority. The host and its approval storage
+are trusted; this is not a signature scheme against a compromised host.
 
 Three token tests are not sufficient and an earlier draft that used them was both incomplete
 and self-contradictory. Level must be an effect judgment over the closure.
@@ -1349,6 +1373,11 @@ visualisations have kit functions and all six are in the consumer's tag table.
 `makepad::lower` is still in the crate and is still exercised by the profile tests, but the
 device path calls only `kit::lower`. A verification done through `makepad::lower` therefore
 proves nothing about what a phone renders, which is a mistake this repository has made before.
+
+The review's “L0–L3” names the four implementation layers: profile/realization,
+kit lowering, VM/node translation, and native widget mounting/interaction. The fourth
+layer is native rendering. There is no `# level: L3` language capability profile;
+that header remains rejected.
 
 L1 and L2 **as capability levels** — the levels this document's §7 classifies, not the layers
 above — are a separate matter from the kit work; the two senses of "L1" are easy to conflate and
@@ -1473,8 +1502,7 @@ defect and is recorded in §9.8.
 
 ### 9.3 §4's no-facts rule, one level up
 
-L0 keeps §4 structurally: a literal in a value position is refused outright, which is decidable
-because a `view` is a typed tree. **L1 cannot use that check**, because at L1 a literal in a value
+L0 rejects a direct literal in a value position, as described in §4. **L1 cannot use that check**, because at L1 a literal in a value
 position is often legitimate — a coefficient. `temp * 9 / 5 + 32` is a formula, and `9`, `5` and
 `32` are not claims about the world.
 
@@ -1487,27 +1515,16 @@ fact wearing arithmetic, and is refused. Every path an expression reads — at a
 checked against declared names exactly as a bare binding is, so an expression cannot launder an
 undeclared name past the check that a plain path would fail.
 
-That rule alone bounds what an expression is made OF and not what it may PRODUCE, and the gap is
-real: `quote.last * 0 + 1547` reads a source, computes, and yields a fabricated number. So there
-is a second rule.
+The checker also rejects constants recognized by a limited structural analysis: finite
+literal arithmetic, identical subexpressions subtracted or reduced modulo themselves,
+identical numerator and denominator, and multiplication by a known zero. These identities
+are interpreted wherever the expression is defined; missing values remain missing at
+runtime. Thus `last * 0 + 1547` and `(last - 2) / (last - 2) * 1547` are refused.
 
-> **An expression's answer must MOVE when its inputs move.**
-
-A formula is a formula because it depends on what it reads. So the expression is evaluated under
-several assignments of its reads, and an answer that never changes is a constant the model wrote
-with extra steps — refused. `temp * 9 / 5 + 32` moves; `last * 0 + 1547`, `last - last + 99` and
-`(last - last) * k + 5` do not.
-
-The assignments differ **per path** as well as per round, because binding every read to one number
-would make `a - b` constant and condemn a correct formula. Three rounds of coprime-ish values: an
-expression constant across all three and not constant in general is not something five arithmetic
-operators can express. Unresolvable in every round — a division by a probed zero — is *not*
-degenerate; that is a partial expression, and §9.4 already renders it as missing.
-
-The two rules together are still not L0's *structural* guarantee, which is that no position admits
-a fabricated number at all. They are a pair of decidable checks that between them refuse the
-constructions a fabrication has available. The remaining distance is that L1 must ASK these
-questions where L0 has no question to ask.
+An unrecognized expression is **unknown**, not proven to depend on its inputs. There is no
+sampling rule: `(last - 2) * (last - 5) * (last - 11)` must be accepted even though it is zero
+at all three assignments used by the former implementation. This analysis is deliberately
+incomplete and does not prove factual correctness or rule out every disguised constant.
 
 ### 9.4 Evaluation
 
@@ -1530,8 +1547,9 @@ or the host.
 
 A backend receives the **shape** of an expression, not the number realization computed:
 each operand is either a live capability call or a constant, and each join carries its operator.
-Every join is parenthesised on the way out, so the target VM's own precedence rules cannot
-change what the card meant.
+Every join lowers to `sys.l0_math(operator, left, right)`, preserving grouping and checking
+finite operands, zero divisors and finite results at each operation. Missing propagates as
+an em dash through further operations. Both renderer lineages install these pure helpers.
 
 This is not an optimisation. A value computed at realization is the answer for whatever data the
 host happened to seed, and a live card is seeded with nothing — so lowering the computed number
@@ -1588,10 +1606,8 @@ Recorded rather than patched over, in the order they would bite.
   refused too.
 - ~~**No grouping and no unary minus.**~~ **Fixed**, per §9.2. `(a + b) * c` and `n * -1` are both
   admitted, and a bare `value: -1` is still refused by §4's original rule.
-- ~~**The no-facts rule bounds operands, not results.**~~ **Fixed**, per §9.3's second rule: an
-  expression's answer must move when its inputs move, so `last * 0 + 1547` is refused. This was
-  recorded as needing an argument rather than a patch, and the argument is that a formula depends
-  on what it reads.
+- **Constant analysis is incomplete.** §9.3 rejects structurally recognized constants and
+  leaves other expressions unknown. Neither source/state reads nor arithmetic prove truth.
 - ~~**A state's `initial:` was a third position, and it discarded the expression.**~~
   **Fixed.** §9.2 admits an expression in one position; §9.8 already recorded a guard as
   a second. `initial:` was a third, and the worst of the three: the parser scanned the
@@ -1606,3 +1622,17 @@ Recorded rather than patched over, in the order they would bite.
   this section admits, which is the reason it was left alone.
 - **`Form` is unchanged**, so a transition still cannot compute. `set(shares * 2)` is not
   admitted, and §6's condition 3 continues to hold for the reason it did at L0.
+
+### Complete rendering and runtime limits
+
+A host must call `RealizeReport::complete_root()` before mounting, capturing state or pruning
+instances. Diagnostics, duplicate keys and truncation are failures even if a partial root
+exists. Duplicate loop items are omitted from that diagnostic tree and are never renamed.
+Patch reuse cannot replace a truncated result or overwrite a changed subtree.
+
+Both kit walkers admit at most 128 edges of depth and 65,536 nodes. Unknown or malformed
+children reject the entire tree. Kit evaluation uses a 2,000,000-instruction budget and
+rejects uncaught runtime errors even if a later expression returns a node. That instruction
+budget covers VM execution, not native capability work or parsing; these trusted host and
+theme operations need their own resource policy. L0/L1 source parsing additionally bounds
+the resulting expression AST, including flat operator chains.

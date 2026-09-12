@@ -14,7 +14,7 @@
 //!
 //! # Why this is its own crate
 //!
-//! It depends on `serde_json` and nothing else, so any host can adopt L0 without
+//! It depends on `serde_json` and `blake3`, so any host can adopt L0 without
 //! adopting a runtime. That is not a stylistic preference: `splash-core` carries
 //! a vendored `makepad-script`, and an application already using a different
 //! makepad lineage cannot depend on it — Cargo refuses the lockfile, because
@@ -43,6 +43,12 @@
 //!
 //! Everything is effect-free and bounded: no evaluation, no imports, no host access.
 
+pub mod approval;
+pub mod kit_pack;
+mod value_origin;
+use value_origin::{card_state_origin, initial_origin, needs_data_origin};
+pub use value_origin::{event_payload_origin, ValueOrigin};
+
 /// One one-based location. Mirrors `splash_core::SyntaxDiagnostic` in shape;
 /// separate so this crate stands alone.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +70,7 @@ pub enum Level {
     /// Constructors, bindings, keyed loops, guarded branches, components with
     /// declared local state. No expression form, no reachable capability.
     L0,
-    /// Adds pure expressions. Not accepted by this checker.
+    /// Adds pure arithmetic; accepted when explicitly declared in the header.
     L1,
     /// Full Splash, including imperative widget commands. Not accepted here.
     L2,
@@ -74,8 +80,8 @@ pub enum Level {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UiL0Report {
     pub valid: bool,
-    /// The narrowest level the source belongs to. `valid` is true only for
-    /// [`Level::L0`].
+    /// The admitted profile, or the required profile on a level mismatch.
+    /// An explicitly declared L1 is retained even if no arithmetic is used.
     pub level: Level,
     pub diagnostics: Vec<SyntaxDiagnostic>,
     pub diagnostics_truncated: bool,
@@ -206,6 +212,15 @@ pub fn check_ui_l0(source: &str) -> UiL0Report {
 
 /// Check source against the L0 profile, naming it for diagnostics.
 pub fn check_ui_l0_named(_name: &str, source: &str) -> UiL0Report {
+    if let Some(report) = CHECK_CACHE.with(|cache| cache.borrow_mut().get(source)) {
+        return report;
+    }
+    let report = check_ui_l0_uncached(source);
+    CHECK_CACHE.with(|cache| cache.borrow_mut().insert(source, report.clone()));
+    report
+}
+
+fn check_ui_l0_uncached(source: &str) -> UiL0Report {
     let mut sink = Diagnostics::default();
     let header = parse_header(source);
 
@@ -384,23 +399,23 @@ fn check_header(header: &Option<CardHeader>, derived: Level, report: &mut UiL0Re
 
 /// A digest per component definition, sorted by name — profile §7.
 ///
-/// The digest covers everything that can move a card's level or change what it
-/// renders: params, state, events and the whole view body. It deliberately does
-/// NOT cover the component's position in the file, so reordering declarations is
+/// The digest covers params, state, events and transitive component/view bodies.
+/// External source/copy/theme contents are not approval-pinned by this report.
+/// It excludes the component's position in the file, so reordering declarations is
 /// not a version change.
 fn component_closure(card: &Card) -> Vec<(String, u64)> {
     let mut out: Vec<(String, u64)> = card
         .components
         .iter()
-        .map(|c| (c.name.clone(), definition_digest(c)))
+        .map(|c| (c.name.clone(), definition_digest(c, card)))
         .collect();
     out.sort();
     out
 }
 
-fn definition_digest(component: &Component) -> u64 {
+fn definition_digest(component: &Component, card: &Card) -> u64 {
     fn element(e: &Element, into: &mut String) {
-        into.push_str(&e.name);
+        into.push_str(&format!("{:?}", (&e.name, e.is_reference, &e.key_path)));
         into.push('(');
         for b in &e.binders {
             into.push_str(b);
@@ -425,25 +440,66 @@ fn definition_digest(component: &Component) -> u64 {
         into.push(')');
     }
 
-    let mut acc = String::new();
-    acc.push_str(&component.name);
-    for p in &component.params {
-        acc.push_str(&format!("{}:{:?}:{:?}", p.name, p.shape, p.default));
-        acc.push(',');
+    fn component_body(component: &Component, acc: &mut String) {
+        acc.push_str(&format!("component:{:?}", component.name));
+        for p in &component.params {
+            acc.push_str(&format!("{}:{:?}:{:?}", p.name, p.shape, p.default));
+            acc.push(',');
+        }
+        for st in &component.states {
+            acc.push_str(&format!(
+                "{}:{:?}:{:?}:{:?}:{}",
+                st.path, st.shape, st.initial, st.initial_path, st.keep
+            ));
+        }
+        for ev in &component.events {
+            acc.push_str(&ev.name);
+            for t in &ev.transitions {
+                acc.push_str(&format!("{}={:?}{:?}", t.target, t.form, t.tokens));
+            }
+        }
+        element(&component.body, acc);
     }
-    for st in &component.states {
-        acc.push_str(&format!(
-            "{}:{:?}:{:?}:{:?}:{}",
-            st.path, st.shape, st.initial, st.initial_path, st.keep
-        ));
-    }
-    for ev in &component.events {
-        acc.push_str(&ev.name);
-        for t in &ev.transitions {
-            acc.push_str(&format!("{}={:?}{:?}", t.target, t.form, t.tokens));
+    fn references(e: &Element, out: &mut Vec<(bool, String)>, card: &Card) {
+        if e.is_reference {
+            out.push((true, e.name.clone()));
+        } else if card.components.iter().any(|c| c.name == e.name) {
+            out.push((false, e.name.clone()));
+        }
+        for child in &e.children {
+            references(child, out, card);
         }
     }
-    element(&component.body, &mut acc);
+    // Include the actual transitive definitions, including referenced views.
+    // Locations and declaration order are excluded; semantic ordering within a
+    // definition is retained. State schema identity remains separate.
+    let mut pending = vec![(false, component.name.clone())];
+    let mut definitions = std::collections::BTreeMap::new();
+    while let Some((is_view, name)) = pending.pop() {
+        if definitions.contains_key(&(is_view, name.clone())) {
+            continue;
+        }
+        let mut definition = String::new();
+        let body = if is_view {
+            let Some(view) = card.views.iter().find(|v| v.name == name) else {
+                continue;
+            };
+            element(&view.body, &mut definition);
+            &view.body
+        } else {
+            let Some(component) = card.components.iter().find(|c| c.name == name) else {
+                continue;
+            };
+            component_body(component, &mut definition);
+            &component.body
+        };
+        references(body, &mut pending, card);
+        definitions.insert((is_view, name), definition);
+    }
+    let mut acc = format!("closure-v2:{:?}", component.name);
+    for (name, definition) in definitions {
+        acc.push_str(&format!("{:?}", (name, definition)));
+    }
 
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in acc.bytes() {
@@ -455,7 +511,7 @@ fn definition_digest(component: &Component) -> u64 {
 
 // ─────────────────────────────────────────────────────────────────── diagnostics ──
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Diagnostics {
     items: Vec<SyntaxDiagnostic>,
     truncated: bool,
@@ -568,7 +624,7 @@ fn lex(source: &str, sink: &mut Diagnostics) -> Option<Vec<Token>> {
 
         // String literal.
         if c == '"' {
-            let mut text = String::new();
+            let start = i;
             i += 1;
             col += 1;
             let mut closed = false;
@@ -582,7 +638,16 @@ fn lex(source: &str, sink: &mut Diagnostics) -> Option<Vec<Token>> {
                 if bytes[i] == '\n' {
                     break;
                 }
-                text.push(bytes[i]);
+                if bytes[i] == '\\' {
+                    // An escaped quote does not terminate the literal. Decode
+                    // once below so copy, state and component props all retain
+                    // identical newlines, Unicode escapes and backslashes.
+                    i += 1;
+                    col += 1;
+                    if i >= bytes.len() || bytes[i] == '\n' {
+                        break;
+                    }
+                }
                 i += 1;
                 col += 1;
             }
@@ -590,6 +655,18 @@ fn lex(source: &str, sink: &mut Diagnostics) -> Option<Vec<Token>> {
                 sink.push(start_line, start_col, "unterminated string".into());
                 return None;
             }
+            let raw: String = bytes[start..i].iter().collect();
+            let text = match serde_json::from_str::<String>(&raw) {
+                Ok(text) => text,
+                Err(error) => {
+                    sink.push(
+                        start_line,
+                        start_col,
+                        format!("invalid string escape: {error}"),
+                    );
+                    return None;
+                }
+            };
             out.push(Token {
                 kind: Kind::Str,
                 text,
@@ -844,6 +921,53 @@ fn classify_beyond_l0(tokens: &[Token]) -> Option<(Level, SyntaxDiagnostic)> {
     worst
 }
 
+// Source parsing/checking is independent of runtime data. Keep a small LRU per
+// thread; exact source keys preserve diagnostics and source changes invalidate
+// immediately. Oversized inputs are still checked, but never retained.
+const SOURCE_CACHE_ENTRIES: usize = 8;
+#[derive(Default)]
+struct SourceCache<T> {
+    entries: std::collections::VecDeque<(String, T)>,
+}
+impl<T: Clone> SourceCache<T> {
+    fn get(&mut self, source: &str) -> Option<T> {
+        let index = self.entries.iter().position(|(key, _)| key == source)?;
+        let entry = self.entries.remove(index)?;
+        let value = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(value)
+    }
+    fn insert(&mut self, source: &str, value: T) {
+        if source.len() > DEFAULT_MAX_SOURCE_BYTES {
+            return;
+        }
+        if self.entries.len() == SOURCE_CACHE_ENTRIES {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((source.to_owned(), value));
+    }
+}
+thread_local! {
+    static CHECK_CACHE: std::cell::RefCell<SourceCache<UiL0Report>> =
+        const { std::cell::RefCell::new(SourceCache { entries: std::collections::VecDeque::new() }) };
+    static PARSE_CACHE: std::cell::RefCell<SourceCache<(Option<std::rc::Rc<Card>>, Diagnostics)>> =
+        const { std::cell::RefCell::new(SourceCache { entries: std::collections::VecDeque::new() }) };
+}
+fn parsed_card(source: &str, sink: &mut Diagnostics) -> Option<std::rc::Rc<Card>> {
+    if let Some((card, diagnostics)) = PARSE_CACHE.with(|cache| cache.borrow_mut().get(source)) {
+        *sink = diagnostics;
+        return card;
+    }
+    let card =
+        lex(source, sink).map(|tokens| std::rc::Rc::new(Parser::new(&tokens, sink).parse_card()));
+    PARSE_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(source, (card.clone(), sink.clone()))
+    });
+    card
+}
+
 // ────────────────────────────────────────────────────────────────────────── ast ──
 
 #[derive(Debug, Default)]
@@ -1089,7 +1213,7 @@ struct Arg {
     column: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Operand {
     Path(String),
     Token(String),
@@ -1661,6 +1785,38 @@ impl<'a> Parser<'a> {
                                 )),
                                 Kind::Num => {
                                     v.text.parse::<f64>().ok().map(serde_json::Value::from)
+                                }
+                                Kind::Punct if v.is_punct("-") => {
+                                    // The lexer keeps unary '-' separate from
+                                    // the number. Dropping it silently changed
+                                    // a declared -1 (no selection) into the
+                                    // numeric default 0 during realization.
+                                    match self.tokens.get(scan + 3) {
+                                        Some(number) if number.kind == Kind::Num => {
+                                            if let Some(t) = self.tokens.get(scan + 4).filter(|t| {
+                                                t.kind == Kind::Punct
+                                                    && matches!(
+                                                        t.text.as_str(),
+                                                        "+" | "-" | "*" | "/" | "%"
+                                                    )
+                                            }) {
+                                                self.sink.at(t, "`initial:` takes a literal or source path, not an expression".into());
+                                            }
+                                            number
+                                                .text
+                                                .parse::<f64>()
+                                                .ok()
+                                                .map(|n| serde_json::Value::from(-n))
+                                        }
+                                        _ => {
+                                            self.sink.at(
+                                                v,
+                                                "negative initial requires a numeric literal"
+                                                    .into(),
+                                            );
+                                            None
+                                        }
+                                    }
                                 }
                                 Kind::Ident if v.text == "true" || v.text == "false" => {
                                     Some(serde_json::Value::Bool(v.text == "true"))
@@ -2494,11 +2650,7 @@ impl<'a> Parser<'a> {
             self.depth += 1;
             let rhs = self.parse_term();
             self.depth -= 1;
-            lhs = Operand::Expr {
-                lhs: Box::new(lhs),
-                op: op.text,
-                rhs: Box::new(rhs),
-            };
+            lhs = self.binary_operand(lhs, &op, rhs);
         }
         lhs
     }
@@ -2517,13 +2669,39 @@ impl<'a> Parser<'a> {
             self.depth += 1;
             let rhs = self.parse_atom();
             self.depth -= 1;
-            lhs = Operand::Expr {
-                lhs: Box::new(lhs),
-                op: op.text,
-                rhs: Box::new(rhs),
-            };
+            lhs = self.binary_operand(lhs, &op, rhs);
         }
         lhs
+    }
+
+    /// Parser recursion does not measure a left-associative chain's AST depth.
+    /// Bound each newly constructed operand before any recursive consumer (or
+    /// Drop) can see it. Error recovery discards only already-bounded trees.
+    fn bounded_operand(&mut self, value: Operand, at: &Token) -> Operand {
+        fn depth(value: &Operand) -> usize {
+            match value {
+                Operand::Expr { lhs, rhs, .. } => 1 + depth(lhs).max(depth(rhs)),
+                Operand::Predicate { rhs, .. } => 1 + depth(rhs),
+                _ => 1,
+            }
+        }
+        if depth(&value) > DEFAULT_MAX_SYNTAX_NESTING {
+            self.sink.at(at, "expression tree is too deep".into());
+            Operand::Num(0.0)
+        } else {
+            value
+        }
+    }
+
+    fn binary_operand(&mut self, lhs: Operand, op: &Token, rhs: Operand) -> Operand {
+        self.bounded_operand(
+            Operand::Expr {
+                lhs: Box::new(lhs),
+                op: op.text.clone(),
+                rhs: Box::new(rhs),
+            },
+            op,
+        )
     }
 
     fn parse_atom(&mut self) -> Operand {
@@ -2571,11 +2749,7 @@ impl<'a> Parser<'a> {
             self.depth += 1;
             let inner = self.parse_atom();
             self.depth -= 1;
-            return Operand::Expr {
-                lhs: Box::new(Operand::Num(0.0)),
-                op: "-".to_string(),
-                rhs: Box::new(inner),
-            };
+            return self.binary_operand(Operand::Num(0.0), &t, inner);
         }
         match t.kind {
             Kind::Token => {
@@ -2614,11 +2788,14 @@ impl<'a> Parser<'a> {
                         // same one every other nested construct uses.
                         let rhs = self.parse_operand();
                         self.depth -= 1;
-                        return Operand::Predicate {
-                            path,
-                            cmp: op.text,
-                            rhs: Box::new(rhs),
-                        };
+                        return self.bounded_operand(
+                            Operand::Predicate {
+                                path,
+                                cmp: op.text.clone(),
+                                rhs: Box::new(rhs),
+                            },
+                            &op,
+                        );
                     }
                 }
                 Operand::Path(path)
@@ -2689,8 +2866,11 @@ fn scope_value(scope: &ValueScope, operand: &Operand) -> Option<serde_json::Valu
         )),
         Operand::Str(s) => Some(serde_json::Value::String(s.clone())),
         Operand::Num(n) => Some(serde_json::Value::from(*n)),
-        // A nested comparison is not in the grammar.
-        Operand::Predicate { .. } => None,
+        Operand::Predicate { path, cmp, rhs } => Some(serde_json::Value::Bool(compare(
+            scope.lookup(path),
+            cmp,
+            scope_value(scope, rhs),
+        ))),
         Operand::Expr { lhs, op, rhs } => eval_expr(scope, lhs, op, rhs),
     }
 }
@@ -2732,67 +2912,32 @@ fn apply_op(a: f64, op: &str, b: f64) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
-/// Evaluate an expression with every path resolved by `resolve`.
-///
-/// The shape §9.3's probe needs: the same tree, the same operators, arbitrary
-/// values for the reads.
-fn fold_expr(operand: &Operand, resolve: &dyn Fn(&str) -> Option<f64>) -> Option<f64> {
-    match operand {
-        Operand::Num(n) => Some(*n),
-        Operand::Path(p) => resolve(p),
-        Operand::Expr { lhs, op, rhs } => {
-            apply_op(fold_expr(lhs, resolve)?, op, fold_expr(rhs, resolve)?)
-        }
-        // A comparison is a boolean, not a number, and arithmetic over one is
-        // not in the grammar.
+/// Establish a constant result only for a small set of structural identities.
+/// `None` means unknown, not that dependence or factual provenance was proved.
+/// The identities hold wherever all operands and the result are finite; missing
+/// inputs still propagate at runtime. No trial inputs or reassociation are used.
+fn constant_expr_value(operand: &Operand) -> Option<f64> {
+    let Operand::Expr { lhs, op, rhs } = operand else {
+        return match operand {
+            Operand::Num(n) if n.is_finite() => Some(*n),
+            _ => None,
+        };
+    };
+    let a = constant_expr_value(lhs);
+    let b = constant_expr_value(rhs);
+    if let (Some(a), Some(b)) = (a, b) {
+        return apply_op(a, op, b);
+    }
+    match op.as_str() {
+        "-" | "%" if lhs == rhs => Some(0.0),
+        "/" if lhs == rhs => Some(1.0),
+        "*" if a == Some(0.0) || b == Some(0.0) => Some(0.0),
         _ => None,
     }
 }
 
-/// Whether an expression's value is INDEPENDENT of everything it reads.
-///
-/// §9.3 requires an expression to read something, which stops `1547 * 3.2` and
-/// does not stop `quote.last * 0 + 1547` — one real reading laundering a
-/// fabricated number past the rule. That gap was recorded as needing an argument
-/// nobody had; this is the argument.
-///
-/// A formula is a formula because its answer MOVES when its inputs move. So the
-/// expression is evaluated with its reads bound to several distinct assignments,
-/// and an answer that never changes is a constant the model wrote with extra
-/// steps. `temp * 9 / 5 + 32` moves; `last * 0 + 1547` does not.
-///
-/// Distinct values PER PATH, varied across rounds, because binding every read to
-/// the same number would make `a - b` constant and condemn a correct formula.
-/// Three rounds of coprime-ish values: an expression that is constant across all
-/// three and not constant in general is not something the five arithmetic
-/// operators can express.
-///
-/// Unresolvable in every round (a division by a probed zero, say) is NOT
-/// degenerate — that is a partial expression, and §9.4 already renders it as
-/// missing.
 fn expr_is_constant(expr: &Operand) -> bool {
-    let mut paths = Vec::new();
-    expr_paths(expr, &mut paths);
-    paths.sort();
-    paths.dedup();
-    if paths.is_empty() {
-        // The must-read rule owns this case and reports it better.
-        return false;
-    }
-    let mut seen: Vec<f64> = Vec::new();
-    for (base, step) in [(2.0, 1.0), (5.0, 3.0), (11.0, 7.0)] {
-        let resolve = |p: &str| -> Option<f64> {
-            paths
-                .iter()
-                .position(|q| q == p)
-                .map(|i| base + step * i as f64)
-        };
-        match fold_expr(expr, &resolve) {
-            Some(v) => seen.push(v),
-            None => return false,
-        }
-    }
-    seen.windows(2).all(|w| w[0] == w[1])
+    constant_expr_value(expr).is_some()
 }
 
 /// Compare two resolved values. Shared by guards (`when a == b`) and by
@@ -2934,6 +3079,7 @@ pub mod catalog {
         "atro_light",
         "camo",
         "camo_light",
+        "taskplan_light",
     ];
 
     /// The theme AXES a card may name beside its mood, and the closed set each
@@ -3194,6 +3340,26 @@ pub mod catalog {
 
     /// Every constructor L0 admits, with the arguments each accepts.
     pub const CONSTRUCTORS: &[(&str, Args)] = &[
+        // Host-registered component contract. Presentation and geometry are
+        // references into a kit; neither shader source nor widget DSL is L0.
+        (
+            "Kit",
+            &[
+                ("component", Text),
+                ("instance", Text),
+                ("part", Text),
+                ("text", Text),
+                ("placeholder", Text),
+                ("enabled", Bool),
+                ("checked", Bool),
+                ("selected", Bool),
+                ("index", Number),
+                ("value", Number),
+                ("value2", Number),
+                ("focused", Bool),
+                ("password", Bool),
+            ],
+        ),
         ("Surface", &[("pad", Token(PAD))]),
         ("Photo", &[("src", Path), ("pad", Token(PAD))]),
         // A row-sized image. `Photo` fills its width (it is a backdrop); a list
@@ -3490,6 +3656,7 @@ pub mod catalog {
         ("sys.moonphase", &["lat", "lon"]),
         ("sys.photo", &["query", "cond"]),
         ("sys.locale", &[]),
+        ("sys.convert", &["amount", "from", "to", "direction", "fields"]),
         ("sys.gps", &[]),
         ("sys.search", &["query", "count", "fields"]),
         // COORDINATES, not places. A route needs four numbers and an argument
@@ -3511,11 +3678,14 @@ pub mod catalog {
         (
             "sys.step",
             &[
-                "from_lat", "from_lon", "to_lat", "to_lon", "at_lat", "at_lon", "fields",
+                "from_lat", "from_lon", "to_lat", "to_lon", "at_lat", "at_lon", "via", "fields",
             ],
         ),
         ("sys.places", &["lat", "lon", "category", "count", "fields"]),
         ("sys.news", &["count", "offset", "fields"]),
+        ("sys.news_digest", &["query", "language", "count", "fields"]),
+        ("sys.news_status", &["query", "language", "fields"]),
+        ("sys.dataset", &["id", "fields"]),
         ("sys.quakes", &["count", "offset", "fields"]),
         ("sys.news_item", &["id", "fields"]),
         // `symbols` names the UNIVERSE to rank. Without it the only universe is
@@ -3549,7 +3719,7 @@ pub mod catalog {
         // The user's saved places. Same shape as `sys.watchlist`: no selector,
         // because it IS the list, and the host joins each stored place to a
         // live reading.
-        ("sys.cities", &["fields"]),
+        ("sys.cities", &["fields", "unit"]),
     ];
 
     pub fn source(name: &str) -> Option<&'static [&'static str]> {
@@ -3624,6 +3794,7 @@ pub mod catalog {
         // A photo is a URL, not a record. No field is readable off it.
         ("sys.photo", &[]),
         ("sys.locale", &["lang", "temp_unit"]),
+        ("sys.convert", &["amount", "value"]),
         ("sys.gps", &["lat", "lon", "accuracy", "ok"]),
         // `label` is the secondary line — city, region, country. Without it a search
         // for "Stanford" renders five rows all reading "Stanford", which is what
@@ -3643,6 +3814,12 @@ pub mod catalog {
             "sys.news",
             &["id", "title", "author", "points", "comments", "url"],
         ),
+        ("sys.news_digest", &["id", "title", "summary", "publisher", "url", "published_at"]),
+        ("sys.dataset", &["title", "subtitle", "summary", "coverage", "status", "as_of",
+            "metric1_label", "metric1_value", "metric2_label", "metric2_value",
+            "pick1_title", "pick1_body", "pick1_source", "url1", "pick2_title", "pick2_body", "pick2_source", "url2",
+            "pick3_title", "pick3_body", "pick3_source", "url3", "evidence_title", "evidence_body"]),
+        ("sys.news_status", &["status", "message", "count"]),
         (
             "sys.quakes",
             &["id", "mag", "place", "depth", "ago", "lat", "lon"],
@@ -3728,7 +3905,7 @@ pub mod catalog {
         (
             "sys.cities",
             &[
-                "name", "lat", "lon", "temp", "feels", "hi", "lo", "cond", "humidity", "wind",
+                "name", "lat", "lon", "temp", "feels", "feels_delta", "hi", "lo", "cond", "humidity", "wind",
             ],
         ),
     ];
@@ -5537,6 +5714,8 @@ pub struct UiNode {
     pub bindings: Vec<(String, SourceBinding)>,
     /// For each argument that is an L1 expression, its resolved shape.
     pub exprs: Vec<(String, ExprPart)>,
+    /// Host-authenticated origins, retained through props and state.
+    pub origins: Vec<(String, ValueOrigin)>,
 }
 
 /// Where an argument's value came from, with the source's own arguments already
@@ -5650,7 +5829,8 @@ pub struct RealizeReport {
     /// A bound was reached; the tree is partial.
     pub truncated: bool,
     /// Every component instance this realization produced, plus the card cell.
-    /// Pass to [`InstanceStore::prune`] to forget instances that went away —
+    /// After [`Self::complete_root`] succeeds, pass to [`InstanceStore::prune`]
+    /// to forget instances that went away —
     /// without it the store grows for the life of the app, and a key that
     /// reappears inherits a stale value (§5.7, unmount).
     pub live_keys: Vec<String>,
@@ -5660,7 +5840,8 @@ pub struct RealizeReport {
     /// Card state whose value came from a declared `initial: <source path>` this
     /// realization — the first answer a source gave for it.
     ///
-    /// A HOST should write these into the store, and that write is what makes the
+    /// After [`Self::complete_root`] succeeds, a host should write these into
+    /// the store. That write is what makes the
     /// capture a capture. Left unwritten, an `initial:` re-resolves on every
     /// realization and the state follows its source: an origin declared as "where I
     /// am" then chases the device, and a route declared from it is re-fetched before
@@ -5671,6 +5852,27 @@ pub struct RealizeReport {
     /// Only what an `initial_path` produced. A literal initial needs no capturing and
     /// a value already in the store is already captured.
     pub captured: Vec<(String, serde_json::Value)>,
+}
+
+impl RealizeReport {
+    /// Only complete, diagnostic-free realizations may be mounted or used to
+    /// prune instance state. A root alone can represent a partial result.
+    pub fn complete_root(&self) -> Result<&UiNode, String> {
+        if self.truncated {
+            return Err("card realization exceeded its resource limits".into());
+        }
+        if !self.diagnostics.is_empty() {
+            return Err(self
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
+        self.root
+            .as_ref()
+            .ok_or_else(|| "card realization produced no root".into())
+    }
 }
 
 /// Realize a card against resolved data.
@@ -5704,8 +5906,8 @@ fn realize_inner(
         };
     }
 
-    let tokens = match lex(source, &mut sink) {
-        Some(t) => t,
+    let card = match parsed_card(source, &mut sink) {
+        Some(card) => card,
         None => {
             return RealizeReport {
                 root: None,
@@ -5718,8 +5920,6 @@ fn realize_inner(
             }
         }
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
-
     let Some(root) = card.views.iter().find(|v| v.name == "root") else {
         sink.push(1, 1, "a card needs a `view root`".into());
         return RealizeReport {
@@ -5765,14 +5965,22 @@ fn realize_inner(
                 // a state that follows its source is not an initial value.
                 match state.initial_path.as_ref().and_then(|p| data_path(data, p)) {
                     Some(v) => {
-                        captured.push((state.path.clone(), v.clone()));
+                        if initial_origin(state, &card) == ValueOrigin::Source {
+                            captured.push((state.path.clone(), v.clone()));
+                        }
                         v
                     }
                     None => initial_for(&state.shape),
                 }
             }
         };
-        frames.push((state.path.clone(), value, None));
+        frames.push((
+            state.path.clone(),
+            value,
+            None,
+            None,
+            card_state_origin(state, store, data, &card),
+        ));
     }
     let mut scope = ValueScope {
         frames,
@@ -5802,7 +6010,13 @@ fn realize_inner(
 ///
 /// Named rather than left as a bare tuple because it grew a third element and
 /// clippy was right that four nested types in a signature stop being readable.
-type Frame = (String, serde_json::Value, Option<ItemOrigin>);
+type Frame = (
+    String,
+    serde_json::Value,
+    Option<ItemOrigin>,
+    Option<ExprPart>,
+    ValueOrigin,
+);
 
 /// Which collection a loop binder iterates, and at what index.
 ///
@@ -5880,8 +6094,8 @@ impl ValueScope<'_> {
             return Some(serde_json::Value::String(text.1.clone()));
         }
 
-        let mut current = match self.frames.iter().rev().find(|(n, _, _)| n == root) {
-            Some((_, v, _)) => v,
+        let mut current = match self.frames.iter().rev().find(|(n, _, _, _, _)| n == root) {
+            Some((_, v, _, _, _)) => v,
             None => self.data.get(root)?,
         };
         for segment in segments {
@@ -6025,16 +6239,33 @@ impl Realizer<'_> {
             children: Vec::new(),
             bindings: Vec::new(),
             exprs: Vec::new(),
+            origins: Vec::new(),
         };
         for arg in &element.args {
             let value = self.value(&element.name, &arg.name, &arg.value, scope);
+            let origin = scope.operand_origin(&arg.value, self.card);
+            node.origins.push((arg.name.clone(), origin));
+            if needs_data_origin(&element.name, &arg.name, &value) && !origin.permits_data() {
+                // Suppress the binding/expression too, or live lowering could
+                // resurrect the value that the renderer refused.
+                node.args.push((arg.name.clone(), NodeValue::Missing));
+                continue;
+            }
             if let Operand::Path(path) = &arg.value {
                 if let Some(binding) = self.source_binding(path, scope) {
                     node.bindings.push((arg.name.clone(), binding));
                 }
             }
-            if matches!(arg.value, Operand::Expr { .. }) {
+            if matches!(arg.value, Operand::Expr { .. })
+                || matches!(&arg.value, Operand::Path(p) if scope.frames.iter().rev()
+                    .find(|(n, _, _, _, _)| n == p).is_some_and(|(_, _, _, e, _)| e.is_some()))
+            {
                 if let Some(shape) = self.expr_shape(&arg.value, scope) {
+                    if let ExprPart::Call(binding) = &shape {
+                        if !node.bindings.iter().any(|(n, _)| n == &arg.name) {
+                            node.bindings.push((arg.name.clone(), binding.clone()));
+                        }
+                    }
                     node.exprs.push((arg.name.clone(), shape));
                 }
             }
@@ -6067,6 +6298,7 @@ impl Realizer<'_> {
         // routing; and an enum token bound with its leading dot, so every
         // comparison against it inside the component was false.
         let mut bound = 0usize;
+        let mut param_frames = Vec::new();
         for param in &component.params {
             let supplied = call.args.iter().find(|a| a.name == param.name);
             let value = match (supplied, &param.shape) {
@@ -6082,10 +6314,7 @@ impl Realizer<'_> {
                     Operand::Token(t) => {
                         serde_json::Value::String(t.trim_start_matches('.').to_string())
                     }
-                    Operand::Path(p) | Operand::Predicate { path: p, .. } => scope
-                        .lookup(p)
-                        .unwrap_or_else(|| serde_json::Value::String(p.clone())),
-                    other => literal_of(other),
+                    other => scope_value(scope, other).unwrap_or(serde_json::Value::Null),
                 },
                 // Omitted: the declared default, or nothing. Binding a frame
                 // either way is what stops lookup falling through to injected
@@ -6109,14 +6338,23 @@ impl Realizer<'_> {
                         .frames
                         .iter()
                         .rev()
-                        .find(|(n, _, prov)| n == root && prov.is_some())
-                        .and_then(|(_, _, prov)| prov.clone())
+                        .find(|(n, _, prov, _, _)| n == root && prov.is_some())
+                        .and_then(|(_, _, prov, _, _)| prov.clone())
                 }
                 _ => None,
             };
-            scope.frames.push((param.name.clone(), value, provenance));
+            let expression = if param.shape == Shape::Event {
+                None
+            } else {
+                supplied.and_then(|a| self.expr_shape(&a.value, scope))
+            };
+            let origin = supplied
+                .map(|a| scope.operand_origin(&a.value, self.card))
+                .unwrap_or(ValueOrigin::Authored);
+            param_frames.push((param.name.clone(), value, provenance, expression, origin));
             bound += 1;
         }
+        scope.frames.extend(param_frames);
         let instance_key = format!("{key}/{}", component.name);
         self.live.push(instance_key.clone());
         self.slots.push(split_slots(&call.children));
@@ -6138,15 +6376,32 @@ impl Realizer<'_> {
                         *k == schema || state.keep && s.shape_unchanged(component, state)
                     })
                 })
-                .and_then(|s| s.get(&instance_key, &state.path))
-                .cloned();
+                .and_then(|s| {
+                    s.get(&instance_key, &state.path)
+                        .cloned()
+                        .map(|v| (v, s.origin(&instance_key, &state.path).unwrap_or_default()))
+                });
             let from_path = state.initial_path.as_ref().and_then(|p| scope.lookup(p));
+            let origin = live.as_ref().map(|(_, o)| *o).unwrap_or_else(|| {
+                if state.initial.is_none() && state.initial_path.is_some() && from_path.is_none() {
+                    return ValueOrigin::Unknown;
+                }
+                state
+                    .initial_path
+                    .as_ref()
+                    .filter(|_| state.initial.is_none())
+                    .map(|p| scope.path_origin(p, self.card))
+                    .unwrap_or_else(|| initial_origin(state, self.card))
+            });
             scope.frames.push((
                 state.path.clone(),
-                live.or_else(|| state.initial.clone())
+                live.map(|(v, _)| v)
+                    .or_else(|| state.initial.clone())
                     .or(from_path)
                     .unwrap_or_else(|| initial_for(&state.shape)),
                 None,
+                None,
+                origin,
             ));
             bound += 1;
         }
@@ -6230,11 +6485,10 @@ impl Realizer<'_> {
                 })
                 .unwrap_or_else(|| index.to_string());
 
-            // Report the collision, then disambiguate so the two instances do
-            // not share a cell. Rendering both with distinct identity is safer
-            // than dropping one: a missing row is harder to notice than a
-            // diagnostic.
-            let item_key = if seen_keys.contains(&item_key) {
+            // A recovery suffix is still in the input key namespace: A, A,
+            // A#1 used to give two rows the same cell. Omit the duplicate and
+            // keep a diagnostic; complete_root refuses this partial result.
+            if seen_keys.contains(&item_key) {
                 self.sink.push(
                     element.line,
                     element.column,
@@ -6243,11 +6497,9 @@ impl Realizer<'_> {
                          instances share one state cell (profile §5.7)"
                     ),
                 );
-                format!("{item_key}#{index}")
-            } else {
-                seen_keys.push(item_key.clone());
-                item_key
-            };
+                continue;
+            }
+            seen_keys.push(item_key.clone());
 
             let mut bound = 0usize;
             if let Some(binder) = element.binders.first() {
@@ -6258,6 +6510,8 @@ impl Realizer<'_> {
                     binder.clone(),
                     item.clone(),
                     Some((path.to_string(), index)),
+                    None,
+                    scope.path_origin(path, self.card),
                 ));
                 bound += 1;
             }
@@ -6266,6 +6520,8 @@ impl Realizer<'_> {
                     index_binder.clone(),
                     serde_json::Value::from(index + 1),
                     None,
+                    None,
+                    ValueOrigin::Vocabulary,
                 ));
                 bound += 1;
             }
@@ -6464,12 +6720,56 @@ impl Realizer<'_> {
     /// value realization already resolved. Returning `None` for an operand that
     /// resolves to nothing keeps a half-resolved expression from lowering — it
     /// renders as the missing binding it is.
-    fn expr_shape(&self, operand: &Operand, scope: &ValueScope) -> Option<ExprPart> {
+    fn expr_shape(&mut self, operand: &Operand, scope: &ValueScope) -> Option<ExprPart> {
+        self.expr_shape_inner(operand, scope, 0)
+    }
+
+    fn charge_expression(&mut self, depth: usize) -> bool {
+        if depth >= DEFAULT_MAX_SYNTAX_NESTING || self.work >= self.limits.max_work {
+            self.truncated = true;
+            return false;
+        }
+        self.work += 1;
+        true
+    }
+
+    // Substituting props can expand a small AST into an exponential tree.
+    // Charge every copied node and bound depth before allocating or recursing.
+    fn copy_expr(&mut self, expr: &ExprPart, depth: usize) -> Option<ExprPart> {
+        if !self.charge_expression(depth) {
+            return None;
+        }
+        Some(match expr {
+            ExprPart::Bin(a, op, b) => ExprPart::Bin(
+                Box::new(self.copy_expr(a, depth + 1)?),
+                op.clone(),
+                Box::new(self.copy_expr(b, depth + 1)?),
+            ),
+            leaf => leaf.clone(),
+        })
+    }
+
+    fn expr_shape_inner(
+        &mut self,
+        operand: &Operand,
+        scope: &ValueScope,
+        depth: usize,
+    ) -> Option<ExprPart> {
+        if !self.charge_expression(depth) {
+            return None;
+        }
+        if let Operand::Path(p) = operand {
+            if let Some((_, _, _, Some(expr), _)) =
+                scope.frames.iter().rev().find(|(n, _, _, _, _)| n == p)
+            {
+                return self.copy_expr(expr, depth);
+            }
+        }
         match operand {
             Operand::Expr { lhs, op, rhs } => Some(ExprPart::Bin(
-                Box::new(self.expr_shape(lhs, scope)?),
+                Box::new(self.expr_shape_inner(lhs, scope, depth + 1)?),
                 op.clone(),
-                Box::new(self.expr_shape(rhs, scope)?),
+                Box::new(self.expr_shape_inner(rhs, scope, depth + 1)?),
             )),
             // FULL PRECISION, not `trim_num`. `trim_num` is a DISPLAY rule — one
             // decimal, because a temperature reads as 21.4 and not 21.437 — and an
@@ -6507,8 +6807,8 @@ impl Realizer<'_> {
             .frames
             .iter()
             .rev()
-            .find(|(n, _, prov)| n == root && prov.is_some())
-            .and_then(|(_, _, prov)| prov.as_ref())
+            .find(|(n, _, prov, _, _)| n == root && prov.is_some())
+            .and_then(|(_, _, prov, _, _)| prov.as_ref())
             .map(|(collection, index)| {
                 if rest.is_empty() {
                     format!("{collection}.{index}")
@@ -6673,6 +6973,21 @@ impl Realizer<'_> {
                 };
             }
         }
+        // `.on`/`.off` are the authored selected-state tokens used by the
+        // beauty-card pipeline. On a Boolean argument they must become a
+        // Boolean, otherwise Chip's lowerers silently draw every chip off.
+        if catalog::lookup(ctor)
+            .and_then(|args| args.iter().find(|(n, _)| *n == arg))
+            .is_some_and(|(_, kind)| matches!(kind, catalog::ArgKind::Bool))
+        {
+            if let Operand::Token(token) = operand {
+                match token.trim_start_matches('.') {
+                    "on" => return NodeValue::Bool(true),
+                    "off" => return NodeValue::Bool(false),
+                    _ => {}
+                }
+            }
+        }
         match operand {
             Operand::Token(t) => NodeValue::Token(t.trim_start_matches('.').to_string()),
             Operand::Str(s) => NodeValue::Text(s.clone()),
@@ -6827,8 +7142,8 @@ pub mod makepad {
         text_of(arg(node, arg_name))
     }
 
-    /// An `ExprPart` as backend arithmetic. Parenthesised at every join, so the
-    /// tree's shape survives regardless of the target VM's precedence rules.
+    /// An `ExprPart` as finite-or-missing backend arithmetic. Each helper call
+    /// preserves the tree shape and applies the same checks as `apply_op`.
     pub(super) fn render_expr(part: &ExprPart) -> Option<String> {
         match part {
             ExprPart::Const(v) => Some(v.clone()),
@@ -6845,7 +7160,7 @@ pub mod makepad {
             // capability and the helpers cannot all change shape for it.
             ExprPart::Call(binding) => vm_call(binding).map(|c| format!("sys.num({c})")),
             ExprPart::Bin(lhs, op, rhs) => Some(format!(
-                "({} {op} {})",
+                "sys.l0_math({op:?}, {}, {})",
                 render_expr(lhs)?,
                 render_expr(rhs)?
             )),
@@ -7212,6 +7527,22 @@ pub mod makepad {
             })
         };
         match binding.helper.as_str() {
+            "sys.convert" => {
+                if !matches!(binding.field.as_str(), "amount" | "value") {
+                    return None;
+                }
+                let amount = arg("amount")?;
+                if !binding.nested.iter().any(|name| name == "amount")
+                    && !amount.parse::<f64>().is_ok_and(f64::is_finite)
+                {
+                    return None;
+                }
+                let from = text("from")?;
+                let to = text("to")?;
+                let direction = text("direction").unwrap_or_else(|| "\"fwd\"".into());
+                let field = if binding.field == "amount" { ", \"amount\"" } else { "" };
+                Some(format!("sys.convert({amount}, {from}, {to}, {direction}{field})"))
+            }
             // THE FOUR THAT ANSWERED NOTHING. Each is in the catalog, so a card may
             // declare it and the checker accepts it — and each fell through to
             // `None`, which means the realized literal, which on this host is an
@@ -7427,6 +7758,25 @@ pub mod makepad {
                 };
                 Some(format!("sys.airquality({lat}, {lon}, {path:?})"))
             }
+            "sys.dataset" => {
+                let id = text("id")?;
+                if !crate::catalog::answers("sys.dataset")?.contains(&binding.field.as_str()) { return None; }
+                Some(format!("sys.dataset({id}, {:?})", binding.field))
+            }
+            "sys.news_digest" | "sys.news_status" => {
+                let query = text("query")?;
+                let language = text("language").unwrap_or_else(|| "\"en\"".into());
+                let field = if binding.helper == "sys.news_status" {
+                    if !matches!(binding.field.as_str(), "status" | "message" | "count") { return None; }
+                    binding.field.clone()
+                } else {
+                    let (row, field) = binding.field.split_once('.')?;
+                    let row: usize = row.parse().ok()?;
+                    if row >= 3 || !matches!(field, "id" | "title" | "summary" | "publisher" | "url" | "published_at") { return None; }
+                    format!("items.{row}.{field}")
+                };
+                Some(format!("sys.news_digest({query}, {language}, {field:?})"))
+            }
             // A headline feed, indexed like the movers list.
             "sys.news" => {
                 let (index, field) = binding.field.split_once('.')?;
@@ -7581,11 +7931,16 @@ pub mod makepad {
                 let p = num("to_lon")?;
                 let at_lat = num("at_lat")?;
                 let at_lon = num("at_lon")?;
-                let along = format!("sys.navprog({a}, {o}, {b}, {p}, {at_lat}, {at_lon})");
+                let via = via_string(&arg("via").unwrap_or_default())
+                    .map(|v| format!(", {v}"))
+                    .unwrap_or_default();
+                let along = format!("sys.navprog({a}, {o}, {b}, {p}, {at_lat}, {at_lon}{via})");
                 if key == "progress" {
                     return Some(along);
                 }
-                Some(format!("sys.navstep({a}, {o}, {b}, {p}, {along}, {key:?})"))
+                Some(format!(
+                    "sys.navstep({a}, {o}, {b}, {p}, {along}, {key:?}{via})"
+                ))
             }
             "sys.gps" => {
                 let key = match binding.field.as_str() {
@@ -7623,10 +7978,10 @@ pub mod makepad {
                     // `query` is the text that finds this hit again — what a
                     // results row must carry, or picking the third "Stanford" sets
                     // state to "Stanford" and routes to the first.
-                    "name" | "label" | "query" => {
+                    "id" | "name" | "label" | "query" => {
                         Some(format!("sys.search({query}, {index}, {field:?})"))
                     }
-                    // `id` and `distance` have no answer in the helper, so they
+                    // `distance` has no answer in the helper, so it must
                     // fall back rather than emitting a call that returns "".
                     _ => None,
                 }
@@ -7775,11 +8130,14 @@ pub mod makepad {
                 let (index, field) = binding.field.split_once('.')?;
                 index.parse::<u32>().ok()?;
                 let key = match field {
-                    f @ ("name" | "lat" | "lon" | "temp" | "feels" | "hi" | "lo" | "cond"
+                    f @ ("name" | "lat" | "lon" | "temp" | "feels" | "feels_delta" | "hi" | "lo" | "cond"
                     | "humidity" | "wind") => f,
                     _ => return None,
                 };
-                Some(format!("sys.cities({index}, {key:?})"))
+                Some(match text("unit") {
+                    Some(unit) => format!("sys.cities({index}, {key:?}, {unit})"),
+                    None => format!("sys.cities({index}, {key:?})"),
+                })
             }
             // The query is a path into declared state, so it reaches the helper
             // as whatever the user committed — the card never builds it.
@@ -8182,7 +8540,8 @@ pub mod makepad {
     /// | `money` | yes | `sys.stock` returns two decimals, so `"$"` prefixes it |
     /// | `signed_pct` | yes | the VM already returns `"+0.63%"` — applying it again would double the sign |
     /// | `signed_money` | no | the sign goes OUTSIDE the currency symbol; not a prefix |
-    /// | `compact`, `ratio` | no | need the number to divide or round |
+    /// | `ratio` | yes | the runtime formats the live number to one decimal |
+    /// | `compact` | no | needs the number to divide or round |
     ///
     /// Returning `None` is the safe direction: the seeded value is stale but
     /// correct, where a wrong concatenation is neither.
@@ -8208,12 +8567,16 @@ pub mod makepad {
         } else {
             binding.clone()
         };
-        let call = vm_call(binding)?;
+        let mut call = vm_call(binding)?;
         let prefix = match format_kind {
             // Already whole: the helper returned the sign and the symbol in the
             // right order, so nothing may be prepended.
             None | Some("signed_pct") | Some("signed_money") => String::new(),
             Some("money") => "$".to_owned(),
+            Some("ratio") => {
+                call = format!("sys.l0_ratio({call})");
+                String::new()
+            }
             Some(_) => return None,
         };
         let mut expr = String::new();
@@ -8292,6 +8655,15 @@ pub mod makepad {
     fn element_body(node: &UiNode, depth: usize, out: &mut String) {
         let p = pad(depth);
         match node.kind.as_str() {
+            "Kit" => {
+                // The direct dialect backend has no host pack registry. Fail
+                // visibly; the registered kit lowering is the supported path.
+                let _ = writeln!(
+                    out,
+                    "{p}Label{{text: {:?}}}",
+                    "Kit requires registered component lowering"
+                );
+            }
             // A card holding a MAP is laid out the way the shipping nav card lays
             // one out: the map is the BOTTOM layer of an overlay and everything
             // else floats above it. Any other card keeps the ordinary column.
@@ -8958,7 +9330,7 @@ pub const CARD_STATE_KEY: &str = "@card";
 #[derive(Clone, Debug, Default)]
 pub struct InstanceStore {
     /// `instance-key` → field → value.
-    cells: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    cells: BTreeMap<String, BTreeMap<String, (serde_json::Value, ValueOrigin)>>,
     /// Component name → the schema id its live cells were written under.
     schemas: BTreeMap<String, u64>,
     /// Component name → state path → the shape that cell was written under.
@@ -8969,21 +9341,32 @@ pub struct InstanceStore {
 
 impl InstanceStore {
     pub fn get(&self, key: &str, field: &str) -> Option<&serde_json::Value> {
-        self.cells.get(key)?.get(field)
+        self.cells.get(key)?.get(field).map(|(v, _)| v)
     }
 
     /// Write a cell. Public because a HOST owns when a captured initial becomes
     /// durable — see `RealizeReport::captured`. The realizer decides what was
     /// captured; only the host can decide it is now the state's value.
     pub fn set_cell(&mut self, key: &str, field: &str, value: serde_json::Value) {
-        self.set(key, field, value);
+        self.set_cell_with_origin(key, field, value, ValueOrigin::Host);
     }
 
-    fn set(&mut self, key: &str, field: &str, value: serde_json::Value) {
+    pub fn origin(&self, key: &str, field: &str) -> Option<ValueOrigin> {
+        self.cells.get(key)?.get(field).map(|(_, o)| *o)
+    }
+
+    /// Trusted host API. Never take `origin` from card text or event JSON.
+    pub fn set_cell_with_origin(
+        &mut self,
+        key: &str,
+        field: &str,
+        value: serde_json::Value,
+        origin: ValueOrigin,
+    ) {
         self.cells
             .entry(key.to_string())
             .or_default()
-            .insert(field.to_string(), value);
+            .insert(field.to_string(), (value, origin));
     }
 
     /// Whether `state` has the shape the store's live cells were written under.
@@ -9158,7 +9541,15 @@ pub fn dispatch_with_data(
     payload: Option<&serde_json::Value>,
     data: &serde_json::Value,
 ) -> bool {
-    let (changed, durable) = dispatch_writes(source, store, instance_key, event, payload, data);
+    let (changed, durable) = dispatch_writes(
+        source,
+        store,
+        instance_key,
+        event,
+        payload,
+        data,
+        ValueOrigin::Authored,
+    );
     !changed.is_empty() || !durable.is_empty()
 }
 
@@ -9224,7 +9615,36 @@ pub fn dispatch_reporting(
     payload: Option<&serde_json::Value>,
     data: &serde_json::Value,
 ) -> DispatchOutcome {
-    let (changed, writes) = dispatch_writes(source, store, instance_key, event, payload, data);
+    dispatch_reporting_with_origin(
+        source,
+        store,
+        instance_key,
+        event,
+        payload,
+        data,
+        ValueOrigin::Authored,
+    )
+}
+
+/// Dispatch a native event with its origin established by the host.
+pub fn dispatch_reporting_with_origin(
+    source: &str,
+    store: &mut InstanceStore,
+    instance_key: &str,
+    event: &str,
+    payload: Option<&serde_json::Value>,
+    data: &serde_json::Value,
+    payload_origin: ValueOrigin,
+) -> DispatchOutcome {
+    let (changed, writes) = dispatch_writes(
+        source,
+        store,
+        instance_key,
+        event,
+        payload,
+        data,
+        payload_origin,
+    );
     if changed.is_empty() && writes.is_empty() {
         return DispatchOutcome::default();
     }
@@ -9257,12 +9677,12 @@ fn dispatch_writes(
     event: &str,
     payload: Option<&serde_json::Value>,
     data: &serde_json::Value,
+    payload_origin: ValueOrigin,
 ) -> (Vec<String>, Vec<CollectionWrite>) {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return (Vec::new(), Vec::new());
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
 
     // A backend dispatches with the key of the NODE that was tapped, which sits
     // inside the component rather than at its boundary — `…/Rowy/0/1`. The cell
@@ -9315,7 +9735,13 @@ fn dispatch_writes(
     // Stage every write first, commit only if the whole batch resolves.
     // (target, next, effective current) — the third is what decides whether this
     // transition is a change at all.
-    let mut staged: Vec<(String, serde_json::Value, serde_json::Value)> = Vec::new();
+    let mut staged: Vec<(
+        String,
+        serde_json::Value,
+        serde_json::Value,
+        ValueOrigin,
+        ValueOrigin,
+    )> = Vec::new();
     // §5.12 writes are staged alongside the cells, so §3's atomicity covers both:
     // a batch that sets a preference AND appends to a list must do neither if the
     // preference cannot be resolved.
@@ -9373,8 +9799,8 @@ fn dispatch_writes(
         let current = staged
             .iter()
             .rev()
-            .find(|(t, _, _)| *t == transition.target)
-            .map(|(_, v, _)| v.clone())
+            .find(|(t, ..)| *t == transition.target)
+            .map(|(_, v, ..)| v.clone())
             .or_else(|| store.get(instance_key, &transition.target).cloned())
             // The HOST-SEEDED value, and it has to be here because it is here in
             // the renderer.
@@ -9472,7 +9898,49 @@ fn dispatch_writes(
             },
             _ => return (Vec::new(), Vec::new()),
         };
-        staged.push((transition.target.clone(), next, current));
+        let previous_origin = staged
+            .iter()
+            .rev()
+            .find(|(t, ..)| *t == transition.target)
+            .map(|(_, _, _, o, _)| *o)
+            .or_else(|| store.origin(instance_key, &transition.target))
+            .unwrap_or_else(|| {
+                if instance_key == CARD_STATE_KEY {
+                    card_state_origin(state, None, data, &card)
+                } else {
+                    initial_origin(state, &card)
+                }
+            });
+        let origin = match &transition.form {
+            Form::Set(SetSource::Payload) => payload_origin,
+            Form::Set(SetSource::Path(path)) => ValueScope {
+                frames: Vec::new(),
+                data,
+                copies: &card.copies,
+            }
+            .path_origin(path, &card),
+            Form::Next(_) | Form::Prev(_) => ValueOrigin::Source,
+            Form::Toggle | Form::Cycle | Form::Set(SetSource::Token(_) | SetSource::Bool(_)) => {
+                ValueOrigin::Vocabulary
+            }
+            Form::Clear if declared_initial.is_none() && state.initial_path.is_some() => {
+                ValueOrigin::Unknown
+            }
+            Form::Clear => initial_origin(state, &card),
+            _ => ValueOrigin::Authored,
+        };
+        let origin = if matches!(state.shape, Shape::Bool | Shape::Enum(_)) {
+            ValueOrigin::Vocabulary
+        } else {
+            origin
+        };
+        staged.push((
+            transition.target.clone(),
+            next,
+            current,
+            origin,
+            previous_origin,
+        ));
     }
 
     // Commit, and report what CHANGED. The targets are what a host needs to know
@@ -9496,9 +9964,10 @@ fn dispatch_writes(
     // its transitions moved. A batch that sets one cell to a new value and
     // another to the value it holds reports the first and rebuilds once.
     let mut written = Vec::new();
-    for (target, value, previous) in staged {
-        let unchanged = value == previous;
-        store.set(instance_key, &target, value);
+    for (target, value, previous, origin, previous_origin) in staged {
+        let unchanged =
+            value == previous && origin.permits_data() == previous_origin.permits_data();
+        store.set_cell_with_origin(instance_key, &target, value, origin);
         if unchanged || written.contains(&target) {
             continue;
         }
@@ -9549,10 +10018,9 @@ pub struct SourcePlan {
 /// against injected data at realization, which is after this is useful.
 pub fn state_initials(source: &str) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return std::collections::BTreeMap::new();
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
     card.states
         .iter()
         .filter_map(|st| st.initial.clone().map(|v| (st.path.clone(), v)))
@@ -9643,10 +10111,10 @@ pub fn icon_glyph(name: &str) -> &'static str {
 /// source rather than about a realized tree.
 pub fn card_theme_axes(source: &str) -> Vec<(String, String)> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return Vec::new();
     };
-    Parser::new(&tokens, &mut sink).parse_card().theme_axes
+    card.theme_axes.clone()
 }
 
 /// The theme this card declares, or `None` for the default.
@@ -9661,11 +10129,10 @@ pub fn card_theme_axes(source: &str) -> Vec<(String, String)> {
 /// build the source the kit is concatenated into, which is earlier than a tree.
 pub fn card_theme(source: &str) -> Option<String> {
     let mut sink = Diagnostics::default();
-    let tokens = lex(source, &mut sink)?;
-    Parser::new(&tokens, &mut sink)
-        .parse_card()
+    parsed_card(source, &mut sink)?
         .theme
-        .map(|(name, _)| name)
+        .as_ref()
+        .map(|(name, _)| name.clone())
 }
 
 /// The ROLE the card's root view names — `Surface`, `Photo`, `Map`.
@@ -9680,9 +10147,7 @@ pub fn card_theme(source: &str) -> Option<String> {
 /// caller seeing `None` has a card that was not going to render anyway.
 pub fn card_root_role(source: &str) -> Option<String> {
     let mut sink = Diagnostics::default();
-    let tokens = lex(source, &mut sink)?;
-    Parser::new(&tokens, &mut sink)
-        .parse_card()
+    parsed_card(source, &mut sink)?
         .views
         .iter()
         .find(|v| v.name == "root")
@@ -9714,10 +10179,9 @@ pub fn card_root_role(source: &str) -> Option<String> {
 /// component reads its props rather than a card-level source.
 pub fn guarded_source_fields(source: &str) -> Vec<(String, String)> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return Vec::new();
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
     guarded_fields_of(&card)
 }
 
@@ -9890,10 +10354,9 @@ fn resolved_bindings(
     select: fn(&Card) -> Vec<(String, String)>,
 ) -> Vec<GuardBinding> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return Vec::new();
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
     let wanted = select(&card);
     if wanted.is_empty() {
         return Vec::new();
@@ -9910,8 +10373,20 @@ fn resolved_bindings(
             .or_else(|| data.get(&state.path).cloned())
             .or_else(|| state.initial.clone())
             .or_else(|| state.initial_path.as_ref().and_then(|p| data_path(data, p)))
-            .unwrap_or_else(|| initial_for(&state.shape));
-        frames.push((state.path.clone(), value, None));
+            .unwrap_or_else(|| {
+                if state.initial_path.is_some() {
+                    serde_json::Value::Null
+                } else {
+                    initial_for(&state.shape)
+                }
+            });
+        frames.push((
+            state.path.clone(),
+            value,
+            None,
+            None,
+            card_state_origin(state, Some(store), data, &card),
+        ));
     }
     let scope = ValueScope {
         frames,
@@ -9950,13 +10425,12 @@ fn resolved_bindings(
 
 pub fn source_plan(source: &str) -> SourcePlan {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return SourcePlan {
             requests: Vec::new(),
             diagnostics: sink.items,
         };
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
 
     // The plan is what a host acts on, so the capability check has to happen
     // HERE too and not only in `check_ui_l0`. A caller that skips checking must
@@ -10075,10 +10549,9 @@ pub struct RecordDeps {
 /// approximating shows stale data, and only one of those is a correctness bug.
 pub fn record_dependencies(source: &str) -> Vec<RecordDeps> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return Vec::new();
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
 
     // Direct reads, plus the records each one pulls in.
     let mut direct: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
@@ -10146,10 +10619,9 @@ pub fn record_dependencies(source: &str) -> Vec<RecordDeps> {
 /// stale forecast.
 pub fn stale_sources(source: &str, changed: &[&str]) -> Vec<String> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return Vec::new();
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
     let declared: Vec<&str> = card.sources.iter().map(|s| s.name.as_str()).collect();
     invalidated_by(&card, changed)
         .into_iter()
@@ -10221,8 +10693,10 @@ pub fn realize_patch(
     let dirty = patch_points(source, changed);
     let mut report = realize_inner(source, data, store, limits);
 
-    if let Some(root) = report.root.as_mut() {
-        report.reused = carry_over(root, previous, &dirty);
+    if report.complete_root().is_ok() {
+        if let Some(root) = report.root.as_mut() {
+            report.reused = carry_over(root, previous, &dirty);
+        }
     }
     report
 }
@@ -10256,6 +10730,7 @@ fn carry_over(next: &mut UiNode, previous: &UiNode, dirty: &[String]) -> usize {
     if next.key == previous.key
         && next.kind == previous.kind
         && subtree_is_clean(next, &touches_dirty)
+        && next == previous
     {
         *next = previous.clone();
         return count_nodes(previous);
@@ -10276,10 +10751,9 @@ fn count_nodes(n: &UiNode) -> usize {
 
 pub fn patch_points(source: &str, changed: &[&str]) -> Vec<String> {
     let mut sink = Diagnostics::default();
-    let Some(tokens) = lex(source, &mut sink) else {
+    let Some(card) = parsed_card(source, &mut sink) else {
         return Vec::new();
     };
-    let card = Parser::new(&tokens, &mut sink).parse_card();
     let invalidated = invalidated_by(&card, changed);
 
     let mut out = Vec::new();
@@ -10320,11 +10794,8 @@ pub fn dirty_records(source: &str, changed: &[&str]) -> Vec<String> {
     // of a disagreement between two functions answering one question: the coarse
     // one is what a host reaches for first.
     let mut sink = Diagnostics::default();
-    let invalidated = match lex(source, &mut sink) {
-        Some(tokens) => {
-            let card = Parser::new(&tokens, &mut sink).parse_card();
-            invalidated_by(&card, changed)
-        }
+    let invalidated = match parsed_card(source, &mut sink) {
+        Some(card) => invalidated_by(&card, changed),
         None => changed.iter().map(root_of).collect(),
     };
     record_dependencies(source)
@@ -10743,9 +11214,9 @@ pub mod kit {
             if let Some(call) = makepad::vm_call(binding) {
                 let head = serde_json::json!({ "e": event, "k": node.key });
                 let head = head.to_string();
-                // `{"e":…,"k":…}` → `l0:{"e":…,"k":…,"v":"` + <call> + `"}`
-                let open = format!("l0:{},\"v\":\"", head.trim_end_matches('}'));
-                return Some(format!("{open:?} + {call} + {:?}", "\"}"));
+                // Encode the complete JSON value, including quotes, at runtime.
+                let open = format!("l0:{},\"v\":", head.trim_end_matches('}'));
+                return Some(format!("{open:?} + sys.json_string({call}) + {:?}", "}"));
             }
         }
         let value = match arg(node, "value") {
@@ -10883,6 +11354,14 @@ pub mod kit {
     }
 
     fn element(node: &UiNode, depth: usize, out: &mut String) {
+        if node.kind == "Kit" {
+            out.push_str("l0_kit_component(");
+            out.push_str(&super::kit_pack::arguments(node));
+            out.push_str(", ");
+            children(node, depth, out);
+            out.push(')');
+            return;
+        }
         // A `Field` carries its own commit target and must NOT be wrapped in a
         // tap: a hit target over a text input eats the focus, and the payload
         // here is what was typed rather than what the row was bound to.
@@ -11494,7 +11973,13 @@ pub mod kit {
                     scalar_num_of(node, "years")
                 );
             }
-            "TempBar" | "SunArc" | "MoonPhase" | "AqiContour" | "StockPlot" | "Satellite" => {
+            "StockPlot" => {
+                // A ticker is text even when it comes from a live source.
+                // Numeric coercion turned a mover's "BLTE" into a missing
+                // symbol, while literal state-selected tickers still worked.
+                let _ = write!(out, "{f}({}, {})", scalar_of(node, "symbol"), scalar_of(node, "range"));
+            }
+            "TempBar" | "SunArc" | "MoonPhase" | "AqiContour" | "Satellite" => {
                 let params: &[&str] = match node.kind.as_str() {
                     "TempBar" => &["lo", "hi", "min", "max"],
                     "SunArc" => &["rise", "set", "now"],
@@ -11555,5 +12040,50 @@ mod guarded_fields_tests {
             2,
             "state, $state and duplicates must not appear: {got:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_cache_tests {
+    use super::*;
+
+    #[test]
+    fn source_cache_reuses_syntax_but_never_freezes_data_or_validation() {
+        let source = "state title { shape: text, initial: \"first\" } view root Surface { TextBody(text: title) }";
+        let first = parsed_card(source, &mut Diagnostics::default()).unwrap();
+        let second = parsed_card(source, &mut Diagnostics::default()).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &second));
+        for title in ["first", "second"] {
+            let report = realize(
+                source,
+                &serde_json::json!({"title": title}),
+                RealizeLimits::default(),
+            );
+            let lowered = kit::lower(report.complete_root().unwrap());
+            assert!(lowered.contains(title), "{lowered}");
+        }
+        let valid = check_ui_l0(source);
+        assert!(valid.valid, "{valid:?}");
+        let invalid = format!("{source}\nsource forbidden sys.shell()");
+        let refused = check_ui_l0(&invalid);
+        assert!(!refused.valid);
+        assert_eq!(refused, check_ui_l0(&invalid));
+        assert_eq!(valid, check_ui_l0(source));
+    }
+
+    #[test]
+    fn source_cache_evicts_old_entries_and_does_not_retain_oversized_inputs() {
+        let mut cache = SourceCache {
+            entries: std::collections::VecDeque::new(),
+        };
+        for i in 0..SOURCE_CACHE_ENTRIES {
+            cache.insert(&i.to_string(), i);
+        }
+        assert_eq!(cache.get("0"), Some(0));
+        cache.insert("next", 99);
+        assert_eq!(cache.get("1"), None);
+        assert_eq!(cache.get("0"), Some(0));
+        cache.insert(&"x".repeat(DEFAULT_MAX_SOURCE_BYTES + 1), 100);
+        assert_eq!(cache.entries.len(), SOURCE_CACHE_ENTRIES);
     }
 }
